@@ -1,0 +1,57 @@
+services:
+  watchtower:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: watchtower
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      APP_ENV: prod
+      LOG_LEVEL: info
+      METRICS_PORT: "9090"
+    ports:
+      - "9090:9090"
+    networks: [obs]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: watchtower-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9091:9090"
+    depends_on: [watchtower]
+    networks: [obs]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: watchtower-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [obs]
+
+volumes:
+  prom-data: {}
+  grafana-data: {}
+
+networks:
+  obs: {}

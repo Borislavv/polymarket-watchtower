@@ -1,0 +1,98 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "title": "Polymarket Watchtower",
+  "tags": ["polymarket", "watchtower"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "market",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+        "query": "label_values(watchtower_collect_trades_total, market)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Markets tracked",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "watchtower_discover_markets_tracked", "legendFormat": "markets"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Trades ingested (per market)",
+      "gridPos": {"x": 6, "y": 0, "w": 18, "h": 8},
+      "targets": [{
+        "expr": "sum by (market) (rate(watchtower_collect_trades_total{market=~\"$market\"}[1m]))",
+        "legendFormat": "{{market}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Notional USD (per market, $/min)",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "sum by (market) (rate(watchtower_collect_notional_usd_total{market=~\"$market\"}[1m])) * 60",
+        "legendFormat": "{{market}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Window trade rate (per market, window)",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "watchtower_window_trade_rate_per_min{market=~\"$market\"}",
+        "legendFormat": "{{market}} · {{window}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Anomaly multiplier (recent/baseline)",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "watchtower_anomaly_last_multiplier",
+        "legendFormat": "{{scope}} · {{metric}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Anomalies fired (severity)",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "sum by (severity) (increase(watchtower_anomaly_findings_total[5m]))",
+        "legendFormat": "{{severity}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Upstream call rate",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "sum by (api, status) (rate(watchtower_upstream_requests_total[1m]))",
+        "legendFormat": "{{api}} · {{status}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Upstream latency p95",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (api, endpoint, le) (rate(watchtower_upstream_request_duration_seconds_bucket[5m])))",
+        "legendFormat": "{{api}} · {{endpoint}}"
+      }]
+    }
+  ]
+}
