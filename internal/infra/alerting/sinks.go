@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/rs/zerolog"
 )
 
