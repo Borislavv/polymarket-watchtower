@@ -4,6 +4,7 @@ package collect
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	"github.com/rs/zerolog"
 )
 
@@ -106,7 +108,12 @@ func (l *Loop) pull(ctx context.Context, id vo.MarketID) {
 	since := l.lookback(id)
 	trades, err := l.client.ListTradesSince(ctx, dataapi.ListTradesOpts{Market: id, Since: since})
 	if err != nil {
-		l.log.Err(err).Str("market", string(id)).Msg("collect: pull failed")
+		var apiErr *httpx.APIError
+		ev := l.log.Err(err).Str("market", string(id)).Time("since", since)
+		if errors.As(err, &apiErr) {
+			ev.Int("status", apiErr.Status).Bool("retryable", apiErr.Retryable()).Str("body", apiErr.Body)
+		}
+		ev.Msg("collect: pull failed")
 		return
 	}
 	if len(trades) == 0 {

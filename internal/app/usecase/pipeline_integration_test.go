@@ -173,7 +173,7 @@ func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
 		t.Fatalf("telegram sink: %v", err)
 	}
 	cap := &capturingSink{}
-	fanout := &alerting2.Fanout{Sinks: []alerting2.Sink{cap, tg}, Logger: &log}
+	fanout := &alerting2.Fanout{Sinks: []alerting2.Channel{cap, tg}, Logger: &log}
 
 	det := detect.New(detect.Config{
 		Interval:      time.Hour,
