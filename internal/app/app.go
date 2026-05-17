@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
@@ -67,7 +69,6 @@ func New() (*App, error) {
 		Baseline: cfg.Aggregate.BaselineWindow,
 	})
 
-	// HTTP clients — each one gets its own per-host limiter and metrics hook.
 	gammaHTTP, err := httpx.New(httpx.Config{
 		BaseURL:   cfg.Polymarket.GammaURL,
 		Timeout:   cfg.Polymarket.HTTPTimeout,
@@ -101,12 +102,6 @@ func New() (*App, error) {
 		OrderBy:    cfg.Pipeline.OrderBy,
 	}, gammaClient, registry, engine, met, logger)
 
-	collectLoop := collect.New(collect.Config{
-		Interval:     cfg.Pipeline.CollectInterval,
-		Concurrency:  cfg.Pipeline.CollectConcurrency,
-		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
-	}, dataClient, engine, registry, met, logger)
-
 	sinks := []alerting2.Channel{&alerting2.LogSink{Logger: logger}}
 	if cfg.Alerting.WebhookURL != "" {
 		sinks = append(sinks, alerting2.NewWebhookSink(cfg.Alerting.WebhookURL))
@@ -121,19 +116,40 @@ func New() (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("telegram sink: %w", err)
 	}
+	telegram.WithMetrics(met)
 	sinks = append(sinks, telegram)
 	emitter := &alerting2.Fanout{Sinks: sinks, Logger: logger}
 
 	detectLoop := detect.New(detect.Config{
-		Interval:      cfg.Pipeline.CollectInterval,
-		RecentWindows: cfg.Aggregate.RecentWindows,
-		Rule: anomaly.Rule{
-			Multipliers: cfg.Anomaly.Multipliers,
-			MinNotional: cfg.Anomaly.MinVolumeUSD,
-			MinTrades:   cfg.Anomaly.MinTrades,
+		Thresholds: anomaly.Thresholds{
+			Multipliers:       cfg.Anomaly.Multipliers,
+			AbsoluteUSDTiers:  cfg.Anomaly.AbsoluteUSDTiers,
+			MinBaselineTrades: cfg.Anomaly.MinBaselineTrades,
 		},
-		Cooldown: cfg.Anomaly.CooldownPerRule,
+		Baseline: baseline.Config{
+			Window:     cfg.Anomaly.BaselineWindow,
+			MaxSamples: cfg.Anomaly.BaselineMaxSamples,
+		},
+		Cluster: cluster.Config{
+			Window:           cfg.Anomaly.HardAlertWindow,
+			MinTrades:        cfg.Anomaly.HardAlertMinTrades,
+			MinUniqueWallets: cfg.Anomaly.HardAlertMinWallets,
+			MinTotalUSD:      cfg.Anomaly.HardAlertMinTotalUSD,
+			Cooldown:         cfg.Anomaly.HardAlertCooldown,
+		},
+		RecentWindows:  cfg.Aggregate.RecentWindows,
+		GaugeInterval:  cfg.Pipeline.CollectInterval,
+		PolymarketBase: cfg.Polymarket.PublicBaseURL,
+		GrafanaBase:    cfg.Alerting.GrafanaBaseURL,
+		GrafanaDashUID: cfg.Alerting.GrafanaDashUID,
+		GrafanaContext: cfg.Alerting.GrafanaContext,
 	}, engine, registry, emitter, met, logger)
+
+	collectLoop := collect.New(collect.Config{
+		Interval:     cfg.Pipeline.CollectInterval,
+		Concurrency:  cfg.Pipeline.CollectConcurrency,
+		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
+	}, dataClient, engine, registry, detectLoop, met, logger)
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
@@ -158,7 +174,7 @@ func (a *App) Run() error {
 		{Name: "metrics-server", Fn: a.httpSrv.Run},
 		{Name: "discover", Fn: a.discover.Run},
 		{Name: "collect", Fn: a.collect.Run},
-		{Name: "detect", Fn: a.detect.Run},
+		{Name: "detect", Fn: a.detect.Run}, // refreshes supporting gauges only
 	}
 
 	return shutdown2.Graceful(

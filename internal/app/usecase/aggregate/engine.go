@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	trade2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 )
 
@@ -55,14 +55,14 @@ func New(cfg Config) *Engine {
 
 // marketRing is a fixed-size circular buffer keyed by bucket start.
 type marketRing struct {
-	buckets []trade2.Bucket
+	buckets []trade.Bucket
 	size    int
 }
 
 func (e *Engine) ringFor(id vo.MarketID) *marketRing {
 	r, ok := e.rings[id]
 	if !ok {
-		r = &marketRing{buckets: make([]trade2.Bucket, e.bucketsPerRing), size: e.bucketsPerRing}
+		r = &marketRing{buckets: make([]trade.Bucket, e.bucketsPerRing), size: e.bucketsPerRing}
 		e.rings[id] = r
 	}
 	return r
@@ -74,7 +74,7 @@ func (e *Engine) bucketStart(t time.Time) time.Time {
 
 // Ingest folds a trade into the right bucket. Trades older than the baseline
 // window are dropped silently.
-func (e *Engine) Ingest(t trade2.Trade) {
+func (e *Engine) Ingest(t trade.Trade) {
 	if t.Market == "" {
 		return
 	}
@@ -95,13 +95,13 @@ func (e *Engine) Ingest(t trade2.Trade) {
 	b := &r.buckets[idx]
 	if !b.Start.Equal(bs) {
 		// stale slot — reset
-		*b = trade2.Bucket{Start: bs}
+		*b = trade.Bucket{Start: bs}
 	}
 	b.Add(t)
 }
 
 // IngestBatch is Ingest applied across a slice.
-func (e *Engine) IngestBatch(ts []trade2.Trade) {
+func (e *Engine) IngestBatch(ts []trade.Trade) {
 	for _, t := range ts {
 		e.Ingest(t)
 	}
@@ -109,16 +109,16 @@ func (e *Engine) IngestBatch(ts []trade2.Trade) {
 
 // Window folds the current ring for market `id` into a single Window covering
 // the last `length` of time ending at now.
-func (e *Engine) Window(id vo.MarketID, length time.Duration) trade2.Window {
+func (e *Engine) Window(id vo.MarketID, length time.Duration) trade.Window {
 	now := e.clock()
 	start := now.Add(-length)
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	r, ok := e.rings[id]
 	if !ok {
-		return trade2.Window{Start: start, End: now}
+		return trade.Window{Start: start, End: now}
 	}
-	live := make([]trade2.Bucket, 0, r.size)
+	live := make([]trade.Bucket, 0, r.size)
 	for i := range r.buckets {
 		b := r.buckets[i]
 		if b.Count == 0 {
@@ -126,12 +126,12 @@ func (e *Engine) Window(id vo.MarketID, length time.Duration) trade2.Window {
 		}
 		live = append(live, b)
 	}
-	return trade2.FoldBuckets(live, start, now)
+	return trade.FoldBuckets(live, start, now)
 }
 
 // BaselineWindow returns the full baseline window (excluding the most recent
 // `exclude` time, so a recent-vs-baseline comparison is not self-overlapping).
-func (e *Engine) BaselineWindow(id vo.MarketID, exclude time.Duration) trade2.Window {
+func (e *Engine) BaselineWindow(id vo.MarketID, exclude time.Duration) trade.Window {
 	now := e.clock()
 	end := now.Add(-exclude)
 	if end.Before(now.Add(-e.baseline)) {
@@ -142,9 +142,9 @@ func (e *Engine) BaselineWindow(id vo.MarketID, exclude time.Duration) trade2.Wi
 	defer e.mu.RUnlock()
 	r, ok := e.rings[id]
 	if !ok {
-		return trade2.Window{Start: start, End: end}
+		return trade.Window{Start: start, End: end}
 	}
-	live := make([]trade2.Bucket, 0, r.size)
+	live := make([]trade.Bucket, 0, r.size)
 	for i := range r.buckets {
 		b := r.buckets[i]
 		if b.Count == 0 {
@@ -152,7 +152,7 @@ func (e *Engine) BaselineWindow(id vo.MarketID, exclude time.Duration) trade2.Wi
 		}
 		live = append(live, b)
 	}
-	return trade2.FoldBuckets(live, start, end)
+	return trade.FoldBuckets(live, start, end)
 }
 
 // Markets returns the set of market IDs currently tracked.
