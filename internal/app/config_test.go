@@ -23,10 +23,6 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"ALERT_INFO_MIN_NOTIONAL_USD", "ALERT_INFO_MIN_ODDS", "ALERT_INFO_MIN_MULTIPLIER",
 		"ALERT_WARNING_MIN_NOTIONAL_USD", "ALERT_WARNING_MIN_ODDS", "ALERT_WARNING_MIN_MULTIPLIER",
 		"ALERT_CRITICAL_MIN_NOTIONAL_USD", "ALERT_CRITICAL_MIN_ODDS", "ALERT_CRITICAL_MIN_MULTIPLIER",
-		"ALERT_HARD_A_MIN_NOTIONAL_USD", "ALERT_HARD_A_MIN_ODDS", "ALERT_HARD_A_MIN_MULTIPLIER",
-		"ALERT_HARD_B_MIN_NOTIONAL_USD", "ALERT_HARD_B_MIN_ODDS", "ALERT_HARD_B_MIN_MULTIPLIER",
-		"ALERT_HUGE_WHALE_MIN_NOTIONAL_USD", "ALERT_HUGE_WHALE_MIN_ODDS", "ALERT_HUGE_WHALE_MIN_MULTIPLIER",
-		"ALERT_MEGA_WHALE_MIN_NOTIONAL_USD", "ALERT_MEGA_WHALE_MIN_ODDS", "ALERT_MEGA_WHALE_MIN_MULTIPLIER",
 		"BASELINE_MIN_TRADE_USD",
 		"SINGLE_MIN_BASELINE_TRADES", "SINGLE_MIN_BASELINE_NOTIONAL_USD",
 		"BASELINE_WINDOW", "BASELINE_MAX_SAMPLES", "BASELINE_MIN_READY_WINDOW",
@@ -35,9 +31,6 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"CLUSTER_WINDOW", "CLUSTER_MIN_ANOMALOUS_TRADES",
 		"CLUSTER_MIN_UNIQUE_TRADERS", "CLUSTER_MIN_TOTAL_NOTIONAL_USD",
 		"CLUSTER_COOLDOWN",
-		"SUB_CLUSTER_WINDOW", "SUB_CLUSTER_MIN_TRADE_USD", "SUB_CLUSTER_MIN_ODDS",
-		"SUB_CLUSTER_MIN_MULTIPLIER", "SUB_CLUSTER_MIN_UNIQUE_TRADERS",
-		"SUB_CLUSTER_MIN_TOTAL_NOTIONAL_USD", "SUB_CLUSTER_COOLDOWN",
 		"VOLUME_MULTIPLIERS", "VOLUME_MIN_NOTIONAL_USD", "VOLUME_MIN_TRADES", "VOLUME_COOLDOWN",
 		"CATEGORY_BLACKLIST",
 		"ALERT_WEBHOOK_URL",
@@ -71,29 +64,9 @@ func TestConfigDefaults(t *testing.T) {
 		t.Errorf("warning tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.WarningMinNotionalUSD, cfg.Anomaly.WarningMinOdds, cfg.Anomaly.WarningMinMultiplier)
 	}
-	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 1_000 {
+	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 10_000 {
 		t.Errorf("critical tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.CriticalMinNotionalUSD, cfg.Anomaly.CriticalMinOdds, cfg.Anomaly.CriticalMinMultiplier)
-	}
-	if cfg.Anomaly.HardPromotionA_MinNotionalUSD != 250_000 || cfg.Anomaly.HardPromotionA_MinOdds != 5 || cfg.Anomaly.HardPromotionA_MinMultiplier != 1_000 {
-		t.Errorf("hard-promotion A defaults: notional=%v odds=%v mul=%v",
-			cfg.Anomaly.HardPromotionA_MinNotionalUSD, cfg.Anomaly.HardPromotionA_MinOdds, cfg.Anomaly.HardPromotionA_MinMultiplier)
-	}
-	if cfg.Anomaly.HardPromotionB_MinNotionalUSD != 100_000 || cfg.Anomaly.HardPromotionB_MinOdds != 10 || cfg.Anomaly.HardPromotionB_MinMultiplier != 2_500 {
-		t.Errorf("hard-promotion B defaults: notional=%v odds=%v mul=%v",
-			cfg.Anomaly.HardPromotionB_MinNotionalUSD, cfg.Anomaly.HardPromotionB_MinOdds, cfg.Anomaly.HardPromotionB_MinMultiplier)
-	}
-	if cfg.Anomaly.HugeWhaleMinNotionalUSD != 250_000 || cfg.Anomaly.HugeWhaleMinOdds != 5 || cfg.Anomaly.HugeWhaleMinMultiplier != 1_000 {
-		t.Errorf("huge-whale defaults: notional=%v odds=%v mul=%v",
-			cfg.Anomaly.HugeWhaleMinNotionalUSD, cfg.Anomaly.HugeWhaleMinOdds, cfg.Anomaly.HugeWhaleMinMultiplier)
-	}
-	if cfg.Anomaly.MegaWhaleMinNotionalUSD != 1_000_000 || cfg.Anomaly.MegaWhaleMinOdds != 3 || cfg.Anomaly.MegaWhaleMinMultiplier != 250 {
-		t.Errorf("mega-whale defaults: notional=%v odds=%v mul=%v",
-			cfg.Anomaly.MegaWhaleMinNotionalUSD, cfg.Anomaly.MegaWhaleMinOdds, cfg.Anomaly.MegaWhaleMinMultiplier)
-	}
-	if cfg.Anomaly.SubClusterMinUniqueTraders < 2 || cfg.Anomaly.SubClusterMinTradeUSD <= 0 {
-		t.Errorf("sub-cluster defaults: traders=%d min_trade=%v",
-			cfg.Anomaly.SubClusterMinUniqueTraders, cfg.Anomaly.SubClusterMinTradeUSD)
 	}
 	if cfg.Anomaly.AllowUnknownMarketLifecycle {
 		t.Errorf("AllowUnknownMarketLifecycle default must be false (fail-closed)")

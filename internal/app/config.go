@@ -82,23 +82,24 @@ type AggregateConfig struct {
 	RecentWindows  []time.Duration `env:"AGG_RECENT_WINDOWS" envDefault:"12h,24h" envSeparator:","`
 }
 
-// AnomalyConfig encodes the per-trade single_cluster detector and the
-// category-cluster (CategoryWatchRequired / HARD) alert.
-//
-// Single-trade scoring uses the combined AND strategy (see score.Score):
+// AnomalyConfig encodes the per-trade `single_cluster` detector and the
+// category-cluster (HARD) alert. Single-trade scoring is conservative-MIN
+// of two 3-rung ladders; the cluster fires HARD when several already-firing
+// single-trade alerts converge on one category in a short window.
 //
 //	            absolute (notional AND odds)   multiplier ladder
-//	Info        $10k AND odds 3                ≥ 100×
-//	Warning     $25k AND odds 5                ≥ 1000×
+//	Info        $10k  AND odds 3               ≥ 100×
+//	Warning     $25k  AND odds 5               ≥ 1000×
 //	Critical    $100k AND odds 8               ≥ 10000×
 //
-// Final severity is the conservative MIN of the two tiers; below info on
-// either side ⇒ no alert. Baseline samples below BaselineMinTradeUSD are
-// dropped before the median is computed so micro-trades don't poison it.
+// Final severity is the lower of the two tiers. Either side below Info ⇒ no
+// alert. Single-trade severity caps at Critical; HARD is reserved for
+// cluster alerts (multiple sharks converging).
 type AnomalyConfig struct {
 	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
 
-	// Absolute ladder (notional + odds floors).
+	// Single-trade severity ladders. Both ladders must qualify at the same
+	// rung or higher; final severity is the lower of the two.
 	InfoMinNotionalUSD     float64 `env:"ALERT_INFO_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
 	InfoMinOdds            float64 `env:"ALERT_INFO_MIN_ODDS" envDefault:"3" validate:"gte=1"`
 	InfoMinMultiplier      float64 `env:"ALERT_INFO_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
@@ -107,31 +108,7 @@ type AnomalyConfig struct {
 	WarningMinMultiplier   float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 	CriticalMinNotionalUSD float64 `env:"ALERT_CRITICAL_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
 	CriticalMinOdds        float64 `env:"ALERT_CRITICAL_MIN_ODDS" envDefault:"8" validate:"gte=1"`
-	// Critical multiplier defaults to 1000× (was 10000×): with conservative-min
-	// composition a $100k bet at odds 8 with 1000× rarity would otherwise
-	// collapse to warning. The HardPromotion rule below handles the truly
-	// extreme cases.
-	CriticalMinMultiplier float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
-
-	// HardPromotion: two OR branches. A trade clearing ALL three floors of
-	// either branch is escalated to Hard severity, bypassing conservative-min.
-	HardPromotionA_MinNotionalUSD float64 `env:"ALERT_HARD_A_MIN_NOTIONAL_USD" envDefault:"250000" validate:"gte=0"`
-	HardPromotionA_MinOdds        float64 `env:"ALERT_HARD_A_MIN_ODDS" envDefault:"5" validate:"gte=1"`
-	HardPromotionA_MinMultiplier  float64 `env:"ALERT_HARD_A_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
-	HardPromotionB_MinNotionalUSD float64 `env:"ALERT_HARD_B_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
-	HardPromotionB_MinOdds        float64 `env:"ALERT_HARD_B_MIN_ODDS" envDefault:"10" validate:"gte=1"`
-	HardPromotionB_MinMultiplier  float64 `env:"ALERT_HARD_B_MIN_MULTIPLIER" envDefault:"2500" validate:"gte=0"`
-
-	// HugeWhale: forces final severity to at least Critical on raw-size cases
-	// the conservative-min would otherwise miss.
-	HugeWhaleMinNotionalUSD float64 `env:"ALERT_HUGE_WHALE_MIN_NOTIONAL_USD" envDefault:"250000" validate:"gte=0"`
-	HugeWhaleMinOdds        float64 `env:"ALERT_HUGE_WHALE_MIN_ODDS" envDefault:"5" validate:"gte=1"`
-	HugeWhaleMinMultiplier  float64 `env:"ALERT_HUGE_WHALE_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
-
-	// MegaWhale: forces Hard severity for extreme raw-size cases.
-	MegaWhaleMinNotionalUSD float64 `env:"ALERT_MEGA_WHALE_MIN_NOTIONAL_USD" envDefault:"1000000" validate:"gte=0"`
-	MegaWhaleMinOdds        float64 `env:"ALERT_MEGA_WHALE_MIN_ODDS" envDefault:"3" validate:"gte=1"`
-	MegaWhaleMinMultiplier  float64 `env:"ALERT_MEGA_WHALE_MIN_MULTIPLIER" envDefault:"250" validate:"gte=0"`
+	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
 
 	// Baseline shape.
 	BaselineMinTradeUSD          float64 `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
@@ -148,32 +125,24 @@ type AnomalyConfig struct {
 	// from BaselineWindow which is a *cap*. 0 disables.
 	BaselineMinReadySpan time.Duration `env:"BASELINE_MIN_READY_WINDOW" envDefault:"24h" validate:"gte=0"`
 
-	// Lifecycle gating.
+	// Lifecycle gating: only alert when the market is in the last
+	// (100 - LifecycleAlertFromPct)% of its lifetime. Markets with missing
+	// start/end dates are silenced by default (fail-closed); set
+	// ALLOW_UNKNOWN_MARKET_LIFECYCLE=true to opt in.
 	LifecycleAlertFromPct       float64       `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
 	LifecycleHotFromPct         float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
 	MarketMinAge                time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
 	AllowUnknownMarketLifecycle bool          `env:"ALLOW_UNKNOWN_MARKET_LIFECYCLE" envDefault:"false"`
 
-	// Cluster (HARD) alert — composed of already-fired single-trade alerts.
+	// Cluster (HARD) alert. Fires when several already-firing single-trade
+	// alerts converge on one category within ClusterWindow.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
 	ClusterMinTrades   int           `env:"CLUSTER_MIN_ANOMALOUS_TRADES" envDefault:"3" validate:"gte=2"`
 	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
 	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
 	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
 
-	// Sub-cluster (HARD) alert — composed of *candidate* trades that fall
-	// below the single-trade absolute floor but still look like a
-	// coordinated split. Each candidate must clear the per-candidate floors
-	// below; the cluster fires when enough distinct wallets accumulate.
-	SubClusterWindow              time.Duration `env:"SUB_CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
-	SubClusterMinTradeUSD         float64       `env:"SUB_CLUSTER_MIN_TRADE_USD" envDefault:"3000" validate:"gte=0"`
-	SubClusterMinOdds             float64       `env:"SUB_CLUSTER_MIN_ODDS" envDefault:"5" validate:"gte=1"`
-	SubClusterMinMultiplier       float64       `env:"SUB_CLUSTER_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
-	SubClusterMinUniqueTraders    int           `env:"SUB_CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"5" validate:"gte=2"`
-	SubClusterMinTotalNotionalUSD float64       `env:"SUB_CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
-	SubClusterCooldown            time.Duration `env:"SUB_CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
-
-	// Volume mode (legacy).
+	// Volume mode (legacy aggregate-rate detector).
 	VolumeMultipliers []float64     `env:"VOLUME_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`
 	VolumeMinNotional float64       `env:"VOLUME_MIN_NOTIONAL_USD" envDefault:"5000" validate:"gte=0"`
 	VolumeMinTrades   int           `env:"VOLUME_MIN_TRADES" envDefault:"5" validate:"gte=0"`

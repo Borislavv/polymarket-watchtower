@@ -27,7 +27,6 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/subcluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
@@ -45,14 +44,9 @@ type Emitter interface {
 
 // Config wires the detector. Defaults fill in for zero-valued fields.
 type Config struct {
-	Thresholds anomaly.Thresholds
-	Baseline   baseline.Config
-	Cluster    cluster.Config
-	// SubCluster catches distributed insider activity: small-but-shaped trades
-	// that individually never clear the absolute single-trade floor but in
-	// aggregate (many wallets, high odds, large multiplier) signal a split-
-	// wallet strategy. Zero-value Config disables the detector.
-	SubCluster     subcluster.Config
+	Thresholds     anomaly.Thresholds
+	Baseline       baseline.Config
+	Cluster        cluster.Config
 	Filter         *category.Filter // nil => allow all (no filtering)
 	RecentWindows  []time.Duration
 	GaugeInterval  time.Duration // how often Run() refreshes supporting gauges
@@ -82,16 +76,15 @@ type Config struct {
 
 // Loop owns the analytics state.
 type Loop struct {
-	cfg        Config
-	engine     *aggregate.Engine
-	registry   *aggregate.MarketRegistry
-	baseline   *baseline.Baseline
-	cluster    *cluster.Detector
-	subcluster *subcluster.Detector // nil when SubCluster config is zero-valued
-	emit       Emitter
-	metrics    *metrics.Metrics
-	log        *zerolog.Logger
-	now        func() time.Time
+	cfg      Config
+	engine   *aggregate.Engine
+	registry *aggregate.MarketRegistry
+	baseline *baseline.Baseline
+	cluster  *cluster.Detector
+	emit     Emitter
+	metrics  *metrics.Metrics
+	log      *zerolog.Logger
+	now      func() time.Time
 }
 
 // New wires the analytics state. Baseline.Window doubles as the lookback for
@@ -130,10 +123,7 @@ func New(
 	if cfg.Cluster.Clock == nil {
 		cfg.Cluster.Clock = now
 	}
-	if cfg.SubCluster.Clock == nil {
-		cfg.SubCluster.Clock = now
-	}
-	l := &Loop{
+	return &Loop{
 		cfg:      cfg,
 		engine:   eng,
 		registry: reg,
@@ -144,18 +134,6 @@ func New(
 		log:      log,
 		now:      now,
 	}
-	if subClusterEnabled(cfg.SubCluster) {
-		l.subcluster = subcluster.New(cfg.SubCluster)
-	}
-	return l
-}
-
-// subClusterEnabled reports whether the SubCluster config has the minimum
-// floors set to do meaningful work. A zero-valued Config disables the detector
-// rather than firing on every trade.
-func subClusterEnabled(c subcluster.Config) bool {
-	return c.MinTradeUSD > 0 && c.MinOdds > 0 && c.MinMultiplier > 0 &&
-		c.MinUniqueWallets > 0 && c.MinTotalNotionalUSD > 0
 }
 
 // Observe is the per-trade hot path called by collect for every ingested trade.
@@ -237,11 +215,6 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 
 		sr := score.Score(notional, trade.Price, stats, l.cfg.Thresholds)
 		if !sr.Fired {
-			// Sub-cluster path: a non-firing trade that still looks like a
-			// split-wallet candidate (above the sub-floor in notional/odds and
-			// far above the median) is admitted to the per-category window. If
-			// enough distinct wallets accumulate the detector fires HARD.
-			l.observeSubCluster(ctx, market, trade, notional, stats, cat)
 			continue
 		}
 
@@ -260,31 +233,6 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	}
 	if bestResult.Fired {
 		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef, lifecyclePct, hot)
-	}
-}
-
-// observeSubCluster admits the trade to the per-category sub-threshold
-// window when it clears the per-candidate floors. A non-nil ClusterStats from
-// the subcluster detector emits a HARD CategoryWatch alert.
-func (l *Loop) observeSubCluster(
-	ctx context.Context,
-	m market.Market,
-	t trade.Trade,
-	notional float64,
-	stats baseline.Stats,
-	cat vo.CategoryID,
-) {
-	if l.subcluster == nil || stats.MedianUSD <= 0 || t.Price <= 0 {
-		return
-	}
-	mul := notional / stats.MedianUSD
-	odds := 1.0 / t.Price
-	if !l.subcluster.Qualifies(notional, odds, mul) {
-		return
-	}
-	ref := l.buildTradeRef(m, t, notional)
-	if cs := l.subcluster.Observe(cat, ref, odds, mul); cs != nil {
-		l.emitCategoryWatch(ctx, m, t, cat, cs)
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/subcluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
@@ -54,10 +53,6 @@ func defaultThresholds() anomaly.Thresholds {
 		Info:                   anomaly.Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
 		Warning:                anomaly.Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
 		Critical:               anomaly.Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
-		HardPromotionA:         anomaly.Tier{MinNotionalUSD: 250_000, MinOdds: 5, MinMultiplier: 1_000},
-		HardPromotionB:         anomaly.Tier{MinNotionalUSD: 100_000, MinOdds: 10, MinMultiplier: 2_500},
-		HugeWhale:              anomaly.Tier{MinNotionalUSD: 250_000, MinOdds: 5, MinMultiplier: 1_000},
-		MegaWhale:              anomaly.Tier{MinNotionalUSD: 1_000_000, MinOdds: 3, MinMultiplier: 250},
 		MinBaselineTrades:      20,
 		MinBaselineNotionalUSD: 1_000,
 	}
@@ -172,16 +167,16 @@ func TestCriticalRequiresAllThree(t *testing.T) {
 	m, _ := reg.Get("0xa")
 	// Warm with $60 trades (above the $50 baseline filter).
 	warm(loop, m, 30, 60, 0.5, now)
-	// $700k at odds 8 → multiplier 700000/60 ≈ 11666. With local defaults
-	// (Critical mul 10000) both ladders are critical AND HardPromotion fires
-	// (notional≥100k ∧ odds≥8 ∧ mul≥1000) → promoted to Hard.
+	// $700k at odds 8 → multiplier 700000/60 ≈ 11666. With the new model
+	// (single-trade caps at Critical), absolute=Critical (700k ≥ 100k ∧ odds
+	// 8 ≥ 8) and multiplier=Critical (11666 ≥ 10000) → conservative-MIN = Critical.
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	got := emit.of(anomaly.KindTradeAnomaly)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 finding, got %d", len(got))
 	}
-	if got[0].Severity != anomaly.SeverityHard {
-		t.Fatalf("expected hard (HardPromotion), got %s", got[0].Severity)
+	if got[0].Severity != anomaly.SeverityCritical {
+		t.Fatalf("expected critical (cap for single trades), got %s", got[0].Severity)
 	}
 	// All payload fields populated for human review.
 	tr := got[0].Trade
@@ -194,7 +189,7 @@ func TestCriticalRequiresAllThree(t *testing.T) {
 	if got[0].MarketURL != "https://polymarket.com/event/us-pres-2028" {
 		t.Fatalf("market URL: %q", got[0].MarketURL)
 	}
-	if !strings.Contains(got[0].GrafanaURL, "var-severity=hard") {
+	if !strings.Contains(got[0].GrafanaURL, "var-severity=critical") {
 		t.Fatalf("grafana URL missing severity var: %q", got[0].GrafanaURL)
 	}
 }
@@ -595,32 +590,32 @@ func TestSeverityTableFromStrategy(t *testing.T) {
 	}{
 		// median $100
 		// $100k @ odds 8, mul 1000: absTier=Critical (notional & odds clear),
-		// mulTier=Warning (>=1000, <10000) → conservative=Warning. No promotion:
-		// HardPromotionA needs notional≥250k; HardPromotionB needs odds≥10;
-		// HugeWhale needs notional≥250k; MegaWhale needs notional≥1M.
-		{"100k_odds8_mul1000_warning_conservative", 100, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
-		{"100k_odds3_mul1000_info_conservative", 100, 100_000, 1.0 / 3, true, anomaly.SeverityInfo},
-		{"25k_odds5_mul250_info", 100, 25_000, 1.0 / 5, true, anomaly.SeverityInfo}, // mul=250 → info under defaults
+		// mulTier=Warning (>=1000, <10000) → conservative-MIN = Warning.
+		{"100k_odds8_mul1000_warning", 100, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
+		{"100k_odds3_mul1000_info", 100, 100_000, 1.0 / 3, true, anomaly.SeverityInfo},
+		{"25k_odds5_mul250_info", 100, 25_000, 1.0 / 5, true, anomaly.SeverityInfo},
 		{"10k_odds3_mul100_info", 100, 10_000, 1.0 / 3, true, anomaly.SeverityInfo},
 		// boundary fails
 		{"9999_odds3_no_fire", 100, 9_999, 1.0 / 3, false, ""},
 		{"10k_odds299_no_fire", 100, 10_000, 1.0 / 2.99, false, ""},
 		// median $60 (just above the $50 baseline dust filter)
-		// $100k @ odds 8 / median 60 → mul≈1666. conservative=Warning. Same
-		// promotion analysis as the row above (notional<250k, odds<10) → still Warning.
-		{"100k_odds8_mul1666_warning_no_promo", 60, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
-		// $1M @ odds 3: too-low-odds for HardPromotion/HugeWhale, but MegaWhale
-		// (notional≥1M ∧ odds≥3 ∧ mul≥250) fires → Hard.
-		{"1M_odds3_mega_whale_HARD", 60, 1_000_000, 1.0 / 3, true, anomaly.SeverityHard},
-		// median $1000 (rich market) — multiplier shrinks
-		// $100k @ odds 8 / median 1000 → mul=100. mulTier=Info (>=100). conservative=Info. No promo.
-		{"100k_odds8_mul100_info_no_promo", 1_000, 100_000, 1.0 / 8, true, anomaly.SeverityInfo},
+		// $100k @ odds 8 / median 60 → mul≈1666 → conservative-MIN = Warning.
+		{"100k_odds8_mul1666_warning", 60, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
+		// $1M @ odds 3 / median 60 → absTier=Info (odds 3 < 5 so not Warning),
+		// mulTier=Critical (16666 ≥ 10000) → conservative-MIN = Info.
+		// Single-trade severity caps at Critical; HARD is cluster-only.
+		{"1M_odds3_low_odds_info", 60, 1_000_000, 1.0 / 3, true, anomaly.SeverityInfo},
+		// $100k @ odds 8 / median 1000 → mul=100 → mulTier=Info → conservative = Info.
+		{"100k_odds8_mul100_info", 1_000, 100_000, 1.0 / 8, true, anomaly.SeverityInfo},
 		// Whale-grade insider trade: $300k @ odds 6 / median 60 → mul=5000.
-		// HardPromotionA fires (250k ∧ 5 ∧ 1000); also HugeWhale fires → Hard.
-		{"300k_odds6_mul5000_HARD_promo_A", 60, 300_000, 1.0 / 6, true, anomaly.SeverityHard},
+		// absTier=Warning (odds 6 < 8), mulTier=Warning (5000 < 10000) → Warning.
+		{"300k_odds6_mul5000_warning", 60, 300_000, 1.0 / 6, true, anomaly.SeverityWarning},
 		// Long-shot insider: $150k @ odds 12 / median 60 → mul=2500.
-		// HardPromotionB fires (100k ∧ 10 ∧ 2500) → Hard.
-		{"150k_odds12_mul2500_HARD_promo_B", 60, 150_000, 1.0 / 12, true, anomaly.SeverityHard},
+		// absTier=Critical (150k ≥ 100k ∧ 12 ≥ 8), mulTier=Warning → Warning.
+		{"150k_odds12_mul2500_warning", 60, 150_000, 1.0 / 12, true, anomaly.SeverityWarning},
+		// Genuine top-tier shark: $700k @ odds 10 / median 60 → mul≈11666.
+		// absTier=Critical, mulTier=Critical → conservative-MIN = Critical.
+		{"700k_odds10_mul11666_critical", 60, 700_000, 1.0 / 10, true, anomaly.SeverityCritical},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -670,6 +665,105 @@ func TestUnknownLifecycleFailsClosedByDefault(t *testing.T) {
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
 		t.Fatalf("unknown lifecycle must be fail-closed by default, got %d findings", len(got))
+	}
+}
+
+// TestFranceFifaHideFromNewStillAlerts is the regression guard for the case
+// reported in the field:
+//
+//	Trade: $26,999 @ price 0.1768 (odds 5.66)
+//	Baseline: 29 trades, median $100  → multiplier ≈ 270×
+//	Category: "Hide From New" (NOT sports)
+//	Market: "Will France win the 2026 FIFA World Cup?" — sports words in
+//	        the question and event slug, but not in the category.
+//	Lifecycle: late-stage market (well past the 75% gate).
+//
+// The previous (now reverted) secondary keyword scan silenced this trade by
+// matching "fifa"/"world cup" against market.Question / EventSlug. The
+// product decision is that filtering is category-identity-only, so this
+// trade MUST emit a single-trade alert. Severity calculation under defaults:
+//
+//	absolute  : $26,999 ≥ $25k AND 5.66 ≥ 5 → Warning
+//	multiplier: 270× ≥ 100 but < 1000        → Info
+//	conservative-MIN(Warning, Info)          → Info
+//
+// (This matches the historical alert pasted in the bug report: "tiers:
+// absolute=warning multiplier=info → final=info".)
+func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	// Market lifecycle from real Polymarket data: opened 2025-07-02, ends
+	// 2026-07-20. At 2026-05-17 that's ~83% of the lifetime → past the gate.
+	start := time.Date(2025, 7, 2, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	reg := aggregate.NewRegistry()
+	reg.Replace(
+		[]market.Market{{
+			ID:   "0xfifa-france",
+			Slug: "will-france-win-the-2026-fifa-world-cup",
+			// Sports words present in question + event slug + event title —
+			// must NOT trigger any silencing under category-only filtering.
+			Question:   "Will France win the 2026 FIFA World Cup?",
+			EventSlug:  "2026-fifa-world-cup-winner-595",
+			EventTitle: "2026 FIFA World Cup Winner",
+			TokenIDs:   []vo.TokenID{"tok-yes"},
+			Outcomes:   []string{"Yes"},
+			// "Hide From New" — not a sports category by identity.
+			Categories: []vo.CategoryID{42},
+			Active:     true, Closed: false,
+			StartDate: start, EndDate: end,
+		}},
+		[]market.Category{{ID: 42, Slug: "hide-from-new", Label: "Hide From New"}},
+	)
+	emit := &capturingEmitter{}
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds: defaultThresholds(),
+		// Baseline window long enough to cover the warming period; the test
+		// seeds 29 samples of $100 over the last ~7 days so the actual span
+		// clears BaselineMinReadySpan (24h).
+		Baseline: baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:  cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99}, // never fire cluster
+		// Default-shaped sports blacklist — must not catch this market.
+		Filter:                category.NewFilter([]string{"sports", "sport"}),
+		Clock:                 func() time.Time { return now },
+		LifecycleAlertFromPct: 75,
+		LifecycleHotFromPct:   90,
+		MarketMinAge:          24 * time.Hour,
+		BaselineMinReadySpan:  24 * time.Hour,
+		PolymarketBase:        "https://polymarket.com",
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	m, _ := reg.Get("0xfifa-france")
+	// Warm baseline with 29 samples of $100 across the last week so SpanActual
+	// clears BaselineMinReadySpan and MedianUSD == 100.
+	for i := 0; i < 29; i++ {
+		at := now.Add(-time.Duration(i) * 6 * time.Hour) // ~7 days of span
+		loop.Observe(context.Background(), m, bet(100, 0.5, "warmer", at))
+	}
+	// The exact trade from the regression report.
+	loop.Observe(context.Background(), m, bet(26_999, 0.1768, "0x8ba27b7c9de2b6367f986bff5f9c8049204c1650", now))
+
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 single-trade alert, got %d: %+v", len(got), got)
+	}
+	f := got[0]
+	if f.Severity != anomaly.SeverityInfo {
+		t.Errorf("expected Info (conservative-MIN of abs=Warning, mul=Info), got %s", f.Severity)
+	}
+	if f.AbsoluteTier != anomaly.SeverityWarning {
+		t.Errorf("absolute tier: got %q want warning", f.AbsoluteTier)
+	}
+	if f.MultiplierTier != anomaly.SeverityInfo {
+		t.Errorf("multiplier tier: got %q want info", f.MultiplierTier)
+	}
+	if f.Trade == nil || f.Trade.NotionalUSD < 26_998 || f.Trade.NotionalUSD > 27_000 {
+		t.Errorf("trade notional: %+v", f.Trade)
+	}
+	if f.Multiplier < 200 || f.Multiplier > 350 {
+		t.Errorf("multiplier must reflect 26999/100 ≈ 270, got %v", f.Multiplier)
+	}
+	if !f.Hot && f.LifecyclePct < 75 {
+		t.Errorf("expected lifecycle past 75%%, got %v hot=%v", f.LifecyclePct, f.Hot)
 	}
 }
 
@@ -778,114 +872,6 @@ func TestBlacklistStaysCategoryOnly(t *testing.T) {
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
 		t.Fatalf("non-sports category with sports word in metadata must alert, got %d", len(got))
-	}
-}
-
-// TestSubClusterFiresOnDistributedWhales verifies the split-wallet path: ten
-// wallets each placing a $6,000 bet at odds 6 — every individual trade is
-// below the $10k absolute floor (no single-trade alert) but together they
-// match the sub-cluster signature and should fire one HARD CategoryWatch.
-func TestSubClusterFiresOnDistributedWhales(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
-	reg.Replace(
-		[]market.Market{{
-			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
-			EventSlug: "us-pres-2028", TokenIDs: []vo.TokenID{"tok-yes"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{42}, Active: true,
-		}},
-		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
-	)
-	emit := &capturingEmitter{}
-	log := zerolog.Nop()
-	loop := New(Config{
-		Thresholds: defaultThresholds(),
-		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
-		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99}, // disable normal cluster
-		SubCluster: subcluster.Config{
-			MinTradeUSD:         3_000,
-			MinOdds:             5,
-			MinMultiplier:       50,
-			Window:              30 * time.Minute,
-			MinUniqueWallets:    5,
-			MinTotalNotionalUSD: 25_000,
-			Cooldown:            time.Hour,
-		},
-		Clock:                       func() time.Time { return now },
-		AllowUnknownMarketLifecycle: true,
-		PolymarketBase:              "https://polymarket.com",
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
-	m, _ := reg.Get("0xa")
-	// Warm baseline at $60 median.
-	warm(loop, m, 30, 60, 0.5, now)
-	for _, w := range []string{"sh1", "sh2", "sh3", "sh4", "sh5", "sh6", "sh7", "sh8", "sh9", "sh10"} {
-		loop.Observe(context.Background(), m, bet(6_000, 1.0/6, w, now))
-	}
-	if singles := emit.of(anomaly.KindTradeAnomaly); len(singles) != 0 {
-		t.Fatalf("none of the $6k trades should fire single-trade alerts, got %d", len(singles))
-	}
-	hard := emit.of(anomaly.KindCategoryWatch)
-	if len(hard) != 1 {
-		t.Fatalf("expected 1 sub-cluster HARD alert, got %d", len(hard))
-	}
-	if hard[0].Cluster == nil || hard[0].Cluster.UniqueWallets < 5 {
-		t.Fatalf("sub-cluster stats: %+v", hard[0].Cluster)
-	}
-}
-
-// TestSubClusterDoesNotFireBelowWalletThreshold confirms that 4 sub-floor
-// wallets — short of the MinUniqueWallets of 5 — do not produce a HARD alert.
-func TestSubClusterDoesNotFireBelowWalletThreshold(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
-	reg.Replace(
-		[]market.Market{{
-			ID: "0xa", Slug: "s", EventSlug: "e",
-			TokenIDs: []vo.TokenID{"tok-yes"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{42}, Active: true,
-		}},
-		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
-	)
-	emit := &capturingEmitter{}
-	log := zerolog.Nop()
-	loop := New(Config{
-		Thresholds: defaultThresholds(),
-		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
-		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		SubCluster: subcluster.Config{
-			MinTradeUSD: 3_000, MinOdds: 5, MinMultiplier: 50,
-			Window:           30 * time.Minute,
-			MinUniqueWallets: 5, MinTotalNotionalUSD: 25_000, Cooldown: time.Hour,
-		},
-		Clock:                       func() time.Time { return now },
-		AllowUnknownMarketLifecycle: true,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
-	m, _ := reg.Get("0xa")
-	warm(loop, m, 30, 60, 0.5, now)
-	for _, w := range []string{"a", "b", "c", "d"} {
-		loop.Observe(context.Background(), m, bet(6_000, 1.0/6, w, now))
-	}
-	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("4 wallets must not fire sub-cluster, got %d", len(got))
-	}
-}
-
-// TestSubClusterDisabledWhenConfigZero confirms the loop does not panic and
-// emits nothing when SubCluster is zero-valued.
-func TestSubClusterDisabledWhenConfigZero(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	loop, reg, emit := newLoop(t, now, defaultThresholds(),
-		cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
-	if loop.subcluster != nil {
-		t.Fatal("zero-valued SubCluster config must leave detector nil")
-	}
-	m, _ := reg.Get("0xa")
-	warm(loop, m, 30, 60, 0.5, now)
-	for _, w := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"} {
-		loop.Observe(context.Background(), m, bet(6_000, 1.0/6, w, now))
-	}
-	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("sub-cluster off → no fires expected, got %d", len(got))
 	}
 }
 

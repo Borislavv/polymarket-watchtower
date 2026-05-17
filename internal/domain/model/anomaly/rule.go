@@ -6,82 +6,53 @@ const (
 	ReasonCluster = "WhaleClusterDetected"
 )
 
-// Tier holds the three thresholds a trade must clear simultaneously to qualify
-// at the given severity level on the *absolute* ladder.
+// Tier is one rung on either the absolute (notional+odds) or multiplier ladder.
+// A trade must clear ALL non-zero floors of a tier to qualify at that rung.
 type Tier struct {
 	// MinNotionalUSD is the trade USD notional floor.
 	MinNotionalUSD float64
-	// MinOdds is the implied-odds floor (= 1/price). 0 disables the gate.
+	// MinOdds is the implied-odds floor (= 1/price). 0 disables this gate
+	// for the absolute ladder (rarely useful — operators usually keep it set).
 	MinOdds float64
-	// MinMultiplier is the (notional / baseline median) floor used by the
-	// rarity ladder. 0 disables the gate.
+	// MinMultiplier is the (notional / baseline-median) floor on the
+	// multiplier ladder. 0 disables this gate.
 	MinMultiplier float64
 }
 
-// Thresholds drives the combined per-trade single_cluster detector. A trade
-// fires only when BOTH ladders qualify at info or above:
+// Thresholds defines the three single-trade severity rungs (Info, Warning,
+// Critical) and the baseline-readiness floors required before any rung can
+// be evaluated.
 //
-//   - Absolute ladder: notional AND odds must clear the tier's floors.
-//   - Multiplier ladder: notional / baseline-median must clear the tier's
-//     floor; only evaluated when the baseline meets MinBaselineTrades and
-//     MinBaselineNotionalUSD.
+// A trade fires only when BOTH ladders qualify at Info or above:
 //
-// Final severity is the *lower* of the two tier outcomes (conservative AND).
-// Below-info on either side ⇒ no alert.
+//   - Absolute  : trade USD notional ≥ tier.MinNotionalUSD
+//     AND implied odds (1/price) ≥ tier.MinOdds
+//   - Multiplier: trade USD notional / baseline median ≥ tier.MinMultiplier
 //
-// Override promotions stack on top of the conservative-min combination:
+// Final severity is the *lower* of the two tier outcomes — the conservative
+// minimum. This keeps precision high: a $1M bet at fair odds isn't called
+// Critical just because the size is huge, and a 10,000× multiplier on a $500
+// bet isn't called Critical just because the ratio is wild. Both signals
+// must be present.
 //
-//   - HardPromotionA / HardPromotionB: two independent OR branches that fire
-//     Hard ("HumanReviewRequired") when ALL three of (notional, odds, mul)
-//     clear their floors. Two branches let presets express e.g. "$250k AND
-//     odds 5 AND 1000×" OR "$100k AND odds 10 AND 2500×".
-//   - HugeWhale: forces the final severity to at least Critical when the
-//     trade clears (notional, odds, mul). The conservative-min may have
-//     under-classified a $250k bet at warning; this rescues it.
-//   - MegaWhale: forces Hard. For absurd raw-size cases where odds/mul are
-//     less relevant.
-//
-// Any tier with a zero field disables that override path.
+// Single-trade severity caps at Critical. HARD is reserved for the cluster
+// detector (multiple sharks converging on one category) — a qualitatively
+// different signal that warrants human review.
 type Thresholds struct {
 	Info     Tier
 	Warning  Tier
 	Critical Tier
 
-	HardPromotionA Tier
-	HardPromotionB Tier
-
-	HugeWhale Tier
-	MegaWhale Tier
-
-	MinBaselineTrades      int
+	// MinBaselineTrades is the minimum sample count required on the bucket
+	// reservoir before the multiplier ladder is evaluated.
+	MinBaselineTrades int
+	// MinBaselineNotionalUSD is the minimum aggregate USD in the reservoir
+	// required before the multiplier ladder is evaluated.
 	MinBaselineNotionalUSD float64
 }
 
-// meets reports (n, o, m) ≥ tier on every non-zero floor.
-func (t Tier) meets(notional, odds, mul float64) bool {
-	if t.MinNotionalUSD <= 0 || t.MinOdds <= 0 || t.MinMultiplier <= 0 {
-		return false
-	}
-	return notional >= t.MinNotionalUSD && odds >= t.MinOdds && mul >= t.MinMultiplier
-}
-
-// MeetsHardPromotion reports whether either HardPromotion branch fires.
-func (t Thresholds) MeetsHardPromotion(notional, odds, mul float64) bool {
-	return t.HardPromotionA.meets(notional, odds, mul) || t.HardPromotionB.meets(notional, odds, mul)
-}
-
-// MeetsHugeWhale reports whether the HugeWhale override fires.
-func (t Thresholds) MeetsHugeWhale(notional, odds, mul float64) bool {
-	return t.HugeWhale.meets(notional, odds, mul)
-}
-
-// MeetsMegaWhale reports whether the MegaWhale override fires.
-func (t Thresholds) MeetsMegaWhale(notional, odds, mul float64) bool {
-	return t.MegaWhale.meets(notional, odds, mul)
-}
-
-// AbsoluteTier returns the highest tier where notional AND odds both meet the
-// tier's floors, or "" when none qualifies.
+// AbsoluteTier returns the highest rung where notional AND odds both clear
+// the rung's floors, or "" when none qualifies.
 func (t Thresholds) AbsoluteTier(notionalUSD, odds float64) Severity {
 	switch {
 	case notionalUSD >= t.Critical.MinNotionalUSD && odds >= t.Critical.MinOdds:
@@ -94,8 +65,8 @@ func (t Thresholds) AbsoluteTier(notionalUSD, odds float64) Severity {
 	return ""
 }
 
-// MultiplierTier returns the highest tier the multiplier clears, or "" when
-// it doesn't clear the info rung.
+// MultiplierTier returns the highest rung the multiplier clears, or "" when
+// it doesn't clear the Info rung.
 func (t Thresholds) MultiplierTier(multiplier float64) Severity {
 	switch {
 	case multiplier >= t.Critical.MinMultiplier:
@@ -109,7 +80,7 @@ func (t Thresholds) MultiplierTier(multiplier float64) Severity {
 }
 
 // ConservativeMin returns the lower (more conservative) of two non-empty
-// severities. If either is empty, returns "".
+// severities. Either side empty ⇒ "".
 func ConservativeMin(a, b Severity) Severity {
 	if a == "" || b == "" {
 		return ""

@@ -18,10 +18,10 @@ A single-trade alert fires only when **all** are true:
 4. Per-(category, market, outcome) baseline has `Count ≥ SINGLE_MIN_BASELINE_TRADES`,
    `TotalUSD ≥ SINGLE_MIN_BASELINE_NOTIONAL_USD`, `MedianUSD > 0`, and
    `SpanActual ≥ BASELINE_MIN_READY_WINDOW`.
-5. Trade clears both absolute tier (notional AND odds) and multiplier tier
-   (notional / baseline median).
-6. Final severity = `ConservativeMin(absoluteTier, multiplierTier)` —
-   **unless** `HardPromotion` fires (see below).
+5. Trade clears both the absolute tier (notional AND odds) and the
+   multiplier tier (notional / baseline median).
+6. Final severity = `ConservativeMin(absoluteTier, multiplierTier)`. Single-
+   trade severity caps at `critical`. `hard` is cluster-only.
 
 Baseline updates run **before** the alert gates so the reservoir warms
 continuously even when alerts are suppressed.
@@ -56,22 +56,25 @@ do not extend it.
 ## Severity rule
 
 Three tiers, each `(MinNotionalUSD, MinOdds, MinMultiplier)`. Both ladders
-must qualify at info or above; final = `ConservativeMin` (lower wins).
-**HardPromotion** bypasses MIN: a trade matching all three HardPromotion
-floors is promoted straight to `Hard` severity ("HumanReviewRequired").
+must qualify at Info or above; final = `ConservativeMin` (lower wins).
+Single-trade severity caps at `critical`. `hard` is the cluster detector's
+output and is qualitatively different — "multiple sharks agreeing", not
+"one very big bet".
 
 Defaults:
 
-|         | Notional ≥ | Odds ≥ | Multiplier ≥ |
-|---------|------------|--------|--------------|
-| Info    | $10,000    | 3      | 100×         |
-| Warning | $25,000    | 5      | 250×         |
-| Critical| $100,000   | 8      | 1,000×       |
-| HardPromotion | $100,000 | 8 | 1,000× |
+|          | Notional ≥ | Odds ≥ | Multiplier ≥ |
+|----------|------------|--------|--------------|
+| Info     | $10,000    | 3      | 100×         |
+| Warning  | $25,000    | 5      | 1,000×       |
+| Critical | $100,000   | 8      | 10,000×      |
 
-Operators can tune Critical/Warning multipliers downward to taste; the
-shipped defaults align with the "shark hunting" goal of catching $100k
-@ odds 8 @ 1000× as the canonical insider signal.
+No promotion-override ladders (HardPromotion, HugeWhale, MegaWhale,
+sub-cluster) live in the model anymore. Earlier iterations stacked them on
+top of conservative-MIN and produced four overlapping ways to reach `hard`
+on a single trade — too many independent knobs to reason about. Operators
+who want a single $1M bet to wake them up should set the Critical
+thresholds to a shape it clears.
 
 ## Cluster rule
 
@@ -147,7 +150,7 @@ Required coverage for any alerting/baseline/lifecycle change:
 - Lifecycle pct at 50% / 75% / 90% boundaries.
 - `MARKET_MIN_AGE` and `BASELINE_MIN_READY_WINDOW` gates.
 - `ALLOW_UNKNOWN_MARKET_LIFECYCLE` — fail-closed default.
-- Tier composition (`ConservativeMin` + `HardPromotion` override).
+- Tier composition (`ConservativeMin` of absolute and multiplier ladders).
 - Cluster floors (trades / wallets / total / cooldown).
 - Telegram link rendering with each URL present and missing.
 - Grafana URL includes `var-severity`.
@@ -159,12 +162,12 @@ Required coverage for any alerting/baseline/lifecycle change:
 ## Presets
 
 Three opinionated overlays under `presets/` (see `presets/README.md`):
-- `conservative.env` — pager-grade; lifecycle ≥85%, multiplier ≥500×,
-  notional ≥$50k. HardPromotion at $250k AND odds 8 AND 2500×.
-- `balanced.env` — defaults; lifecycle ≥75%, multiplier ≥100×, notional
-  ≥$10k. HardPromotion at $100k AND odds 8 AND 1000×.
-- `aggressive.env` — local exploration only; lifecycle ≥60%, multiplier
-  ≥30×, notional ≥$2.5k. `ALLOW_UNKNOWN_MARKET_LIFECYCLE=true`.
+- `conservative.env` — pager-grade; lifecycle ≥85%, Info multiplier ≥500×,
+  Info notional ≥$50k.
+- `balanced.env` — defaults; lifecycle ≥75%, Info multiplier ≥100×, Info
+  notional ≥$10k.
+- `aggressive.env` — local exploration only; lifecycle ≥60%, Info
+  multiplier ≥30×, Info notional ≥$2.5k. `ALLOW_UNKNOWN_MARKET_LIFECYCLE=true`.
 
 Apply via `set -a && source presets/<name>.env` or `env_file:` in compose.
 Preset behaviour pinned by tests in `internal/app/preset_test.go`.
