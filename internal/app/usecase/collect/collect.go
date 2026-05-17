@@ -1,20 +1,31 @@
 // Package collect pulls public trades from the Data API for every market in
-// the registry on a fixed cadence and folds them into the aggregate engine.
+// the registry on a fixed cadence, folds them into the supporting aggregate
+// engine, and hands each trade to the per-trade detector for scoring.
 package collect
 
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	"github.com/rs/zerolog"
 )
+
+// TradeObserver is the per-trade hook into the detection pipeline. The detect
+// package implements it; we depend on the interface so collect tests can fake
+// it without dragging the whole analytics graph in.
+type TradeObserver interface {
+	Observe(ctx context.Context, m market.Market, t trade.Trade)
+}
 
 type Config struct {
 	Interval     time.Duration
@@ -28,6 +39,7 @@ type Loop struct {
 	client   *dataapi.Client
 	engine   *aggregate.Engine
 	registry *aggregate.MarketRegistry
+	observer TradeObserver
 	metrics  *metrics.Metrics
 	log      *zerolog.Logger
 	now      func() time.Time
@@ -41,6 +53,7 @@ func New(
 	c *dataapi.Client,
 	eng *aggregate.Engine,
 	reg *aggregate.MarketRegistry,
+	obs TradeObserver,
 	m *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Loop {
@@ -59,6 +72,7 @@ func New(
 		client:   c,
 		engine:   eng,
 		registry: reg,
+		observer: obs,
 		metrics:  m,
 		log:      log,
 		now:      now,
@@ -95,21 +109,21 @@ func (l *Loop) tick(ctx context.Context) {
 		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(id vo.MarketID) {
+		go func(m market.Market) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			l.pull(ctx, id)
-		}(m.ID)
+			l.pull(ctx, m)
+		}(m)
 	}
 	wg.Wait()
 }
 
-func (l *Loop) pull(ctx context.Context, id vo.MarketID) {
-	since := l.lookback(id)
-	trades, err := l.client.ListTradesSince(ctx, dataapi.ListTradesOpts{Market: id, Since: since})
+func (l *Loop) pull(ctx context.Context, m market.Market) {
+	since := l.lookback(m.ID)
+	trades, err := l.client.ListTradesSince(ctx, dataapi.ListTradesOpts{Market: m.ID, Since: since})
 	if err != nil {
 		var apiErr *httpx.APIError
-		ev := l.log.Err(err).Str("market", string(id)).Time("since", since)
+		ev := l.log.Err(err).Str("market", string(m.ID)).Time("since", since)
 		if errors.As(err, &apiErr) {
 			ev.Int("status", apiErr.Status).Bool("retryable", apiErr.Retryable()).Str("body", apiErr.Body)
 		}
@@ -119,6 +133,10 @@ func (l *Loop) pull(ctx context.Context, id vo.MarketID) {
 	if len(trades) == 0 {
 		return
 	}
+	// Process trades oldest → newest so the baseline is seeded with historical
+	// context before any "recent" trade is scored against it. The Data API
+	// returns DESC within a market; reverse client-side.
+	sort.SliceStable(trades, func(i, j int) bool { return trades[i].Timestamp.Before(trades[j].Timestamp) })
 	l.engine.IngestBatch(trades)
 
 	var notional float64
@@ -128,10 +146,13 @@ func (l *Loop) pull(ctx context.Context, id vo.MarketID) {
 		if t.Timestamp.After(newest) {
 			newest = t.Timestamp
 		}
+		if l.observer != nil {
+			l.observer.Observe(ctx, m, t)
+		}
 	}
-	l.metrics.TradesIngested.WithLabelValues(string(id)).Add(float64(len(trades)))
-	l.metrics.NotionalIngested.WithLabelValues(string(id)).Add(notional)
-	l.setLastTs(id, newest)
+	l.metrics.TradesIngested.WithLabelValues(string(m.ID)).Add(float64(len(trades)))
+	l.metrics.NotionalIngested.WithLabelValues(string(m.ID)).Add(notional)
+	l.setLastTs(m.ID, newest)
 }
 
 func (l *Loop) lookback(id vo.MarketID) time.Time {

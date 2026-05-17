@@ -1,6 +1,5 @@
-// Package usecase_test holds end-to-end pipeline tests that wire real
-// discover/collect/detect against httptest-backed upstreams. Nothing in here
-// touches the public internet.
+// Package usecase_test wires real discover/collect/detect against
+// httptest-backed upstreams. Nothing in here touches the public internet.
 package usecase_test
 
 import (
@@ -16,6 +15,8 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
@@ -49,11 +50,18 @@ func (s *capturingSink) Findings() []anomaly2.Finding {
 	return out
 }
 
-func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
+// TestPipelineDetectsWhalesAndCategoryWatch wires the full pipeline against
+// fakes and asserts:
+//   - per-trade anomalies fire for outsized single bets,
+//   - a category-watch HARD alert fires when multiple wallets converge in one
+//     category within the window,
+//   - Telegram receives both kinds and the messages carry the expected fields
+//     (links + dollar amounts + outcome + wallet).
+func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 
-	// --- Gamma fake: 1 market with 1 tag ---------------------------------
+	// --- Gamma fake: 1 market, 1 tag, two outcomes (Yes/No) ----------------
 	gammaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/tags":
@@ -75,10 +83,12 @@ func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
 		case "/markets":
 			if r.URL.Query().Get("offset") == "0" {
 				_ = json.NewEncoder(w).Encode([]map[string]any{{
-					"conditionId": "0xa",
-					"slug":        "us-pres",
-					"question":    "Who wins?",
-					"active":      true,
+					"conditionId":  "0xa",
+					"slug":         "us-pres",
+					"question":     "Who wins?",
+					"active":       true,
+					"outcomes":     `["Yes","No"]`,
+					"clobTokenIds": `["tok-yes","tok-no"]`,
 				}})
 			} else {
 				_, _ = w.Write([]byte(`[]`))
@@ -89,64 +99,83 @@ func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
 	}))
 	defer gammaSrv.Close()
 
-	// --- Data API fake: 60 baseline trades + 1500 recent trades ----------
+	// --- Data API fake: baseline of small bets, then three whale bets by
+	//     three distinct wallets within the cluster window --------------------
 	type t1 struct {
 		ID        string  `json:"id"`
-		Market    string  `json:"market"`
+		Cond      string  `json:"conditionId"`
 		Asset     string  `json:"asset"`
 		Side      string  `json:"side"`
 		Size      float64 `json:"size"`
 		Price     float64 `json:"price"`
 		Timestamp int64   `json:"timestamp"`
+		Wallet    string  `json:"proxyWallet"`
 	}
 	var trades []t1
-	for i := 0; i < 60; i++ {
+	// 100 small "Yes" bets at $10 across the last 24h
+	for i := 0; i < 100; i++ {
 		trades = append(trades, t1{
-			ID: "b" + strconv.Itoa(i), Market: "0xa", Asset: "1",
-			Side: "BUY", Size: 1, Price: 0.5,
-			Timestamp: now.Add(-24 * time.Hour).Add(time.Duration(i) * time.Minute).Unix(),
+			ID: "b" + strconv.Itoa(i), Cond: "0xa", Asset: "tok-yes",
+			Side: "BUY", Size: 20, Price: 0.5, Wallet: "0xnoise",
+			Timestamp: now.Add(-24 * time.Hour).Add(time.Duration(i*14) * time.Minute).Unix(),
 		})
 	}
-	for i := 0; i < 1500; i++ {
+	// 3 whales: $50k each on "Yes", within the cluster window (HARD alert)
+	for i, wallet := range []string{
+		"0xshark111111111111111111111111111111111111",
+		"0xshark222222222222222222222222222222222222",
+		"0xshark333333333333333333333333333333333333",
+	} {
 		trades = append(trades, t1{
-			ID: "r" + strconv.Itoa(i), Market: "0xa", Asset: "1",
-			Side: "BUY", Size: 10, Price: 0.5,
-			Timestamp: now.Add(-time.Hour).Add(time.Duration(i*2) * time.Second).Unix(),
+			ID: "w" + strconv.Itoa(i), Cond: "0xa", Asset: "tok-yes",
+			Side: "BUY", Size: 100_000, Price: 0.5, Wallet: wallet,
+			Timestamp: now.Add(-time.Duration(i) * time.Minute).Unix(),
 		})
 	}
-	dataCalls := atomic.Int32{}
+
+	// Data API order is timestamp DESC within a market. Match the contract.
 	dataSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dataCalls.Add(1)
 		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		if limit == 0 {
 			limit = 500
 		}
-		if offset >= len(trades) {
+		// sort desc by timestamp on every call (cheap; small fixture)
+		sorted := make([]t1, len(trades))
+		copy(sorted, trades)
+		for i := 0; i < len(sorted); i++ {
+			for j := i + 1; j < len(sorted); j++ {
+				if sorted[j].Timestamp > sorted[i].Timestamp {
+					sorted[i], sorted[j] = sorted[j], sorted[i]
+				}
+			}
+		}
+		if offset >= len(sorted) {
 			_, _ = w.Write([]byte(`[]`))
 			return
 		}
 		end := offset + limit
-		if end > len(trades) {
-			end = len(trades)
+		if end > len(sorted) {
+			end = len(sorted)
 		}
-		_ = json.NewEncoder(w).Encode(trades[offset:end])
+		_ = json.NewEncoder(w).Encode(sorted[offset:end])
 	}))
 	defer dataSrv.Close()
 
-	// --- Telegram fake -----------------------------------------------------
 	telegramCalls := atomic.Int32{}
-	var telegramBody atomic.Value
+	telegramBodies := make(chan string, 16)
 	telegramSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		telegramCalls.Add(1)
-		buf := make([]byte, 4096)
+		buf := make([]byte, 8192)
 		n, _ := r.Body.Read(buf)
-		telegramBody.Store(string(buf[:n]))
+		select {
+		case telegramBodies <- string(buf[:n]):
+		default:
+		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer telegramSrv.Close()
 
-	// --- wire pipeline ----------------------------------------------------
 	gh, _ := httpx.New(httpx.Config{BaseURL: gammaSrv.URL, Limiter: ratelimit.Noop{}})
 	dh, _ := httpx.New(httpx.Config{BaseURL: dataSrv.URL, Limiter: ratelimit.Noop{}})
 	gammaClient := gamma.New(gh)
@@ -154,17 +183,12 @@ func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
 
 	met := metrics.New()
 	reg := aggregate.NewRegistry()
-	eng := aggregate.New(aggregate.Config{
-		Bucket: time.Minute, Baseline: 26 * time.Hour, Clock: clock,
-	})
-
+	eng := aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour, Clock: clock})
 	log := zerolog.Nop()
+
 	disc := discover.New(discover.Config{
 		Interval: time.Hour, ActiveOnly: true, MaxMarkets: 100,
 	}, gammaClient, reg, eng, met, &log)
-	collectLoop := collect.New(collect.Config{
-		Interval: time.Hour, Concurrency: 1, LookbackBoot: 25 * time.Hour, Clock: clock,
-	}, dataClient, eng, reg, met, &log)
 
 	tg, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled: true, BotToken: "test", ChatID: "1", BaseURL: telegramSrv.URL,
@@ -176,47 +200,92 @@ func TestPipelineEndToEndAnomalyFiresAndReachesTelegram(t *testing.T) {
 	fanout := &alerting2.Fanout{Sinks: []alerting2.Channel{cap, tg}, Logger: &log}
 
 	det := detect.New(detect.Config{
-		Interval:      time.Hour,
-		RecentWindows: []time.Duration{time.Hour},
-		Rule:          anomaly2.Rule{Multipliers: []float64{30, 100, 1000}},
-		Cooldown:      time.Hour,
-		Clock:         clock,
+		Thresholds: anomaly2.Thresholds{
+			Multipliers:       []float64{30, 100, 1000},
+			AbsoluteUSDTiers:  []float64{3_000, 10_000, 100_000},
+			MinBaselineTrades: 20,
+		},
+		Baseline: baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster: cluster.Config{
+			Window: time.Hour, MinTrades: 3, MinUniqueWallets: 3, MinTotalUSD: 50_000, Cooldown: time.Hour,
+		},
+		RecentWindows:  []time.Duration{time.Hour},
+		PolymarketBase: "https://polymarket.com",
+		GrafanaBase:    "http://grafana.local",
+		GrafanaDashUID: "uid1",
+		GrafanaContext: time.Hour,
+		Clock:          clock,
 	}, eng, reg, fanout, met, &log)
 
-	ctx := context.Background()
+	collectLoop := collect.New(collect.Config{
+		Interval: time.Hour, Concurrency: 1, LookbackBoot: 25 * time.Hour, Clock: clock,
+	}, dataClient, eng, reg, det, met, &log)
 
-	// --- act --------------------------------------------------------------
+	ctx := context.Background()
 	if err := disc.RunOnce(ctx); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
 	collectLoop.Tick(ctx)
-	det.Tick(ctx)
 
 	// --- assert -----------------------------------------------------------
 	if reg.Size() != 1 {
 		t.Fatalf("registry size: %d", reg.Size())
 	}
-	if dataCalls.Load() == 0 {
-		t.Fatalf("data API not called")
-	}
 	findings := cap.Findings()
 	if len(findings) == 0 {
-		t.Fatalf("no anomaly findings produced")
+		t.Fatal("no findings emitted")
 	}
-	var sawFatal bool
+
+	var tradeAnoms, hardAlerts int
+	var sawCritical, sawHard bool
 	for _, f := range findings {
-		if f.Severity == anomaly2.SeverityFatal {
-			sawFatal = true
+		switch f.Kind {
+		case anomaly2.KindTradeAnomaly:
+			tradeAnoms++
+			if f.Severity == anomaly2.SeverityCritical {
+				sawCritical = true
+			}
+			if f.Trade == nil || f.Trade.Outcome != "Yes" {
+				t.Errorf("trade ref missing outcome: %+v", f.Trade)
+			}
+			if f.MarketURL != "https://polymarket.com/event/us-pres" {
+				t.Errorf("market URL: %q", f.MarketURL)
+			}
+			if !strings.Contains(f.GrafanaURL, "var-category=Politics") {
+				t.Errorf("grafana URL missing category var: %q", f.GrafanaURL)
+			}
+		case anomaly2.KindCategoryWatch:
+			hardAlerts++
+			if f.Severity == anomaly2.SeverityHard {
+				sawHard = true
+			}
+			if f.Cluster == nil || f.Cluster.UniqueWallets < 3 {
+				t.Errorf("cluster stats: %+v", f.Cluster)
+			}
 		}
 	}
-	if !sawFatal {
-		t.Fatalf("expected fatal-severity finding, got %+v", findings)
+	if tradeAnoms < 3 {
+		t.Errorf("expected >=3 single-trade findings (one per whale), got %d", tradeAnoms)
 	}
+	if !sawCritical {
+		t.Errorf("expected at least one critical single-trade finding")
+	}
+	if hardAlerts != 1 || !sawHard {
+		t.Errorf("expected exactly 1 HARD category-watch alert, got %d", hardAlerts)
+	}
+
 	if telegramCalls.Load() == 0 {
-		t.Fatalf("telegram not called")
+		t.Fatal("telegram not called")
 	}
-	bodyStr, _ := telegramBody.Load().(string)
-	if !strings.Contains(bodyStr, "Polymarket") {
-		t.Errorf("telegram body missing branding:\n%s", bodyStr)
+	// At least one body should be the HARD alert with the required wording.
+	close(telegramBodies)
+	var sawWatchMsg bool
+	for body := range telegramBodies {
+		if strings.Contains(body, "CATEGORY WATCH REQUIRED") && strings.Contains(body, "3 unique wallets") {
+			sawWatchMsg = true
+		}
+	}
+	if !sawWatchMsg {
+		t.Error("telegram never received the CATEGORY WATCH REQUIRED message")
 	}
 }

@@ -170,6 +170,7 @@ func mapMarket(m gammaMarket) (market2.Market, error) {
 	for _, t := range tokens {
 		tokenIDs = append(tokenIDs, vo.TokenID(t))
 	}
+	outcomes, _ := parseStringArray(m.OutcomesJSON)
 	start, _ := parseTime(m.StartDate)
 	end, _ := parseTime(m.EndDate)
 	return market2.Market{
@@ -178,6 +179,7 @@ func mapMarket(m gammaMarket) (market2.Market, error) {
 		Question:    m.Question,
 		ConditionID: m.ConditionID,
 		TokenIDs:    tokenIDs,
+		Outcomes:    outcomes,
 		Active:      m.Active,
 		Closed:      m.Closed,
 		StartDate:   start,

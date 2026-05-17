@@ -12,11 +12,10 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 )
 
 // TelegramConfig is the minimal config for a single-channel Telegram bot.
-// BaseURL defaults to the public Telegram API but is configurable so tests can
-// point it at an httptest.Server.
 type TelegramConfig struct {
 	Enabled  bool
 	BotToken string
@@ -26,14 +25,14 @@ type TelegramConfig struct {
 }
 
 // TelegramSink posts findings to a single Telegram chat. It is a no-op when
-// Config.Enabled is false; this lets the app wire it unconditionally.
+// Enabled is false; the app wires it unconditionally.
 type TelegramSink struct {
-	cfg    TelegramConfig
-	client *http.Client
+	cfg     TelegramConfig
+	client  *http.Client
+	metrics *metrics.Metrics // optional; nil-safe
 }
 
-// NewTelegramSink validates config and returns a sink. When Enabled is false
-// it still returns a valid sink whose Notify is a no-op.
+// NewTelegramSink validates config and returns a sink.
 func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if !cfg.Enabled {
 		return &TelegramSink{cfg: cfg}, nil
@@ -47,10 +46,14 @@ func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Second
 	}
-	return &TelegramSink{
-		cfg:    cfg,
-		client: &http.Client{Timeout: cfg.Timeout},
-	}, nil
+	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}}, nil
+}
+
+// WithMetrics attaches a metrics handle so the sink can report send success /
+// failure counts. Returns the sink for chaining at construction time.
+func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
+	s.metrics = m
+	return s
 }
 
 func (s *TelegramSink) Name() string { return "telegram" }
@@ -69,70 +72,208 @@ func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
+		s.observeErr(f.Severity)
 		return err
 	}
 
 	url := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(s.cfg.BaseURL, "/"), s.cfg.BotToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
+		s.observeErr(f.Severity)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		s.observeErr(f.Severity)
 		return fmt.Errorf("telegram: send: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		s.observeErr(f.Severity)
 		return fmt.Errorf("telegram: %d: %s", resp.StatusCode, string(b))
 	}
+	s.observeOK(f.Severity)
 	return nil
 }
 
-// FormatTelegramMessage produces the Markdown-formatted body for one finding.
-// Exposed so tests can assert on it without invoking the HTTP path.
+func (s *TelegramSink) observeOK(sev anomaly.Severity) {
+	if s.metrics != nil {
+		s.metrics.TelegramAlertsSent.WithLabelValues(string(sev)).Inc()
+	}
+}
+
+func (s *TelegramSink) observeErr(sev anomaly.Severity) {
+	if s.metrics != nil {
+		s.metrics.TelegramAlertErrors.WithLabelValues(string(sev)).Inc()
+	}
+}
+
+// FormatTelegramMessage renders the Markdown body for one finding. The format
+// is tuned for a human reviewing the alert on a phone — what / where / why /
+// dynamics / links, in that order. Exposed so tests can assert on it without
+// invoking HTTP.
 func FormatTelegramMessage(f anomaly.Finding) string {
+	switch f.Kind {
+	case anomaly.KindCategoryWatch:
+		return formatCategoryWatch(f)
+	default:
+		return formatTradeAnomaly(f)
+	}
+}
+
+func formatTradeAnomaly(f anomaly.Finding) string {
 	var b strings.Builder
-	icon := severityIcon(f.Severity)
-	fmt.Fprintf(&b, "%s *Polymarket %s anomaly*\n", icon, strings.ToUpper(string(f.Severity)))
-	fmt.Fprintf(&b, "_%s_ on `%s`\n", f.Metric, scopeTarget(f))
-	if f.Label != "" {
-		fmt.Fprintf(&b, "*%s*\n", escapeMarkdown(f.Label))
+	fmt.Fprintf(&b, "%s *Polymarket %s — single bet anomaly*\n", severityBadge(f.Severity), strings.ToUpper(string(f.Severity)))
+	if f.Reason != "" {
+		fmt.Fprintf(&b, "_rule: %s_\n", escapeMarkdown(f.Reason))
 	}
-	fmt.Fprintf(&b, "multiplier: *x%.1f*\n", f.Multiplier)
-	fmt.Fprintf(&b, "recent: `%.4g`  baseline: `%.4g`\n", f.Recent, f.Baseline)
-	fmt.Fprintf(&b, "window: %s  baseline window: %s\n", f.WindowLen, f.BaselineLen)
-	fmt.Fprintf(&b, "at: %s\n", f.At.UTC().Format(time.RFC3339))
-	if f.MarketURL != "" {
-		fmt.Fprintf(&b, "[open market](%s)", f.MarketURL)
+	if f.Trade != nil {
+		t := f.Trade
+		title := t.Question
+		if title == "" {
+			title = t.Slug
+		}
+		if title == "" {
+			title = string(t.Market)
+		}
+		fmt.Fprintf(&b, "*%s*\n", escapeMarkdown(title))
+		if t.Outcome != "" || t.Side != "" {
+			fmt.Fprintf(&b, "outcome: `%s`  side: `%s`\n", escapeMarkdown(t.Outcome), escapeMarkdown(string(t.Side)))
+		}
+		fmt.Fprintf(&b, "size: *$%s*  (`%.2f` @ `%.4f`)\n", money(t.NotionalUSD), t.SizeShares, t.Price)
+		if t.Wallet != "" {
+			fmt.Fprintf(&b, "wallet: `%s`\n", t.Wallet)
+		}
 	}
+	if f.Category != nil && f.Category.Label != "" {
+		fmt.Fprintf(&b, "category: *%s*\n", escapeMarkdown(f.Category.Label))
+	}
+	if f.Baseline != nil {
+		bs := f.Baseline
+		fmt.Fprintf(&b, "baseline: median *$%s*  mean *$%s*  p95 *$%s*  N=`%d`  window=`%s`\n",
+			money(bs.MedianUSD), money(bs.MeanUSD), money(bs.P95USD), bs.SampleN, bs.WindowAgo)
+	}
+	if f.Multiplier > 0 {
+		fmt.Fprintf(&b, "multiplier: *x%s*\n", multiplierFmt(f.Multiplier))
+	}
+	if f.AbsoluteTier > 0 {
+		fmt.Fprintf(&b, "absolute tier crossed: *$%s*\n", money(f.AbsoluteTier))
+	}
+	fmt.Fprintf(&b, "at: `%s`\n", f.At.UTC().Format(time.RFC3339))
+	appendLinks(&b, f)
 	return b.String()
 }
 
-func scopeTarget(f anomaly.Finding) string {
-	if f.Scope == anomaly.ScopeMarket && f.Market != "" {
-		return string(f.Market)
+func formatCategoryWatch(f anomaly.Finding) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s *Polymarket — CATEGORY WATCH REQUIRED*\n", severityBadge(f.Severity))
+	if f.Category != nil {
+		fmt.Fprintf(&b, "category: *%s*\n", escapeMarkdown(nonEmpty(f.Category.Label, fmt.Sprintf("id=%d", f.Category.ID))))
 	}
-	return fmt.Sprintf("category:%d", f.Category)
+	if f.Cluster != nil {
+		c := f.Cluster
+		fmt.Fprintf(&b, "*%d anomalous trades* from *%d unique wallets* totalling *$%s* in the last `%s`\n",
+			c.AnomalousTrades, c.UniqueWallets, money(c.TotalUSD), c.Window)
+		if len(c.Sample) > 0 {
+			b.WriteString("\nrecent contributors:\n")
+			for _, t := range c.Sample {
+				title := t.Question
+				if title == "" {
+					title = t.Slug
+				}
+				if title == "" {
+					title = string(t.Market)
+				}
+				fmt.Fprintf(&b, "  • *$%s* on `%s` — %s `%s`\n",
+					money(t.NotionalUSD), escapeMarkdown(title), shortWallet(t.Wallet), escapeMarkdown(t.Outcome))
+			}
+		}
+	}
+	fmt.Fprintf(&b, "\nat: `%s`\n", f.At.UTC().Format(time.RFC3339))
+	appendLinks(&b, f)
+	return b.String()
 }
 
-func severityIcon(s anomaly.Severity) string {
+func appendLinks(b *strings.Builder, f anomaly.Finding) {
+	if f.MarketURL != "" {
+		fmt.Fprintf(b, "[open market](%s)", f.MarketURL)
+	}
+	if f.GrafanaURL != "" {
+		if f.MarketURL != "" {
+			b.WriteString("  •  ")
+		}
+		fmt.Fprintf(b, "[open in Grafana](%s)", f.GrafanaURL)
+	}
+}
+
+func severityBadge(s anomaly.Severity) string {
 	switch s {
-	case anomaly.SeverityFatal:
-		return "[CRIT]"
+	case anomaly.SeverityHard:
+		return "[HARD]"
 	case anomaly.SeverityCritical:
+		return "[CRIT]"
+	case anomaly.SeverityWarning:
 		return "[WARN]"
-	default:
+	case anomaly.SeverityInfo:
 		return "[INFO]"
 	}
+	return "[ANOM]"
 }
 
-// escapeMarkdown blunts the legacy Markdown parser's special characters so
-// market questions don't break the rendering. The legacy "Markdown" parse
-// mode has fewer escape rules than MarkdownV2.
+func nonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// shortWallet returns "0xabcd…wxyz" for a 0x-address.
+func shortWallet(w string) string {
+	if len(w) < 12 {
+		return w
+	}
+	return w[:6] + "…" + w[len(w)-4:]
+}
+
+// money formats a USD amount with thousand separators and 0/2 decimals.
+func money(v float64) string {
+	if v >= 1000 {
+		// integer dollars with thousand commas
+		whole := int64(v)
+		s := fmt.Sprintf("%d", whole)
+		// insert commas
+		n := len(s)
+		out := make([]byte, 0, n+n/3)
+		for i, c := range []byte(s) {
+			if i > 0 && (n-i)%3 == 0 {
+				out = append(out, ',')
+			}
+			out = append(out, c)
+		}
+		return string(out)
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
+func multiplierFmt(m float64) string {
+	switch {
+	case m >= 1000:
+		return fmt.Sprintf("%.0f", m)
+	case m >= 100:
+		return fmt.Sprintf("%.0f", m)
+	case m >= 10:
+		return fmt.Sprintf("%.1f", m)
+	default:
+		return fmt.Sprintf("%.2f", m)
+	}
+}
+
+// escapeMarkdown blunts the legacy "Markdown" parse-mode reserved chars so
+// market questions don't break rendering.
 func escapeMarkdown(s string) string {
 	r := strings.NewReplacer("_", `\_`, "*", `\*`, "`", "\\`", "[", `\[`)
 	return r.Replace(s)

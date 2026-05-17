@@ -1,15 +1,32 @@
-// Package detect compares recent windows against baseline windows and emits
-// anomaly findings when the ratio exceeds a configured multiplier.
+// Package detect is the per-trade anomaly pipeline. It is called synchronously
+// from the collect loop for every freshly ingested trade and is responsible
+// for:
+//
+//  1. Updating the per-(category, market, outcome) baseline of trade
+//     notionals (for use by the next scoring round).
+//  2. Scoring the trade against multiplier and absolute USD ladders.
+//  3. Observing anomalous trades in a per-category cluster detector that
+//     emits a HARD "CategoryWatchRequired" alert when many sharks circle one
+//     category at once.
+//  4. Periodically refreshing aggregate Grafana gauges (trade_rate /
+//     notional_rate / avg_size) — kept as supporting telemetry only;
+//     **never** drives alerts on its own.
+//
+// All state mutation is concurrency-safe; the package is safe to call from
+// multiple collect goroutines simultaneously.
 package detect
 
 import (
 	"context"
+	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
-	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -17,40 +34,41 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type Config struct {
-	Interval      time.Duration
-	RecentWindows []time.Duration
-	Rule          anomaly2.Rule
-	Cooldown      time.Duration
-	Clock         func() time.Time // optional; defaults to time.Now
-}
-
-// Emitter is the dependency-inverted output side: detect doesn't care whether
-// findings go to logs, webhooks, or a queue.
+// Emitter receives findings. Decoupled so detect doesn't care whether output is
+// logs, telegram, webhooks, or all of them.
 type Emitter interface {
-	Notify(ctx context.Context, f anomaly2.Finding) error
+	Notify(ctx context.Context, f anomaly.Finding) error
 }
 
+// Config wires the detector. Defaults fill in for zero-valued fields.
+type Config struct {
+	Thresholds     anomaly.Thresholds
+	Baseline       baseline.Config
+	Cluster        cluster.Config
+	RecentWindows  []time.Duration
+	GaugeInterval  time.Duration // how often Run() refreshes supporting gauges
+	PolymarketBase string        // "https://polymarket.com" (no trailing slash)
+	GrafanaBase    string        // "http://localhost:3000" (no trailing slash); "" disables Grafana links
+	GrafanaDashUID string        // dashboard UID for deep-link
+	GrafanaContext time.Duration // ±window around trade time in Grafana link
+	Clock          func() time.Time
+}
+
+// Loop owns the analytics state.
 type Loop struct {
 	cfg      Config
 	engine   *aggregate.Engine
 	registry *aggregate.MarketRegistry
+	baseline *baseline.Baseline
+	cluster  *cluster.Detector
 	emit     Emitter
 	metrics  *metrics.Metrics
 	log      *zerolog.Logger
 	now      func() time.Time
-
-	mu       sync.Mutex
-	lastFire map[fireKey]time.Time
 }
 
-type fireKey struct {
-	scope  anomaly2.Scope
-	target string
-	metric anomaly2.Metric
-	window time.Duration
-}
-
+// New wires the analytics state. Baseline.Window doubles as the lookback for
+// per-(category, market, outcome) reservoirs.
 func New(
 	cfg Config,
 	eng *aggregate.Engine,
@@ -59,195 +77,246 @@ func New(
 	m *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Loop {
-	cfg.Rule.Normalise()
+	cfg.Thresholds.Normalise()
+	if cfg.GaugeInterval <= 0 {
+		cfg.GaugeInterval = time.Minute
+	}
+	if cfg.GrafanaContext <= 0 {
+		cfg.GrafanaContext = time.Hour
+	}
 	now := cfg.Clock
 	if now == nil {
 		now = time.Now
+	}
+	// Propagate the clock into sub-detectors so tests stay deterministic.
+	if cfg.Baseline.Clock == nil {
+		cfg.Baseline.Clock = now
+	}
+	if cfg.Cluster.Clock == nil {
+		cfg.Cluster.Clock = now
 	}
 	return &Loop{
 		cfg:      cfg,
 		engine:   eng,
 		registry: reg,
+		baseline: baseline.New(cfg.Baseline),
+		cluster:  cluster.New(cfg.Cluster),
 		emit:     emit,
 		metrics:  m,
 		log:      log,
 		now:      now,
-		lastFire: make(map[fireKey]time.Time),
 	}
 }
 
-// Tick is exposed for tests that want to drive a single evaluation without
-// running the ticker loop.
-func (l *Loop) Tick(ctx context.Context) { l.tick(ctx) }
+// Observe is the per-trade hot path called by collect for every ingested trade.
+// Safe for concurrent calls.
+//
+// Steps (per category the market belongs to):
+//  1. Read current baseline stats for the bucket.
+//  2. Add the trade to the bucket (post-read so the new sample doesn't
+//     pollute its own baseline).
+//  3. Score; on fire, push into cluster + remember best-severity context for
+//     the single-trade alert.
+//  4. After looping all categories, emit at most one single-trade Finding
+//     (with the highest-severity category as context).
+func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Trade) {
+	if trade.Size <= 0 || trade.Price <= 0 {
+		return
+	}
+	notional := trade.NotionalUSD()
+	if notional <= 0 {
+		return
+	}
+	l.metrics.TradeSizeUSD.Observe(notional)
 
+	categories := market.Categories
+	if len(categories) == 0 {
+		// Bucket trades from un-categorised markets under category id 0 so the
+		// signal is still seen — it just won't roll up to a named category.
+		categories = []vo.CategoryID{0}
+	}
+
+	var (
+		bestCat    vo.CategoryID
+		bestStats  baseline.Stats
+		bestResult score.Result
+		bestRef    anomaly.TradeRef
+	)
+	for _, cat := range categories {
+		bucket := baseline.Key{Category: cat, Market: market.ID, OutcomeToken: trade.Token}
+		stats := l.baseline.Stats(bucket)
+		l.baseline.Add(bucket, notional, trade.Timestamp)
+
+		sr := score.Score(notional, stats, l.cfg.Thresholds)
+		if !sr.Fired {
+			continue
+		}
+
+		ref := l.buildTradeRef(market, trade, notional)
+		if cs := l.cluster.Observe(cat, ref); cs != nil {
+			l.emitCategoryWatch(ctx, market, trade, cat, cs)
+		}
+
+		// Keep the highest-severity category as the single-trade alert context.
+		if !bestResult.Fired || anomaly.MaxSeverity(sr.Severity, bestResult.Severity) == sr.Severity {
+			bestCat = cat
+			bestStats = stats
+			bestResult = sr
+			bestRef = ref
+		}
+	}
+	if bestResult.Fired {
+		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef)
+	}
+}
+
+func (l *Loop) buildTradeRef(m market.Market, t trade.Trade, notional float64) anomaly.TradeRef {
+	return anomaly.TradeRef{
+		ID:          t.ID,
+		TxHash:      t.TxHash,
+		Wallet:      t.Taker,
+		Market:      m.ID,
+		Slug:        m.Slug,
+		Question:    m.Question,
+		Outcome:     m.OutcomeLabel(t.Token),
+		Side:        t.Side,
+		SizeShares:  t.Size,
+		Price:       t.Price,
+		NotionalUSD: notional,
+		At:          t.Timestamp,
+	}
+}
+
+func (l *Loop) emitTradeAnomaly(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	cat vo.CategoryID,
+	stats baseline.Stats,
+	sr score.Result,
+	ref anomaly.TradeRef,
+) {
+	catRef := l.categoryRef(cat)
+	scope := fmt.Sprintf("category=%s market=%s outcome=%s",
+		nonEmpty(catRef.Label, "uncategorised"), m.Slug, nonEmpty(ref.Outcome, "?"))
+	f := anomaly.Finding{
+		Kind:     anomaly.KindTradeAnomaly,
+		Severity: sr.Severity,
+		At:       l.now(),
+		Reason:   sr.Reason,
+		Trade:    &ref,
+		Category: &catRef,
+		Baseline: &anomaly.BaselineRef{
+			Scope:     scope,
+			MedianUSD: stats.MedianUSD,
+			MeanUSD:   stats.MeanUSD,
+			P95USD:    stats.P95USD,
+			SampleN:   stats.Count,
+			WindowAgo: l.cfg.Baseline.Window,
+		},
+		Multiplier:   sr.Multiplier,
+		AbsoluteTier: sr.AbsoluteTier,
+		MarketURL:    l.marketURL(m),
+		GrafanaURL:   l.grafanaURL(catRef, m, t.Timestamp),
+	}
+	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), sr.Reason).Inc()
+	if sr.Multiplier > 0 {
+		l.metrics.TradeAnomalyMultiplier.Observe(sr.Multiplier)
+	}
+	l.metrics.CategoryAnomalousTrades.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Inc()
+	l.metrics.CategoryAnomalousUSD.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Add(ref.NotionalUSD)
+	if err := l.emit.Notify(ctx, f); err != nil {
+		l.log.Err(err).Msg("detect: emit single-trade failed")
+	}
+}
+
+func (l *Loop) emitCategoryWatch(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	cat vo.CategoryID,
+	cs *anomaly.ClusterStats,
+) {
+	catRef := l.categoryRef(cat)
+	f := anomaly.Finding{
+		Kind:       anomaly.KindCategoryWatch,
+		Severity:   anomaly.SeverityHard,
+		At:         l.now(),
+		Reason:     "cluster",
+		Category:   &catRef,
+		Cluster:    cs,
+		MarketURL:  l.marketURL(m),
+		GrafanaURL: l.grafanaURL(catRef, market.Market{}, t.Timestamp),
+	}
+	l.metrics.CategoryHardAlerts.WithLabelValues(categoryLabel(catRef)).Inc()
+	if err := l.emit.Notify(ctx, f); err != nil {
+		l.log.Err(err).Msg("detect: emit category-watch failed")
+	}
+}
+
+func (l *Loop) categoryRef(cat vo.CategoryID) anomaly.CategoryRef {
+	ref := anomaly.CategoryRef{ID: cat}
+	if c, ok := l.registry.Category(cat); ok {
+		ref.Slug = c.Slug
+		ref.Label = c.Label
+	}
+	return ref
+}
+
+func (l *Loop) marketURL(m market.Market) string {
+	if l.cfg.PolymarketBase == "" || m.Slug == "" {
+		return ""
+	}
+	return l.cfg.PolymarketBase + "/event/" + m.Slug
+}
+
+// grafanaURL builds a deep-link with from/to ±GrafanaContext around `at` and
+// the right dashboard variables. Empty when not configured.
+func (l *Loop) grafanaURL(cat anomaly.CategoryRef, m market.Market, at time.Time) string {
+	if l.cfg.GrafanaBase == "" || l.cfg.GrafanaDashUID == "" {
+		return ""
+	}
+	fromMs := at.Add(-l.cfg.GrafanaContext).UnixMilli()
+	toMs := at.Add(l.cfg.GrafanaContext).UnixMilli()
+	u := l.cfg.GrafanaBase + "/d/" + l.cfg.GrafanaDashUID + "/?orgId=1"
+	u += "&from=" + strconv.FormatInt(fromMs, 10)
+	u += "&to=" + strconv.FormatInt(toMs, 10)
+	if cat.Label != "" {
+		u += "&var-category=" + urlEncode(cat.Label)
+	}
+	if m.Slug != "" {
+		u += "&var-market=" + urlEncode(m.Slug)
+	}
+	return u
+}
+
+// Run periodically refreshes supporting Grafana gauges from the aggregate
+// engine. It does NOT fire any alerts — alerts are emitted synchronously from
+// Observe. Run blocks until ctx is cancelled.
 func (l *Loop) Run(ctx context.Context) error {
-	t := time.NewTicker(l.cfg.Interval)
+	t := time.NewTicker(l.cfg.GaugeInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			l.tick(ctx)
+			l.refreshGauges()
 		}
 	}
 }
 
-func (l *Loop) tick(ctx context.Context) {
-	now := l.now()
-	snapshot := l.registry.Snapshot()
-
-	for _, m := range snapshot {
-		baseline := l.engine.BaselineWindow(m.ID, longest(l.cfg.RecentWindows))
+func (l *Loop) refreshGauges() {
+	for _, m := range l.registry.Snapshot() {
 		for _, w := range l.cfg.RecentWindows {
-			recent := l.engine.Window(m.ID, w)
+			win := l.engine.Window(m.ID, w)
 			label := windowLabel(w)
-			l.metrics.WindowTradeRate.WithLabelValues(string(m.ID), label).Set(recent.TradesPerMinute())
-			l.metrics.WindowNotionalRate.WithLabelValues(string(m.ID), label).Set(recent.NotionalPerMinute())
-			l.metrics.WindowAvgSize.WithLabelValues(string(m.ID), label).Set(recent.AvgSize())
-
-			l.evaluate(ctx, now, anomaly2.ScopeMarket, string(m.ID), m.Slug,
-				anomaly2.MetricTradeRate, recent.TradesPerMinute(), baseline.TradesPerMinute(),
-				recent, w, m.ID, 0)
-			l.evaluate(ctx, now, anomaly2.ScopeMarket, string(m.ID), m.Slug,
-				anomaly2.MetricNotionalRate, recent.NotionalPerMinute(), baseline.NotionalPerMinute(),
-				recent, w, m.ID, 0)
-			l.evaluate(ctx, now, anomaly2.ScopeMarket, string(m.ID), m.Slug,
-				anomaly2.MetricAvgSize, recent.AvgSize(), baseline.AvgSize(),
-				recent, w, m.ID, 0)
+			l.metrics.WindowTradeRate.WithLabelValues(string(m.ID), label).Set(win.TradesPerMinute())
+			l.metrics.WindowNotionalRate.WithLabelValues(string(m.ID), label).Set(win.NotionalPerMinute())
+			l.metrics.WindowAvgSize.WithLabelValues(string(m.ID), label).Set(win.AvgSize())
 		}
 	}
-
-	l.evaluateCategories(ctx, now, snapshot)
-}
-
-// catAcc accumulates per-category recent + baseline aggregates so we can fire
-// category-level findings independent of per-market thresholds.
-type catAcc struct {
-	recent   map[time.Duration]trade.Window
-	baseline trade.Window
-	label    string
-}
-
-func (l *Loop) evaluateCategories(ctx context.Context, now time.Time, snapshot []market.Market) {
-	cats := map[vo.CategoryID]*catAcc{}
-	for _, m := range snapshot {
-		for _, cat := range m.Categories {
-			acc, ok := cats[cat]
-			if !ok {
-				acc = &catAcc{recent: map[time.Duration]trade.Window{}}
-				if c, ok := l.registry.Category(cat); ok {
-					acc.label = c.Label
-				}
-				cats[cat] = acc
-			}
-			b := l.engine.BaselineWindow(m.ID, longest(l.cfg.RecentWindows))
-			acc.baseline = mergeWindow(acc.baseline, b)
-			for _, w := range l.cfg.RecentWindows {
-				r := l.engine.Window(m.ID, w)
-				acc.recent[w] = mergeWindow(acc.recent[w], r)
-			}
-		}
-	}
-	for cat, acc := range cats {
-		for _, w := range l.cfg.RecentWindows {
-			r := acc.recent[w]
-			recentTPM := r.TradesPerMinute()
-			recentNPM := r.NotionalPerMinute()
-			baseTPM := acc.baseline.TradesPerMinute()
-			baseNPM := acc.baseline.NotionalPerMinute()
-			target := "cat:" + strconv.FormatInt(int64(cat), 10)
-
-			l.evaluate(ctx, now, anomaly2.ScopeCategory, target, acc.label,
-				anomaly2.MetricTradeRate, recentTPM, baseTPM, r, w, "", cat)
-			l.evaluate(ctx, now, anomaly2.ScopeCategory, target, acc.label,
-				anomaly2.MetricNotionalRate, recentNPM, baseNPM, r, w, "", cat)
-		}
-	}
-}
-
-func mergeWindow(a, b trade.Window) trade.Window {
-	if a.Start.IsZero() {
-		return b
-	}
-	if b.Start.IsZero() {
-		return a
-	}
-	out := trade.Window{
-		Start:    a.Start,
-		End:      a.End,
-		Count:    a.Count + b.Count,
-		Notional: a.Notional + b.Notional,
-		SizeSum:  a.SizeSum + b.SizeSum,
-		SizeMin:  a.SizeMin,
-		SizeMax:  a.SizeMax,
-	}
-	if b.SizeMin < out.SizeMin {
-		out.SizeMin = b.SizeMin
-	}
-	if b.SizeMax > out.SizeMax {
-		out.SizeMax = b.SizeMax
-	}
-	return out
-}
-
-func (l *Loop) evaluate(
-	ctx context.Context,
-	now time.Time,
-	scope anomaly2.Scope,
-	target string,
-	label string,
-	metric anomaly2.Metric,
-	recentVal, baseVal float64,
-	recent trade.Window,
-	winLen time.Duration,
-	market vo.MarketID,
-	cat vo.CategoryID,
-) {
-	ratio := safeRatio(recentVal, baseVal)
-	l.metrics.AnomalyMultiplier.WithLabelValues(string(scope), string(metric)).Set(ratio)
-	sev, ok := l.cfg.Rule.SeverityFor(ratio)
-	if !ok {
-		return
-	}
-	// Avg-size signals are pure rate-of-change and don't need a volume floor.
-	if metric != anomaly2.MetricAvgSize {
-		if recent.Notional < l.cfg.Rule.MinNotional {
-			return
-		}
-		if recent.Count < int64(l.cfg.Rule.MinTrades) {
-			return
-		}
-	}
-
-	key := fireKey{scope: scope, target: target, metric: metric, window: winLen}
-	l.mu.Lock()
-	if last, ok := l.lastFire[key]; ok && now.Sub(last) < l.cfg.Cooldown {
-		l.mu.Unlock()
-		return
-	}
-	l.lastFire[key] = now
-	l.mu.Unlock()
-
-	f := anomaly2.Finding{
-		At:          now,
-		Scope:       scope,
-		Market:      market,
-		Category:    cat,
-		Label:       label,
-		MarketURL:   marketURL(scope, label),
-		Metric:      metric,
-		Severity:    sev,
-		Multiplier:  ratio,
-		Recent:      recentVal,
-		Baseline:    baseVal,
-		WindowLen:   winLen,
-		BaselineLen: l.engine.BaselineWindowLen(),
-	}
-	l.metrics.Anomalies.WithLabelValues(string(scope), string(metric), string(sev)).Inc()
-	if err := l.emit.Notify(ctx, f); err != nil {
-		l.log.Err(err).Msg("detect: emit failed")
-	}
+	l.metrics.BaselineBuckets.Set(float64(l.baseline.Buckets()))
 }
 
 func windowLabel(d time.Duration) string {
@@ -261,37 +330,38 @@ func windowLabel(d time.Duration) string {
 	}
 }
 
-func longest(ds []time.Duration) time.Duration {
-	var m time.Duration
-	for _, d := range ds {
-		if d > m {
-			m = d
-		}
+func categoryLabel(c anomaly.CategoryRef) string {
+	if c.Label != "" {
+		return c.Label
 	}
-	return m
+	return "uncategorized"
 }
 
-// marketURL is a best-effort link to the Polymarket market page. The Polymarket
-// canonical URL uses the event slug, but for single-market events the market
-// slug is the event slug, which is the common case. For category scope we
-// don't emit a link.
-func marketURL(scope anomaly2.Scope, slug string) string {
-	if scope != anomaly2.ScopeMarket || slug == "" {
-		return ""
+func nonEmpty(a, b string) string {
+	if a != "" {
+		return a
 	}
-	return "https://polymarket.com/event/" + slug
+	return b
 }
 
-func safeRatio(num, den float64) float64 {
-	if den <= 0 {
-		if num > 0 {
-			return 1e6 // unbounded; clamp so metrics labels and rules stay sane
+// urlEncode is a minimal query-value escape. Avoids importing net/url to keep
+// the dependency surface small; only handles characters expected in category
+// labels and market slugs.
+func urlEncode(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
+			out = append(out, c)
+		case c == '-' || c == '_' || c == '.' || c == '~':
+			out = append(out, c)
+		case c == ' ':
+			out = append(out, '+')
+		default:
+			const hex = "0123456789ABCDEF"
+			out = append(out, '%', hex[c>>4], hex[c&0xf])
 		}
-		return 0
 	}
-	r := num / den
-	if r > 1e6 {
-		r = 1e6
-	}
-	return r
+	return string(out)
 }

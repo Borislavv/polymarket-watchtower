@@ -2,55 +2,81 @@ package anomaly
 
 import "sort"
 
-// Rule defines the multiplier ladder. Multipliers must be strictly increasing
-// after Normalise(). SeverityFor maps an observed ratio to a severity.
-type Rule struct {
-	Multipliers []float64
-	MinNotional float64 // USD; recent window must clear this to fire
-	MinTrades   int     // trades; recent window must clear this to fire
+// Thresholds defines the two independent single-trade signals:
+//
+//   - Multipliers: a sorted ladder applied to (trade USD notional / baseline
+//     median USD notional) for the same (category, market, outcome) bucket.
+//     Severity mapping: lowest→info, middle→warning, top→critical. Skipped
+//     entirely when the baseline sample is below MinBaselineTrades to avoid
+//     the divide-by-tiny-N false-positive class.
+//
+//   - AbsoluteUSDTiers: a sorted ladder applied to the trade's USD notional
+//     directly, regardless of baseline. Catches "$10k bet on a fresh market"
+//     where no baseline exists yet. Same info/warning/critical mapping.
+//
+// Both signals score every trade; the higher severity wins.
+type Thresholds struct {
+	Multipliers       []float64
+	AbsoluteUSDTiers  []float64
+	MinBaselineTrades int
 }
 
-// Normalise sorts and de-dupes multipliers in place.
-func (r *Rule) Normalise() {
-	if len(r.Multipliers) == 0 {
-		return
+// Normalise sorts and de-dupes both ladders in place.
+func (t *Thresholds) Normalise() {
+	t.Multipliers = sortedUnique(t.Multipliers)
+	t.AbsoluteUSDTiers = sortedUnique(t.AbsoluteUSDTiers)
+}
+
+func sortedUnique(xs []float64) []float64 {
+	if len(xs) == 0 {
+		return xs
 	}
-	sort.Float64s(r.Multipliers)
-	out := r.Multipliers[:0]
+	sort.Float64s(xs)
+	out := xs[:0]
 	var prev float64
-	for i, m := range r.Multipliers {
-		if i == 0 || m != prev {
-			out = append(out, m)
-			prev = m
+	for i, v := range xs {
+		if i == 0 || v != prev {
+			out = append(out, v)
+			prev = v
 		}
 	}
-	r.Multipliers = out
+	return out
 }
 
-// SeverityFor maps a ratio to a severity. Returns ok=false when the ratio is
-// below the lowest multiplier.
-func (r Rule) SeverityFor(ratio float64) (Severity, bool) {
-	if len(r.Multipliers) == 0 || ratio < r.Multipliers[0] {
-		return "", false
+// SeverityForLadder returns the severity for the highest ladder rung that v
+// crosses, plus the rung value. ok=false when v is below every rung.
+func SeverityForLadder(v float64, ladder []float64) (Severity, float64, bool) {
+	if len(ladder) == 0 || v < ladder[0] {
+		return "", 0, false
 	}
-	switch len(r.Multipliers) {
-	case 1:
-		return SeverityWarn, true
-	case 2:
-		if ratio >= r.Multipliers[1] {
-			return SeverityCritical, true
+	hit := ladder[0]
+	for _, rung := range ladder {
+		if v >= rung {
+			hit = rung
 		}
-		return SeverityWarn, true
+	}
+	return ladderSeverity(hit, ladder), hit, true
+}
+
+func ladderSeverity(hit float64, ladder []float64) Severity {
+	switch len(ladder) {
+	case 1:
+		return SeverityInfo
+	case 2:
+		if hit >= ladder[1] {
+			return SeverityWarning
+		}
+		return SeverityInfo
 	default:
-		top := r.Multipliers[len(r.Multipliers)-1]
-		mid := r.Multipliers[len(r.Multipliers)-2]
+		top := ladder[len(ladder)-1]
+		mid := ladder[len(ladder)-2]
 		switch {
-		case ratio >= top:
-			return SeverityFatal, true
-		case ratio >= mid:
-			return SeverityCritical, true
+		case hit >= top:
+			return SeverityCritical
+		case hit >= mid:
+			return SeverityWarning
 		default:
-			return SeverityWarn, true
+			return SeverityInfo
 		}
 	}
 }

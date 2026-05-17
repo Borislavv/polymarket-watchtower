@@ -16,6 +16,7 @@ type Market struct {
 	Question    string
 	ConditionID string
 	TokenIDs    []vo.TokenID
+	Outcomes    []string // human label per TokenIDs index ("Yes"/"No"/"Trump"/...)
 	Categories  []vo.CategoryID
 	Active      bool
 	Closed      bool
@@ -24,6 +25,18 @@ type Market struct {
 	Volume      float64 // lifetime, USD
 	Volume24h   float64 // rolling 24h, USD (Gamma-reported)
 	Liquidity   float64 // USD
+}
+
+// OutcomeLabel resolves a token id to its human outcome label ("", "Yes", "No",
+// etc.). Returns "" when the market doesn't carry outcome metadata or the
+// token id is unknown.
+func (m Market) OutcomeLabel(token vo.TokenID) string {
+	for i, t := range m.TokenIDs {
+		if t == token && i < len(m.Outcomes) {
+			return m.Outcomes[i]
+		}
+	}
+	return ""
 }
 
 // IsTradable returns true when the market is open and inside its trading window.
