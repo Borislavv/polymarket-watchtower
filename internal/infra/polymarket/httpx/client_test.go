@@ -93,15 +93,28 @@ func TestGetJSONReturns404AsErrNotFound(t *testing.T) {
 }
 
 func TestGetJSONNonRetryable4xx(t *testing.T) {
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(403)
-		_, _ = w.Write([]byte("nope"))
+		calls.Add(1)
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"error":"bad"}`))
 	}))
 	defer srv.Close()
 	c := newClient(t, srv.URL)
 	var out struct{}
-	if err := c.GetJSON(context.Background(), "/", nil, &out); err == nil {
-		t.Fatal("expected error for 403")
+	err := c.GetJSON(context.Background(), "/x", nil, &out)
+	if err == nil {
+		t.Fatal("expected error for 400")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("want *APIError, got %T: %v", err, err)
+	}
+	if apiErr.Status != 400 || apiErr.Retryable() {
+		t.Fatalf("status=%d retryable=%v body=%q", apiErr.Status, apiErr.Retryable(), apiErr.Body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("4xx must not retry, got %d calls", calls.Load())
 	}
 }
 
