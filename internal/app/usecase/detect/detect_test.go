@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
-	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/market"
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/trade"
+	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/rs/zerolog"
