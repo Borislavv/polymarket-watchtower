@@ -107,7 +107,7 @@ func New() (*App, error) {
 		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
 	}, dataClient, engine, registry, met, logger)
 
-	sinks := []alerting2.Sink{&alerting2.LogSink{Logger: logger}}
+	sinks := []alerting2.Channel{&alerting2.LogSink{Logger: logger}}
 	if cfg.Alerting.WebhookURL != "" {
 		sinks = append(sinks, alerting2.NewWebhookSink(cfg.Alerting.WebhookURL))
 	}
