@@ -294,18 +294,22 @@ func appendLinks(b *strings.Builder, f anomaly.Finding) {
 	}
 }
 
+// severityBadge returns a short uppercased label for the alert header. We
+// deliberately avoid `[` because Telegram's legacy "Markdown" parse mode reads
+// it as the start of a `[text](url)` link and rejects the whole message with
+// a 400 ("can't parse entities").
 func severityBadge(s anomaly.Severity) string {
 	switch s {
 	case anomaly.SeverityHard:
-		return "[HARD]"
+		return "HARD"
 	case anomaly.SeverityCritical:
-		return "[CRIT]"
+		return "CRIT"
 	case anomaly.SeverityWarning:
-		return "[WARN]"
+		return "WARN"
 	case anomaly.SeverityInfo:
-		return "[INFO]"
+		return "INFO"
 	}
-	return "[ANOM]"
+	return "ANOM"
 }
 
 func nonEmpty(a, b string) string {
