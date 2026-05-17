@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	market2 "github.com/Borislavv/polymarket-watchtower/internal/domain/market"
+	market2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 )

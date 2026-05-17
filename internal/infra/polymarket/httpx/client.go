@@ -26,6 +26,23 @@ import (
 // resources from transport failures.
 var ErrNotFound = errors.New("httpx: not found")
 
+// APIError represents a non-retryable upstream response (4xx other than 404 and
+// 429). Callers can errors.As to log a structured "mapping bug" and avoid
+// retrying a permanently broken request.
+type APIError struct {
+	Status int
+	URL    string
+	Body   string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("httpx: %s -> %d: %s", e.URL, e.Status, e.Body)
+}
+
+// Retryable reports whether retrying might succeed. Always false for APIError —
+// 4xx responses indicate a client-side mapping bug, not a transient failure.
+func (e *APIError) Retryable() bool { return false }
+
 // ObserveFn is the callback signature for per-request telemetry.
 // It is invoked once per round-trip (including failed ones).
 type ObserveFn func(endpoint string, status int, duration time.Duration)
@@ -133,7 +150,7 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out
 					c.log.Warn().Int("status", resp.StatusCode).Str("url", u.String()).Int("attempt", attempt).Msg("retrying upstream")
 				}
 			default:
-				return fmt.Errorf("httpx: %s -> %d: %s", u.String(), resp.StatusCode, truncate(body, 256))
+				return &APIError{Status: resp.StatusCode, URL: u.String(), Body: truncate(body, 256)}
 			}
 		}
 
