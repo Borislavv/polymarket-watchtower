@@ -51,10 +51,16 @@ type Config struct {
 	RecentWindows  []time.Duration
 	GaugeInterval  time.Duration // how often Run() refreshes supporting gauges
 	PolymarketBase string        // "https://polymarket.com" (no trailing slash)
-	GrafanaBase    string        // "http://localhost:3000" (no trailing slash); "" disables Grafana links
+	GrafanaBase    string        // public base URL for Grafana deep-links; "" disables
 	GrafanaDashUID string        // dashboard UID for deep-link
 	GrafanaContext time.Duration // ±window around trade time in Grafana link
-	Clock          func() time.Time
+	// Lifecycle gating: alerts only fire when the market is at or past
+	// LifecycleAlertFromPct of its lifetime, and are marked Hot when at or
+	// past LifecycleHotFromPct. Markets without start/end dates bypass the
+	// gate.
+	LifecycleAlertFromPct float64
+	LifecycleHotFromPct   float64
+	Clock                 func() time.Time
 }
 
 // Loop owns the analytics state.
@@ -88,6 +94,12 @@ func New(
 	}
 	if cfg.Filter == nil {
 		cfg.Filter = category.NewFilter(nil)
+	}
+	if cfg.LifecycleAlertFromPct < 0 {
+		cfg.LifecycleAlertFromPct = 0
+	}
+	if cfg.LifecycleHotFromPct < cfg.LifecycleAlertFromPct {
+		cfg.LifecycleHotFromPct = cfg.LifecycleAlertFromPct
 	}
 	now := cfg.Clock
 	if now == nil {
@@ -134,6 +146,14 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	}
 	l.metrics.TradeSizeUSD.Observe(notional)
 
+	// Lifecycle gate: skip markets that aren't deep enough into their lifetime.
+	// Markets without start/end dates pass (we can't gate on missing info).
+	lifecyclePct, lifecycleKnown := market.LifecyclePct(trade.Timestamp)
+	if lifecycleKnown && lifecyclePct < l.cfg.LifecycleAlertFromPct {
+		return
+	}
+	hot := lifecycleKnown && lifecyclePct >= l.cfg.LifecycleHotFromPct
+
 	categories := market.Categories
 	if len(categories) == 0 {
 		// Bucket trades from un-categorised markets under category id 0 so the
@@ -178,7 +198,7 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		}
 	}
 	if bestResult.Fired {
-		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef)
+		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef, lifecyclePct, hot)
 	}
 }
 
@@ -212,10 +232,13 @@ func (l *Loop) emitTradeAnomaly(
 	stats baseline.Stats,
 	sr score.Result,
 	ref anomaly.TradeRef,
+	lifecyclePct float64,
+	hot bool,
 ) {
 	catRef := l.categoryRef(cat)
 	scope := fmt.Sprintf("category=%s market=%s outcome=%s",
 		nonEmpty(catRef.Label, "uncategorised"), m.Slug, nonEmpty(ref.Outcome, "?"))
+	peerCount := l.cluster.Count(cat)
 	f := anomaly.Finding{
 		Kind:     anomaly.KindTradeAnomaly,
 		Severity: sr.Severity,
@@ -231,11 +254,17 @@ func (l *Loop) emitTradeAnomaly(
 			SampleN:   stats.Count,
 			WindowAgo: l.cfg.Baseline.Window,
 		},
-		Multiplier:     sr.Multiplier,
-		AbsoluteTier:   sr.AbsoluteTier,
-		MultiplierTier: sr.MultiplierTier,
-		MarketURL:      l.marketURL(m),
-		GrafanaURL:     l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
+		Multiplier:       sr.Multiplier,
+		AbsoluteTier:     sr.AbsoluteTier,
+		MultiplierTier:   sr.MultiplierTier,
+		LifecyclePct:     lifecyclePct,
+		Hot:              hot,
+		InCluster:        peerCount >= 2,
+		ClusterPeerCount: peerCount,
+		MarketURL:        l.marketURL(m),
+		CategoryURL:      l.categoryURL(catRef),
+		TraderURL:        l.traderURL(ref.Wallet),
+		GrafanaURL:       l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
 	}
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
 	if sr.Multiplier > 0 {
@@ -260,14 +289,15 @@ func (l *Loop) emitCategoryWatch(
 ) {
 	catRef := l.categoryRef(cat)
 	f := anomaly.Finding{
-		Kind:       anomaly.KindCategoryWatch,
-		Severity:   anomaly.SeverityHard,
-		At:         l.now(),
-		Reason:     anomaly.ReasonCluster,
-		Category:   &catRef,
-		Cluster:    cs,
-		MarketURL:  l.marketURL(m),
-		GrafanaURL: l.grafanaURL(catRef, market.Market{}, t.Timestamp, anomaly.SeverityHard),
+		Kind:        anomaly.KindCategoryWatch,
+		Severity:    anomaly.SeverityHard,
+		At:          l.now(),
+		Reason:      anomaly.ReasonCluster,
+		Category:    &catRef,
+		Cluster:     cs,
+		MarketURL:   l.marketURL(m),
+		CategoryURL: l.categoryURL(catRef),
+		GrafanaURL:  l.grafanaURL(catRef, market.Market{}, t.Timestamp, anomaly.SeverityHard),
 	}
 	l.metrics.CategoryHardAlerts.WithLabelValues(categoryLabel(catRef)).Inc()
 	if err := l.emit.Notify(ctx, f); err != nil {
@@ -302,14 +332,35 @@ func (l *Loop) categoryRef(cat vo.CategoryID) anomaly.CategoryRef {
 // market slug. When the event slug is missing we return "" rather than emit a
 // known-broken /event/<market-slug> URL.
 func (l *Loop) marketURL(m market.Market) string {
-	if l.cfg.PolymarketBase == "" || m.EventSlug == "" {
+	return l.polymarketPath("event", m.EventSlug)
+}
+
+// categoryURL produces a /predictions/<slug> link. Verified live: Polymarket
+// 308-redirects /markets/<slug> to /predictions/<slug>; we emit the canonical
+// destination directly so the click doesn't pay a redirect round-trip.
+func (l *Loop) categoryURL(c anomaly.CategoryRef) string {
+	return l.polymarketPath("predictions", c.Slug)
+}
+
+// traderURL produces a /profile/<wallet> link.
+func (l *Loop) traderURL(wallet string) string {
+	return l.polymarketPath("profile", wallet)
+}
+
+func (l *Loop) polymarketPath(segs ...string) string {
+	if l.cfg.PolymarketBase == "" {
 		return ""
+	}
+	for _, s := range segs {
+		if s == "" {
+			return ""
+		}
 	}
 	u, err := url.Parse(l.cfg.PolymarketBase)
 	if err != nil {
 		return ""
 	}
-	u.Path = singleSlashJoin(u.Path, "event", m.EventSlug)
+	u.Path = singleSlashJoin(u.Path, segs...)
 	return u.String()
 }
 

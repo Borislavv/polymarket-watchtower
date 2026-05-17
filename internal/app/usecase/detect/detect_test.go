@@ -300,6 +300,144 @@ func TestMarketURLUsesEventSlug(t *testing.T) {
 	}
 }
 
+func TestLifecycleGateSkipsEarlyMarkets(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := aggregate.NewRegistry()
+	// Market spans 100 days; trade at day 50 = 50% elapsed; below 75% floor.
+	start := now.Add(-50 * 24 * time.Hour)
+	end := now.Add(50 * 24 * time.Hour)
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
+			EventSlug:  "us-pres-2028",
+			TokenIDs:   []vo.TokenID{"tok-yes"},
+			Outcomes:   []string{"Yes"},
+			Categories: []vo.CategoryID{42},
+			Active:     true,
+			StartDate:  start,
+			EndDate:    end,
+		}},
+		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
+	)
+	emit := &capturingEmitter{}
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds:            defaultThresholds(),
+		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:                 func() time.Time { return now },
+		LifecycleAlertFromPct: 75,
+		LifecycleHotFromPct:   90,
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+
+	m, _ := reg.Get("0xa")
+	warm(loop, m, 30, 60, 0.5, now)
+	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
+	if got := emit.all(); len(got) != 0 {
+		t.Fatalf("early-lifecycle market should not alert, got %d", len(got))
+	}
+}
+
+func TestLifecycleMarksHotInFinalStretch(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := aggregate.NewRegistry()
+	// 100-day span; trade at day 95 = 95% elapsed → above HOT threshold.
+	start := now.Add(-95 * 24 * time.Hour)
+	end := now.Add(5 * 24 * time.Hour)
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
+			EventSlug:  "us-pres-2028",
+			TokenIDs:   []vo.TokenID{"tok-yes"},
+			Outcomes:   []string{"Yes"},
+			Categories: []vo.CategoryID{42},
+			Active:     true,
+			StartDate:  start,
+			EndDate:    end,
+		}},
+		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
+	)
+	emit := &capturingEmitter{}
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds:            defaultThresholds(),
+		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:                 func() time.Time { return now },
+		LifecycleAlertFromPct: 75,
+		LifecycleHotFromPct:   90,
+		PolymarketBase:        "https://polymarket.com",
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+
+	m, _ := reg.Get("0xa")
+	warm(loop, m, 30, 60, 0.5, now)
+	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(got))
+	}
+	if !got[0].Hot {
+		t.Fatalf("expected Hot=true, got %+v", got[0])
+	}
+	if got[0].LifecyclePct < 90 || got[0].LifecyclePct > 100 {
+		t.Fatalf("lifecycle pct: %v", got[0].LifecyclePct)
+	}
+}
+
+func TestMarketWithoutLifecycleAllowsAlert(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	// newLoop seeds a market without StartDate/EndDate — the lifecycle gate
+	// must not silently block it (we have nothing to gate on).
+	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	loop.cfg.LifecycleAlertFromPct = 75
+	loop.cfg.LifecycleHotFromPct = 90
+	m, _ := reg.Get("0xa")
+	warm(loop, m, 30, 60, 0.5, now)
+	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
+	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
+		t.Fatalf("expected 1 finding when lifecycle is unknown, got %d", len(got))
+	}
+}
+
+func TestCategoryURLAndTraderURL(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, _, _ := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	loop.cfg.PolymarketBase = "https://polymarket.com"
+	if got := loop.categoryURL(anomaly.CategoryRef{Slug: "politics"}); got != "https://polymarket.com/predictions/politics" {
+		t.Errorf("categoryURL: %q", got)
+	}
+	if got := loop.traderURL("0xabc"); got != "https://polymarket.com/profile/0xabc" {
+		t.Errorf("traderURL: %q", got)
+	}
+	if got := loop.categoryURL(anomaly.CategoryRef{}); got != "" {
+		t.Errorf("missing slug must produce empty URL, got %q", got)
+	}
+	if got := loop.traderURL(""); got != "" {
+		t.Errorf("empty wallet must produce empty URL, got %q", got)
+	}
+}
+
+func TestSingleTradeRecordsClusterPeerCount(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	m, _ := reg.Get("0xa")
+	warm(loop, m, 30, 60, 0.5, now)
+	// First fire: alone, InCluster=false.
+	loop.Observe(context.Background(), m, bet(50_000, 1.0/8, "w1", now))
+	// Second fire: peer present, InCluster=true.
+	loop.Observe(context.Background(), m, bet(50_000, 1.0/8, "w2", now))
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 single-trade findings, got %d", len(got))
+	}
+	if got[0].InCluster {
+		t.Errorf("first trade should be alone: %+v", got[0])
+	}
+	if !got[1].InCluster || got[1].ClusterPeerCount < 2 {
+		t.Errorf("second trade should report peers: %+v", got[1])
+	}
+}
+
 func TestObserveConcurrencySafe(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, _ := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 5, MinUniqueWallets: 3})

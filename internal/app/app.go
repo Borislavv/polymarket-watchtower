@@ -183,13 +183,15 @@ func New() (*App, error) {
 				MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
 				Cooldown:         cfg.Anomaly.ClusterCooldown,
 			},
-			Filter:         categoryFilter,
-			RecentWindows:  cfg.Aggregate.RecentWindows,
-			GaugeInterval:  cfg.Pipeline.CollectInterval,
-			PolymarketBase: cfg.Polymarket.PublicBaseURL,
-			GrafanaBase:    cfg.Alerting.GrafanaBaseURL,
-			GrafanaDashUID: cfg.Alerting.GrafanaDashUID,
-			GrafanaContext: cfg.Alerting.GrafanaContext,
+			Filter:                categoryFilter,
+			RecentWindows:         cfg.Aggregate.RecentWindows,
+			GaugeInterval:         cfg.Pipeline.CollectInterval,
+			PolymarketBase:        cfg.Polymarket.PublicBaseURL,
+			GrafanaBase:           cfg.Alerting.GrafanaBaseURL,
+			GrafanaDashUID:        cfg.Alerting.GrafanaDashUID,
+			GrafanaContext:        cfg.Alerting.GrafanaContext,
+			LifecycleAlertFromPct: cfg.Anomaly.LifecycleAlertFromPct,
+			LifecycleHotFromPct:   cfg.Anomaly.LifecycleHotFromPct,
 		}, engine, registry, emitter, met, logger)
 		observer = detectLoop
 		detectRun = detectLoop.Run

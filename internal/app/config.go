@@ -111,11 +111,19 @@ type AnomalyConfig struct {
 	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
 
 	// Baseline shape.
-	BaselineMinTradeUSD          float64       `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
-	SingleMinBaselineTrades      int           `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
-	SingleMinBaselineNotionalUSD float64       `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
-	BaselineWindow               time.Duration `env:"BASELINE_WINDOW" envDefault:"168h" validate:"required"`
-	BaselineMaxSamples           int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+	BaselineMinTradeUSD          float64 `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
+	SingleMinBaselineTrades      int     `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
+	SingleMinBaselineNotionalUSD float64 `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
+	// BaselineWindow defaults to 1 year so the reservoir captures essentially
+	// all historical activity per (cat, market, outcome). The per-bucket
+	// MaxSamples ring still bounds memory; readiness gates (MinTrades and
+	// MinNotional) guard the cold-start window.
+	BaselineWindow     time.Duration `env:"BASELINE_WINDOW" envDefault:"8760h" validate:"required"`
+	BaselineMaxSamples int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+
+	// Lifecycle gating.
+	LifecycleAlertFromPct float64 `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
+	LifecycleHotFromPct   float64 `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
 
 	// Cluster (HARD) alert.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`

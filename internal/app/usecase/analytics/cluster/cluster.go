@@ -126,6 +126,21 @@ func (d *Detector) Observe(cat vo.CategoryID, tr anomaly.TradeRef) *anomaly.Clus
 	}
 }
 
+// Count returns the number of entries currently in the per-category window.
+// Used by single-trade alerts to render the "part of N-trade cluster" hint
+// without firing a cluster alert.
+func (d *Detector) Count(cat vo.CategoryID) int {
+	cutoff := d.now().Add(-d.cfg.Window)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	w := d.perCat[cat]
+	if w == nil {
+		return 0
+	}
+	w.entries = trimBefore(w.entries, cutoff)
+	return len(w.entries)
+}
+
 // Forget releases the per-category state. Useful when discovery prunes a
 // category entirely (rare).
 func (d *Detector) Forget(cat vo.CategoryID) {

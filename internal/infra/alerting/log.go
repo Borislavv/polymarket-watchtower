@@ -83,8 +83,23 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 	if f.MarketURL != "" {
 		evt = evt.Str("market_url", f.MarketURL)
 	}
+	if f.CategoryURL != "" {
+		evt = evt.Str("category_url", f.CategoryURL)
+	}
+	if f.TraderURL != "" {
+		evt = evt.Str("trader_url", f.TraderURL)
+	}
 	if f.GrafanaURL != "" {
 		evt = evt.Str("grafana_url", f.GrafanaURL)
+	}
+	if f.LifecyclePct > 0 {
+		evt = evt.Float64("lifecycle_pct", f.LifecyclePct)
+	}
+	if f.Hot {
+		evt = evt.Bool("hot", true)
+	}
+	if f.Kind == anomaly.KindTradeAnomaly {
+		evt = evt.Bool("in_cluster", f.InCluster).Int("cluster_peer_count", f.ClusterPeerCount)
 	}
 	evt.Msg("anomaly detected")
 	return nil

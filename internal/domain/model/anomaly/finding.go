@@ -133,7 +133,18 @@ type Finding struct {
 	Category *CategoryRef
 	Cluster  *ClusterStats
 
+	// Lifecycle.
+	LifecyclePct float64 // 0..100; 0 when unknown (no start/end on the market)
+	Hot          bool    // true when the market is in its final HotFromPct window
+
+	// Cluster context on single-trade alerts (the per-trade signal also
+	// reports how many anomalous siblings sit in the current category window).
+	InCluster        bool
+	ClusterPeerCount int
+
 	// Links — sinks render whichever are populated.
-	MarketURL  string
-	GrafanaURL string
+	MarketURL   string
+	CategoryURL string
+	TraderURL   string
+	GrafanaURL  string
 }

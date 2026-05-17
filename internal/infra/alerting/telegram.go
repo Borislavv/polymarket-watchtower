@@ -211,10 +211,15 @@ func formatCategoryWatch(f anomaly.Finding) string {
 
 func writeTradeHeader(b *strings.Builder, f anomaly.Finding) {
 	title := tradeTitle(f)
-	fmt.Fprintf(b, "<b>%s: x%s · $%s · %s</b>\n",
+	hot := ""
+	if f.Hot {
+		hot = " · HOT"
+	}
+	fmt.Fprintf(b, "<b>%s: x%s · $%s%s · %s</b>\n",
 		strings.ToUpper(string(f.Severity)),
 		multiplierFmt(f.Multiplier),
 		money(notional(f)),
+		hot,
 		html.EscapeString(title),
 	)
 }
@@ -230,8 +235,12 @@ func writeClusterHeader(b *strings.Builder, f anomaly.Finding) {
 		count = f.Cluster.AnomalousTrades
 		wallets = f.Cluster.UniqueWallets
 	}
-	fmt.Fprintf(b, "<b>%s — CategoryWatchRequired: %d trades · %d wallets · $%s · %s</b>\n",
-		strings.ToUpper(string(f.Severity)), count, wallets, money(totalUSD), html.EscapeString(cat))
+	hot := ""
+	if f.Hot {
+		hot = " · HOT"
+	}
+	fmt.Fprintf(b, "<b>%s — CategoryWatchRequired: %d trades · %d wallets · $%s%s · %s</b>\n",
+		strings.ToUpper(string(f.Severity)), count, wallets, money(totalUSD), hot, html.EscapeString(cat))
 }
 
 func writeWhy(b *strings.Builder, f anomaly.Finding) {
@@ -251,6 +260,19 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 	if f.AbsoluteTier != "" || f.MultiplierTier != "" {
 		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> → final=<b>%s</b>\n",
 			string(f.AbsoluteTier), string(f.MultiplierTier), string(f.Severity))
+	}
+	if f.LifecyclePct > 0 {
+		hot := ""
+		if f.Hot {
+			hot = " (HOT — final stretch)"
+		}
+		fmt.Fprintf(b, "• market lifecycle: <b>%.1f%%</b> elapsed%s\n", f.LifecyclePct, hot)
+	}
+	switch {
+	case f.Kind == anomaly.KindTradeAnomaly && f.InCluster:
+		fmt.Fprintf(b, "• <b>part of a forming cluster</b>: %d anomalous trades in the current window\n", f.ClusterPeerCount)
+	case f.Kind == anomaly.KindTradeAnomaly:
+		b.WriteString("• single trade (no peers in cluster window yet)\n")
 	}
 }
 
@@ -302,18 +324,24 @@ func writeCluster(b *strings.Builder, f anomaly.Finding) {
 }
 
 func writeLinks(b *strings.Builder, f anomaly.Finding) {
-	if f.MarketURL == "" && f.GrafanaURL == "" {
+	if f.MarketURL == "" && f.CategoryURL == "" && f.TraderURL == "" && f.GrafanaURL == "" {
 		return
 	}
 	b.WriteString("\n<b>Links</b>\n")
-	parts := make([]string, 0, 2)
-	if f.MarketURL != "" {
-		parts = append(parts, fmt.Sprintf(`<a href="%s">Polymarket</a>`, html.EscapeString(f.MarketURL)))
+	type linkEntry struct {
+		label, href string
 	}
-	if f.GrafanaURL != "" {
-		parts = append(parts, fmt.Sprintf(`<a href="%s">Grafana</a>`, html.EscapeString(f.GrafanaURL)))
+	for _, e := range []linkEntry{
+		{"Polymarket market", f.MarketURL},
+		{"Polymarket category", f.CategoryURL},
+		{"Trader", f.TraderURL},
+		{"Grafana", f.GrafanaURL},
+	} {
+		if e.href == "" {
+			continue
+		}
+		fmt.Fprintf(b, `• <a href="%s">%s</a>`+"\n", html.EscapeString(e.href), e.label)
 	}
-	b.WriteString(strings.Join(parts, " · "))
 }
 
 // --- helpers ---------------------------------------------------------------

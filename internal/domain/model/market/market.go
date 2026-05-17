@@ -46,6 +46,28 @@ func (m Market) OutcomeLabel(token vo.TokenID) string {
 	return ""
 }
 
+// LifecyclePct returns where now sits inside [StartDate, EndDate] as a 0–100
+// percentage, plus ok=true when both dates are present and total span > 0.
+// Markets without lifecycle metadata cannot be gated; callers should pass them
+// through by default.
+func (m Market) LifecyclePct(now time.Time) (float64, bool) {
+	if m.StartDate.IsZero() || m.EndDate.IsZero() {
+		return 0, false
+	}
+	total := m.EndDate.Sub(m.StartDate)
+	if total <= 0 {
+		return 0, false
+	}
+	pct := float64(now.Sub(m.StartDate)) / float64(total) * 100
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct, true
+}
+
 // IsTradable returns true when the market is open and inside its trading window.
 func (m Market) IsTradable(now time.Time) bool {
 	if !m.Active || m.Closed {

@@ -40,12 +40,18 @@ func sampleTradeFinding() anomaly.Finding {
 			Scope:     "category=Weather market=rain outcome=Yes",
 			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, SampleN: 1240, WindowAgo: 7 * 24 * time.Hour,
 		},
-		Category:       &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
-		Multiplier:     12_371,
-		AbsoluteTier:   anomaly.SeverityCritical,
-		MultiplierTier: anomaly.SeverityCritical,
-		MarketURL:      "https://polymarket.com/event/rain-tomorrow",
-		GrafanaURL:     "http://grafana.local/d/uid123/?from=1&to=2&var-category=Weather&var-market=rain-tomorrow&var-severity=critical",
+		Category:         &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
+		Multiplier:       12_371,
+		AbsoluteTier:     anomaly.SeverityCritical,
+		MultiplierTier:   anomaly.SeverityCritical,
+		MarketURL:        "https://polymarket.com/event/rain-tomorrow",
+		CategoryURL:      "https://polymarket.com/predictions/weather",
+		TraderURL:        "https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678",
+		GrafanaURL:       "http://grafana.public/d/uid123/?from=1&to=2&var-category=Weather&var-market=rain-tomorrow&var-severity=critical",
+		LifecyclePct:     93.5,
+		Hot:              true,
+		InCluster:        true,
+		ClusterPeerCount: 4,
 	}
 }
 
@@ -90,8 +96,8 @@ func TestTelegramEnabledRequiresTokenAndSubscribers(t *testing.T) {
 func TestTradeAnomalyHeaderFormat(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	first := strings.SplitN(msg, "\n", 2)[0]
-	// Header: <b>SEV: xMUL · $NOTIONAL · TITLE</b>
-	for _, want := range []string{"<b>", "CRITICAL", "x12371", "$120,000", "Will it rain &lt;tomorrow&gt;?", "</b>"} {
+	// Header: <b>SEV: xMUL · $NOTIONAL · HOT · TITLE</b>
+	for _, want := range []string{"<b>", "CRITICAL", "x12371", "$120,000", "HOT", "Will it rain &lt;tomorrow&gt;?", "</b>"} {
 		if !strings.Contains(first, want) {
 			t.Errorf("header missing %q in:\n%s", want, first)
 		}
@@ -106,15 +112,54 @@ func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 		"odds <b>20.0</b>, implied probability <b>5.0%</b>",
 		"baseline: <b>1240</b> trades, median $9.70",
 		"tiers: absolute=<code>critical</code> multiplier=<code>critical</code>",
+		"market lifecycle: <b>93.5%</b> elapsed (HOT — final stretch)",
+		"<b>part of a forming cluster</b>: 4 anomalous trades",
 		"<b>Trade</b>",
 		"outcome: <b>Yes</b> (BUY)",
 		"size: $120,000",
 		"trader: <code>0xabc1234567890def1234567890abcdef12345678</code>",
-		"category: Weather &amp; Climate", // & must be escaped
+		"category: Weather &amp; Climate",
 		"<b>Links</b>",
-		`<a href="https://polymarket.com/event/rain-tomorrow">Polymarket</a>`,
-		`<a href="http://grafana.local/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>`,
+		`• <a href="https://polymarket.com/event/rain-tomorrow">Polymarket market</a>`,
+		`• <a href="https://polymarket.com/predictions/weather">Polymarket category</a>`,
+		`• <a href="https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678">Trader</a>`,
+		`• <a href="http://grafana.public/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>`,
 	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+}
+
+func TestSingleTradeAloneSaysSo(t *testing.T) {
+	f := sampleTradeFinding()
+	f.InCluster = false
+	f.ClusterPeerCount = 1
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "single trade (no peers in cluster window yet)") {
+		t.Errorf("missing single-trade hint in:\n%s", msg)
+	}
+}
+
+func TestLinksOmittedWhenAllURLsEmpty(t *testing.T) {
+	f := sampleTradeFinding()
+	f.MarketURL, f.CategoryURL, f.TraderURL, f.GrafanaURL = "", "", "", ""
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<b>Links</b>") {
+		t.Errorf("Links section should be omitted entirely when no URLs are set:\n%s", msg)
+	}
+}
+
+func TestLinksOmitMissingEntries(t *testing.T) {
+	// Plain-text "Grafana" must NEVER appear — only as a hyperlink when URL is set.
+	f := sampleTradeFinding()
+	f.GrafanaURL = ""
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, ">Grafana</a>") || strings.Contains(msg, "• Grafana") {
+		t.Errorf("Grafana entry must be hidden when GrafanaURL is empty:\n%s", msg)
+	}
+	// The other three should still be present.
+	for _, want := range []string{"Polymarket market", "Polymarket category", "Trader"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
 		}
