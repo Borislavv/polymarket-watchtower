@@ -173,6 +173,14 @@ func mapMarket(m gammaMarket) (market2.Market, error) {
 	outcomes, _ := parseStringArray(m.OutcomesJSON)
 	start, _ := parseTime(m.StartDate)
 	end, _ := parseTime(m.EndDate)
+	var eventSlug, eventTitle string
+	for _, e := range m.Events {
+		if e.Slug != "" {
+			eventSlug = e.Slug
+			eventTitle = e.Title
+			break
+		}
+	}
 	return market2.Market{
 		ID:          vo.MarketID(m.ConditionID),
 		Slug:        m.Slug,
@@ -180,6 +188,8 @@ func mapMarket(m gammaMarket) (market2.Market, error) {
 		ConditionID: m.ConditionID,
 		TokenIDs:    tokenIDs,
 		Outcomes:    outcomes,
+		EventSlug:   eventSlug,
+		EventTitle:  eventTitle,
 		Active:      m.Active,
 		Closed:      m.Closed,
 		StartDate:   start,

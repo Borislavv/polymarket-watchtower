@@ -84,11 +84,16 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 			if r.URL.Query().Get("offset") == "0" {
 				_ = json.NewEncoder(w).Encode([]map[string]any{{
 					"conditionId":  "0xa",
-					"slug":         "us-pres",
-					"question":     "Who wins?",
+					"slug":         "will-candidate-a-win",
+					"question":     "Will Candidate A win?",
 					"active":       true,
 					"outcomes":     `["Yes","No"]`,
 					"clobTokenIds": `["tok-yes","tok-no"]`,
+					// Parent event — the user-facing URL is /event/<event.slug>,
+					// NOT /event/<market.slug>. Verified live: market slugs 404.
+					"events": []map[string]any{{
+						"id": "e1", "slug": "us-pres-2028", "title": "US Presidential Election 2028",
+					}},
 				}})
 			} else {
 				_, _ = w.Write([]byte(`[]`))
@@ -248,8 +253,12 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 			if f.Trade == nil || f.Trade.Outcome != "Yes" {
 				t.Errorf("trade ref missing outcome: %+v", f.Trade)
 			}
-			if f.MarketURL != "https://polymarket.com/event/us-pres" {
-				t.Errorf("market URL: %q", f.MarketURL)
+			if f.MarketURL != "https://polymarket.com/event/us-pres-2028" {
+				t.Errorf("market URL must point at the EVENT slug, got %q", f.MarketURL)
+			}
+			// Regression: never address the user at /event/<market-slug>.
+			if strings.Contains(f.MarketURL, "/event/will-candidate-a-win") {
+				t.Errorf("alert leaked a /event/<market-slug> URL: %q", f.MarketURL)
 			}
 			if !strings.Contains(f.GrafanaURL, "var-category=Politics") {
 				t.Errorf("grafana URL missing category var: %q", f.GrafanaURL)

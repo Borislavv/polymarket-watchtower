@@ -18,13 +18,20 @@ type Market struct {
 	TokenIDs    []vo.TokenID
 	Outcomes    []string // human label per TokenIDs index ("Yes"/"No"/"Trump"/...)
 	Categories  []vo.CategoryID
-	Active      bool
-	Closed      bool
-	StartDate   time.Time
-	EndDate     time.Time
-	Volume      float64 // lifetime, USD
-	Volume24h   float64 // rolling 24h, USD (Gamma-reported)
-	Liquidity   float64 // USD
+	// EventSlug is the Gamma event the market belongs to. The user-facing
+	// Polymarket URL is /event/<EventSlug> — the market slug alone is NOT a
+	// valid page (returns 404 for any market grouped under a multi-outcome
+	// event, e.g. "Will Tunisia win the FIFA World Cup?" lives under the
+	// "2026 FIFA World Cup Winner" event).
+	EventSlug  string
+	EventTitle string
+	Active     bool
+	Closed     bool
+	StartDate  time.Time
+	EndDate    time.Time
+	Volume     float64 // lifetime, USD
+	Volume24h  float64 // rolling 24h, USD (Gamma-reported)
+	Liquidity  float64 // USD
 }
 
 // OutcomeLabel resolves a token id to its human outcome label ("", "Yes", "No",

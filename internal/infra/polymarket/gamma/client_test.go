@@ -123,6 +123,49 @@ func TestListTagsDecodesStringIDs(t *testing.T) {
 	}
 }
 
+func TestMapMarketPropagatesEventSlug(t *testing.T) {
+	// Mirrors the production failure: a market that lives inside a parent
+	// "winner" event. The market slug itself is NOT a valid Polymarket URL —
+	// only the event slug is.
+	raw := gammaMarket{
+		ID:          "514929",
+		Slug:        "will-tunisia-win-the-2026-fifa-world-cup-165",
+		Question:    "Will Tunisia win the 2026 FIFA World Cup?",
+		ConditionID: "0xff0cfa9506cfa95759e4c7591654195bd26e3011f9882b51439135e04f2b69f1",
+		Events: []gammaEventRef{{
+			ID: "30615", Slug: "2026-fifa-world-cup-winner-595", Title: "2026 FIFA World Cup Winner",
+		}},
+	}
+	got, err := mapMarket(raw)
+	if err != nil {
+		t.Fatalf("mapMarket: %v", err)
+	}
+	if got.EventSlug != "2026-fifa-world-cup-winner-595" {
+		t.Fatalf("EventSlug: got %q want %q", got.EventSlug, "2026-fifa-world-cup-winner-595")
+	}
+	if got.EventTitle != "2026 FIFA World Cup Winner" {
+		t.Fatalf("EventTitle: %q", got.EventTitle)
+	}
+	if got.Slug != "will-tunisia-win-the-2026-fifa-world-cup-165" {
+		t.Fatalf("market slug should still round-trip, got %q", got.Slug)
+	}
+}
+
+func TestMapMarketWithoutEventsLeavesSlugEmpty(t *testing.T) {
+	raw := gammaMarket{
+		ConditionID: "0xabc",
+		Slug:        "standalone-market",
+		// Events omitted — represents markets that aren't grouped under an event.
+	}
+	got, err := mapMarket(raw)
+	if err != nil {
+		t.Fatalf("mapMarket: %v", err)
+	}
+	if got.EventSlug != "" || got.EventTitle != "" {
+		t.Fatalf("expected empty event fields, got slug=%q title=%q", got.EventSlug, got.EventTitle)
+	}
+}
+
 func TestMapEventsToMarketCategories(t *testing.T) {
 	evs := []gammaEvent{
 		{Tags: []gammaTag{{ID: 1}, {ID: 2}}, Markets: []gammaMarket{{ConditionID: "0xa"}, {ConditionID: "0xb"}}},

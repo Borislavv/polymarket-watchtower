@@ -264,15 +264,20 @@ func (l *Loop) categoryRef(cat vo.CategoryID) anomaly.CategoryRef {
 	return ref
 }
 
+// marketURL returns the user-facing Polymarket event page URL for m. We
+// deliberately key on the EVENT slug, not the market slug — sub-card markets
+// (e.g. one team's leg of the World Cup winner event) 404 when addressed by
+// market slug. When the event slug is missing we return "" rather than emit a
+// known-broken /event/<market-slug> URL.
 func (l *Loop) marketURL(m market.Market) string {
-	if l.cfg.PolymarketBase == "" || m.Slug == "" {
+	if l.cfg.PolymarketBase == "" || m.EventSlug == "" {
 		return ""
 	}
 	u, err := url.Parse(l.cfg.PolymarketBase)
 	if err != nil {
 		return ""
 	}
-	u.Path = singleSlashJoin(u.Path, "event", m.Slug)
+	u.Path = singleSlashJoin(u.Path, "event", m.EventSlug)
 	return u.String()
 }
 
@@ -371,4 +376,3 @@ func nonEmpty(a, b string) string {
 	}
 	return b
 }
-

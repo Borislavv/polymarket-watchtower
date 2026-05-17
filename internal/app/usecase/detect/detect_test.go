@@ -53,6 +53,8 @@ func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Conf
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
+			EventSlug:  "us-pres-2028",
+			EventTitle: "US Presidential Election 2028",
 			TokenIDs:   []vo.TokenID{"tok-yes", "tok-no"},
 			Outcomes:   []string{"Yes", "No"},
 			Categories: []vo.CategoryID{42},
@@ -134,8 +136,8 @@ func TestSingleTradeFiresMultiplierTiers(t *testing.T) {
 		if f.Trade == nil || f.Trade.Outcome != "Yes" {
 			t.Errorf("[%d] trade ref: %+v", i, f.Trade)
 		}
-		if f.MarketURL != "https://polymarket.com/event/us-pres" {
-			t.Errorf("[%d] market URL: %q", i, f.MarketURL)
+		if f.MarketURL != "https://polymarket.com/event/us-pres-2028" {
+			t.Errorf("[%d] market URL: %q (must use EventSlug, not market slug)", i, f.MarketURL)
 		}
 		if !strings.Contains(f.GrafanaURL, "var-category=Politics") || !strings.Contains(f.GrafanaURL, "var-market=us-pres") {
 			t.Errorf("[%d] grafana URL: %q", i, f.GrafanaURL)
@@ -296,20 +298,41 @@ func TestGrafanaURLEncoding(t *testing.T) {
 	}
 }
 
-func TestMarketURLEncoding(t *testing.T) {
+func TestMarketURLUsesEventSlugNotMarketSlug(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 
-	// Polymarket slugs are kebab-case ASCII by convention; verify we still
-	// build a parseable URL even when the base has a trailing slash.
+	// Regression: the failing production case. A market grouped under a
+	// "winner" event must NOT produce /event/<market-slug> (Polymarket 404s).
 	loop.cfg.PolymarketBase = "https://polymarket.com/"
-	got := loop.marketURL(market.Market{Slug: "will-argentina-win-the-2026-fifa-world-cup-245"})
-	want := "https://polymarket.com/event/will-argentina-win-the-2026-fifa-world-cup-245"
+	tunisia := market.Market{
+		Slug:       "will-tunisia-win-the-2026-fifa-world-cup-165",
+		EventSlug:  "2026-fifa-world-cup-winner-595",
+		EventTitle: "2026 FIFA World Cup Winner",
+	}
+	got := loop.marketURL(tunisia)
+	want := "https://polymarket.com/event/2026-fifa-world-cup-winner-595"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
+	// The known-broken URL must NEVER be emitted.
+	const broken = "https://polymarket.com/event/will-tunisia-win-the-2026-fifa-world-cup-165"
+	if got == broken {
+		t.Fatalf("regression: emitted the broken /event/<market-slug> URL")
+	}
 	if _, err := url.Parse(got); err != nil {
 		t.Fatalf("unparseable URL: %v", err)
+	}
+}
+
+func TestMarketURLEmptyWhenEventSlugMissing(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+
+	// No event metadata: better to omit the link than to ship a known-broken
+	// /event/<market-slug>.
+	if got := loop.marketURL(market.Market{Slug: "orphan-market"}); got != "" {
+		t.Fatalf("expected empty URL when EventSlug is missing, got %q", got)
 	}
 }
 

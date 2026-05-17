@@ -4,23 +4,31 @@ package gamma
 // is messy (some fields are JSON-encoded strings, e.g. outcomes/clobTokenIds),
 // so we keep them as strings and parse in the mapper.
 type gammaMarket struct {
-	ID               string  `json:"id"`
-	Slug             string  `json:"slug"`
-	Question         string  `json:"question"`
-	ConditionID      string  `json:"conditionId"`
-	OutcomesJSON     string  `json:"outcomes"`
-	OutcomePricesRaw string  `json:"outcomePrices"`
-	ClobTokenIDsRaw  string  `json:"clobTokenIds"`
-	Active           bool    `json:"active"`
-	Closed           bool    `json:"closed"`
-	Archived         bool    `json:"archived"`
-	StartDate        string  `json:"startDate"`
-	EndDate          string  `json:"endDate"`
-	Volume           float64 `json:"volumeNum"`
-	Volume24h        float64 `json:"volume24hr"`
-	Liquidity        float64 `json:"liquidityNum"`
-	// Tags can come back as a nested object array on events; on markets we
-	// derive categories from the parent event tags, fetched separately.
+	ID               string          `json:"id"`
+	Slug             string          `json:"slug"`
+	Question         string          `json:"question"`
+	ConditionID      string          `json:"conditionId"`
+	OutcomesJSON     string          `json:"outcomes"`
+	OutcomePricesRaw string          `json:"outcomePrices"`
+	ClobTokenIDsRaw  string          `json:"clobTokenIds"`
+	Active           bool            `json:"active"`
+	Closed           bool            `json:"closed"`
+	Archived         bool            `json:"archived"`
+	StartDate        string          `json:"startDate"`
+	EndDate          string          `json:"endDate"`
+	Volume           float64         `json:"volumeNum"`
+	Volume24h        float64         `json:"volume24hr"`
+	Liquidity        float64         `json:"liquidityNum"`
+	Events           []gammaEventRef `json:"events"`
+}
+
+// gammaEventRef is the subset of /markets[].events fields we need to build a
+// user-facing event URL (https://polymarket.com/event/<slug>). Markets are
+// sub-cards inside events; the market slug is NOT a valid page URL.
+type gammaEventRef struct {
+	ID    string `json:"id"`
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
 }
 
 type gammaEvent struct {
