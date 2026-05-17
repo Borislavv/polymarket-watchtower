@@ -79,6 +79,27 @@ func TestNonPositiveNotionalsIgnored(t *testing.T) {
 	}
 }
 
+// TestAcceptsAllValidNotionals pins the product decision that the baseline
+// has no per-trade size filter: even sub-dollar retail trades enter the
+// reservoir. Protection against thin/all-dust baselines lives in the
+// detector's readiness gates (count, total USD, span), not here.
+func TestAcceptsAllValidNotionals(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	b := New(Config{Window: time.Hour, Clock: func() time.Time { return now }})
+	for _, v := range []float64{0.50, 1, 2, 5, 9, 12, 25, 50, 100} {
+		b.Add(k(1), v, now)
+	}
+	s := b.Stats(k(1))
+	if s.Count != 9 {
+		t.Fatalf("expected every valid sample to enter the reservoir, got count=%d", s.Count)
+	}
+	// Median of {0.5, 1, 2, 5, 9, 12, 25, 50, 100} is 9 — well below any
+	// "dust filter" value, proving small trades are kept.
+	if s.MedianUSD != 9 {
+		t.Errorf("median=%v want 9 (small trades must be kept)", s.MedianUSD)
+	}
+}
+
 func TestBucketsIsolated(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	b := New(Config{Window: time.Hour, Clock: func() time.Time { return now }})

@@ -172,9 +172,8 @@ func New() (*App, error) {
 				MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
 			},
 			Baseline: baseline.Config{
-				Window:      cfg.Anomaly.BaselineWindow,
-				MaxSamples:  cfg.Anomaly.BaselineMaxSamples,
-				MinTradeUSD: cfg.Anomaly.BaselineMinTradeUSD,
+				Window:     cfg.Anomaly.BaselineWindow,
+				MaxSamples: cfg.Anomaly.BaselineMaxSamples,
 			},
 			Cluster: cluster.Config{
 				Window:           cfg.Anomaly.ClusterWindow,

@@ -110,8 +110,9 @@ type AnomalyConfig struct {
 	CriticalMinOdds        float64 `env:"ALERT_CRITICAL_MIN_ODDS" envDefault:"8" validate:"gte=1"`
 	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
 
-	// Baseline shape.
-	BaselineMinTradeUSD          float64 `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
+	// Baseline shape. Every valid trade enters the reservoir — there is no
+	// per-trade size filter. Readiness gates below protect against thin or
+	// all-dust baselines.
 	SingleMinBaselineTrades      int     `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
 	SingleMinBaselineNotionalUSD float64 `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
 	// BaselineWindow is the MAXIMUM lookback the reservoir keeps; 0 means

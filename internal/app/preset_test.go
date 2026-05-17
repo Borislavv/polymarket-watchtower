@@ -99,3 +99,48 @@ func TestAllPresetsRespectLifecycleGate(t *testing.T) {
 		})
 	}
 }
+
+// TestPresetsHaveNoRemovedEnvVars guards against accidental reintroduction
+// of env keys that the strategy refactor removed. If a preset sets one of
+// these the binary will ignore it silently — better to fail the test loudly.
+func TestPresetsHaveNoRemovedEnvVars(t *testing.T) {
+	removed := []string{
+		"BASELINE_MIN_TRADE_USD",
+		"ALERT_HARD_A_MIN_NOTIONAL_USD", "ALERT_HARD_A_MIN_ODDS", "ALERT_HARD_A_MIN_MULTIPLIER",
+		"ALERT_HARD_B_MIN_NOTIONAL_USD", "ALERT_HARD_B_MIN_ODDS", "ALERT_HARD_B_MIN_MULTIPLIER",
+		"ALERT_HUGE_WHALE_MIN_NOTIONAL_USD", "ALERT_HUGE_WHALE_MIN_ODDS", "ALERT_HUGE_WHALE_MIN_MULTIPLIER",
+		"ALERT_MEGA_WHALE_MIN_NOTIONAL_USD", "ALERT_MEGA_WHALE_MIN_ODDS", "ALERT_MEGA_WHALE_MIN_MULTIPLIER",
+		"SUB_CLUSTER_WINDOW", "SUB_CLUSTER_MIN_TRADE_USD", "SUB_CLUSTER_MIN_ODDS",
+		"SUB_CLUSTER_MIN_MULTIPLIER", "SUB_CLUSTER_MIN_UNIQUE_TRADERS",
+		"SUB_CLUSTER_MIN_TOTAL_NOTIONAL_USD", "SUB_CLUSTER_COOLDOWN",
+		"MARKET_KEYWORD_BLACKLIST",
+	}
+	for _, name := range []string{"conservative", "balanced", "aggressive"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "presets", name+".env")
+			f, err := os.Open(path)
+			if err != nil {
+				t.Fatalf("open %s: %v", path, err)
+			}
+			defer func() { _ = f.Close() }()
+			present := make(map[string]bool)
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				eq := strings.IndexByte(line, '=')
+				if eq <= 0 {
+					continue
+				}
+				present[strings.TrimSpace(line[:eq])] = true
+			}
+			for _, key := range removed {
+				if present[key] {
+					t.Errorf("preset %s reintroduces removed env var %s", name, key)
+				}
+			}
+		})
+	}
+}

@@ -39,16 +39,16 @@ type Stats struct {
 	OldestAt time.Time
 }
 
-// Config controls memory and freshness.
+// Config controls memory and freshness. All valid trades enter the
+// reservoir — readiness gates (`SINGLE_MIN_BASELINE_TRADES`,
+// `SINGLE_MIN_BASELINE_NOTIONAL_USD`, `BASELINE_MIN_READY_WINDOW`) are
+// enforced downstream by the detector, not here.
 type Config struct {
 	// Window is the maximum sample age. Older samples are dropped on access.
+	// 0 means "no upper bound" (only MaxSamples caps memory).
 	Window time.Duration
 	// MaxSamples caps the ring buffer per bucket. 0 → defaultMaxSamples.
 	MaxSamples int
-	// MinTradeUSD drops samples below this notional from the baseline. Cleans
-	// out micro-trade noise that would otherwise drag the median into the
-	// cents range and inflate every multiplier. 0 → no filter.
-	MinTradeUSD float64
 	// Clock optionally overrides time.Now (tests).
 	Clock func() time.Time
 }
@@ -94,11 +94,12 @@ func New(cfg Config) *Baseline {
 	return &Baseline{cfg: cfg, buckets: make(map[Key]*ring), now: now}
 }
 
-// Add records one trade's USD notional in the bucket. Safe for concurrent calls.
-// Notionals at or below cfg.MinTradeUSD are dropped so the baseline reflects
-// "real" trades, not retail dust.
+// Add records one trade's USD notional in the bucket. Safe for concurrent
+// calls. Every positive notional enters the reservoir — there is no
+// per-trade size filter. The detector's readiness gates (count, total USD,
+// observed span) protect against thin or all-dust baselines.
 func (b *Baseline) Add(k Key, notionalUSD float64, at time.Time) {
-	if notionalUSD <= 0 || notionalUSD < b.cfg.MinTradeUSD {
+	if notionalUSD <= 0 {
 		return
 	}
 	b.mu.Lock()

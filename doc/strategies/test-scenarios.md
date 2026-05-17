@@ -15,8 +15,10 @@ Defined in `internal/app/usecase/detect/detect_test.go::defaultThresholds`:
 | Warning  | $25,000    | 5      | 1,000×       |
 | Critical | $100,000   | 8      | 10,000×      |
 
-Baseline gates: `MinBaselineTrades=20`, `MinBaselineNotionalUSD=$1,000`,
-`BaselineMinTradeUSD=$50` (the warm fixture seeds 30 trades).
+Baseline readiness gates: `MinBaselineTrades=20`,
+`MinBaselineNotionalUSD=$1,000`, `BaselineMinReadySpan=24h`. Every valid
+trade enters the reservoir — there is no per-trade size filter. The warm
+fixture seeds 30 trades sized $60+ so the readiness gates clear quickly.
 
 Single-trade severity caps at **Critical**. `Hard` is reserved for the
 cluster detector.

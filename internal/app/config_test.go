@@ -23,7 +23,6 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"ALERT_INFO_MIN_NOTIONAL_USD", "ALERT_INFO_MIN_ODDS", "ALERT_INFO_MIN_MULTIPLIER",
 		"ALERT_WARNING_MIN_NOTIONAL_USD", "ALERT_WARNING_MIN_ODDS", "ALERT_WARNING_MIN_MULTIPLIER",
 		"ALERT_CRITICAL_MIN_NOTIONAL_USD", "ALERT_CRITICAL_MIN_ODDS", "ALERT_CRITICAL_MIN_MULTIPLIER",
-		"BASELINE_MIN_TRADE_USD",
 		"SINGLE_MIN_BASELINE_TRADES", "SINGLE_MIN_BASELINE_NOTIONAL_USD",
 		"BASELINE_WINDOW", "BASELINE_MAX_SAMPLES", "BASELINE_MIN_READY_WINDOW",
 		"LIFECYCLE_ALERT_FROM_PCT", "LIFECYCLE_HOT_FROM_PCT",
@@ -71,8 +70,11 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.Anomaly.AllowUnknownMarketLifecycle {
 		t.Errorf("AllowUnknownMarketLifecycle default must be false (fail-closed)")
 	}
-	if cfg.Anomaly.BaselineMinTradeUSD != 50 {
-		t.Errorf("baseline min trade: %v", cfg.Anomaly.BaselineMinTradeUSD)
+	if cfg.Anomaly.SingleMinBaselineTrades != 20 {
+		t.Errorf("baseline trade-count gate: %d", cfg.Anomaly.SingleMinBaselineTrades)
+	}
+	if cfg.Anomaly.SingleMinBaselineNotionalUSD != 1_000 {
+		t.Errorf("baseline notional gate: %v", cfg.Anomaly.SingleMinBaselineNotionalUSD)
 	}
 	if cfg.Anomaly.ClusterWindow != 30*time.Minute {
 		t.Errorf("cluster window: %s", cfg.Anomaly.ClusterWindow)
@@ -83,7 +85,7 @@ func TestConfigEnvOverrides(t *testing.T) {
 	cfg, err := loadConfigWithEnv(t, map[string]string{
 		"ALERT_INFO_MIN_NOTIONAL_USD":   "1000",
 		"ALERT_CRITICAL_MIN_MULTIPLIER": "5000",
-		"BASELINE_MIN_TRADE_USD":        "100",
+		"SINGLE_MIN_BASELINE_TRADES":    "50",
 		"CLUSTER_MIN_UNIQUE_TRADERS":    "5",
 	})
 	if err != nil {
@@ -95,8 +97,8 @@ func TestConfigEnvOverrides(t *testing.T) {
 	if cfg.Anomaly.CriticalMinMultiplier != 5_000 {
 		t.Errorf("critical mul override: %v", cfg.Anomaly.CriticalMinMultiplier)
 	}
-	if cfg.Anomaly.BaselineMinTradeUSD != 100 {
-		t.Errorf("baseline min: %v", cfg.Anomaly.BaselineMinTradeUSD)
+	if cfg.Anomaly.SingleMinBaselineTrades != 50 {
+		t.Errorf("baseline trade-count override: %d", cfg.Anomaly.SingleMinBaselineTrades)
 	}
 	if cfg.Anomaly.ClusterMinWallets != 5 {
 		t.Errorf("cluster wallets: %d", cfg.Anomaly.ClusterMinWallets)

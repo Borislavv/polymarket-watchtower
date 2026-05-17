@@ -38,9 +38,17 @@ do not extend it.
   requirement. A 1-month-old market with `BASELINE_WINDOW=1y` uses the 1
   month of available history. `0` means "no upper bound" (only
   `BASELINE_MAX_SAMPLES` caps memory).
-- `BASELINE_MIN_TRADE_USD` (default $50) drops retail dust at `Baseline.Add`.
-- `BASELINE_MIN_READY_WINDOW` (default 24h) requires the observed span
-  (newest - oldest sample) to clear this floor before alerts can fire.
+- Every valid trade enters the reservoir. There is **no per-trade size
+  filter** — discarding small trades would weaken rarity detection (a $5
+  retail trade makes a later $25k whale bet more anomalous, not less).
+  Robustness comes from median + the readiness gates, not from filtering.
+- Readiness gates (must all clear before the multiplier ladder is
+  evaluated):
+  - `SINGLE_MIN_BASELINE_TRADES` (default 20) — sample count floor.
+  - `SINGLE_MIN_BASELINE_NOTIONAL_USD` (default $1,000) — aggregate USD
+    floor. Catches "many micro-trades" baselines.
+  - `BASELINE_MIN_READY_WINDOW` (default 24h) — observed sample span
+    (newest − oldest) floor.
 - Alerts display the **actual** span (`BaselineRef.Span`), never the
   configured cap.
 

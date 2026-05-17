@@ -74,7 +74,7 @@ func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Conf
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds:                  th,
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:                     cl,
 		Clock:                       func() time.Time { return now },
 		PolymarketBase:              "https://polymarket.com",
@@ -100,8 +100,7 @@ func bet(notional, price float64, wallet string, at time.Time) trade.Trade {
 	}
 }
 
-// warm seeds the baseline with `n` trades of `notional` USD each. Notionals
-// below BaselineMinTradeUSD are filtered out by the baseline itself.
+// warm seeds the baseline with `n` trades of `notional` USD each.
 func warm(loop *Loop, m market.Market, n int, notional, price float64, at time.Time) {
 	for i := 0; i < n; i++ {
 		loop.Observe(context.Background(), m, bet(notional, price, "wb", at))
@@ -203,18 +202,6 @@ func TestInsufficientBaselineNoAlert(t *testing.T) {
 	loop.Observe(context.Background(), m, bet(100_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
 		t.Fatalf("expected no fire on thin baseline, got %+v", got)
-	}
-}
-
-func TestBaselineFiltersMicroTrades(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
-	m, _ := reg.Get("0xa")
-	// 30 trades of $5 each — all below the $50 BaselineMinTradeUSD, baseline ends up empty.
-	warm(loop, m, 30, 5, 0.5, now)
-	loop.Observe(context.Background(), m, bet(100_000, 1.0/8, "shark", now))
-	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("expected no fire when baseline only had filtered micro-trades, got %+v", got)
 	}
 }
 
@@ -326,7 +313,7 @@ func TestLifecycleGateSkipsEarlyMarkets(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds:            defaultThresholds(),
-		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75,
@@ -364,7 +351,7 @@ func TestLifecycleMarksHotInFinalStretch(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds:            defaultThresholds(),
-		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:              baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75,
@@ -463,7 +450,7 @@ func TestBaselineWindowDoesNotBlockShortMarkets(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds:            defaultThresholds(),
-		Baseline:              baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:              baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75,
@@ -502,7 +489,7 @@ func TestEarlyLifecycleBlocksShortMarkets(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75, LifecycleHotFromPct: 90,
@@ -530,7 +517,7 @@ func TestMarketMinAgeBlocksTooYoung(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75, LifecycleHotFromPct: 90,
@@ -558,7 +545,7 @@ func TestBaselineMinReadySpanBlocksThinSpan(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Thresholds: defaultThresholds(), Baseline: baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 0, LifecycleHotFromPct: 100,
@@ -652,7 +639,7 @@ func TestUnknownLifecycleFailsClosedByDefault(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds: defaultThresholds(),
-		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:      func() time.Time { return now },
 		// AllowUnknownMarketLifecycle deliberately omitted → false → fail-closed.
@@ -721,7 +708,7 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 		// Baseline window long enough to cover the warming period; the test
 		// seeds 29 samples of $100 over the last ~7 days so the actual span
 		// clears BaselineMinReadySpan (24h).
-		Baseline: baseline.Config{Window: 365 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline: baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:  cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99}, // never fire cluster
 		// Default-shaped sports blacklist — must not catch this market.
 		Filter:                category.NewFilter([]string{"sports", "sport"}),
@@ -785,7 +772,7 @@ func TestPrimarySportsCategorySkipped(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds: defaultThresholds(),
-		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Filter:     category.NewFilter([]string{"sports", "sport"}),
 		Clock:      func() time.Time { return now },
@@ -822,7 +809,7 @@ func TestSportsLikeMarketUnderNonSportsCategoryAllowed(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds: defaultThresholds(),
-		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		// Default-shaped sports blacklist — must not catch this market.
 		Filter:                      category.NewFilter([]string{"sports", "sport"}),
@@ -859,7 +846,7 @@ func TestBlacklistStaysCategoryOnly(t *testing.T) {
 	log := zerolog.Nop()
 	loop := New(Config{
 		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Filter:                      category.NewFilter([]string{"sports", "sport"}),
 		Clock:                       func() time.Time { return now },
