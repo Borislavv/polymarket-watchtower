@@ -39,7 +39,7 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"SUB_CLUSTER_MIN_MULTIPLIER", "SUB_CLUSTER_MIN_UNIQUE_TRADERS",
 		"SUB_CLUSTER_MIN_TOTAL_NOTIONAL_USD", "SUB_CLUSTER_COOLDOWN",
 		"VOLUME_MULTIPLIERS", "VOLUME_MIN_NOTIONAL_USD", "VOLUME_MIN_TRADES", "VOLUME_COOLDOWN",
-		"CATEGORY_BLACKLIST", "MARKET_KEYWORD_BLACKLIST",
+		"CATEGORY_BLACKLIST",
 		"ALERT_WEBHOOK_URL",
 		"TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 		"TELEGRAM_BASE_URL", "TELEGRAM_TIMEOUT",
@@ -141,17 +141,18 @@ func TestConfigCategoryBlacklistDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	want := []string{"sport", "nba", "nhl", "fifa", "uefa"}
-	for _, w := range want {
-		found := false
-		for _, g := range cfg.CategoryFilter.Blacklist {
-			if g == w {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("default blacklist missing %q", w)
+	// The default blacklist is intentionally narrow: only "sports" + "sport"
+	// so that the parent Polymarket sports category is excluded by identity.
+	// Markets whose titles or event slugs contain sports words but live under
+	// non-sports categories MUST still be analysed — that requirement is
+	// enforced in detect/detect_test.go.
+	want := map[string]bool{"sports": true, "sport": true}
+	if len(cfg.CategoryFilter.Blacklist) != len(want) {
+		t.Fatalf("default blacklist size: got %d want %d (%v)", len(cfg.CategoryFilter.Blacklist), len(want), cfg.CategoryFilter.Blacklist)
+	}
+	for _, g := range cfg.CategoryFilter.Blacklist {
+		if !want[g] {
+			t.Errorf("unexpected default blacklist entry: %q", g)
 		}
 	}
 }

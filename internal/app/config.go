@@ -62,19 +62,16 @@ type PipelineConfig struct {
 	CollectConcurrency int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
 }
 
-// CategoryFilterConfig holds two independent blacklists:
+// CategoryFilterConfig holds the category-identity blacklist.
 //
-//   - CategoryBlacklist matches against the Polymarket category slug+label.
-//   - MarketKeywordBlacklist matches against the market title + slug + event
-//     slug. Catches sports markets tagged with non-sports categories like
-//     Polymarket's `Hide From New`.
-//
-// Splitting them prevents the operator footgun where adding "weather" to
-// silence a category accidentally silences every market title containing
-// "weather". Both lists are case-insensitive substring matches.
+// Matching is case-insensitive substring against the Polymarket category
+// `slug + " " + label` only. Market titles, event slugs, and market slugs
+// are deliberately NOT consulted — a sports-shaped question Polymarket
+// happens to file under a non-sports category (e.g. `Hide From New`) is
+// still real prediction-market activity and should be analysed. The
+// operator's filtering tool is the category, not the market metadata.
 type CategoryFilterConfig struct {
-	Blacklist              []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sport,football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,racing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
-	MarketKeywordBlacklist []string `env:"MARKET_KEYWORD_BLACKLIST" envSeparator:"," envDefault:"football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
+	Blacklist []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sports,sport"`
 }
 
 // AggregateConfig sizes the rolling-bucket engine used by both modes

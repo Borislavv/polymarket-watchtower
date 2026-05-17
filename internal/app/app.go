@@ -225,7 +225,6 @@ func New() (*App, error) {
 			MarketMinAge:                cfg.Anomaly.MarketMinAge,
 			BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
 			AllowUnknownMarketLifecycle: cfg.Anomaly.AllowUnknownMarketLifecycle,
-			SportsKeywords:              cfg.CategoryFilter.MarketKeywordBlacklist,
 		}, engine, registry, emitter, met, logger)
 		observer = detectLoop
 		detectRun = detectLoop.Run

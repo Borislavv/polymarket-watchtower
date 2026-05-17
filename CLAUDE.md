@@ -9,8 +9,9 @@ Goal: surface large risky bets and suspicious wallet clusters near the end
 of a market's lifetime. Spam reduction is non-negotiable.
 
 A single-trade alert fires only when **all** are true:
-1. Category passes `CATEGORY_BLACKLIST` AND the market title/slug/event-slug
-   contain none of the same keywords (catches sports tagged as `Hide From New`).
+1. The market's category passes `CATEGORY_BLACKLIST`. Matching is case-
+   insensitive substring against the category `slug + " " + label` ONLY —
+   market titles, event slugs, market slugs, and tags are not scanned.
 2. Market lifecycle progress ≥ `LIFECYCLE_ALERT_FROM_PCT` (default 75%).
    Unknown lifecycle → **silent by default** (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`).
 3. Market absolute age ≥ `MARKET_MIN_AGE` (default 24h).
@@ -88,11 +89,16 @@ Severity always `SeverityHard`. Payload carries a `Sample []TradeRef`
 ## Category blacklist rule
 
 - One list, `CATEGORY_BLACKLIST`. No allowlist.
-- Case-insensitive substring match against `slug + " " + label` at the
-  category level.
-- **Also** matched against `market.Question + market.Slug + market.EventSlug +
-  market.EventTitle` — catches sports markets tagged with non-sports
-  categories like Polymarket's `Hide From New`.
+- Case-insensitive substring match against the Polymarket category
+  `slug + " " + label` and **nothing else**. Market titles, event slugs,
+  market slugs, and tags are deliberately NOT scanned.
+- A sports-themed market (e.g. "Will France win the 2026 FIFA World Cup?")
+  filed under a non-sports category like Polymarket's `Hide From New` is
+  still real prediction-market activity and is analysed normally. Sports
+  exclusion is a category-identity decision, not a keyword-on-text decision.
+- Default value: `sports,sport`. Operators wanting to exclude additional
+  categories add their slug or label — never a keyword meant to catch
+  market wording.
 - Applied at discover (prune ids before they reach the registry) and at
   detect (defense in depth, increments
   `watchtower_filter_category_skipped_total{stage="detect"}`).
@@ -145,7 +151,9 @@ Required coverage for any alerting/baseline/lifecycle change:
 - Cluster floors (trades / wallets / total / cooldown).
 - Telegram link rendering with each URL present and missing.
 - Grafana URL includes `var-severity`.
-- Category blacklist via category AND via market title/slug/event-slug.
+- Category blacklist: primary sports category blocked, sports-themed market
+  under non-sports category allowed, sports keyword in market metadata only
+  is allowed.
 - Every preset loads and matches its documented strictness.
 
 ## Presets

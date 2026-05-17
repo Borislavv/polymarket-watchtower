@@ -85,4 +85,6 @@ profile bets and the split-wallet pattern are present.
 | Baseline span < `BASELINE_MIN_READY_WINDOW` | `TestBaselineMinReadySpanBlocksThinSpan` | No alert. |
 | 1-month market on 1y `BASELINE_WINDOW`| `TestBaselineWindowDoesNotBlockShortMarkets`  | Fires; alert shows actual ~29d span. |
 | Blacklisted category                  | `TestBlacklistedCategoryNoAlert`              | No alert. |
-| Sports market in non-sports category  | `TestSportsLeakViaMarketTitleBlocked`         | No alert (caught by `MARKET_KEYWORD_BLACKLIST`). |
+| Primary sports category (slug `sports`) | `TestPrimarySportsCategorySkipped`          | No alert. |
+| Sports-themed market under non-sports category | `TestSportsLikeMarketUnderNonSportsCategoryAllowed` | **Fires** — category filter is identity-only; market title / event slug are not scanned. |
+| `sports` keyword in market metadata only | `TestBlacklistStaysCategoryOnly`           | Fires — blacklist matches category slug+label, never market wording. |

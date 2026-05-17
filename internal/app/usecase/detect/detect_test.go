@@ -673,28 +673,30 @@ func TestUnknownLifecycleFailsClosedByDefault(t *testing.T) {
 	}
 }
 
-func TestSportsLeakViaMarketTitleBlocked(t *testing.T) {
+// TestPrimarySportsCategorySkipped confirms the category-level blacklist
+// silences a market whose category itself is sports — the only place sports
+// filtering applies.
+func TestPrimarySportsCategorySkipped(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	reg := aggregate.NewRegistry()
-	// Market whose category looks innocuous ("Hide From New") but whose
-	// question/event-slug contain a sports keyword. Must still be blocked.
 	reg.Replace(
 		[]market.Market{{
-			ID: "0xa", Slug: "will-france-win-fifa", Question: "Will France win the 2026 FIFA World Cup?",
-			EventSlug: "2026-fifa-world-cup-winner-595", TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{1}, Active: true,
+			ID: "0xa", Slug: "anything", Question: "Anything?", EventSlug: "anything",
+			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
+			Categories: []vo.CategoryID{99}, Active: true,
 		}},
-		[]market.Category{{ID: 1, Slug: "hide-from-new", Label: "Hide From New"}},
+		[]market.Category{{ID: 99, Slug: "sports", Label: "Sports"}},
 	)
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
+		Thresholds: defaultThresholds(),
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Filter:     category.NewFilter([]string{"sports", "sport"}),
+		Clock:      func() time.Time { return now },
+		// Lifecycle gate is disabled for the test; category filter must still bite.
 		AllowUnknownMarketLifecycle: true,
-		SportsKeywords:              []string{"fifa", "nba", "nhl"},
 	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
@@ -702,7 +704,80 @@ func TestSportsLeakViaMarketTitleBlocked(t *testing.T) {
 	}
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("sports market via title/slug must be silenced, got %d", len(got))
+		t.Fatalf("primary sports category must be silenced, got %d", len(got))
+	}
+}
+
+// TestSportsLikeMarketUnderNonSportsCategoryAllowed pins the corrected
+// behaviour: a market whose title / event slug contain sports words ("FIFA",
+// "World Cup") but whose category is something else (Polymarket's
+// `Hide From New`) MUST still produce an alert. Filtering is category-only.
+func TestSportsLikeMarketUnderNonSportsCategoryAllowed(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := aggregate.NewRegistry()
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "will-france-win-fifa", Question: "Will France win the 2026 FIFA World Cup?",
+			EventSlug: "2026-fifa-world-cup-winner-595", EventTitle: "FIFA World Cup 2026",
+			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
+			Categories: []vo.CategoryID{1}, Active: true,
+		}},
+		[]market.Category{{ID: 1, Slug: "hide-from-new", Label: "Hide From New"}},
+	)
+	emit := &capturingEmitter{}
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds: defaultThresholds(),
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		// Default-shaped sports blacklist — must not catch this market.
+		Filter:                      category.NewFilter([]string{"sports", "sport"}),
+		Clock:                       func() time.Time { return now },
+		AllowUnknownMarketLifecycle: true,
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	m, _ := reg.Get("0xa")
+	for i := 0; i < 30; i++ {
+		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))
+	}
+	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
+	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
+		t.Fatalf("sports-themed market under non-sports category must alert, got %d findings", len(got))
+	}
+}
+
+// TestBlacklistStaysCategoryOnly is the explicit guard for the
+// `sports` keyword: even when the market slug / event slug literally contain
+// the word "sports", the category filter (which sees only category slug+label)
+// must let the trade through when the category is not sports.
+func TestBlacklistStaysCategoryOnly(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := aggregate.NewRegistry()
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "will-the-sports-bill-pass", Question: "Will the new sports betting bill pass?",
+			EventSlug: "us-sports-betting-bill-2026", EventTitle: "Sports Betting Bill",
+			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
+			Categories: []vo.CategoryID{2}, Active: true,
+		}},
+		[]market.Category{{ID: 2, Slug: "politics", Label: "Politics"}},
+	)
+	emit := &capturingEmitter{}
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds:                  defaultThresholds(),
+		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour, MinTradeUSD: 50},
+		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Filter:                      category.NewFilter([]string{"sports", "sport"}),
+		Clock:                       func() time.Time { return now },
+		AllowUnknownMarketLifecycle: true,
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	m, _ := reg.Get("0xa")
+	for i := 0; i < 30; i++ {
+		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))
+	}
+	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
+	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
+		t.Fatalf("non-sports category with sports word in metadata must alert, got %d", len(got))
 	}
 }
 

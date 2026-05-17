@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
@@ -78,11 +77,7 @@ type Config struct {
 	// StartDate/EndDate are silently skipped — fail-closed. Set true to
 	// allow them through (legacy / debugging).
 	AllowUnknownMarketLifecycle bool
-	// SportsKeywords is consulted against the market title, event slug, and
-	// market slug as a secondary blacklist. Catches sports markets attached
-	// to non-sports categories like Polymarket's "Hide From New".
-	SportsKeywords []string
-	Clock          func() time.Time
+	Clock                       func() time.Time
 }
 
 // Loop owns the analytics state.
@@ -200,12 +195,6 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	}
 	if l.cfg.MarketMinAge > 0 && !market.StartDate.IsZero() &&
 		l.now().Sub(market.StartDate) < l.cfg.MarketMinAge {
-		gateAllowsAlert = false
-	}
-	// Secondary sports check on the market itself (title, slug, event slug)
-	// — catches sports markets attached to non-sports categories like
-	// "Hide From New".
-	if gateAllowsAlert && marketLooksLikeSport(market, l.cfg.SportsKeywords) {
 		gateAllowsAlert = false
 	}
 
@@ -401,25 +390,6 @@ func (l *Loop) emitCategoryWatch(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit category-watch failed")
 	}
-}
-
-// marketLooksLikeSport scans the market's title/slug/event-slug for any
-// blacklisted sports keyword (case-insensitive substring). Empty keyword list
-// disables the check.
-func marketLooksLikeSport(m market.Market, keywords []string) bool {
-	if len(keywords) == 0 {
-		return false
-	}
-	hay := strings.ToLower(m.Question + " " + m.Slug + " " + m.EventSlug + " " + m.EventTitle)
-	for _, k := range keywords {
-		if k == "" {
-			continue
-		}
-		if strings.Contains(hay, k) {
-			return true
-		}
-	}
-	return false
 }
 
 // allowed reports whether the category passes the blacklist. Uncategorised

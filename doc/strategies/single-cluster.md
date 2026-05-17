@@ -93,10 +93,12 @@ These gates *only block alert emission*. They never block baseline updates —
 the reservoir must warm continuously so it is ready the moment a market
 crosses the lifecycle threshold.
 
-- **Category filter** — `CATEGORY_BLACKLIST` (slug+label) and
-  `MARKET_KEYWORD_BLACKLIST` (title/slug/event-slug) are independent
-  case-insensitive substring checks. Sports markets attached to non-sports
-  categories like Polymarket's `Hide From New` are caught by the second list.
+- **Category filter** — `CATEGORY_BLACKLIST` is a case-insensitive substring
+  match against the category `slug + " " + label` and nothing else. Market
+  titles, event slugs, market slugs, and tags are NOT scanned. A market that
+  *looks* like a sports market because its title or event slug mentions FIFA
+  or NBA but lives under a non-sports category (e.g. Polymarket's
+  `Hide From New`) is still analysed normally. Default: `sports,sport`.
 - **Lifecycle gate** — `LIFECYCLE_ALERT_FROM_PCT` (alerts fire) and
   `LIFECYCLE_HOT_FROM_PCT` (alerts marked HOT). Markets without start/end
   dates are silenced when `ALLOW_UNKNOWN_MARKET_LIFECYCLE=false` (default).

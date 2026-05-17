@@ -48,7 +48,9 @@ collect loop at process start.
   `MARKET_MIN_AGE` *and* is past `LIFECYCLE_ALERT_FROM_PCT` of its lifetime.
   Markets without start/end dates are silenced by default
   (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`, fail-closed).
-- **Two-list category filtering:** `CATEGORY_BLACKLIST` matches category
-  slugs/labels; `MARKET_KEYWORD_BLACKLIST` matches market titles, slugs, and
-  event slugs. They are independent on purpose — adding a term to one cannot
-  silence the other.
+- **Category-only filtering:** `CATEGORY_BLACKLIST` is a case-insensitive
+  substring match against the Polymarket category `slug + " " + label` and
+  nothing else. Market titles, event slugs, market slugs, and tags are NOT
+  consulted. A sports-themed market filed under a non-sports category (e.g.
+  Polymarket's `Hide From New`) is still real prediction-market activity and
+  is analysed normally. The default blacklist is just `sports,sport`.

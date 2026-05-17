@@ -28,9 +28,10 @@ Common rules across all three:
   floor) into a per-category window; enough distinct wallets totalling enough
   USD trigger a HARD `WhaleClusterDetected` alert. Split-wallet patterns that
   no single trade could surface are caught here.
-- `CATEGORY_BLACKLIST` filters by category slug+label. `MARKET_KEYWORD_BLACKLIST`
-  filters by market title / slug / event-slug — separate from the category
-  list so adding a term to one cannot silence the other.
+- `CATEGORY_BLACKLIST` filters by category slug+label only (case-insensitive
+  substring). Default `sports,sport`. Market titles, event slugs, market
+  slugs, and tags are never scanned — a sports-themed market filed under a
+  non-sports category like `Hide From New` is still analysed normally.
 
 How to apply:
 
