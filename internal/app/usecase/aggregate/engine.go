@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	trade2 "github.com/Borislavv/polymarket-watchtower/internal/domain/trade"
+	trade2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 )
 
