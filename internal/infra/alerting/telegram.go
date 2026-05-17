@@ -8,37 +8,100 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 )
 
-// TelegramConfig is the minimal config for a single-channel Telegram bot.
+// TelegramConfig is the minimal config for a Telegram bot. ChatIDs are sourced
+// from two places, deduplicated at send time:
+//   - The optional static ChatID seeded at construction.
+//   - Dynamic subscribers discovered via Poller (/getUpdates) added at runtime.
 type TelegramConfig struct {
 	Enabled  bool
 	BotToken string
-	ChatID   string
+	ChatID   string // static seed; empty is OK when a Poller is running
 	BaseURL  string
 	Timeout  time.Duration
 }
 
-// TelegramSink posts findings to a single Telegram chat. It is a no-op when
-// Enabled is false; the app wires it unconditionally.
-type TelegramSink struct {
-	cfg     TelegramConfig
-	client  *http.Client
-	metrics *metrics.Metrics // optional; nil-safe
+// Subscribers is a concurrency-safe set of Telegram chat ids. The sink reads
+// it on every send, the poller writes to it as new chats interact with the bot.
+type Subscribers struct {
+	mu  sync.RWMutex
+	ids map[int64]struct{}
 }
 
-// NewTelegramSink validates config and returns a sink.
-func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
-	if !cfg.Enabled {
-		return &TelegramSink{cfg: cfg}, nil
+// NewSubscribers builds a registry pre-seeded with the supplied chat ids.
+// Empty / unparseable inputs are skipped silently.
+func NewSubscribers(seed ...string) *Subscribers {
+	s := &Subscribers{ids: make(map[int64]struct{})}
+	for _, raw := range seed {
+		if raw == "" {
+			continue
+		}
+		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			s.ids[id] = struct{}{}
+		}
 	}
-	if cfg.BotToken == "" || cfg.ChatID == "" {
-		return nil, errors.New("telegram: bot token and chat id required when enabled")
+	return s
+}
+
+// Add records a chat id; returns true when it wasn't already known.
+func (s *Subscribers) Add(id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ids[id]; ok {
+		return false
+	}
+	s.ids[id] = struct{}{}
+	return true
+}
+
+// Snapshot returns a stable copy of the chat ids. Safe to iterate while the
+// registry is being mutated.
+func (s *Subscribers) Snapshot() []int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]int64, 0, len(s.ids))
+	for id := range s.ids {
+		out = append(out, id)
+	}
+	return out
+}
+
+// Size is the current subscriber count.
+func (s *Subscribers) Size() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.ids)
+}
+
+// TelegramSink broadcasts findings to every chat in the Subscribers registry.
+// A disabled sink (Config.Enabled == false) is a no-op so the app can wire it
+// unconditionally.
+type TelegramSink struct {
+	cfg         TelegramConfig
+	client      *http.Client
+	subscribers *Subscribers
+	metrics     *metrics.Metrics // optional; nil-safe
+}
+
+// NewTelegramSink validates config and returns a sink. The supplied Subscribers
+// must be non-nil when Enabled is true.
+func NewTelegramSink(cfg TelegramConfig, subs *Subscribers) (*TelegramSink, error) {
+	if !cfg.Enabled {
+		return &TelegramSink{cfg: cfg, subscribers: subs}, nil
+	}
+	if cfg.BotToken == "" {
+		return nil, errors.New("telegram: bot token required when enabled")
+	}
+	if subs == nil {
+		return nil, errors.New("telegram: subscribers registry required when enabled")
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.telegram.org"
@@ -46,11 +109,14 @@ func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Second
 	}
-	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}}, nil
+	return &TelegramSink{
+		cfg:         cfg,
+		client:      &http.Client{Timeout: cfg.Timeout},
+		subscribers: subs,
+	}, nil
 }
 
-// WithMetrics attaches a metrics handle so the sink can report send success /
-// failure counts. Returns the sink for chaining at construction time.
+// WithMetrics attaches a metrics handle for send success / failure counters.
 func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 	s.metrics = m
 	return s
@@ -58,45 +124,63 @@ func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 
 func (s *TelegramSink) Name() string { return "telegram" }
 
-// Notify formats and sends one Telegram message.
+// Notify broadcasts the finding to every known chat. Per-chat failures are
+// logged via metrics and don't abort the broadcast. Returns the first error
+// (so the Fanout records something), but all chats are attempted.
 func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
 	if !s.cfg.Enabled {
 		return nil
 	}
+	chatIDs := s.subscribers.Snapshot()
+	if len(chatIDs) == 0 {
+		// Nothing to send to yet — silent rather than spamming an error per
+		// alert before any user has interacted with the bot.
+		return nil
+	}
+	text := FormatTelegramMessage(f)
+	var firstErr error
+	for _, id := range chatIDs {
+		if err := s.sendOne(ctx, id, text); err != nil {
+			s.observeErr(f.Severity)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		s.observeOK(f.Severity)
+	}
+	return firstErr
+}
 
+func (s *TelegramSink) sendOne(ctx context.Context, chatID int64, text string) error {
 	body := map[string]any{
-		"chat_id":                  s.cfg.ChatID,
-		"text":                     FormatTelegramMessage(f),
+		"chat_id":                  chatID,
+		"text":                     text,
 		"parse_mode":               "Markdown",
 		"disable_web_page_preview": true,
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		s.observeErr(f.Severity)
 		return err
 	}
 
 	url := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(s.cfg.BaseURL, "/"), s.cfg.BotToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		s.observeErr(f.Severity)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		s.observeErr(f.Severity)
-		return fmt.Errorf("telegram: send: %w", err)
+		return fmt.Errorf("telegram: send to chat %d: %w", chatID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		s.observeErr(f.Severity)
-		return fmt.Errorf("telegram: %d: %s", resp.StatusCode, string(b))
+		return fmt.Errorf("telegram: chat %d -> %d: %s", chatID, resp.StatusCode, string(b))
 	}
-	s.observeOK(f.Severity)
 	return nil
 }
 
@@ -242,10 +326,8 @@ func shortWallet(w string) string {
 // money formats a USD amount with thousand separators and 0/2 decimals.
 func money(v float64) string {
 	if v >= 1000 {
-		// integer dollars with thousand commas
 		whole := int64(v)
 		s := fmt.Sprintf("%d", whole)
-		// insert commas
 		n := len(s)
 		out := make([]byte, 0, n+n/3)
 		for i, c := range []byte(s) {

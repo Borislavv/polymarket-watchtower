@@ -93,13 +93,21 @@ type AnomalyConfig struct {
 }
 
 // AlertingConfig selects sinks and provides the Grafana deep-link base.
+//
+// Telegram chats are addressed via a union of two sources:
+//   - TELEGRAM_CHAT_ID: optional static chat (always included if non-empty).
+//   - Dynamic subscribers discovered by polling /getUpdates when
+//     TELEGRAM_UPDATES_ENABLED=true. The bot must be interacted with (or
+//     added to a group/channel) at least once for it to learn the chat id.
 type AlertingConfig struct {
-	WebhookURL       string        `env:"ALERT_WEBHOOK_URL"`
-	TelegramEnabled  bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
-	TelegramBotToken string        `env:"TELEGRAM_BOT_TOKEN"`
-	TelegramChatID   string        `env:"TELEGRAM_CHAT_ID"`
-	TelegramBaseURL  string        `env:"TELEGRAM_BASE_URL"`
-	TelegramTimeout  time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
+	WebhookURL              string        `env:"ALERT_WEBHOOK_URL"`
+	TelegramEnabled         bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
+	TelegramBotToken        string        `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID          string        `env:"TELEGRAM_CHAT_ID"`
+	TelegramBaseURL         string        `env:"TELEGRAM_BASE_URL"`
+	TelegramTimeout         time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
+	TelegramUpdatesEnabled  bool          `env:"TELEGRAM_UPDATES_ENABLED" envDefault:"false"`
+	TelegramUpdatesInterval time.Duration `env:"TELEGRAM_UPDATES_INTERVAL" envDefault:"10s"`
 
 	GrafanaBaseURL string        `env:"GRAFANA_BASE_URL" envDefault:"http://localhost:3000"`
 	GrafanaDashUID string        `env:"GRAFANA_DASH_UID" envDefault:""`

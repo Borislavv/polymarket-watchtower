@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func sampleClusterFinding() anomaly.Finding {
 }
 
 func TestTelegramDisabledIsNoop(t *testing.T) {
-	s, err := NewTelegramSink(TelegramConfig{Enabled: false})
+	s, err := NewTelegramSink(TelegramConfig{Enabled: false}, nil)
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
@@ -76,9 +77,26 @@ func TestTelegramDisabledIsNoop(t *testing.T) {
 	}
 }
 
-func TestTelegramEnabledRequiresTokenAndChat(t *testing.T) {
-	if _, err := NewTelegramSink(TelegramConfig{Enabled: true}); err == nil {
-		t.Fatal("expected validation error when enabled w/o creds")
+func TestTelegramEnabledRequiresTokenAndSubscribers(t *testing.T) {
+	if _, err := NewTelegramSink(TelegramConfig{Enabled: true}, nil); err == nil {
+		t.Fatal("expected validation error when enabled w/o token")
+	}
+	if _, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t"}, nil); err == nil {
+		t.Fatal("expected validation error when enabled w/o subscribers")
+	}
+}
+
+func TestNoSubscribersIsSilentNotError(t *testing.T) {
+	// A live bot may have no subscribers yet — alerts should silently no-op
+	// rather than spam the log with errors.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("must not POST when there are no subscribers")
+	}))
+	defer srv.Close()
+	subs := NewSubscribers() // empty
+	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
+	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
 	}
 }
 
@@ -136,7 +154,8 @@ func TestTelegramSendsFormattedMessage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "fake", ChatID: "1", BaseURL: srv.URL})
+	subs := NewSubscribers("1")
+	s, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "fake", BaseURL: srv.URL}, subs)
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
@@ -151,8 +170,9 @@ func TestTelegramSendsFormattedMessage(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("payload not JSON: %v", err)
 	}
-	if body["chat_id"] != "1" {
-		t.Errorf("chat_id: %v", body["chat_id"])
+	// chat_id is numeric in the JSON payload.
+	if got, _ := body["chat_id"].(float64); int64(got) != 1 {
+		t.Errorf("chat_id: got %v want 1", body["chat_id"])
 	}
 }
 
@@ -162,8 +182,98 @@ func TestTelegramReturnsErrorOnBadStatus(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":false,"description":"bad chat"}`))
 	}))
 	defer srv.Close()
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", ChatID: "1", BaseURL: srv.URL})
+	subs := NewSubscribers("1")
+	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
 		t.Fatal("expected error for 400")
+	}
+}
+
+func TestBroadcastSendsToEveryChat(t *testing.T) {
+	var seen sync.Map // chat id -> struct{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p struct {
+			ChatID int64 `json:"chat_id"`
+		}
+		_ = json.Unmarshal(body, &p)
+		seen.Store(p.ChatID, struct{}{})
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	subs := NewSubscribers("10", "20", "30")
+	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
+	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	for _, id := range []int64{10, 20, 30} {
+		if _, ok := seen.Load(id); !ok {
+			t.Errorf("chat %d did not receive the broadcast", id)
+		}
+	}
+}
+
+func TestBroadcastContinuesAfterPerChatError(t *testing.T) {
+	var sent atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p struct {
+			ChatID int64 `json:"chat_id"`
+		}
+		_ = json.Unmarshal(body, &p)
+		if p.ChatID == 20 {
+			w.WriteHeader(400)
+			return
+		}
+		sent.Add(1)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	subs := NewSubscribers("10", "20", "30")
+	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
+	err := s.Notify(context.Background(), sampleTradeFinding())
+	if err == nil {
+		t.Fatal("expected the failing chat to surface as error")
+	}
+	if got := sent.Load(); got != 2 {
+		t.Errorf("expected 2 successful sends, got %d", got)
+	}
+}
+
+func TestSubscribersAddDedupesAndSnapshots(t *testing.T) {
+	s := NewSubscribers("1", "", "abc", "2") // empty + bad input skipped
+	if got := s.Size(); got != 2 {
+		t.Fatalf("seed size: %d", got)
+	}
+	if !s.Add(3) {
+		t.Fatal("first add should be true")
+	}
+	if s.Add(3) {
+		t.Fatal("duplicate add should be false")
+	}
+	if got := s.Size(); got != 3 {
+		t.Fatalf("size after add: %d", got)
+	}
+	snap := s.Snapshot()
+	if len(snap) != 3 {
+		t.Fatalf("snapshot len: %d", len(snap))
+	}
+}
+
+func TestSubscribersConcurrentAddRaceSafe(t *testing.T) {
+	s := NewSubscribers()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				s.Add(int64(seed*1000 + j))
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := s.Size(); got != 4000 {
+		t.Fatalf("expected 4000 unique ids, got %d", got)
 	}
 }

@@ -42,6 +42,8 @@ type App struct {
 	collect  *collect.Loop
 	detect   *detect.Loop
 	httpSrv  *httpsrv.Server
+
+	telegramPoller *alerting2.Poller // nil when TELEGRAM_UPDATES_ENABLED=false
 }
 
 func New() (*App, error) {
@@ -106,19 +108,33 @@ func New() (*App, error) {
 	if cfg.Alerting.WebhookURL != "" {
 		sinks = append(sinks, alerting2.NewWebhookSink(cfg.Alerting.WebhookURL))
 	}
+	telegramSubs := alerting2.NewSubscribers(cfg.Alerting.TelegramChatID)
 	telegram, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled:  cfg.Alerting.TelegramEnabled,
 		BotToken: cfg.Alerting.TelegramBotToken,
 		ChatID:   cfg.Alerting.TelegramChatID,
 		BaseURL:  cfg.Alerting.TelegramBaseURL,
 		Timeout:  cfg.Alerting.TelegramTimeout,
-	})
+	}, telegramSubs)
 	if err != nil {
 		return nil, fmt.Errorf("telegram sink: %w", err)
 	}
 	telegram.WithMetrics(met)
 	sinks = append(sinks, telegram)
 	emitter := &alerting2.Fanout{Sinks: sinks, Logger: logger}
+
+	var telegramPoller *alerting2.Poller
+	if cfg.Alerting.TelegramEnabled && cfg.Alerting.TelegramUpdatesEnabled {
+		telegramPoller, err = alerting2.NewPoller(alerting2.PollerConfig{
+			BotToken: cfg.Alerting.TelegramBotToken,
+			BaseURL:  cfg.Alerting.TelegramBaseURL,
+			Interval: cfg.Alerting.TelegramUpdatesInterval,
+			Timeout:  cfg.Alerting.TelegramTimeout,
+		}, telegramSubs, logger)
+		if err != nil {
+			return nil, fmt.Errorf("telegram poller: %w", err)
+		}
+	}
 
 	detectLoop := detect.New(detect.Config{
 		Thresholds: anomaly.Thresholds{
@@ -154,15 +170,16 @@ func New() (*App, error) {
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
 	return &App{
-		cfg:      cfg,
-		logger:   logger,
-		metrics:  met,
-		registry: registry,
-		engine:   engine,
-		discover: discoverLoop,
-		collect:  collectLoop,
-		detect:   detectLoop,
-		httpSrv:  httpSrv,
+		cfg:            cfg,
+		logger:         logger,
+		metrics:        met,
+		registry:       registry,
+		engine:         engine,
+		discover:       discoverLoop,
+		collect:        collectLoop,
+		detect:         detectLoop,
+		httpSrv:        httpSrv,
+		telegramPoller: telegramPoller,
 	}, nil
 }
 
@@ -175,6 +192,9 @@ func (a *App) Run() error {
 		{Name: "discover", Fn: a.discover.Run},
 		{Name: "collect", Fn: a.collect.Run},
 		{Name: "detect", Fn: a.detect.Run}, // refreshes supporting gauges only
+	}
+	if a.telegramPoller != nil {
+		execs = append(execs, shutdown2.Exec{Name: "telegram-poller", Fn: a.telegramPoller.Run})
 	}
 
 	return shutdown2.Graceful(
