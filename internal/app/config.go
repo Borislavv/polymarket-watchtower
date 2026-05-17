@@ -62,17 +62,19 @@ type PipelineConfig struct {
 	CollectConcurrency int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
 }
 
-// CategoryFilterConfig holds the category blacklist applied to both modes.
+// CategoryFilterConfig holds two independent blacklists:
 //
-// Defaults exclude Polymarket's sports categories — they are high-hype,
-// high-volume venues where small baselines and casual whales generate way
-// too much noise for the current detector. Operators wanting full coverage
-// can set CATEGORY_BLACKLIST= (empty) to disable.
+//   - CategoryBlacklist matches against the Polymarket category slug+label.
+//   - MarketKeywordBlacklist matches against the market title + slug + event
+//     slug. Catches sports markets tagged with non-sports categories like
+//     Polymarket's `Hide From New`.
 //
-// Matching is case-insensitive substring on (slug + label); see the
-// internal/app/usecase/category package for the full rule.
+// Splitting them prevents the operator footgun where adding "weather" to
+// silence a category accidentally silences every market title containing
+// "weather". Both lists are case-insensitive substring matches.
 type CategoryFilterConfig struct {
-	Blacklist []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sport,football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,racing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
+	Blacklist              []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sport,football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,racing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
+	MarketKeywordBlacklist []string `env:"MARKET_KEYWORD_BLACKLIST" envSeparator:"," envDefault:"football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
 }
 
 // AggregateConfig sizes the rolling-bucket engine used by both modes
@@ -114,11 +116,25 @@ type AnomalyConfig struct {
 	// extreme cases.
 	CriticalMinMultiplier float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 
-	// HardPromotion (HumanReviewRequired): when a trade clears ALL three
-	// floors it is promoted to Hard severity, bypassing conservative-min.
-	HardPromotionMinNotionalUSD float64 `env:"ALERT_HARD_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
-	HardPromotionMinOdds        float64 `env:"ALERT_HARD_MIN_ODDS" envDefault:"8" validate:"gte=1"`
-	HardPromotionMinMultiplier  float64 `env:"ALERT_HARD_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+	// HardPromotion: two OR branches. A trade clearing ALL three floors of
+	// either branch is escalated to Hard severity, bypassing conservative-min.
+	HardPromotionA_MinNotionalUSD float64 `env:"ALERT_HARD_A_MIN_NOTIONAL_USD" envDefault:"250000" validate:"gte=0"`
+	HardPromotionA_MinOdds        float64 `env:"ALERT_HARD_A_MIN_ODDS" envDefault:"5" validate:"gte=1"`
+	HardPromotionA_MinMultiplier  float64 `env:"ALERT_HARD_A_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+	HardPromotionB_MinNotionalUSD float64 `env:"ALERT_HARD_B_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
+	HardPromotionB_MinOdds        float64 `env:"ALERT_HARD_B_MIN_ODDS" envDefault:"10" validate:"gte=1"`
+	HardPromotionB_MinMultiplier  float64 `env:"ALERT_HARD_B_MIN_MULTIPLIER" envDefault:"2500" validate:"gte=0"`
+
+	// HugeWhale: forces final severity to at least Critical on raw-size cases
+	// the conservative-min would otherwise miss.
+	HugeWhaleMinNotionalUSD float64 `env:"ALERT_HUGE_WHALE_MIN_NOTIONAL_USD" envDefault:"250000" validate:"gte=0"`
+	HugeWhaleMinOdds        float64 `env:"ALERT_HUGE_WHALE_MIN_ODDS" envDefault:"5" validate:"gte=1"`
+	HugeWhaleMinMultiplier  float64 `env:"ALERT_HUGE_WHALE_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+
+	// MegaWhale: forces Hard severity for extreme raw-size cases.
+	MegaWhaleMinNotionalUSD float64 `env:"ALERT_MEGA_WHALE_MIN_NOTIONAL_USD" envDefault:"1000000" validate:"gte=0"`
+	MegaWhaleMinOdds        float64 `env:"ALERT_MEGA_WHALE_MIN_ODDS" envDefault:"3" validate:"gte=1"`
+	MegaWhaleMinMultiplier  float64 `env:"ALERT_MEGA_WHALE_MIN_MULTIPLIER" envDefault:"250" validate:"gte=0"`
 
 	// Baseline shape.
 	BaselineMinTradeUSD          float64 `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
@@ -141,12 +157,24 @@ type AnomalyConfig struct {
 	MarketMinAge                time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
 	AllowUnknownMarketLifecycle bool          `env:"ALLOW_UNKNOWN_MARKET_LIFECYCLE" envDefault:"false"`
 
-	// Cluster (HARD) alert.
+	// Cluster (HARD) alert — composed of already-fired single-trade alerts.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
 	ClusterMinTrades   int           `env:"CLUSTER_MIN_ANOMALOUS_TRADES" envDefault:"3" validate:"gte=2"`
 	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
-	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"30000" validate:"gte=0"`
+	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
 	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
+
+	// Sub-cluster (HARD) alert — composed of *candidate* trades that fall
+	// below the single-trade absolute floor but still look like a
+	// coordinated split. Each candidate must clear the per-candidate floors
+	// below; the cluster fires when enough distinct wallets accumulate.
+	SubClusterWindow              time.Duration `env:"SUB_CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
+	SubClusterMinTradeUSD         float64       `env:"SUB_CLUSTER_MIN_TRADE_USD" envDefault:"3000" validate:"gte=0"`
+	SubClusterMinOdds             float64       `env:"SUB_CLUSTER_MIN_ODDS" envDefault:"5" validate:"gte=1"`
+	SubClusterMinMultiplier       float64       `env:"SUB_CLUSTER_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
+	SubClusterMinUniqueTraders    int           `env:"SUB_CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"5" validate:"gte=2"`
+	SubClusterMinTotalNotionalUSD float64       `env:"SUB_CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
+	SubClusterCooldown            time.Duration `env:"SUB_CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
 
 	// Volume mode (legacy).
 	VolumeMultipliers []float64     `env:"VOLUME_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`

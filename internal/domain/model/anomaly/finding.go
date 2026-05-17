@@ -44,6 +44,14 @@ func MaxSeverity(a, b Severity) Severity {
 	return b
 }
 
+// RankAtLeast returns s if it already ranks at floor or higher, else "".
+func RankAtLeast(s, floor Severity) Severity {
+	if rank(s) >= rank(floor) {
+		return s
+	}
+	return ""
+}
+
 func rank(s Severity) int {
 	switch s {
 	case SeverityHard:

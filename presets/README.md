@@ -19,6 +19,18 @@ Common rules across all three:
   cleared the `MARKET_MIN_AGE` gate, and the observed baseline span has at
   least `BASELINE_MIN_READY_WINDOW` of data.
 - The Telegram alert shows the **actual** baseline span used, not the cap.
+- Severity is the conservative MIN of the absolute and multiplier ladders.
+  `ALERT_HARD_A_*` and `ALERT_HARD_B_*` are two independent OR branches that
+  promote to HARD on insider-grade trades. `ALERT_HUGE_WHALE_*` rescues raw-
+  size bets that conservative-min would under-classify; `ALERT_MEGA_WHALE_*`
+  catches absurd-size outliers.
+- `SUB_CLUSTER_*` admits sub-threshold trades (below the single-trade absolute
+  floor) into a per-category window; enough distinct wallets totalling enough
+  USD trigger a HARD `WhaleClusterDetected` alert. Split-wallet patterns that
+  no single trade could surface are caught here.
+- `CATEGORY_BLACKLIST` filters by category slug+label. `MARKET_KEYWORD_BLACKLIST`
+  filters by market title / slug / event-slug — separate from the category
+  list so adding a term to one cannot silence the other.
 
 How to apply:
 

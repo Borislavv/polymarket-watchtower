@@ -29,32 +29,55 @@ type Tier struct {
 // Final severity is the *lower* of the two tier outcomes (conservative AND).
 // Below-info on either side ⇒ no alert.
 //
-// HardPromotion takes precedence: any trade matching ALL three HardPromotion
-// thresholds is promoted straight to Hard severity — the "HumanReviewRequired"
-// signal that bypasses the conservative-min collapse for unambiguous whale
-// activity (e.g. $100k @ odds 8 @ 1000× baseline).
+// Override promotions stack on top of the conservative-min combination:
+//
+//   - HardPromotionA / HardPromotionB: two independent OR branches that fire
+//     Hard ("HumanReviewRequired") when ALL three of (notional, odds, mul)
+//     clear their floors. Two branches let presets express e.g. "$250k AND
+//     odds 5 AND 1000×" OR "$100k AND odds 10 AND 2500×".
+//   - HugeWhale: forces the final severity to at least Critical when the
+//     trade clears (notional, odds, mul). The conservative-min may have
+//     under-classified a $250k bet at warning; this rescues it.
+//   - MegaWhale: forces Hard. For absurd raw-size cases where odds/mul are
+//     less relevant.
+//
+// Any tier with a zero field disables that override path.
 type Thresholds struct {
 	Info     Tier
 	Warning  Tier
 	Critical Tier
-	// HardPromotion: a single-trade alert is promoted to Hard severity when
-	// notional, odds, and multiplier all clear these floors. Zero-valued
-	// fields disable the promotion path entirely.
-	HardPromotion Tier
+
+	HardPromotionA Tier
+	HardPromotionB Tier
+
+	HugeWhale Tier
+	MegaWhale Tier
 
 	MinBaselineTrades      int
 	MinBaselineNotionalUSD float64
 }
 
-// MeetsHardPromotion reports whether (notional, odds, mul) clears every
-// HardPromotion floor. All three must be configured (non-zero) for the rule
-// to be eligible; otherwise the promotion is disabled.
-func (t Thresholds) MeetsHardPromotion(notional, odds, mul float64) bool {
-	p := t.HardPromotion
-	if p.MinNotionalUSD <= 0 || p.MinOdds <= 0 || p.MinMultiplier <= 0 {
+// meets reports (n, o, m) ≥ tier on every non-zero floor.
+func (t Tier) meets(notional, odds, mul float64) bool {
+	if t.MinNotionalUSD <= 0 || t.MinOdds <= 0 || t.MinMultiplier <= 0 {
 		return false
 	}
-	return notional >= p.MinNotionalUSD && odds >= p.MinOdds && mul >= p.MinMultiplier
+	return notional >= t.MinNotionalUSD && odds >= t.MinOdds && mul >= t.MinMultiplier
+}
+
+// MeetsHardPromotion reports whether either HardPromotion branch fires.
+func (t Thresholds) MeetsHardPromotion(notional, odds, mul float64) bool {
+	return t.HardPromotionA.meets(notional, odds, mul) || t.HardPromotionB.meets(notional, odds, mul)
+}
+
+// MeetsHugeWhale reports whether the HugeWhale override fires.
+func (t Thresholds) MeetsHugeWhale(notional, odds, mul float64) bool {
+	return t.HugeWhale.meets(notional, odds, mul)
+}
+
+// MeetsMegaWhale reports whether the MegaWhale override fires.
+func (t Thresholds) MeetsMegaWhale(notional, odds, mul float64) bool {
+	return t.MegaWhale.meets(notional, odds, mul)
 }
 
 // AbsoluteTier returns the highest tier where notional AND odds both meet the

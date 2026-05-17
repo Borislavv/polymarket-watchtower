@@ -11,6 +11,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/subcluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
@@ -168,10 +169,25 @@ func New() (*App, error) {
 					MinOdds:        cfg.Anomaly.CriticalMinOdds,
 					MinMultiplier:  cfg.Anomaly.CriticalMinMultiplier,
 				},
-				HardPromotion: anomaly.Tier{
-					MinNotionalUSD: cfg.Anomaly.HardPromotionMinNotionalUSD,
-					MinOdds:        cfg.Anomaly.HardPromotionMinOdds,
-					MinMultiplier:  cfg.Anomaly.HardPromotionMinMultiplier,
+				HardPromotionA: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.HardPromotionA_MinNotionalUSD,
+					MinOdds:        cfg.Anomaly.HardPromotionA_MinOdds,
+					MinMultiplier:  cfg.Anomaly.HardPromotionA_MinMultiplier,
+				},
+				HardPromotionB: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.HardPromotionB_MinNotionalUSD,
+					MinOdds:        cfg.Anomaly.HardPromotionB_MinOdds,
+					MinMultiplier:  cfg.Anomaly.HardPromotionB_MinMultiplier,
+				},
+				HugeWhale: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.HugeWhaleMinNotionalUSD,
+					MinOdds:        cfg.Anomaly.HugeWhaleMinOdds,
+					MinMultiplier:  cfg.Anomaly.HugeWhaleMinMultiplier,
+				},
+				MegaWhale: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.MegaWhaleMinNotionalUSD,
+					MinOdds:        cfg.Anomaly.MegaWhaleMinOdds,
+					MinMultiplier:  cfg.Anomaly.MegaWhaleMinMultiplier,
 				},
 				MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
 				MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
@@ -188,6 +204,15 @@ func New() (*App, error) {
 				MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
 				Cooldown:         cfg.Anomaly.ClusterCooldown,
 			},
+			SubCluster: subcluster.Config{
+				MinTradeUSD:         cfg.Anomaly.SubClusterMinTradeUSD,
+				MinOdds:             cfg.Anomaly.SubClusterMinOdds,
+				MinMultiplier:       cfg.Anomaly.SubClusterMinMultiplier,
+				Window:              cfg.Anomaly.SubClusterWindow,
+				MinUniqueWallets:    cfg.Anomaly.SubClusterMinUniqueTraders,
+				MinTotalNotionalUSD: cfg.Anomaly.SubClusterMinTotalNotionalUSD,
+				Cooldown:            cfg.Anomaly.SubClusterCooldown,
+			},
 			Filter:                      categoryFilter,
 			RecentWindows:               cfg.Aggregate.RecentWindows,
 			GaugeInterval:               cfg.Pipeline.CollectInterval,
@@ -200,7 +225,7 @@ func New() (*App, error) {
 			MarketMinAge:                cfg.Anomaly.MarketMinAge,
 			BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
 			AllowUnknownMarketLifecycle: cfg.Anomaly.AllowUnknownMarketLifecycle,
-			SportsKeywords:              cfg.CategoryFilter.Blacklist,
+			SportsKeywords:              cfg.CategoryFilter.MarketKeywordBlacklist,
 		}, engine, registry, emitter, met, logger)
 		observer = detectLoop
 		detectRun = detectLoop.Run

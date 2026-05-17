@@ -52,7 +52,12 @@ func Score(notionalUSD, price float64, bs baseline.Stats, t anomaly.Thresholds) 
 	}
 
 	finalSev := anomaly.ConservativeMin(absTier, mulTier)
-	if t.MeetsHardPromotion(notionalUSD, odds, mul) {
+	// Overrides stack from softest to hardest so the final pick is the
+	// strongest signal that fired.
+	if t.MeetsHugeWhale(notionalUSD, odds, mul) && anomaly.RankAtLeast(finalSev, anomaly.SeverityCritical) == "" {
+		finalSev = anomaly.SeverityCritical
+	}
+	if t.MeetsHardPromotion(notionalUSD, odds, mul) || t.MeetsMegaWhale(notionalUSD, odds, mul) {
 		finalSev = anomaly.SeverityHard
 	}
 	return Result{
