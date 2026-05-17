@@ -117,15 +117,17 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 		Wallet    string  `json:"proxyWallet"`
 	}
 	var trades []t1
-	// 100 small "Yes" bets at $10 across the last 24h
+	// 100 baseline "Yes" bets at notional $100 (above the $50 baseline filter).
 	for i := 0; i < 100; i++ {
 		trades = append(trades, t1{
 			ID: "b" + strconv.Itoa(i), Cond: "0xa", Asset: "tok-yes",
-			Side: "BUY", Size: 20, Price: 0.5, Wallet: "0xnoise",
+			Side: "BUY", Size: 200, Price: 0.5, Wallet: "0xnoise",
 			Timestamp: now.Add(-24 * time.Hour).Add(time.Duration(i*14) * time.Minute).Unix(),
 		})
 	}
-	// 3 whales: $50k each on "Yes", within the cluster window (HARD alert)
+	// 3 whales: $100k each at price 0.05 (odds 20). Absolute=critical.
+	// Multiplier = 100000/100 = 1000 → warning. Conservative final = warning.
+	// Cluster of 3 warning trades from 3 unique wallets totalling $300k fires HARD.
 	for i, wallet := range []string{
 		"0xshark111111111111111111111111111111111111",
 		"0xshark222222222222222222222222222222222222",
@@ -133,7 +135,7 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	} {
 		trades = append(trades, t1{
 			ID: "w" + strconv.Itoa(i), Cond: "0xa", Asset: "tok-yes",
-			Side: "BUY", Size: 100_000, Price: 0.5, Wallet: wallet,
+			Side: "BUY", Size: 2_000_000, Price: 0.05, Wallet: wallet,
 			Timestamp: now.Add(-time.Duration(i) * time.Minute).Unix(),
 		})
 	}
@@ -193,7 +195,7 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 
 	disc := discover.New(discover.Config{
 		Interval: time.Hour, ActiveOnly: true, MaxMarkets: 100,
-	}, gammaClient, reg, eng, met, &log)
+	}, gammaClient, reg, eng, nil, met, &log)
 
 	tg, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled: true, BotToken: "test", ChatID: "1", BaseURL: telegramSrv.URL,
@@ -206,9 +208,9 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 
 	det := detect.New(detect.Config{
 		Thresholds: anomaly2.Thresholds{
-			MultiplierLadder:       []float64{30, 100, 1000},
-			OddsLadder:             []float64{3, 10, 25},
-			MinTradeUSD:            10_000,
+			Info:                   anomaly2.Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
+			Warning:                anomaly2.Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
+			Critical:               anomaly2.Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
 			MinBaselineTrades:      20,
 			MinBaselineNotionalUSD: 100,
 		},
@@ -244,13 +246,14 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	}
 
 	var tradeAnoms, hardAlerts int
-	var sawCritical, sawHard bool
+	var sawWarning, sawHard bool
 	for _, f := range findings {
 		switch f.Kind {
 		case anomaly2.KindTradeAnomaly:
 			tradeAnoms++
-			if f.Severity == anomaly2.SeverityCritical {
-				sawCritical = true
+			// Conservative MIN of absolute=critical + multiplier=warning => warning.
+			if f.Severity == anomaly2.SeverityWarning {
+				sawWarning = true
 			}
 			if f.Trade == nil || f.Trade.Outcome != "Yes" {
 				t.Errorf("trade ref missing outcome: %+v", f.Trade)
@@ -278,8 +281,8 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	if tradeAnoms < 3 {
 		t.Errorf("expected >=3 single-trade findings (one per whale), got %d", tradeAnoms)
 	}
-	if !sawCritical {
-		t.Errorf("expected at least one critical single-trade finding")
+	if !sawWarning {
+		t.Errorf("expected at least one warning single-trade finding")
 	}
 	if hardAlerts != 1 || !sawHard {
 		t.Errorf("expected exactly 1 HARD category-watch alert, got %d", hardAlerts)
@@ -292,7 +295,7 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	close(telegramBodies)
 	var sawWatchMsg bool
 	for body := range telegramBodies {
-		if strings.Contains(body, "CategoryWatchRequired") && strings.Contains(body, "3 unique wallets") {
+		if strings.Contains(body, "CategoryWatchRequired") && strings.Contains(body, "3 unique traders") {
 			sawWatchMsg = true
 		}
 	}

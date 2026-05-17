@@ -153,15 +153,28 @@ func New() (*App, error) {
 	case ModeSingleCluster:
 		detectLoop = detect.New(detect.Config{
 			Thresholds: anomaly.Thresholds{
-				MultiplierLadder:       cfg.Anomaly.SingleMultiplierThresholds,
-				OddsLadder:             cfg.Anomaly.SingleOddsThresholds,
-				MinTradeUSD:            cfg.Anomaly.SingleMinTradeUSD,
+				Info: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.InfoMinNotionalUSD,
+					MinOdds:        cfg.Anomaly.InfoMinOdds,
+					MinMultiplier:  cfg.Anomaly.InfoMinMultiplier,
+				},
+				Warning: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.WarningMinNotionalUSD,
+					MinOdds:        cfg.Anomaly.WarningMinOdds,
+					MinMultiplier:  cfg.Anomaly.WarningMinMultiplier,
+				},
+				Critical: anomaly.Tier{
+					MinNotionalUSD: cfg.Anomaly.CriticalMinNotionalUSD,
+					MinOdds:        cfg.Anomaly.CriticalMinOdds,
+					MinMultiplier:  cfg.Anomaly.CriticalMinMultiplier,
+				},
 				MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
 				MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
 			},
 			Baseline: baseline.Config{
-				Window:     cfg.Anomaly.BaselineWindow,
-				MaxSamples: cfg.Anomaly.BaselineMaxSamples,
+				Window:      cfg.Anomaly.BaselineWindow,
+				MaxSamples:  cfg.Anomaly.BaselineMaxSamples,
+				MinTradeUSD: cfg.Anomaly.BaselineMinTradeUSD,
 			},
 			Cluster: cluster.Config{
 				Window:           cfg.Anomaly.ClusterWindow,
@@ -188,6 +201,7 @@ func New() (*App, error) {
 			MinNotional:   cfg.Anomaly.VolumeMinNotional,
 			MinTrades:     cfg.Anomaly.VolumeMinTrades,
 			Cooldown:      cfg.Anomaly.VolumeCooldown,
+			Filter:        categoryFilter,
 		}, engine, registry, emitter, met, logger)
 		observer = volumeLoop
 		detectRun = volumeLoop.Run

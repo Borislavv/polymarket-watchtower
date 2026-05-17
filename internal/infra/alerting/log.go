@@ -71,8 +71,11 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 	if f.Multiplier > 0 {
 		evt = evt.Float64("multiplier", f.Multiplier)
 	}
-	if f.OddsRung > 0 {
-		evt = evt.Float64("odds_rung", f.OddsRung)
+	if f.AbsoluteTier != "" {
+		evt = evt.Str("absolute_tier", string(f.AbsoluteTier))
+	}
+	if f.MultiplierTier != "" {
+		evt = evt.Str("multiplier_tier", string(f.MultiplierTier))
 	}
 	if f.Trade != nil && f.Trade.Odds > 0 {
 		evt = evt.Float64("odds", f.Trade.Odds)

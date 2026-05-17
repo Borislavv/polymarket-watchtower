@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"strconv"
@@ -17,27 +18,21 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 )
 
-// TelegramConfig is the minimal config for a Telegram bot. ChatIDs are sourced
-// from two places, deduplicated at send time:
-//   - The optional static ChatID seeded at construction.
-//   - Dynamic subscribers discovered via Poller (/getUpdates) added at runtime.
+// TelegramConfig is the minimal config for a Telegram bot.
 type TelegramConfig struct {
 	Enabled  bool
 	BotToken string
-	ChatID   string // static seed; empty is OK when a Poller is running
+	ChatID   string
 	BaseURL  string
 	Timeout  time.Duration
 }
 
-// Subscribers is a concurrency-safe set of Telegram chat ids. The sink reads
-// it on every send, the poller writes to it as new chats interact with the bot.
+// Subscribers is a concurrency-safe set of Telegram chat ids.
 type Subscribers struct {
 	mu  sync.RWMutex
 	ids map[int64]struct{}
 }
 
-// NewSubscribers builds a registry pre-seeded with the supplied chat ids.
-// Empty / unparseable inputs are skipped silently.
 func NewSubscribers(seed ...string) *Subscribers {
 	s := &Subscribers{ids: make(map[int64]struct{})}
 	for _, raw := range seed {
@@ -51,7 +46,6 @@ func NewSubscribers(seed ...string) *Subscribers {
 	return s
 }
 
-// Add records a chat id; returns true when it wasn't already known.
 func (s *Subscribers) Add(id int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -62,8 +56,6 @@ func (s *Subscribers) Add(id int64) bool {
 	return true
 }
 
-// Snapshot returns a stable copy of the chat ids. Safe to iterate while the
-// registry is being mutated.
 func (s *Subscribers) Snapshot() []int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -74,7 +66,6 @@ func (s *Subscribers) Snapshot() []int64 {
 	return out
 }
 
-// Size is the current subscriber count.
 func (s *Subscribers) Size() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -82,17 +73,13 @@ func (s *Subscribers) Size() int {
 }
 
 // TelegramSink broadcasts findings to every chat in the Subscribers registry.
-// A disabled sink (Config.Enabled == false) is a no-op so the app can wire it
-// unconditionally.
 type TelegramSink struct {
 	cfg         TelegramConfig
 	client      *http.Client
 	subscribers *Subscribers
-	metrics     *metrics.Metrics // optional; nil-safe
+	metrics     *metrics.Metrics
 }
 
-// NewTelegramSink validates config and returns a sink. The supplied Subscribers
-// must be non-nil when Enabled is true.
 func NewTelegramSink(cfg TelegramConfig, subs *Subscribers) (*TelegramSink, error) {
 	if !cfg.Enabled {
 		return &TelegramSink{cfg: cfg, subscribers: subs}, nil
@@ -109,14 +96,9 @@ func NewTelegramSink(cfg TelegramConfig, subs *Subscribers) (*TelegramSink, erro
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Second
 	}
-	return &TelegramSink{
-		cfg:         cfg,
-		client:      &http.Client{Timeout: cfg.Timeout},
-		subscribers: subs,
-	}, nil
+	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}, subscribers: subs}, nil
 }
 
-// WithMetrics attaches a metrics handle for send success / failure counters.
 func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 	s.metrics = m
 	return s
@@ -124,17 +106,12 @@ func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 
 func (s *TelegramSink) Name() string { return "telegram" }
 
-// Notify broadcasts the finding to every known chat. Per-chat failures are
-// logged via metrics and don't abort the broadcast. Returns the first error
-// (so the Fanout records something), but all chats are attempted.
 func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
 	if !s.cfg.Enabled {
 		return nil
 	}
 	chatIDs := s.subscribers.Snapshot()
 	if len(chatIDs) == 0 {
-		// Nothing to send to yet — silent rather than spamming an error per
-		// alert before any user has interacted with the bot.
 		return nil
 	}
 	text := FormatTelegramMessage(f)
@@ -156,7 +133,7 @@ func (s *TelegramSink) sendOne(ctx context.Context, chatID int64, text string) e
 	body := map[string]any{
 		"chat_id":                  chatID,
 		"text":                     text,
-		"parse_mode":               "Markdown",
+		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 	}
 	payload, err := json.Marshal(body)
@@ -196,10 +173,14 @@ func (s *TelegramSink) observeErr(sev anomaly.Severity) {
 	}
 }
 
-// FormatTelegramMessage renders the Markdown body for one finding. The format
-// is tuned for a human reviewing the alert on a phone — what / where / why /
-// dynamics / links, in that order. Exposed so tests can assert on it without
-// invoking HTTP.
+// FormatTelegramMessage renders the HTML body for one finding. The output is
+// structured into clearly-separated sections so a human glancing at the alert
+// on a phone gets the answer fast: severity headline → why → trade → cluster
+// → links. Exposed so tests can assert on it without invoking HTTP.
+//
+// HTML parse mode requires escaping `&`, `<`, `>`. We use html.EscapeString
+// for any user-supplied content (market titles, wallet, etc.) — no homemade
+// escaping.
 func FormatTelegramMessage(f anomaly.Finding) string {
 	switch f.Kind {
 	case anomaly.KindCategoryWatch:
@@ -211,118 +192,153 @@ func FormatTelegramMessage(f anomaly.Finding) string {
 
 func formatTradeAnomaly(f anomaly.Finding) string {
 	var b strings.Builder
-	reason := f.Reason
-	if reason == "" {
-		reason = "anomaly"
-	}
-	fmt.Fprintf(&b, "%s *Polymarket %s — %s*\n",
-		severityBadge(f.Severity), strings.ToUpper(string(f.Severity)), escapeMarkdown(reason))
-	if f.Trade != nil {
-		t := f.Trade
-		title := t.Question
-		if title == "" {
-			title = t.Slug
-		}
-		if title == "" {
-			title = string(t.Market)
-		}
-		fmt.Fprintf(&b, "*%s*\n", escapeMarkdown(title))
-		if t.Outcome != "" || t.Side != "" {
-			fmt.Fprintf(&b, "outcome: `%s`  side: `%s`\n", escapeMarkdown(t.Outcome), escapeMarkdown(string(t.Side)))
-		}
-		fmt.Fprintf(&b, "size: *$%s*  (`%.2f` @ `%.4f`)\n", money(t.NotionalUSD), t.SizeShares, t.Price)
-		if t.Wallet != "" {
-			fmt.Fprintf(&b, "wallet: `%s`\n", t.Wallet)
-		}
-	}
-	if f.Category != nil && f.Category.Label != "" {
-		fmt.Fprintf(&b, "category: *%s*\n", escapeMarkdown(f.Category.Label))
-	}
-	if f.Baseline != nil {
-		bs := f.Baseline
-		fmt.Fprintf(&b, "baseline: median *$%s*  mean *$%s*  p95 *$%s*  N=`%d`  window=`%s`\n",
-			money(bs.MedianUSD), money(bs.MeanUSD), money(bs.P95USD), bs.SampleN, bs.WindowAgo)
-	}
-	if f.Multiplier > 0 {
-		fmt.Fprintf(&b, "multiplier: *x%s*\n", multiplierFmt(f.Multiplier))
-	}
-	if f.Trade != nil && f.Trade.Odds > 0 {
-		fmt.Fprintf(&b, "odds: *%s*  (price `%.4f`)\n", multiplierFmt(f.Trade.Odds), f.Trade.Price)
-	}
-	if f.OddsRung > 0 {
-		fmt.Fprintf(&b, "odds rung crossed: *>=%s*\n", multiplierFmt(f.OddsRung))
-	}
-	fmt.Fprintf(&b, "at: `%s`\n", f.At.UTC().Format(time.RFC3339))
-	appendLinks(&b, f)
+	writeTradeHeader(&b, f)
+	writeWhy(&b, f)
+	writeTrade(&b, f)
+	writeLinks(&b, f)
 	return b.String()
 }
 
 func formatCategoryWatch(f anomaly.Finding) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s *Polymarket — CategoryWatchRequired (%s)*\n",
-		severityBadge(f.Severity), escapeMarkdown(nonEmpty(f.Reason, "cluster")))
-	if f.Category != nil {
-		fmt.Fprintf(&b, "category: *%s*\n", escapeMarkdown(nonEmpty(f.Category.Label, fmt.Sprintf("id=%d", f.Category.ID))))
-	}
-	if f.Cluster != nil {
-		c := f.Cluster
-		fmt.Fprintf(&b, "*%d anomalous trades* from *%d unique wallets* totalling *$%s* in the last `%s`\n",
-			c.AnomalousTrades, c.UniqueWallets, money(c.TotalUSD), c.Window)
-		if len(c.Sample) > 0 {
-			b.WriteString("\nrecent contributors:\n")
-			for _, t := range c.Sample {
-				title := t.Question
-				if title == "" {
-					title = t.Slug
-				}
-				if title == "" {
-					title = string(t.Market)
-				}
-				fmt.Fprintf(&b, "  • *$%s* on `%s` — %s `%s`\n",
-					money(t.NotionalUSD), escapeMarkdown(title), shortWallet(t.Wallet), escapeMarkdown(t.Outcome))
-			}
-		}
-	}
-	fmt.Fprintf(&b, "\nat: `%s`\n", f.At.UTC().Format(time.RFC3339))
-	appendLinks(&b, f)
+	writeClusterHeader(&b, f)
+	writeCluster(&b, f)
+	writeLinks(&b, f)
 	return b.String()
 }
 
-func appendLinks(b *strings.Builder, f anomaly.Finding) {
+// --- HTML section builders --------------------------------------------------
+
+func writeTradeHeader(b *strings.Builder, f anomaly.Finding) {
+	title := tradeTitle(f)
+	fmt.Fprintf(b, "<b>%s: x%s · $%s · %s</b>\n",
+		strings.ToUpper(string(f.Severity)),
+		multiplierFmt(f.Multiplier),
+		money(notional(f)),
+		html.EscapeString(title),
+	)
+}
+
+func writeClusterHeader(b *strings.Builder, f anomaly.Finding) {
+	cat := "(uncategorised)"
+	if f.Category != nil && f.Category.Label != "" {
+		cat = f.Category.Label
+	}
+	totalUSD, count, wallets := 0.0, 0, 0
+	if f.Cluster != nil {
+		totalUSD = f.Cluster.TotalUSD
+		count = f.Cluster.AnomalousTrades
+		wallets = f.Cluster.UniqueWallets
+	}
+	fmt.Fprintf(b, "<b>%s — CategoryWatchRequired: %d trades · %d wallets · $%s · %s</b>\n",
+		strings.ToUpper(string(f.Severity)), count, wallets, money(totalUSD), html.EscapeString(cat))
+}
+
+func writeWhy(b *strings.Builder, f anomaly.Finding) {
+	b.WriteString("\n<b>Why</b>\n")
+	if f.Multiplier > 0 && f.Baseline != nil {
+		fmt.Fprintf(b, "• <b>x%s</b> above baseline median ($%s)\n",
+			multiplierFmt(f.Multiplier), money(f.Baseline.MedianUSD))
+	}
+	if f.Trade != nil && f.Trade.Odds > 0 {
+		fmt.Fprintf(b, "• odds <b>%s</b>, implied probability <b>%.1f%%</b>\n",
+			multiplierFmt(f.Trade.Odds), f.Trade.Price*100)
+	}
+	if f.Baseline != nil {
+		fmt.Fprintf(b, "• baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, window %s\n",
+			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD), money(f.Baseline.P95USD), f.Baseline.WindowAgo)
+	}
+	if f.AbsoluteTier != "" || f.MultiplierTier != "" {
+		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> → final=<b>%s</b>\n",
+			string(f.AbsoluteTier), string(f.MultiplierTier), string(f.Severity))
+	}
+}
+
+func writeTrade(b *strings.Builder, f anomaly.Finding) {
+	if f.Trade == nil {
+		return
+	}
+	t := f.Trade
+	b.WriteString("\n<b>Trade</b>\n")
+	if t.Outcome != "" || t.Side != "" {
+		fmt.Fprintf(b, "• outcome: <b>%s</b> (%s)\n",
+			html.EscapeString(t.Outcome), html.EscapeString(string(t.Side)))
+	}
+	fmt.Fprintf(b, "• size: $%s (%.2f shares @ %.4f)\n", money(t.NotionalUSD), t.SizeShares, t.Price)
+	if t.Wallet != "" {
+		fmt.Fprintf(b, "• trader: <code>%s</code>\n", html.EscapeString(t.Wallet))
+	}
+	if f.Category != nil && f.Category.Label != "" {
+		fmt.Fprintf(b, "• category: %s\n", html.EscapeString(f.Category.Label))
+	}
+	fmt.Fprintf(b, "• time: %s\n", t.At.UTC().Format("2006-01-02 15:04:05 UTC"))
+}
+
+func writeCluster(b *strings.Builder, f anomaly.Finding) {
+	if f.Cluster == nil {
+		return
+	}
+	c := f.Cluster
+	b.WriteString("\n<b>Cluster</b>\n")
+	fmt.Fprintf(b, "• <b>%d anomalous trades</b>\n", c.AnomalousTrades)
+	fmt.Fprintf(b, "• <b>%d unique traders</b>\n", c.UniqueWallets)
+	fmt.Fprintf(b, "• <b>$%s total anomalous notional</b>\n", money(c.TotalUSD))
+	fmt.Fprintf(b, "• window: %s\n", c.Window)
+	if len(c.Sample) > 0 {
+		b.WriteString("\n<b>Recent contributors</b>\n")
+		for _, t := range c.Sample {
+			title := t.Question
+			if title == "" {
+				title = t.Slug
+			}
+			if title == "" {
+				title = string(t.Market)
+			}
+			fmt.Fprintf(b, "• $%s on <i>%s</i> — <code>%s</code> %s\n",
+				money(t.NotionalUSD), html.EscapeString(title),
+				html.EscapeString(shortWallet(t.Wallet)), html.EscapeString(t.Outcome))
+		}
+	}
+}
+
+func writeLinks(b *strings.Builder, f anomaly.Finding) {
+	if f.MarketURL == "" && f.GrafanaURL == "" {
+		return
+	}
+	b.WriteString("\n<b>Links</b>\n")
+	parts := make([]string, 0, 2)
 	if f.MarketURL != "" {
-		fmt.Fprintf(b, "[open market](%s)", f.MarketURL)
+		parts = append(parts, fmt.Sprintf(`<a href="%s">Polymarket</a>`, html.EscapeString(f.MarketURL)))
 	}
 	if f.GrafanaURL != "" {
-		if f.MarketURL != "" {
-			b.WriteString("  •  ")
+		parts = append(parts, fmt.Sprintf(`<a href="%s">Grafana</a>`, html.EscapeString(f.GrafanaURL)))
+	}
+	b.WriteString(strings.Join(parts, " · "))
+}
+
+// --- helpers ---------------------------------------------------------------
+
+func tradeTitle(f anomaly.Finding) string {
+	if f.Trade != nil {
+		if f.Trade.Question != "" {
+			return f.Trade.Question
 		}
-		fmt.Fprintf(b, "[open in Grafana](%s)", f.GrafanaURL)
+		if f.Trade.Slug != "" {
+			return f.Trade.Slug
+		}
+		return string(f.Trade.Market)
 	}
+	return "anomaly"
 }
 
-// severityBadge returns a short uppercased label for the alert header. We
-// deliberately avoid `[` because Telegram's legacy "Markdown" parse mode reads
-// it as the start of a `[text](url)` link and rejects the whole message with
-// a 400 ("can't parse entities").
-func severityBadge(s anomaly.Severity) string {
-	switch s {
-	case anomaly.SeverityHard:
-		return "HARD"
-	case anomaly.SeverityCritical:
-		return "CRIT"
-	case anomaly.SeverityWarning:
-		return "WARN"
-	case anomaly.SeverityInfo:
-		return "INFO"
+func notional(f anomaly.Finding) float64 {
+	if f.Trade != nil {
+		return f.Trade.NotionalUSD
 	}
-	return "ANOM"
-}
-
-func nonEmpty(a, b string) string {
-	if a != "" {
-		return a
+	if f.Cluster != nil {
+		return f.Cluster.TotalUSD
 	}
-	return b
+	return 0
 }
 
 // shortWallet returns "0xabcd…wxyz" for a 0x-address.
@@ -353,8 +369,6 @@ func money(v float64) string {
 
 func multiplierFmt(m float64) string {
 	switch {
-	case m >= 1000:
-		return fmt.Sprintf("%.0f", m)
 	case m >= 100:
 		return fmt.Sprintf("%.0f", m)
 	case m >= 10:
@@ -362,11 +376,4 @@ func multiplierFmt(m float64) string {
 	default:
 		return fmt.Sprintf("%.2f", m)
 	}
-}
-
-// escapeMarkdown blunts the legacy "Markdown" parse-mode reserved chars so
-// market questions don't break rendering.
-func escapeMarkdown(s string) string {
-	r := strings.NewReplacer("_", `\_`, "*", `\*`, "`", "\\`", "[", `\[`)
-	return r.Replace(s)
 }

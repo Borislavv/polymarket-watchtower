@@ -38,6 +38,10 @@ type Config struct {
 	Window time.Duration
 	// MaxSamples caps the ring buffer per bucket. 0 → defaultMaxSamples.
 	MaxSamples int
+	// MinTradeUSD drops samples below this notional from the baseline. Cleans
+	// out micro-trade noise that would otherwise drag the median into the
+	// cents range and inflate every multiplier. 0 → no filter.
+	MinTradeUSD float64
 	// Clock optionally overrides time.Now (tests).
 	Clock func() time.Time
 }
@@ -79,8 +83,10 @@ func New(cfg Config) *Baseline {
 }
 
 // Add records one trade's USD notional in the bucket. Safe for concurrent calls.
+// Notionals at or below cfg.MinTradeUSD are dropped so the baseline reflects
+// "real" trades, not retail dust.
 func (b *Baseline) Add(k Key, notionalUSD float64, at time.Time) {
-	if notionalUSD <= 0 {
+	if notionalUSD <= 0 || notionalUSD < b.cfg.MinTradeUSD {
 		return
 	}
 	b.mu.Lock()

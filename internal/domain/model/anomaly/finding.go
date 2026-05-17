@@ -123,10 +123,11 @@ type Finding struct {
 	Reason string
 
 	// Single-trade anomaly fields.
-	Trade      *TradeRef
-	Baseline   *BaselineRef
-	Multiplier float64 // observed NotionalUSD / Baseline.MedianUSD (0 if N/A)
-	OddsRung   float64 // crossed odds-ladder rung (0 if N/A)
+	Trade          *TradeRef
+	Baseline       *BaselineRef
+	Multiplier     float64  // observed NotionalUSD / Baseline.MedianUSD (0 if N/A)
+	AbsoluteTier   Severity // tier crossed by the (notional, odds) pair
+	MultiplierTier Severity // tier crossed by the multiplier ladder
 
 	// Cluster fields.
 	Category *CategoryRef

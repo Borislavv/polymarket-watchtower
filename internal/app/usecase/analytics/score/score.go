@@ -2,20 +2,14 @@
 // single_cluster thresholds, returning at most one anomaly result. It is pure
 // (no I/O, no clock, no goroutines) and trivial to test exhaustively.
 //
-// Three independent signals are evaluated; the higher severity wins:
+// A trade fires only when BOTH ladders qualify at info or above:
+//   - Absolute (notional AND odds) — guards against tiny bets and against bets
+//     at near-even odds where there's no asymmetric-payoff insider angle.
+//   - Multiplier (notional / baseline median) — guards against ordinary big
+//     bets on busy markets; the baseline must already be material.
 //
-//  1. Whale (relative): the trade's USD notional crosses a multiplier of the
-//     baseline median for the same (category, market, outcome). Gated by
-//     MinTradeUSD (no whale alerts on $5 bets) plus baseline-sample floors
-//     (no "first trade looks like ∞×" false positives).
-//
-//  2. High odds: 1/price crosses an odds ladder. Catches the
-//     asymmetric-payoff insider pattern (large bet on a long-odds leg) even
-//     when no baseline exists. Gated by a softer notional floor so a $1
-//     joke bet on a 0.001 outcome stays silent.
-//
-//  3. Combined: when both fire, the reason becomes HighOddsWhaleDetected —
-//     the strongest single-trade signal we can emit.
+// Final severity is the lower (conservative) of the two — see
+// anomaly.ConservativeMin. Either side below info ⇒ no alert.
 package score
 
 import (
@@ -25,74 +19,44 @@ import (
 
 // Result is the outcome of scoring one trade.
 type Result struct {
-	Fired      bool
-	Severity   anomaly.Severity
-	Reason     string  // one of anomaly.Reason* constants when Fired
-	Multiplier float64 // notional / baseline median; 0 when whale path did not run
-	OddsRung   float64 // crossed odds-ladder rung; 0 when odds path did not fire
+	Fired          bool
+	Severity       anomaly.Severity // conservative MIN of absolute and multiplier tiers
+	AbsoluteTier   anomaly.Severity // tier crossed by (notional, odds)
+	MultiplierTier anomaly.Severity // tier crossed by (notional / baseline median)
+	Multiplier     float64          // observed notional / baseline median (0 if not evaluated)
+	Odds           float64          // 1/price
 }
 
-// Score evaluates the trade. price is the Polymarket implied probability of
-// the outcome leg ((0,1)), so odds = 1/price (>=1).
+// Score evaluates the trade. price is the implied probability (0,1); odds = 1/price.
 func Score(notionalUSD, price float64, bs baseline.Stats, t anomaly.Thresholds) Result {
 	if notionalUSD <= 0 || price <= 0 {
 		return Result{}
 	}
 	odds := 1.0 / price
 
-	var (
-		whaleSev   anomaly.Severity
-		whaleMul   float64
-		whaleFired bool
-	)
-	if notionalUSD >= t.MinTradeUSD &&
-		bs.Count >= t.MinBaselineTrades &&
-		bs.TotalUSD >= t.MinBaselineNotionalUSD &&
-		bs.MedianUSD > 0 &&
-		len(t.MultiplierLadder) > 0 {
-		whaleMul = notionalUSD / bs.MedianUSD
-		if sev, _, ok := anomaly.SeverityForLadder(whaleMul, t.MultiplierLadder); ok {
-			whaleSev, whaleFired = sev, true
-		}
+	absTier := t.AbsoluteTier(notionalUSD, odds)
+	if absTier == "" {
+		return Result{Odds: odds}
 	}
 
-	// Odds path uses a softer notional floor (MinTradeUSD/10) so small but
-	// asymmetric bets are not silently dropped — they are exactly the signal
-	// the spec wants ("Very high odds: meaningful notional with lower confidence").
-	var (
-		oddsSev   anomaly.Severity
-		oddsHit   float64
-		oddsFired bool
-	)
-	if len(t.OddsLadder) > 0 && notionalUSD >= t.MinTradeUSD/10 {
-		if sev, hit, ok := anomaly.SeverityForLadder(odds, t.OddsLadder); ok {
-			oddsSev, oddsHit, oddsFired = sev, hit, true
-		}
+	// Multiplier path requires a meaningful baseline; without it we refuse to
+	// rank rarity and the trade goes unalerted (spec: "If baseline is
+	// insufficient, do not produce normal alert").
+	if bs.Count < t.MinBaselineTrades || bs.TotalUSD < t.MinBaselineNotionalUSD || bs.MedianUSD <= 0 {
+		return Result{Odds: odds, AbsoluteTier: absTier}
+	}
+	mul := notionalUSD / bs.MedianUSD
+	mulTier := t.MultiplierTier(mul)
+	if mulTier == "" {
+		return Result{Odds: odds, AbsoluteTier: absTier, Multiplier: mul}
 	}
 
-	switch {
-	case whaleFired && oddsFired:
-		return Result{
-			Fired:      true,
-			Severity:   anomaly.MaxSeverity(whaleSev, oddsSev),
-			Reason:     anomaly.ReasonHighOddsWhale,
-			Multiplier: whaleMul,
-			OddsRung:   oddsHit,
-		}
-	case whaleFired:
-		return Result{
-			Fired:      true,
-			Severity:   whaleSev,
-			Reason:     anomaly.ReasonWhale,
-			Multiplier: whaleMul,
-		}
-	case oddsFired:
-		return Result{
-			Fired:    true,
-			Severity: oddsSev,
-			Reason:   anomaly.ReasonHighOdds,
-			OddsRung: oddsHit,
-		}
+	return Result{
+		Fired:          true,
+		Severity:       anomaly.ConservativeMin(absTier, mulTier),
+		AbsoluteTier:   absTier,
+		MultiplierTier: mulTier,
+		Multiplier:     mul,
+		Odds:           odds,
 	}
-	return Result{}
 }

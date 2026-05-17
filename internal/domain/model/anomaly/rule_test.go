@@ -2,58 +2,74 @@ package anomaly
 
 import "testing"
 
-func TestThresholdsNormaliseSortsAndDedupes(t *testing.T) {
-	x := Thresholds{MultiplierLadder: []float64{1000, 30, 30, 100}, OddsLadder: []float64{25, 3, 10}}
-	x.Normalise()
-	if got := x.MultiplierLadder; len(got) != 3 || got[0] != 30 || got[1] != 100 || got[2] != 1000 {
-		t.Fatalf("multipliers: %v", got)
-	}
-	if got := x.OddsLadder; len(got) != 3 || got[0] != 3 || got[1] != 10 || got[2] != 25 {
-		t.Fatalf("odds: %v", got)
+func defaultThresholds() Thresholds {
+	return Thresholds{
+		Info:                   Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
+		Warning:                Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
+		Critical:               Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 1_000,
 	}
 }
 
-func TestSeverityForLadder(t *testing.T) {
-	ladder := []float64{30, 100, 1000}
+func TestAbsoluteTierRequiresBothNotionalAndOdds(t *testing.T) {
+	th := defaultThresholds()
 	cases := []struct {
-		v       float64
-		want    Severity
-		fire    bool
-		wantHit float64
+		name           string
+		notional, odds float64
+		want           Severity
 	}{
-		{29, "", false, 0},
-		{30, SeverityInfo, true, 30},
-		{99.999, SeverityInfo, true, 30},
-		{100, SeverityWarning, true, 100},
-		{999, SeverityWarning, true, 100},
-		{1000, SeverityCritical, true, 1000},
-		{1_000_000, SeverityCritical, true, 1000},
+		{"below_info_notional", 9_999, 5, ""},
+		{"below_info_odds", 10_000, 2.99, ""},
+		{"info_exact", 10_000, 3, SeverityInfo},
+		{"info_high_odds_low_notional", 15_000, 4, SeverityInfo},
+		{"warning_both_meet", 25_000, 5, SeverityWarning},
+		{"warning_notional_not_critical", 99_999, 8, SeverityWarning},
+		{"critical_both_meet", 100_000, 8, SeverityCritical},
+		{"critical_odds_not_met", 200_000, 7, SeverityWarning},
 	}
 	for _, c := range cases {
-		sev, hit, ok := SeverityForLadder(c.v, ladder)
-		if ok != c.fire || sev != c.want {
-			t.Errorf("v=%v: got (%s,%v) want (%s,%v)", c.v, sev, ok, c.want, c.fire)
-		}
-		if c.fire && hit != c.wantHit {
-			t.Errorf("v=%v: hit=%v want %v", c.v, hit, c.wantHit)
+		t.Run(c.name, func(t *testing.T) {
+			if got := th.AbsoluteTier(c.notional, c.odds); got != c.want {
+				t.Fatalf("notional=%v odds=%v: got %q want %q", c.notional, c.odds, got, c.want)
+			}
+		})
+	}
+}
+
+func TestMultiplierTier(t *testing.T) {
+	th := defaultThresholds()
+	cases := []struct {
+		mul  float64
+		want Severity
+	}{
+		{99, ""},
+		{100, SeverityInfo},
+		{999, SeverityInfo},
+		{1000, SeverityWarning},
+		{9999, SeverityWarning},
+		{10_000, SeverityCritical},
+		{1_000_000, SeverityCritical},
+	}
+	for _, c := range cases {
+		if got := th.MultiplierTier(c.mul); got != c.want {
+			t.Errorf("mul=%v: got %q want %q", c.mul, got, c.want)
 		}
 	}
 }
 
-func TestSeverityForEmptyLadderNeverFires(t *testing.T) {
-	if _, _, ok := SeverityForLadder(1e9, nil); ok {
-		t.Fatal("empty ladder should never fire")
+func TestConservativeMin(t *testing.T) {
+	cases := []struct{ a, b, want Severity }{
+		{SeverityInfo, SeverityCritical, SeverityInfo},
+		{SeverityCritical, SeverityWarning, SeverityWarning},
+		{SeverityWarning, SeverityWarning, SeverityWarning},
+		{"", SeverityCritical, ""},
+		{SeverityCritical, "", ""},
+		{"", "", ""},
 	}
-}
-
-func TestMaxSeverity(t *testing.T) {
-	if got := MaxSeverity(SeverityInfo, SeverityCritical); got != SeverityCritical {
-		t.Fatalf("got %s", got)
-	}
-	if got := MaxSeverity(SeverityHard, SeverityCritical); got != SeverityHard {
-		t.Fatalf("got %s", got)
-	}
-	if got := MaxSeverity("", SeverityInfo); got != SeverityInfo {
-		t.Fatalf("got %s", got)
+	for _, c := range cases {
+		if got := ConservativeMin(c.a, c.b); got != c.want {
+			t.Errorf("ConservativeMin(%q,%q) = %q want %q", c.a, c.b, got, c.want)
+		}
 	}
 }

@@ -84,28 +84,49 @@ type AggregateConfig struct {
 }
 
 // AnomalyConfig encodes the per-trade single_cluster detector and the
-// category-cluster (CategoryWatchRequired / HARD) alert. See score.Score for
-// the full semantics of each signal.
+// category-cluster (CategoryWatchRequired / HARD) alert.
+//
+// Single-trade scoring uses the combined AND strategy (see score.Score):
+//
+//	            absolute (notional AND odds)   multiplier ladder
+//	Info        $10k AND odds 3                ≥ 100×
+//	Warning     $25k AND odds 5                ≥ 1000×
+//	Critical    $100k AND odds 8               ≥ 10000×
+//
+// Final severity is the conservative MIN of the two tiers; below info on
+// either side ⇒ no alert. Baseline samples below BaselineMinTradeUSD are
+// dropped before the median is computed so micro-trades don't poison it.
 type AnomalyConfig struct {
 	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
 
-	SingleMinTradeUSD            float64       `env:"SINGLE_MIN_TRADE_USD" envDefault:"10000" validate:"gte=0"`
-	SingleMultiplierThresholds   []float64     `env:"SINGLE_MULTIPLIER_THRESHOLDS" envDefault:"30,100,1000" envSeparator:","`
-	SingleOddsThresholds         []float64     `env:"SINGLE_ODDS_THRESHOLDS" envDefault:"3,10,25" envSeparator:","`
+	// Absolute ladder (notional + odds floors).
+	InfoMinNotionalUSD     float64 `env:"ALERT_INFO_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
+	InfoMinOdds            float64 `env:"ALERT_INFO_MIN_ODDS" envDefault:"3" validate:"gte=1"`
+	InfoMinMultiplier      float64 `env:"ALERT_INFO_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
+	WarningMinNotionalUSD  float64 `env:"ALERT_WARNING_MIN_NOTIONAL_USD" envDefault:"25000" validate:"gte=0"`
+	WarningMinOdds         float64 `env:"ALERT_WARNING_MIN_ODDS" envDefault:"5" validate:"gte=1"`
+	WarningMinMultiplier   float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+	CriticalMinNotionalUSD float64 `env:"ALERT_CRITICAL_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
+	CriticalMinOdds        float64 `env:"ALERT_CRITICAL_MIN_ODDS" envDefault:"8" validate:"gte=1"`
+	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
+
+	// Baseline shape.
+	BaselineMinTradeUSD          float64       `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
 	SingleMinBaselineTrades      int           `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
 	SingleMinBaselineNotionalUSD float64       `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
 	BaselineWindow               time.Duration `env:"BASELINE_WINDOW" envDefault:"168h" validate:"required"`
 	BaselineMaxSamples           int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
 
+	// Cluster (HARD) alert.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
 	ClusterMinTrades   int           `env:"CLUSTER_MIN_ANOMALOUS_TRADES" envDefault:"3" validate:"gte=2"`
 	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
 	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"30000" validate:"gte=0"`
 	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
 
-	// Volume mode (legacy) ---------------------------------------------------
+	// Volume mode (legacy).
 	VolumeMultipliers []float64     `env:"VOLUME_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`
-	VolumeMinNotional float64       `env:"VOLUME_MIN_NOTIONAL_USD" envDefault:"500" validate:"gte=0"`
+	VolumeMinNotional float64       `env:"VOLUME_MIN_NOTIONAL_USD" envDefault:"5000" validate:"gte=0"`
 	VolumeMinTrades   int           `env:"VOLUME_MIN_TRADES" envDefault:"5" validate:"gte=0"`
 	VolumeCooldown    time.Duration `env:"VOLUME_COOLDOWN" envDefault:"30m" validate:"required"`
 }

@@ -80,7 +80,6 @@ func New(
 	m *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Loop {
-	cfg.Thresholds.Normalise()
 	if cfg.GaugeInterval <= 0 {
 		cfg.GaugeInterval = time.Minute
 	}
@@ -221,7 +220,7 @@ func (l *Loop) emitTradeAnomaly(
 		Kind:     anomaly.KindTradeAnomaly,
 		Severity: sr.Severity,
 		At:       l.now(),
-		Reason:   sr.Reason,
+		Reason:   anomaly.ReasonSingle,
 		Trade:    &ref,
 		Category: &catRef,
 		Baseline: &anomaly.BaselineRef{
@@ -232,20 +231,18 @@ func (l *Loop) emitTradeAnomaly(
 			SampleN:   stats.Count,
 			WindowAgo: l.cfg.Baseline.Window,
 		},
-		Multiplier: sr.Multiplier,
-		OddsRung:   sr.OddsRung,
-		MarketURL:  l.marketURL(m),
-		GrafanaURL: l.grafanaURL(catRef, m, t.Timestamp),
+		Multiplier:     sr.Multiplier,
+		AbsoluteTier:   sr.AbsoluteTier,
+		MultiplierTier: sr.MultiplierTier,
+		MarketURL:      l.marketURL(m),
+		GrafanaURL:     l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
 	}
-	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), sr.Reason).Inc()
+	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
 	if sr.Multiplier > 0 {
 		l.metrics.TradeAnomalyMultiplier.Observe(sr.Multiplier)
 	}
 	if ref.Odds > 0 {
 		l.metrics.TradeOdds.Observe(ref.Odds)
-	}
-	if sr.Reason == anomaly.ReasonHighOdds || sr.Reason == anomaly.ReasonHighOddsWhale {
-		l.metrics.HighOddsTrades.WithLabelValues(string(sr.Severity), categoryLabel(catRef)).Inc()
 	}
 	l.metrics.CategoryAnomalousTrades.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Inc()
 	l.metrics.CategoryAnomalousUSD.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Add(ref.NotionalUSD)
@@ -270,7 +267,7 @@ func (l *Loop) emitCategoryWatch(
 		Category:   &catRef,
 		Cluster:    cs,
 		MarketURL:  l.marketURL(m),
-		GrafanaURL: l.grafanaURL(catRef, market.Market{}, t.Timestamp),
+		GrafanaURL: l.grafanaURL(catRef, market.Market{}, t.Timestamp, anomaly.SeverityHard),
 	}
 	l.metrics.CategoryHardAlerts.WithLabelValues(categoryLabel(catRef)).Inc()
 	if err := l.emit.Notify(ctx, f); err != nil {
@@ -318,7 +315,7 @@ func (l *Loop) marketURL(m market.Market) string {
 
 // grafanaURL builds a deep-link with from/to ±GrafanaContext around `at` and
 // the right dashboard variables. Empty when not configured.
-func (l *Loop) grafanaURL(cat anomaly.CategoryRef, m market.Market, at time.Time) string {
+func (l *Loop) grafanaURL(cat anomaly.CategoryRef, m market.Market, at time.Time, sev anomaly.Severity) string {
 	if l.cfg.GrafanaBase == "" || l.cfg.GrafanaDashUID == "" {
 		return ""
 	}
@@ -337,6 +334,9 @@ func (l *Loop) grafanaURL(cat anomaly.CategoryRef, m market.Market, at time.Time
 	}
 	if m.Slug != "" {
 		q.Set("var-market", m.Slug)
+	}
+	if sev != "" {
+		q.Set("var-severity", string(sev))
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

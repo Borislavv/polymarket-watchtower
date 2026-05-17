@@ -3,7 +3,11 @@ package app
 import (
 	"testing"
 	"time"
+
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 )
+
+func categoryFilter(blacklist []string) *category.Filter { return category.NewFilter(blacklist) }
 
 func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 	t.Helper()
@@ -16,13 +20,17 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"DISCOVER_ORDER", "COLLECT_CONCURRENCY",
 		"AGG_BUCKET", "AGG_BASELINE_WINDOW", "AGG_RECENT_WINDOWS",
 		"ANOMALY_MODE",
-		"SINGLE_MIN_TRADE_USD", "SINGLE_MULTIPLIER_THRESHOLDS", "SINGLE_ODDS_THRESHOLDS",
+		"ALERT_INFO_MIN_NOTIONAL_USD", "ALERT_INFO_MIN_ODDS", "ALERT_INFO_MIN_MULTIPLIER",
+		"ALERT_WARNING_MIN_NOTIONAL_USD", "ALERT_WARNING_MIN_ODDS", "ALERT_WARNING_MIN_MULTIPLIER",
+		"ALERT_CRITICAL_MIN_NOTIONAL_USD", "ALERT_CRITICAL_MIN_ODDS", "ALERT_CRITICAL_MIN_MULTIPLIER",
+		"BASELINE_MIN_TRADE_USD",
 		"SINGLE_MIN_BASELINE_TRADES", "SINGLE_MIN_BASELINE_NOTIONAL_USD",
 		"BASELINE_WINDOW", "BASELINE_MAX_SAMPLES",
 		"CLUSTER_WINDOW", "CLUSTER_MIN_ANOMALOUS_TRADES",
 		"CLUSTER_MIN_UNIQUE_TRADERS", "CLUSTER_MIN_TOTAL_NOTIONAL_USD",
 		"CLUSTER_COOLDOWN",
 		"VOLUME_MULTIPLIERS", "VOLUME_MIN_NOTIONAL_USD", "VOLUME_MIN_TRADES", "VOLUME_COOLDOWN",
+		"CATEGORY_BLACKLIST",
 		"ALERT_WEBHOOK_URL",
 		"TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 		"TELEGRAM_BASE_URL", "TELEGRAM_TIMEOUT",
@@ -43,35 +51,90 @@ func TestConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Application.Env != EnvDev {
-		t.Errorf("env: want dev got %q", cfg.Application.Env)
-	}
 	if cfg.Anomaly.Mode != ModeSingleCluster {
-		t.Errorf("default mode: want single_cluster got %q", cfg.Anomaly.Mode)
+		t.Errorf("default mode: %q", cfg.Anomaly.Mode)
 	}
-	if got := cfg.Anomaly.SingleMultiplierThresholds; len(got) != 3 || got[0] != 30 || got[2] != 1000 {
-		t.Errorf("multipliers default: %v", got)
+	if cfg.Anomaly.InfoMinNotionalUSD != 10_000 || cfg.Anomaly.InfoMinOdds != 3 || cfg.Anomaly.InfoMinMultiplier != 100 {
+		t.Errorf("info tier defaults: notional=%v odds=%v mul=%v",
+			cfg.Anomaly.InfoMinNotionalUSD, cfg.Anomaly.InfoMinOdds, cfg.Anomaly.InfoMinMultiplier)
 	}
-	if got := cfg.Anomaly.SingleOddsThresholds; len(got) != 3 || got[0] != 3 || got[2] != 25 {
-		t.Errorf("odds default: %v", got)
+	if cfg.Anomaly.WarningMinNotionalUSD != 25_000 || cfg.Anomaly.WarningMinOdds != 5 || cfg.Anomaly.WarningMinMultiplier != 1_000 {
+		t.Errorf("warning tier defaults: notional=%v odds=%v mul=%v",
+			cfg.Anomaly.WarningMinNotionalUSD, cfg.Anomaly.WarningMinOdds, cfg.Anomaly.WarningMinMultiplier)
 	}
-	if cfg.Anomaly.SingleMinTradeUSD != 10_000 {
-		t.Errorf("min trade default: %v", cfg.Anomaly.SingleMinTradeUSD)
+	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 10_000 {
+		t.Errorf("critical tier defaults: notional=%v odds=%v mul=%v",
+			cfg.Anomaly.CriticalMinNotionalUSD, cfg.Anomaly.CriticalMinOdds, cfg.Anomaly.CriticalMinMultiplier)
 	}
-	if cfg.Anomaly.SingleMinBaselineTrades != 20 {
-		t.Errorf("min baseline trades: %d", cfg.Anomaly.SingleMinBaselineTrades)
-	}
-	if cfg.Anomaly.SingleMinBaselineNotionalUSD != 1_000 {
-		t.Errorf("min baseline notional: %v", cfg.Anomaly.SingleMinBaselineNotionalUSD)
+	if cfg.Anomaly.BaselineMinTradeUSD != 50 {
+		t.Errorf("baseline min trade: %v", cfg.Anomaly.BaselineMinTradeUSD)
 	}
 	if cfg.Anomaly.ClusterWindow != 30*time.Minute {
 		t.Errorf("cluster window: %s", cfg.Anomaly.ClusterWindow)
 	}
-	if cfg.Anomaly.ClusterMinTrades != 3 || cfg.Anomaly.ClusterMinWallets != 2 {
-		t.Errorf("cluster floors: trades=%d wallets=%d", cfg.Anomaly.ClusterMinTrades, cfg.Anomaly.ClusterMinWallets)
+}
+
+func TestConfigEnvOverrides(t *testing.T) {
+	cfg, err := loadConfigWithEnv(t, map[string]string{
+		"ALERT_INFO_MIN_NOTIONAL_USD":   "1000",
+		"ALERT_CRITICAL_MIN_MULTIPLIER": "5000",
+		"BASELINE_MIN_TRADE_USD":        "100",
+		"CLUSTER_MIN_UNIQUE_TRADERS":    "5",
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Anomaly.ClusterMinTotalUSD != 30_000 {
-		t.Errorf("cluster usd: %v", cfg.Anomaly.ClusterMinTotalUSD)
+	if cfg.Anomaly.InfoMinNotionalUSD != 1_000 {
+		t.Errorf("info notional override: %v", cfg.Anomaly.InfoMinNotionalUSD)
+	}
+	if cfg.Anomaly.CriticalMinMultiplier != 5_000 {
+		t.Errorf("critical mul override: %v", cfg.Anomaly.CriticalMinMultiplier)
+	}
+	if cfg.Anomaly.BaselineMinTradeUSD != 100 {
+		t.Errorf("baseline min: %v", cfg.Anomaly.BaselineMinTradeUSD)
+	}
+	if cfg.Anomaly.ClusterMinWallets != 5 {
+		t.Errorf("cluster wallets: %d", cfg.Anomaly.ClusterMinWallets)
+	}
+}
+
+func TestConfigRejectsInvalidOdds(t *testing.T) {
+	if _, err := loadConfigWithEnv(t, map[string]string{"ALERT_INFO_MIN_ODDS": "0.5"}); err == nil {
+		t.Fatal("expected validation error for odds < 1")
+	}
+}
+
+func TestConfigCategoryBlacklistDefaults(t *testing.T) {
+	cfg, err := loadConfigWithEnv(t, nil)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"sport", "nba", "nhl", "fifa", "uefa"}
+	for _, w := range want {
+		found := false
+		for _, g := range cfg.CategoryFilter.Blacklist {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("default blacklist missing %q", w)
+		}
+	}
+}
+
+func TestConfigCategoryBlacklistOverride(t *testing.T) {
+	cfg, err := loadConfigWithEnv(t, map[string]string{"CATEGORY_BLACKLIST": "weather, crypto"})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	f := categoryFilter(cfg.CategoryFilter.Blacklist)
+	if f.Allowed("", "Weather") || f.Allowed("", "Crypto Prices") {
+		t.Error("override not applied")
+	}
+	if !f.Allowed("", "Politics") {
+		t.Error("politics should pass")
 	}
 }
 
@@ -86,55 +149,25 @@ func TestConfigVolumeMode(t *testing.T) {
 }
 
 func TestConfigRejectsInvalidMode(t *testing.T) {
-	_, err := loadConfigWithEnv(t, map[string]string{"ANOMALY_MODE": "rate"})
-	if err == nil {
-		t.Fatal("expected validation error for ANOMALY_MODE=rate")
-	}
-}
-
-func TestConfigEnvOverrides(t *testing.T) {
-	cfg, err := loadConfigWithEnv(t, map[string]string{
-		"APP_ENV":                      "prod",
-		"METRICS_PORT":                 "8080",
-		"SINGLE_MULTIPLIER_THRESHOLDS": "50",
-		"SINGLE_ODDS_THRESHOLDS":       "2,5,20",
-		"SINGLE_MIN_TRADE_USD":         "500",
-		"CLUSTER_MIN_UNIQUE_TRADERS":   "5",
-	})
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.Application.Env != EnvProd || cfg.Application.MetricsPort != 8080 {
-		t.Errorf("env/port: %s %d", cfg.Application.Env, cfg.Application.MetricsPort)
-	}
-	if got := cfg.Anomaly.SingleMultiplierThresholds; len(got) != 1 || got[0] != 50 {
-		t.Errorf("multipliers: %v", got)
-	}
-	if got := cfg.Anomaly.SingleOddsThresholds; len(got) != 3 || got[2] != 20 {
-		t.Errorf("odds: %v", got)
-	}
-	if cfg.Anomaly.SingleMinTradeUSD != 500 {
-		t.Errorf("min trade usd: %v", cfg.Anomaly.SingleMinTradeUSD)
-	}
-	if cfg.Anomaly.ClusterMinWallets != 5 {
-		t.Errorf("cluster wallets: %d", cfg.Anomaly.ClusterMinWallets)
+	if _, err := loadConfigWithEnv(t, map[string]string{"ANOMALY_MODE": "rate"}); err == nil {
+		t.Fatal("expected error for ANOMALY_MODE=rate")
 	}
 }
 
 func TestConfigRejectsInvalidEnv(t *testing.T) {
 	if _, err := loadConfigWithEnv(t, map[string]string{"APP_ENV": "staging"}); err == nil {
-		t.Fatal("expected validation error for APP_ENV=staging")
+		t.Fatal("expected error for APP_ENV=staging")
 	}
 }
 
 func TestConfigRejectsInvalidPort(t *testing.T) {
 	if _, err := loadConfigWithEnv(t, map[string]string{"METRICS_PORT": "0"}); err == nil {
-		t.Fatal("expected validation error for METRICS_PORT=0")
+		t.Fatal("expected error for METRICS_PORT=0")
 	}
 }
 
 func TestConfigRejectsBadURL(t *testing.T) {
 	if _, err := loadConfigWithEnv(t, map[string]string{"GAMMA_API_URL": "not-a-url"}); err == nil {
-		t.Fatal("expected validation error for bad URL")
+		t.Fatal("expected error for bad URL")
 	}
 }

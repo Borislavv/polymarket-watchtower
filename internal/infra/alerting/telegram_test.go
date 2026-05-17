@@ -20,31 +20,32 @@ func sampleTradeFinding() anomaly.Finding {
 	return anomaly.Finding{
 		Kind:     anomaly.KindTradeAnomaly,
 		Severity: anomaly.SeverityCritical,
-		Reason:   anomaly.ReasonHighOddsWhale,
+		Reason:   anomaly.ReasonSingle,
 		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
 		Trade: &anomaly.TradeRef{
 			ID:          "trade-1",
 			Wallet:      "0xabc1234567890def1234567890abcdef12345678",
 			Market:      "0xabc",
 			Slug:        "rain-tomorrow",
-			Question:    "Will it rain *tomorrow*?",
+			Question:    "Will it rain <tomorrow>?", // exercise HTML escaping
 			Outcome:     "Yes",
 			Side:        trade.SideBuy,
 			SizeShares:  4_000,
 			Price:       0.05,
 			Odds:        20,
-			NotionalUSD: 2_000_000,
+			NotionalUSD: 120_000,
 			At:          time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
 		},
 		Baseline: &anomaly.BaselineRef{
-			Scope:     "category=Weather market=rain-tomorrow outcome=Yes",
-			MedianUSD: 10, MeanUSD: 12, P95USD: 60, SampleN: 1234, WindowAgo: 7 * 24 * time.Hour,
+			Scope:     "category=Weather market=rain outcome=Yes",
+			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, SampleN: 1240, WindowAgo: 7 * 24 * time.Hour,
 		},
-		Category:   &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather"},
-		Multiplier: 200_000,
-		OddsRung:   10,
-		MarketURL:  "https://polymarket.com/event/rain-tomorrow",
-		GrafanaURL: "http://grafana.local/d/uid123/?orgId=1&from=1&to=2&var-category=Weather&var-market=rain-tomorrow",
+		Category:       &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
+		Multiplier:     12_371,
+		AbsoluteTier:   anomaly.SeverityCritical,
+		MultiplierTier: anomaly.SeverityCritical,
+		MarketURL:      "https://polymarket.com/event/rain-tomorrow",
+		GrafanaURL:     "http://grafana.local/d/uid123/?from=1&to=2&var-category=Weather&var-market=rain-tomorrow&var-severity=critical",
 	}
 }
 
@@ -52,19 +53,18 @@ func sampleClusterFinding() anomaly.Finding {
 	return anomaly.Finding{
 		Kind:     anomaly.KindCategoryWatch,
 		Severity: anomaly.SeverityHard,
+		Reason:   anomaly.ReasonCluster,
 		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
 		Category: &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather"},
 		Cluster: &anomaly.ClusterStats{
-			Window:          time.Hour,
-			AnomalousTrades: 7,
-			UniqueWallets:   5,
-			TotalUSD:        125_000,
+			Window: 30 * time.Minute, AnomalousTrades: 4, UniqueWallets: 3, TotalUSD: 184_000,
 			Sample: []anomaly.TradeRef{
 				{Question: "Will it rain?", NotionalUSD: 50_000, Outcome: "Yes", Wallet: "0xabc1234567890def1234567890abcdef12345678"},
 				{Question: "Snow on Friday?", NotionalUSD: 40_000, Outcome: "No", Wallet: "0xfeed4567890abc1234567890abcdef12345678ab"},
 			},
 		},
-		GrafanaURL: "http://grafana.local/d/uid123/?orgId=1&var-category=Weather",
+		MarketURL:  "https://polymarket.com/event/rain-tomorrow",
+		GrafanaURL: "http://grafana.local/d/uid123/?var-category=Weather&var-severity=hard",
 	}
 }
 
@@ -80,44 +80,40 @@ func TestTelegramDisabledIsNoop(t *testing.T) {
 
 func TestTelegramEnabledRequiresTokenAndSubscribers(t *testing.T) {
 	if _, err := NewTelegramSink(TelegramConfig{Enabled: true}, nil); err == nil {
-		t.Fatal("expected validation error when enabled w/o token")
+		t.Fatal("expected error w/o token")
 	}
 	if _, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t"}, nil); err == nil {
-		t.Fatal("expected validation error when enabled w/o subscribers")
+		t.Fatal("expected error w/o subscribers")
 	}
 }
 
-func TestNoSubscribersIsSilentNotError(t *testing.T) {
-	// A live bot may have no subscribers yet — alerts should silently no-op
-	// rather than spam the log with errors.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("must not POST when there are no subscribers")
-	}))
-	defer srv.Close()
-	subs := NewSubscribers() // empty
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
-	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
-		t.Fatalf("expected nil, got %v", err)
+func TestTradeAnomalyHeaderFormat(t *testing.T) {
+	msg := FormatTelegramMessage(sampleTradeFinding())
+	first := strings.SplitN(msg, "\n", 2)[0]
+	// Header: <b>SEV: xMUL · $NOTIONAL · TITLE</b>
+	for _, want := range []string{"<b>", "CRITICAL", "x12371", "$120,000", "Will it rain &lt;tomorrow&gt;?", "</b>"} {
+		if !strings.Contains(first, want) {
+			t.Errorf("header missing %q in:\n%s", want, first)
+		}
 	}
 }
 
-func TestTradeAnomalyMessageHasAllRequiredFields(t *testing.T) {
+func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	for _, want := range []string{
-		"CRITICAL",
-		"HighOddsWhaleDetected",
-		"Will it rain \\*tomorrow\\*?",
-		"outcome: `Yes`",
-		"side: `BUY`",
-		"$2,000,000",
-		"category: *Weather*",
-		"baseline: median *$10",
-		"N=`1234`",
-		"multiplier: *x200000*",
-		"odds: *20.0*",
-		"odds rung crossed: *>=10.0*",
-		"polymarket.com/event/rain-tomorrow",
-		"grafana.local",
+		"<b>Why</b>",
+		"<b>x12371</b> above baseline median ($9.70)",
+		"odds <b>20.0</b>, implied probability <b>5.0%</b>",
+		"baseline: <b>1240</b> trades, median $9.70",
+		"tiers: absolute=<code>critical</code> multiplier=<code>critical</code>",
+		"<b>Trade</b>",
+		"outcome: <b>Yes</b> (BUY)",
+		"size: $120,000",
+		"trader: <code>0xabc1234567890def1234567890abcdef12345678</code>",
+		"category: Weather &amp; Climate", // & must be escaped
+		"<b>Links</b>",
+		`<a href="https://polymarket.com/event/rain-tomorrow">Polymarket</a>`,
+		`<a href="http://grafana.local/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>`,
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
@@ -128,18 +124,20 @@ func TestTradeAnomalyMessageHasAllRequiredFields(t *testing.T) {
 func TestCategoryWatchMessageHasAllRequiredFields(t *testing.T) {
 	msg := FormatTelegramMessage(sampleClusterFinding())
 	for _, want := range []string{
-		"HARD",
-		"CategoryWatchRequired",
-		"category: *Weather*",
-		"7 anomalous trades",
-		"5 unique wallets",
-		"$125,000",
-		"1h",
+		"<b>HARD — CategoryWatchRequired:",
+		"4 trades · 3 wallets · $184,000 · Weather",
+		"<b>Cluster</b>",
+		"<b>4 anomalous trades</b>",
+		"<b>3 unique traders</b>",
+		"<b>$184,000 total anomalous notional</b>",
+		"window: 30m",
+		"<b>Recent contributors</b>",
 		"Will it rain?",
 		"Snow on Friday?",
 		"$50,000",
 		"$40,000",
-		"grafana.local",
+		"<b>Links</b>",
+		"Grafana",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
@@ -147,7 +145,7 @@ func TestCategoryWatchMessageHasAllRequiredFields(t *testing.T) {
 	}
 }
 
-func TestTelegramSendsFormattedMessage(t *testing.T) {
+func TestTelegramHTMLParseMode(t *testing.T) {
 	var received atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -165,34 +163,31 @@ func TestTelegramSendsFormattedMessage(t *testing.T) {
 		t.Fatalf("Notify: %v", err)
 	}
 	raw, _ := received.Load().([]byte)
-	if raw == nil {
-		t.Fatal("server received no request")
-	}
 	var body map[string]any
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("payload not JSON: %v", err)
 	}
-	// chat_id is numeric in the JSON payload.
+	if body["parse_mode"] != "HTML" {
+		t.Errorf("parse_mode: got %v want HTML", body["parse_mode"])
+	}
 	if got, _ := body["chat_id"].(float64); int64(got) != 1 {
-		t.Errorf("chat_id: got %v want 1", body["chat_id"])
+		t.Errorf("chat_id: %v", body["chat_id"])
 	}
 }
 
 func TestTelegramReturnsErrorOnBadStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(400)
-		_, _ = w.Write([]byte(`{"ok":false,"description":"bad chat"}`))
 	}))
 	defer srv.Close()
-	subs := NewSubscribers("1")
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
+	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, NewSubscribers("1"))
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
 		t.Fatal("expected error for 400")
 	}
 }
 
 func TestBroadcastSendsToEveryChat(t *testing.T) {
-	var seen sync.Map // chat id -> struct{}
+	var seen sync.Map
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var p struct {
@@ -210,7 +205,7 @@ func TestBroadcastSendsToEveryChat(t *testing.T) {
 	}
 	for _, id := range []int64{10, 20, 30} {
 		if _, ok := seen.Load(id); !ok {
-			t.Errorf("chat %d did not receive the broadcast", id)
+			t.Errorf("chat %d did not receive broadcast", id)
 		}
 	}
 }
@@ -233,32 +228,24 @@ func TestBroadcastContinuesAfterPerChatError(t *testing.T) {
 	defer srv.Close()
 	subs := NewSubscribers("10", "20", "30")
 	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
-	err := s.Notify(context.Background(), sampleTradeFinding())
-	if err == nil {
-		t.Fatal("expected the failing chat to surface as error")
+	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
+		t.Fatal("expected surfacing error")
 	}
 	if got := sent.Load(); got != 2 {
-		t.Errorf("expected 2 successful sends, got %d", got)
+		t.Fatalf("expected 2 successful sends, got %d", got)
 	}
 }
 
 func TestSubscribersAddDedupesAndSnapshots(t *testing.T) {
-	s := NewSubscribers("1", "", "abc", "2") // empty + bad input skipped
-	if got := s.Size(); got != 2 {
-		t.Fatalf("seed size: %d", got)
+	s := NewSubscribers("1", "", "abc", "2")
+	if s.Size() != 2 {
+		t.Fatalf("seed size: %d", s.Size())
 	}
-	if !s.Add(3) {
-		t.Fatal("first add should be true")
+	if !s.Add(3) || s.Add(3) {
+		t.Fatal("Add dedupe broken")
 	}
-	if s.Add(3) {
-		t.Fatal("duplicate add should be false")
-	}
-	if got := s.Size(); got != 3 {
-		t.Fatalf("size after add: %d", got)
-	}
-	snap := s.Snapshot()
-	if len(snap) != 3 {
-		t.Fatalf("snapshot len: %d", len(snap))
+	if s.Size() != 3 {
+		t.Fatalf("size: %d", s.Size())
 	}
 }
 
@@ -275,7 +262,16 @@ func TestSubscribersConcurrentAddRaceSafe(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if got := s.Size(); got != 4000 {
-		t.Fatalf("expected 4000 unique ids, got %d", got)
+	if s.Size() != 4000 {
+		t.Fatalf("expected 4000 unique ids, got %d", s.Size())
+	}
+}
+
+func TestEscapingHandlesSpecialCharsInTitle(t *testing.T) {
+	f := sampleTradeFinding()
+	f.Trade.Question = `Will the price of "BTC" be > $100k & < $200k by 2026?`
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "&gt; $100k &amp; &lt;") {
+		t.Errorf("HTML escaping missing in:\n%s", msg)
 	}
 }

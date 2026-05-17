@@ -132,8 +132,8 @@ func (l *VolumeLoop) evalMetric(
 	recentVal, baseVal float64,
 ) {
 	ratio := safeRatio(recentVal, baseVal)
-	sev, _, ok := anomaly.SeverityForLadder(ratio, l.cfg.Multipliers)
-	if !ok {
+	sev := volumeSeverity(ratio, l.cfg.Multipliers)
+	if sev == "" {
 		return
 	}
 	if metric != "avg_size" {
@@ -189,6 +189,27 @@ func longestWindow(ws []time.Duration) time.Duration {
 		}
 	}
 	return m
+}
+
+// volumeSeverity is a small 3-rung mapper local to the legacy volume detector;
+// the single_cluster path has its own thresholds in anomaly.Thresholds.
+func volumeSeverity(v float64, ladder []float64) anomaly.Severity {
+	if len(ladder) == 0 || v < ladder[0] {
+		return ""
+	}
+	top := ladder[len(ladder)-1]
+	mid := top
+	if len(ladder) >= 2 {
+		mid = ladder[len(ladder)-2]
+	}
+	switch {
+	case v >= top && len(ladder) >= 3:
+		return anomaly.SeverityCritical
+	case v >= mid && len(ladder) >= 2:
+		return anomaly.SeverityWarning
+	default:
+		return anomaly.SeverityInfo
+	}
 }
 
 func safeRatio(num, den float64) float64 {
