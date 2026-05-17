@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	market2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
@@ -32,6 +33,7 @@ type Loop struct {
 	client   *gamma.Client
 	registry *aggregate.MarketRegistry
 	engine   Forgetter
+	filter   *category.Filter
 	metrics  *metrics.Metrics
 	log      *zerolog.Logger
 }
@@ -41,10 +43,14 @@ func New(
 	c *gamma.Client,
 	r *aggregate.MarketRegistry,
 	engine Forgetter,
+	filter *category.Filter,
 	m *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Loop {
-	return &Loop{cfg: cfg, client: c, registry: r, engine: engine, metrics: m, log: log}
+	if filter == nil {
+		filter = category.NewFilter(nil)
+	}
+	return &Loop{cfg: cfg, client: c, registry: r, engine: engine, filter: filter, metrics: m, log: log}
 }
 
 // Run executes one fetch immediately and then on every Interval until ctx is
@@ -92,10 +98,37 @@ func (l *Loop) tick(ctx context.Context) error {
 		return err
 	}
 
+	// Build the set of category ids blocked by the filter, walking the freshly-
+	// fetched /tags response. Subsequent loops apply this set to each market's
+	// Categories and to the cats slice itself so the registry never sees them.
+	denied := make(map[vo.CategoryID]struct{}, len(cats))
+	keptCats := cats[:0]
+	for _, c := range cats {
+		if l.filter.Allowed(c.Slug, c.Label) {
+			keptCats = append(keptCats, c)
+			continue
+		}
+		denied[c.ID] = struct{}{}
+	}
+	cats = keptCats
+
+	var skippedAssignments int
 	for i := range markets {
 		if ids, ok := tagsByCondition[string(markets[i].ID)]; ok {
-			markets[i].Categories = dedup(ids)
+			ids = dedup(ids)
+			kept := ids[:0]
+			for _, id := range ids {
+				if _, blocked := denied[id]; blocked {
+					skippedAssignments++
+					continue
+				}
+				kept = append(kept, id)
+			}
+			markets[i].Categories = kept
 		}
+	}
+	if skippedAssignments > 0 && l.metrics != nil {
+		l.metrics.CategoryFilterSkipped.WithLabelValues("discover").Add(float64(skippedAssignments))
 	}
 
 	removed := l.registry.Replace(markets, cats)
@@ -105,7 +138,13 @@ func (l *Loop) tick(ctx context.Context) error {
 		}
 	}
 	l.metrics.MarketsTracked.Set(float64(len(markets)))
-	l.log.Info().Int("markets", len(markets)).Int("categories", len(cats)).Int("dropped", len(removed)).Msg("discover: refreshed")
+	l.log.Info().
+		Int("markets", len(markets)).
+		Int("categories", len(cats)).
+		Int("dropped", len(removed)).
+		Int("filtered_assignments", skippedAssignments).
+		Int("filtered_categories", len(denied)).
+		Msg("discover: refreshed")
 	return nil
 }
 
