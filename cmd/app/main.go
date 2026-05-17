@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/core/app"
+	"github.com/Borislavv/polymarket-watchtower/internal/app"
 )
 
 func main() {
