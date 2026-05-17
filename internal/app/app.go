@@ -12,7 +12,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	httpsrv "github.com/Borislavv/polymarket-watchtower/internal/infra/http"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/log"
