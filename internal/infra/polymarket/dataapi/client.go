@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/trade"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 )

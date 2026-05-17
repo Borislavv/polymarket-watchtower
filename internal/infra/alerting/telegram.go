@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 )
 
 // TelegramConfig is the minimal config for a single-channel Telegram bot.

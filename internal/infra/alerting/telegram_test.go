@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 )
 
 func sampleFinding() anomaly.Finding {
