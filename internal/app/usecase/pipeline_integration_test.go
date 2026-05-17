@@ -206,9 +206,11 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 
 	det := detect.New(detect.Config{
 		Thresholds: anomaly2.Thresholds{
-			Multipliers:       []float64{30, 100, 1000},
-			AbsoluteUSDTiers:  []float64{3_000, 10_000, 100_000},
-			MinBaselineTrades: 20,
+			MultiplierLadder:       []float64{30, 100, 1000},
+			OddsLadder:             []float64{3, 10, 25},
+			MinTradeUSD:            10_000,
+			MinBaselineTrades:      20,
+			MinBaselineNotionalUSD: 100,
 		},
 		Baseline: baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster: cluster.Config{
@@ -290,11 +292,11 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	close(telegramBodies)
 	var sawWatchMsg bool
 	for body := range telegramBodies {
-		if strings.Contains(body, "CATEGORY WATCH REQUIRED") && strings.Contains(body, "3 unique wallets") {
+		if strings.Contains(body, "CategoryWatchRequired") && strings.Contains(body, "3 unique wallets") {
 			sawWatchMsg = true
 		}
 	}
 	if !sawWatchMsg {
-		t.Error("telegram never received the CATEGORY WATCH REQUIRED message")
+		t.Error("telegram never received the CategoryWatchRequired message")
 	}
 }

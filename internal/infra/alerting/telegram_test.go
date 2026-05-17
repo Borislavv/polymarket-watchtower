@@ -20,7 +20,7 @@ func sampleTradeFinding() anomaly.Finding {
 	return anomaly.Finding{
 		Kind:     anomaly.KindTradeAnomaly,
 		Severity: anomaly.SeverityCritical,
-		Reason:   "multiplier+absolute_tier",
+		Reason:   anomaly.ReasonHighOddsWhale,
 		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
 		Trade: &anomaly.TradeRef{
 			ID:          "trade-1",
@@ -31,19 +31,20 @@ func sampleTradeFinding() anomaly.Finding {
 			Outcome:     "Yes",
 			Side:        trade.SideBuy,
 			SizeShares:  4_000,
-			Price:       0.5,
-			NotionalUSD: 2_000_000, // big number, with commas
+			Price:       0.05,
+			Odds:        20,
+			NotionalUSD: 2_000_000,
 			At:          time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
 		},
 		Baseline: &anomaly.BaselineRef{
 			Scope:     "category=Weather market=rain-tomorrow outcome=Yes",
 			MedianUSD: 10, MeanUSD: 12, P95USD: 60, SampleN: 1234, WindowAgo: 7 * 24 * time.Hour,
 		},
-		Category:     &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather"},
-		Multiplier:   200_000,
-		AbsoluteTier: 100_000,
-		MarketURL:    "https://polymarket.com/event/rain-tomorrow",
-		GrafanaURL:   "http://grafana.local/d/uid123/?orgId=1&from=1&to=2&var-category=Weather&var-market=rain-tomorrow",
+		Category:   &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather"},
+		Multiplier: 200_000,
+		OddsRung:   10,
+		MarketURL:  "https://polymarket.com/event/rain-tomorrow",
+		GrafanaURL: "http://grafana.local/d/uid123/?orgId=1&from=1&to=2&var-category=Weather&var-market=rain-tomorrow",
 	}
 }
 
@@ -104,16 +105,17 @@ func TestTradeAnomalyMessageHasAllRequiredFields(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	for _, want := range []string{
 		"CRITICAL",
-		`multiplier+absolute\_tier`,    // why selected (markdown-escaped)
-		"Will it rain \\*tomorrow\\*?", // market question, escaped
+		"HighOddsWhaleDetected",
+		"Will it rain \\*tomorrow\\*?",
 		"outcome: `Yes`",
 		"side: `BUY`",
-		"$2,000,000", // formatted notional
+		"$2,000,000",
 		"category: *Weather*",
 		"baseline: median *$10",
 		"N=`1234`",
 		"multiplier: *x200000*",
-		"absolute tier crossed: *$100,000*",
+		"odds: *20.0*",
+		"odds rung crossed: *>=10.0*",
 		"polymarket.com/event/rain-tomorrow",
 		"grafana.local",
 	} {
@@ -127,7 +129,7 @@ func TestCategoryWatchMessageHasAllRequiredFields(t *testing.T) {
 	msg := FormatTelegramMessage(sampleClusterFinding())
 	for _, want := range []string{
 		"HARD",
-		"CATEGORY WATCH REQUIRED",
+		"CategoryWatchRequired",
 		"category: *Weather*",
 		"7 anomalous trades",
 		"5 unique wallets",

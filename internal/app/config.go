@@ -16,6 +16,16 @@ const (
 	EnvProd  Environment = "prod"
 )
 
+// AnomalyMode selects which detector wires alerts. single_cluster is the
+// default; volume keeps the legacy aggregate-rate behaviour for operators
+// who explicitly want it.
+type AnomalyMode string
+
+const (
+	ModeSingleCluster AnomalyMode = "single_cluster"
+	ModeVolume        AnomalyMode = "volume"
+)
+
 // ApplicationConfig holds process-wide settings.
 type ApplicationConfig struct {
 	Env                 Environment   `env:"APP_ENV" envDefault:"dev" validate:"required,oneof=dev local prod"`
@@ -26,13 +36,12 @@ type ApplicationConfig struct {
 
 // PolymarketConfig points at upstream APIs.
 type PolymarketConfig struct {
-	GammaURL    string        `env:"GAMMA_API_URL" envDefault:"https://gamma-api.polymarket.com" validate:"required,url"`
-	DataAPIURL  string        `env:"DATA_API_URL" envDefault:"https://data-api.polymarket.com" validate:"required,url"`
-	CLOBURL     string        `env:"CLOB_API_URL" envDefault:"https://clob.polymarket.com" validate:"required,url"`
-	HTTPTimeout time.Duration `env:"POLYMARKET_HTTP_TIMEOUT" envDefault:"15s" validate:"required"`
-	UserAgent   string        `env:"POLYMARKET_USER_AGENT" envDefault:"polymarket-watchtower/0.1"`
-	// PublicBaseURL is the user-facing site used in alert deep-links.
-	PublicBaseURL string `env:"POLYMARKET_PUBLIC_BASE_URL" envDefault:"https://polymarket.com"`
+	GammaURL      string        `env:"GAMMA_API_URL" envDefault:"https://gamma-api.polymarket.com" validate:"required,url"`
+	DataAPIURL    string        `env:"DATA_API_URL" envDefault:"https://data-api.polymarket.com" validate:"required,url"`
+	CLOBURL       string        `env:"CLOB_API_URL" envDefault:"https://clob.polymarket.com" validate:"required,url"`
+	HTTPTimeout   time.Duration `env:"POLYMARKET_HTTP_TIMEOUT" envDefault:"15s" validate:"required"`
+	UserAgent     string        `env:"POLYMARKET_USER_AGENT" envDefault:"polymarket-watchtower/0.1"`
+	PublicBaseURL string        `env:"POLYMARKET_PUBLIC_BASE_URL" envDefault:"https://polymarket.com"`
 }
 
 // RateLimitConfig holds per-host caps.
@@ -53,52 +62,55 @@ type PipelineConfig struct {
 	CollectConcurrency int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
 }
 
-// AggregateConfig sizes the supporting rolling-bucket engine (Grafana gauges
-// only — no longer drives alerts).
+// CategoryFilterConfig holds the category blacklist applied to both modes.
+//
+// Defaults exclude Polymarket's sports categories — they are high-hype,
+// high-volume venues where small baselines and casual whales generate way
+// too much noise for the current detector. Operators wanting full coverage
+// can set CATEGORY_BLACKLIST= (empty) to disable.
+//
+// Matching is case-insensitive substring on (slug + label); see the
+// internal/app/usecase/category package for the full rule.
+type CategoryFilterConfig struct {
+	Blacklist []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sport,football,basketball,baseball,hockey,soccer,tennis,golf,mma,boxing,racing,nba,nfl,nhl,mlb,ufc,nascar,cricket,rugby,fifa,uefa,champions league,stanley cup,world cup,epl,wimbledon,grand prix"`
+}
+
+// AggregateConfig sizes the rolling-bucket engine used by both modes
+// (supporting gauges in single_cluster; alert source in volume).
 type AggregateConfig struct {
 	BucketSize     time.Duration   `env:"AGG_BUCKET" envDefault:"1m" validate:"required"`
 	BaselineWindow time.Duration   `env:"AGG_BASELINE_WINDOW" envDefault:"168h" validate:"required"`
 	RecentWindows  []time.Duration `env:"AGG_RECENT_WINDOWS" envDefault:"12h,24h" envSeparator:","`
 }
 
-// AnomalyConfig encodes the per-trade detector and the category-cluster
-// (CategoryWatchRequired / HARD) alert.
-//
-// Two independent single-trade ladders, higher severity wins:
-//
-//   - Multipliers: (trade USD / baseline median USD), evaluated only when the
-//     bucket has at least MinBaselineTrades samples. Mapping
-//     [info, warning, critical] = [30, 100, 1000]× by default.
-//
-//   - AbsoluteUSDTiers: absolute USD ladder on the trade's notional, evaluated
-//     regardless of baseline. Defaults [$3k, $10k, $100k] = [info, warning,
-//     critical]. These match the product example "$10 → $3k/$10k/$100k"
-//     even when no baseline exists yet.
-//
-// Cluster: in HardAlertWindow (default 1h), if a single category sees at least
-// HardAlertMinTrades anomalous trades from at least HardAlertMinWallets unique
-// wallets totalling at least HardAlertMinTotalUSD, emit HARD alert with cooldown.
+// AnomalyConfig encodes the per-trade single_cluster detector and the
+// category-cluster (CategoryWatchRequired / HARD) alert. See score.Score for
+// the full semantics of each signal.
 type AnomalyConfig struct {
-	Multipliers        []float64     `env:"SINGLE_TRADE_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`
-	AbsoluteUSDTiers   []float64     `env:"SINGLE_TRADE_ABSOLUTE_USD" envDefault:"3000,10000,100000" envSeparator:","`
-	MinBaselineTrades  int           `env:"MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
-	BaselineWindow     time.Duration `env:"BASELINE_WINDOW" envDefault:"168h" validate:"required"`
-	BaselineMaxSamples int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
 
-	HardAlertWindow      time.Duration `env:"HARD_ALERT_WINDOW" envDefault:"1h" validate:"required"`
-	HardAlertMinTrades   int           `env:"HARD_ALERT_MIN_ANOMALOUS_TRADES" envDefault:"5" validate:"gte=2"`
-	HardAlertMinWallets  int           `env:"HARD_ALERT_MIN_UNIQUE_TRADERS" envDefault:"3" validate:"gte=1"`
-	HardAlertMinTotalUSD float64       `env:"HARD_ALERT_MIN_TOTAL_NOTIONAL_USD" envDefault:"25000" validate:"gte=0"`
-	HardAlertCooldown    time.Duration `env:"HARD_ALERT_COOLDOWN" envDefault:"1h" validate:"required"`
+	SingleMinTradeUSD            float64       `env:"SINGLE_MIN_TRADE_USD" envDefault:"10000" validate:"gte=0"`
+	SingleMultiplierThresholds   []float64     `env:"SINGLE_MULTIPLIER_THRESHOLDS" envDefault:"30,100,1000" envSeparator:","`
+	SingleOddsThresholds         []float64     `env:"SINGLE_ODDS_THRESHOLDS" envDefault:"3,10,25" envSeparator:","`
+	SingleMinBaselineTrades      int           `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
+	SingleMinBaselineNotionalUSD float64       `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
+	BaselineWindow               time.Duration `env:"BASELINE_WINDOW" envDefault:"168h" validate:"required"`
+	BaselineMaxSamples           int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+
+	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`
+	ClusterMinTrades   int           `env:"CLUSTER_MIN_ANOMALOUS_TRADES" envDefault:"3" validate:"gte=2"`
+	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
+	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"30000" validate:"gte=0"`
+	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
+
+	// Volume mode (legacy) ---------------------------------------------------
+	VolumeMultipliers []float64     `env:"VOLUME_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`
+	VolumeMinNotional float64       `env:"VOLUME_MIN_NOTIONAL_USD" envDefault:"500" validate:"gte=0"`
+	VolumeMinTrades   int           `env:"VOLUME_MIN_TRADES" envDefault:"5" validate:"gte=0"`
+	VolumeCooldown    time.Duration `env:"VOLUME_COOLDOWN" envDefault:"30m" validate:"required"`
 }
 
 // AlertingConfig selects sinks and provides the Grafana deep-link base.
-//
-// Telegram chats are addressed via a union of two sources:
-//   - TELEGRAM_CHAT_ID: optional static chat (always included if non-empty).
-//   - Dynamic subscribers discovered by polling /getUpdates when
-//     TELEGRAM_UPDATES_ENABLED=true. The bot must be interacted with (or
-//     added to a group/channel) at least once for it to learn the chat id.
 type AlertingConfig struct {
 	WebhookURL              string        `env:"ALERT_WEBHOOK_URL"`
 	TelegramEnabled         bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
@@ -115,13 +127,14 @@ type AlertingConfig struct {
 }
 
 type Config struct {
-	Application ApplicationConfig
-	Polymarket  PolymarketConfig
-	RateLimit   RateLimitConfig
-	Pipeline    PipelineConfig
-	Aggregate   AggregateConfig
-	Anomaly     AnomalyConfig
-	Alerting    AlertingConfig
+	Application    ApplicationConfig
+	Polymarket     PolymarketConfig
+	RateLimit      RateLimitConfig
+	Pipeline       PipelineConfig
+	Aggregate      AggregateConfig
+	Anomaly        AnomalyConfig
+	CategoryFilter CategoryFilterConfig
+	Alerting       AlertingConfig
 }
 
 func LoadConfig() (*Config, error) {

@@ -211,10 +211,12 @@ func FormatTelegramMessage(f anomaly.Finding) string {
 
 func formatTradeAnomaly(f anomaly.Finding) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s *Polymarket %s — single bet anomaly*\n", severityBadge(f.Severity), strings.ToUpper(string(f.Severity)))
-	if f.Reason != "" {
-		fmt.Fprintf(&b, "_rule: %s_\n", escapeMarkdown(f.Reason))
+	reason := f.Reason
+	if reason == "" {
+		reason = "anomaly"
 	}
+	fmt.Fprintf(&b, "%s *Polymarket %s — %s*\n",
+		severityBadge(f.Severity), strings.ToUpper(string(f.Severity)), escapeMarkdown(reason))
 	if f.Trade != nil {
 		t := f.Trade
 		title := t.Question
@@ -244,8 +246,11 @@ func formatTradeAnomaly(f anomaly.Finding) string {
 	if f.Multiplier > 0 {
 		fmt.Fprintf(&b, "multiplier: *x%s*\n", multiplierFmt(f.Multiplier))
 	}
-	if f.AbsoluteTier > 0 {
-		fmt.Fprintf(&b, "absolute tier crossed: *$%s*\n", money(f.AbsoluteTier))
+	if f.Trade != nil && f.Trade.Odds > 0 {
+		fmt.Fprintf(&b, "odds: *%s*  (price `%.4f`)\n", multiplierFmt(f.Trade.Odds), f.Trade.Price)
+	}
+	if f.OddsRung > 0 {
+		fmt.Fprintf(&b, "odds rung crossed: *>=%s*\n", multiplierFmt(f.OddsRung))
 	}
 	fmt.Fprintf(&b, "at: `%s`\n", f.At.UTC().Format(time.RFC3339))
 	appendLinks(&b, f)
@@ -254,7 +259,8 @@ func formatTradeAnomaly(f anomaly.Finding) string {
 
 func formatCategoryWatch(f anomaly.Finding) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s *Polymarket — CATEGORY WATCH REQUIRED*\n", severityBadge(f.Severity))
+	fmt.Fprintf(&b, "%s *Polymarket — CategoryWatchRequired (%s)*\n",
+		severityBadge(f.Severity), escapeMarkdown(nonEmpty(f.Reason, "cluster")))
 	if f.Category != nil {
 		fmt.Fprintf(&b, "category: *%s*\n", escapeMarkdown(nonEmpty(f.Category.Label, fmt.Sprintf("id=%d", f.Category.ID))))
 	}

@@ -3,15 +3,13 @@ package anomaly
 import "testing"
 
 func TestThresholdsNormaliseSortsAndDedupes(t *testing.T) {
-	x := Thresholds{Multipliers: []float64{1000, 30, 30, 100}, AbsoluteUSDTiers: []float64{100_000, 3_000, 10_000}}
+	x := Thresholds{MultiplierLadder: []float64{1000, 30, 30, 100}, OddsLadder: []float64{25, 3, 10}}
 	x.Normalise()
-	wantM := []float64{30, 100, 1000}
-	wantA := []float64{3_000, 10_000, 100_000}
-	if len(x.Multipliers) != 3 || x.Multipliers[0] != wantM[0] || x.Multipliers[1] != wantM[1] || x.Multipliers[2] != wantM[2] {
-		t.Fatalf("multipliers: %v", x.Multipliers)
+	if got := x.MultiplierLadder; len(got) != 3 || got[0] != 30 || got[1] != 100 || got[2] != 1000 {
+		t.Fatalf("multipliers: %v", got)
 	}
-	if len(x.AbsoluteUSDTiers) != 3 || x.AbsoluteUSDTiers[0] != wantA[0] || x.AbsoluteUSDTiers[2] != wantA[2] {
-		t.Fatalf("absolute: %v", x.AbsoluteUSDTiers)
+	if got := x.OddsLadder; len(got) != 3 || got[0] != 3 || got[1] != 10 || got[2] != 25 {
+		t.Fatalf("odds: %v", got)
 	}
 }
 

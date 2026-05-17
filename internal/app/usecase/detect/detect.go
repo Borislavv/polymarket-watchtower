@@ -27,6 +27,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -46,6 +47,7 @@ type Config struct {
 	Thresholds     anomaly.Thresholds
 	Baseline       baseline.Config
 	Cluster        cluster.Config
+	Filter         *category.Filter // nil => allow all (no filtering)
 	RecentWindows  []time.Duration
 	GaugeInterval  time.Duration // how often Run() refreshes supporting gauges
 	PolymarketBase string        // "https://polymarket.com" (no trailing slash)
@@ -84,6 +86,9 @@ func New(
 	}
 	if cfg.GrafanaContext <= 0 {
 		cfg.GrafanaContext = time.Hour
+	}
+	if cfg.Filter == nil {
+		cfg.Filter = category.NewFilter(nil)
 	}
 	now := cfg.Clock
 	if now == nil {
@@ -144,11 +149,18 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		bestRef    anomaly.TradeRef
 	)
 	for _, cat := range categories {
+		// Defense in depth: discover should have stripped blacklisted ids
+		// before they reached the registry, but a missed entry must not be
+		// able to fire an alert here either.
+		if !l.allowed(cat) {
+			l.metrics.CategoryFilterSkipped.WithLabelValues("detect").Inc()
+			continue
+		}
 		bucket := baseline.Key{Category: cat, Market: market.ID, OutcomeToken: trade.Token}
 		stats := l.baseline.Stats(bucket)
 		l.baseline.Add(bucket, notional, trade.Timestamp)
 
-		sr := score.Score(notional, stats, l.cfg.Thresholds)
+		sr := score.Score(notional, trade.Price, stats, l.cfg.Thresholds)
 		if !sr.Fired {
 			continue
 		}
@@ -172,6 +184,10 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 }
 
 func (l *Loop) buildTradeRef(m market.Market, t trade.Trade, notional float64) anomaly.TradeRef {
+	var odds float64
+	if t.Price > 0 {
+		odds = 1.0 / t.Price
+	}
 	return anomaly.TradeRef{
 		ID:          t.ID,
 		TxHash:      t.TxHash,
@@ -183,6 +199,7 @@ func (l *Loop) buildTradeRef(m market.Market, t trade.Trade, notional float64) a
 		Side:        t.Side,
 		SizeShares:  t.Size,
 		Price:       t.Price,
+		Odds:        odds,
 		NotionalUSD: notional,
 		At:          t.Timestamp,
 	}
@@ -215,14 +232,20 @@ func (l *Loop) emitTradeAnomaly(
 			SampleN:   stats.Count,
 			WindowAgo: l.cfg.Baseline.Window,
 		},
-		Multiplier:   sr.Multiplier,
-		AbsoluteTier: sr.AbsoluteTier,
-		MarketURL:    l.marketURL(m),
-		GrafanaURL:   l.grafanaURL(catRef, m, t.Timestamp),
+		Multiplier: sr.Multiplier,
+		OddsRung:   sr.OddsRung,
+		MarketURL:  l.marketURL(m),
+		GrafanaURL: l.grafanaURL(catRef, m, t.Timestamp),
 	}
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), sr.Reason).Inc()
 	if sr.Multiplier > 0 {
 		l.metrics.TradeAnomalyMultiplier.Observe(sr.Multiplier)
+	}
+	if ref.Odds > 0 {
+		l.metrics.TradeOdds.Observe(ref.Odds)
+	}
+	if sr.Reason == anomaly.ReasonHighOdds || sr.Reason == anomaly.ReasonHighOddsWhale {
+		l.metrics.HighOddsTrades.WithLabelValues(string(sr.Severity), categoryLabel(catRef)).Inc()
 	}
 	l.metrics.CategoryAnomalousTrades.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Inc()
 	l.metrics.CategoryAnomalousUSD.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Add(ref.NotionalUSD)
@@ -243,7 +266,7 @@ func (l *Loop) emitCategoryWatch(
 		Kind:       anomaly.KindCategoryWatch,
 		Severity:   anomaly.SeverityHard,
 		At:         l.now(),
-		Reason:     "cluster",
+		Reason:     anomaly.ReasonCluster,
 		Category:   &catRef,
 		Cluster:    cs,
 		MarketURL:  l.marketURL(m),
@@ -253,6 +276,18 @@ func (l *Loop) emitCategoryWatch(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit category-watch failed")
 	}
+}
+
+// allowed reports whether the category passes the blacklist. Uncategorised
+// (id=0) always passes — we still want to score uncategorised whales.
+func (l *Loop) allowed(cat vo.CategoryID) bool {
+	if cat == 0 {
+		return true
+	}
+	if c, ok := l.registry.Category(cat); ok {
+		return l.cfg.Filter.Allowed(c.Slug, c.Label)
+	}
+	return true
 }
 
 func (l *Loop) categoryRef(cat vo.CategoryID) anomaly.CategoryRef {

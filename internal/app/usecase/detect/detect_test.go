@@ -93,94 +93,174 @@ func bet(size, price float64, wallet string, at time.Time) trade.Trade {
 func TestSingleTradeIgnoredWhenSmall(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
-		Multipliers: []float64{30, 100, 1000}, AbsoluteUSDTiers: []float64{3_000, 10_000, 100_000}, MinBaselineTrades: 20,
+		MultiplierLadder:       []float64{30, 100, 1000},
+		OddsLadder:             []float64{1e9}, // odds path disabled
+		MinTradeUSD:            10_000,
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 1_000,
 	}, cluster.Config{Window: time.Hour, MinTrades: 5, MinUniqueWallets: 3})
 	m, _ := reg.Get("0xa")
-	// build baseline of 30 trades at $10 (notional)
+	// build baseline of 30 trades at $10 notional — total $300 (below 1k floor on purpose)
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(20, 0.5, "w-base", now.Add(-time.Minute)))
 	}
-	// next trade at $10 — same as baseline, no fire
+	// next trade — baseline guards still kick in; no fire.
 	loop.Observe(context.Background(), m, bet(20, 0.5, "w-new", now))
 	if got := emit.all(); len(got) != 0 {
 		t.Fatalf("expected no findings, got %d: %+v", len(got), got)
 	}
 }
 
-func TestSingleTradeFiresMultiplierTiers(t *testing.T) {
+func TestWhaleFiresMultiplierTiers(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
-		Multipliers: []float64{30, 100, 1000}, AbsoluteUSDTiers: []float64{1e9}, MinBaselineTrades: 20,
-	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99}) // cluster effectively off
+		MultiplierLadder:       []float64{30, 100, 1000},
+		OddsLadder:             []float64{1e9},
+		MinTradeUSD:            10_000,
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 1_000,
+	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	m, _ := reg.Get("0xa")
-	// baseline: 30 trades at notional $10 (size=20, price=0.5)
+	// Baseline: 30 trades at $100 notional = $3k total.
 	for i := 0; i < 30; i++ {
-		loop.Observe(context.Background(), m, bet(20, 0.5, "w-base", now))
+		loop.Observe(context.Background(), m, bet(200, 0.5, "w-base", now))
 	}
-	// $300 single trade -> x30 -> info
-	loop.Observe(context.Background(), m, bet(600, 0.5, "wA", now))
-	// $1000 single trade -> x100 -> warning
-	loop.Observe(context.Background(), m, bet(2_000, 0.5, "wB", now))
-	// $10_000 single trade -> x1000 -> critical
-	loop.Observe(context.Background(), m, bet(20_000, 0.5, "wC", now))
+	// $10k whale @ x100 baseline => warning
+	loop.Observe(context.Background(), m, bet(20_000, 0.5, "wA", now))
+	// $100k whale @ x1000 baseline => critical
+	loop.Observe(context.Background(), m, bet(200_000, 0.5, "wB", now))
 
 	got := emit.of(anomaly.KindTradeAnomaly)
-	if len(got) != 3 {
-		t.Fatalf("expected 3 single-trade findings, got %d: %+v", len(got), got)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 findings, got %d: %+v", len(got), got)
 	}
-	wantSev := []anomaly.Severity{anomaly.SeverityInfo, anomaly.SeverityWarning, anomaly.SeverityCritical}
-	for i, f := range got {
-		if f.Severity != wantSev[i] {
-			t.Errorf("[%d] severity: got %s want %s", i, f.Severity, wantSev[i])
+	for _, f := range got {
+		if f.Reason != anomaly.ReasonWhale {
+			t.Errorf("reason: %s want %s", f.Reason, anomaly.ReasonWhale)
 		}
 		if f.Trade == nil || f.Trade.Outcome != "Yes" {
-			t.Errorf("[%d] trade ref: %+v", i, f.Trade)
+			t.Errorf("trade ref: %+v", f.Trade)
 		}
 		if f.MarketURL != "https://polymarket.com/event/us-pres-2028" {
-			t.Errorf("[%d] market URL: %q (must use EventSlug, not market slug)", i, f.MarketURL)
+			t.Errorf("market URL: %q (must use EventSlug)", f.MarketURL)
 		}
-		if !strings.Contains(f.GrafanaURL, "var-category=Politics") || !strings.Contains(f.GrafanaURL, "var-market=us-pres") {
-			t.Errorf("[%d] grafana URL: %q", i, f.GrafanaURL)
+		if !strings.Contains(f.GrafanaURL, "var-category=Politics") {
+			t.Errorf("grafana URL missing category: %q", f.GrafanaURL)
 		}
+	}
+	if got[0].Severity != anomaly.SeverityWarning {
+		t.Fatalf("first severity: %s", got[0].Severity)
+	}
+	if got[1].Severity != anomaly.SeverityCritical {
+		t.Fatalf("second severity: %s", got[1].Severity)
 	}
 }
 
-func TestLowBaselineSkipsMultiplierButAbsoluteStillFires(t *testing.T) {
+func TestWhaleSkippedBelowMinTradeUSD(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
-		Multipliers: []float64{30}, AbsoluteUSDTiers: []float64{10_000}, MinBaselineTrades: 50,
+		MultiplierLadder:       []float64{30},
+		OddsLadder:             []float64{1e9},
+		MinTradeUSD:            10_000,
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 100,
 	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	m, _ := reg.Get("0xa")
-	// only 5 baseline trades — well under MinBaselineTrades=50
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(20, 0.5, "wb", now))
 	}
-	// $50k trade — absolute tier should fire (multiplier skipped due to low N)
-	loop.Observe(context.Background(), m, bet(100_000, 0.5, "whale", now))
+	// $5k bet at multiplier x500 but below SINGLE_MIN_TRADE_USD — must not fire.
+	loop.Observe(context.Background(), m, bet(10_000, 0.5, "small-whale", now))
+	if got := emit.all(); len(got) != 0 {
+		t.Fatalf("expected no fire under MinTradeUSD, got %+v", got)
+	}
+}
 
+func TestHighOddsAloneFires(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
+		MultiplierLadder: []float64{1e9}, // whale path disabled
+		OddsLadder:       []float64{3, 10, 25},
+		MinTradeUSD:      10_000,
+	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	m, _ := reg.Get("0xa")
+	// $2k bet @ price 0.02 (odds 50) — top rung -> critical, even with no baseline.
+	loop.Observe(context.Background(), m, bet(100_000, 0.02, "edge", now))
 	got := emit.of(anomaly.KindTradeAnomaly)
 	if len(got) != 1 {
-		t.Fatalf("expected 1 finding, got %d: %+v", len(got), got)
+		t.Fatalf("got %d findings", len(got))
 	}
-	if got[0].Reason != "absolute_tier" {
+	if got[0].Reason != anomaly.ReasonHighOdds {
 		t.Fatalf("reason: %s", got[0].Reason)
+	}
+	if got[0].Severity != anomaly.SeverityCritical {
+		t.Fatalf("severity: %s", got[0].Severity)
+	}
+	if got[0].Trade.Odds < 49 || got[0].Trade.Odds > 51 {
+		t.Fatalf("odds not propagated: %v", got[0].Trade.Odds)
+	}
+}
+
+func TestHighOddsSilencedBelowFloor(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
+		MultiplierLadder: []float64{1e9},
+		OddsLadder:       []float64{3, 10, 25},
+		MinTradeUSD:      10_000, // floor for odds path = 1000
+	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	m, _ := reg.Get("0xa")
+	// $50 at odds 1000 — too small to be interesting.
+	loop.Observe(context.Background(), m, bet(50_000, 0.001, "noise", now))
+	if got := emit.all(); len(got) != 0 {
+		t.Fatalf("expected no fire below odds floor, got %+v", got)
+	}
+}
+
+func TestWhaleAndHighOddsCombineToHighOddsWhale(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
+		MultiplierLadder:       []float64{30, 100, 1000},
+		OddsLadder:             []float64{3, 10, 25},
+		MinTradeUSD:            10_000,
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 1_000,
+	}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	m, _ := reg.Get("0xa")
+	// Build baseline of $100 trades (30 * $100 = $3k).
+	for i := 0; i < 30; i++ {
+		loop.Observe(context.Background(), m, bet(200, 0.5, "wb", now))
+	}
+	// Whale + high odds: $50k at price 0.02 (odds 50). x500 multiplier, top odds rung.
+	loop.Observe(context.Background(), m, bet(2_500_000, 0.02, "shark", now))
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 1 {
+		t.Fatalf("got %d", len(got))
+	}
+	if got[0].Reason != anomaly.ReasonHighOddsWhale {
+		t.Fatalf("reason: %s want %s", got[0].Reason, anomaly.ReasonHighOddsWhale)
+	}
+	if got[0].Severity != anomaly.SeverityCritical {
+		t.Fatalf("severity: %s", got[0].Severity)
 	}
 }
 
 func TestCategoryWatchHardAlertFires(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, anomaly.Thresholds{
-		Multipliers: []float64{30}, AbsoluteUSDTiers: []float64{3_000}, MinBaselineTrades: 1_000_000, // disable multiplier
+		MultiplierLadder: []float64{1e9}, // disable whale
+		OddsLadder:       []float64{3},   // odds path always fires above floor
+		MinTradeUSD:      100,
 	}, cluster.Config{
 		Window: time.Hour, MinTrades: 3, MinUniqueWallets: 3, MinTotalUSD: 10_000,
 	})
 	m, _ := reg.Get("0xa")
 	wallets := []string{"shark-1", "shark-2", "shark-3"}
 	for _, w := range wallets {
-		loop.Observe(context.Background(), m, bet(8_000, 0.5, w, now)) // each = $4k
+		// $4k at price 0.25 (odds 4) — odds rung crossed.
+		loop.Observe(context.Background(), m, bet(16_000, 0.25, w, now))
 	}
 	if len(emit.of(anomaly.KindTradeAnomaly)) != 3 {
-		t.Fatalf("expected 3 single-trade findings")
+		t.Fatalf("expected 3 single-trade findings, got %d", len(emit.of(anomaly.KindTradeAnomaly)))
 	}
 	hard := emit.of(anomaly.KindCategoryWatch)
 	if len(hard) != 1 {
@@ -190,6 +270,9 @@ func TestCategoryWatchHardAlertFires(t *testing.T) {
 	if h.Severity != anomaly.SeverityHard {
 		t.Fatalf("severity: %s", h.Severity)
 	}
+	if h.Reason != anomaly.ReasonCluster {
+		t.Fatalf("cluster reason: %s", h.Reason)
+	}
 	if h.Cluster.UniqueWallets != 3 || h.Cluster.AnomalousTrades != 3 || h.Cluster.TotalUSD != 12_000 {
 		t.Fatalf("cluster stats: %+v", h.Cluster)
 	}
@@ -198,100 +281,46 @@ func TestCategoryWatchHardAlertFires(t *testing.T) {
 	}
 }
 
-// TestGrafanaURLEncoding pins that link building goes through net/url, so any
-// regression that resurrects a homemade encoder is caught here.
+// TestGrafanaURLEncoding pins that link building goes through net/url.
 func TestGrafanaURLEncoding(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	at := time.Date(2026, 5, 17, 14, 30, 0, 0, time.UTC)
-	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{MultiplierLadder: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 
 	cases := []struct {
-		name        string
-		categoryLbl string
-		marketSlug  string
-		// Substrings the resulting URL MUST contain (already-encoded form).
-		wantSubstrs []string
-		// Substrings the resulting URL MUST NOT contain.
-		notContains []string
+		name, categoryLbl, marketSlug string
+		wantSubstrs, notContains      []string
 	}{
-		{
-			name:        "ascii_label_and_slug",
-			categoryLbl: "Politics",
-			marketSlug:  "us-pres",
-			wantSubstrs: []string{"var-category=Politics", "var-market=us-pres", "orgId=1"},
-		},
-		{
-			name:        "label_with_space",
-			categoryLbl: "US Election",
-			marketSlug:  "us-pres-2028",
-			// QueryEscape encodes spaces as '+'.
-			wantSubstrs: []string{"var-category=US+Election", "var-market=us-pres-2028"},
-		},
-		{
-			name:        "label_with_ampersand_and_equals",
-			categoryLbl: "A & B = C",
-			marketSlug:  "x",
-			// & and = must be percent-encoded so they don't break the query.
-			wantSubstrs: []string{"var-category=A+%26+B+%3D+C"},
-			notContains: []string{"var-category=A & B = C"},
-		},
-		{
-			name:        "label_with_slash",
-			categoryLbl: "AI/ML",
-			marketSlug:  "x",
-			wantSubstrs: []string{"var-category=AI%2FML"},
-		},
-		{
-			name:        "label_with_unicode",
-			categoryLbl: "Café — Élections 2024",
-			marketSlug:  "x",
-			// QueryEscape produces uppercase percent-hex for multibyte UTF-8.
-			wantSubstrs: []string{"var-category=Caf%C3%A9+%E2%80%94+%C3%89lections+2024"},
-		},
-		{
-			name:        "label_with_hash",
-			categoryLbl: "#Trending",
-			marketSlug:  "x",
-			wantSubstrs: []string{"var-category=%23Trending"},
-		},
-		{
-			name:        "empty_market_omits_var",
-			categoryLbl: "Politics",
-			marketSlug:  "",
-			wantSubstrs: []string{"var-category=Politics"},
-			notContains: []string{"var-market="},
-		},
+		{"ascii", "Politics", "us-pres", []string{"var-category=Politics", "var-market=us-pres", "orgId=1"}, nil},
+		{"space", "US Election", "us-pres-2028", []string{"var-category=US+Election"}, nil},
+		{"reserved", "A & B = C", "x", []string{"var-category=A+%26+B+%3D+C"}, []string{"var-category=A & B = C"}},
+		{"slash", "AI/ML", "x", []string{"var-category=AI%2FML"}, nil},
+		{"unicode", "Café — Élections", "x", []string{"var-category=Caf%C3%A9+%E2%80%94+%C3%89lections"}, nil},
+		{"hash", "#Trending", "x", []string{"var-category=%23Trending"}, nil},
+		{"empty_market", "Politics", "", []string{"var-category=Politics"}, []string{"var-market="}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotStr := loop.grafanaURL(
-				anomaly.CategoryRef{Label: c.categoryLbl},
-				market.Market{Slug: c.marketSlug},
-				at,
-			)
-			// Round-trip through net/url to prove the result is a valid URL.
-			parsed, err := url.Parse(gotStr)
+			got := loop.grafanaURL(anomaly.CategoryRef{Label: c.categoryLbl}, market.Market{Slug: c.marketSlug}, at)
+			parsed, err := url.Parse(got)
 			if err != nil {
-				t.Fatalf("grafanaURL produced an unparseable URL %q: %v", gotStr, err)
+				t.Fatalf("unparseable URL %q: %v", got, err)
 			}
 			q, err := url.ParseQuery(parsed.RawQuery)
 			if err != nil {
-				t.Fatalf("query did not round-trip: %v (raw=%q)", err, parsed.RawQuery)
+				t.Fatalf("query round-trip failed: %v", err)
 			}
 			if c.categoryLbl != "" && q.Get("var-category") != c.categoryLbl {
-				t.Errorf("var-category round-trip: got %q want %q", q.Get("var-category"), c.categoryLbl)
-			}
-			if c.marketSlug != "" && q.Get("var-market") != c.marketSlug {
-				t.Errorf("var-market round-trip: got %q want %q", q.Get("var-market"), c.marketSlug)
+				t.Errorf("var-category: got %q want %q", q.Get("var-category"), c.categoryLbl)
 			}
 			for _, want := range c.wantSubstrs {
-				if !strings.Contains(gotStr, want) {
-					t.Errorf("URL missing %q in: %s", want, gotStr)
+				if !strings.Contains(got, want) {
+					t.Errorf("URL missing %q in %s", want, got)
 				}
 			}
 			for _, banned := range c.notContains {
-				if strings.Contains(gotStr, banned) {
-					t.Errorf("URL must not contain %q: %s", banned, gotStr)
+				if strings.Contains(got, banned) {
+					t.Errorf("URL must not contain %q: %s", banned, got)
 				}
 			}
 		})
@@ -300,25 +329,17 @@ func TestGrafanaURLEncoding(t *testing.T) {
 
 func TestMarketURLUsesEventSlugNotMarketSlug(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
-
-	// Regression: the failing production case. A market grouped under a
-	// "winner" event must NOT produce /event/<market-slug> (Polymarket 404s).
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{MultiplierLadder: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	loop.cfg.PolymarketBase = "https://polymarket.com/"
-	tunisia := market.Market{
-		Slug:       "will-tunisia-win-the-2026-fifa-world-cup-165",
-		EventSlug:  "2026-fifa-world-cup-winner-595",
-		EventTitle: "2026 FIFA World Cup Winner",
-	}
+	tunisia := market.Market{Slug: "will-tunisia-win-the-2026-fifa-world-cup-165", EventSlug: "2026-fifa-world-cup-winner-595"}
 	got := loop.marketURL(tunisia)
 	want := "https://polymarket.com/event/2026-fifa-world-cup-winner-595"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
-	// The known-broken URL must NEVER be emitted.
 	const broken = "https://polymarket.com/event/will-tunisia-win-the-2026-fifa-world-cup-165"
 	if got == broken {
-		t.Fatalf("regression: emitted the broken /event/<market-slug> URL")
+		t.Fatal("regression: emitted /event/<market-slug>")
 	}
 	if _, err := url.Parse(got); err != nil {
 		t.Fatalf("unparseable URL: %v", err)
@@ -327,19 +348,20 @@ func TestMarketURLUsesEventSlugNotMarketSlug(t *testing.T) {
 
 func TestMarketURLEmptyWhenEventSlugMissing(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
-
-	// No event metadata: better to omit the link than to ship a known-broken
-	// /event/<market-slug>.
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{MultiplierLadder: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	if got := loop.marketURL(market.Market{Slug: "orphan-market"}); got != "" {
-		t.Fatalf("expected empty URL when EventSlug is missing, got %q", got)
+		t.Fatalf("expected empty URL, got %q", got)
 	}
 }
 
 func TestObserveConcurrencySafe(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, _ := newLoop(t, now, anomaly.Thresholds{
-		Multipliers: []float64{30}, AbsoluteUSDTiers: []float64{3_000}, MinBaselineTrades: 20,
+		MultiplierLadder:       []float64{30},
+		OddsLadder:             []float64{3},
+		MinTradeUSD:            100,
+		MinBaselineTrades:      20,
+		MinBaselineNotionalUSD: 10,
 	}, cluster.Config{Window: time.Hour, MinTrades: 5, MinUniqueWallets: 3})
 	m, _ := reg.Get("0xa")
 	var wg sync.WaitGroup

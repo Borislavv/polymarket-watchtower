@@ -40,12 +40,17 @@ type Metrics struct {
 
 	// --- Per-trade anomaly model (primary signal) ---
 	TradeSizeUSD            prometheus.Histogram   // every trade's USD notional
+	TradeOdds               prometheus.Histogram   // every trade's 1/price odds
 	TradeAnomalyMultiplier  prometheus.Histogram   // observed multiplier for fired anomalies
 	TradeAnomalies          *prometheus.CounterVec // severity, category, reason
+	HighOddsTrades          *prometheus.CounterVec // severity, category — odds-driven anomalies
 	CategoryAnomalousTrades *prometheus.CounterVec // category, severity
 	CategoryAnomalousUSD    *prometheus.CounterVec // category, severity
 	CategoryHardAlerts      *prometheus.CounterVec // category
 	BaselineBuckets         prometheus.Gauge       // total live (category,market,outcome) buckets
+
+	// --- Filtering ---
+	CategoryFilterSkipped *prometheus.CounterVec // stage = discover|detect
 
 	// --- Alerting outcomes ---
 	TelegramAlertsSent  *prometheus.CounterVec // severity
@@ -104,6 +109,12 @@ func New() *Metrics {
 		Buckets: []float64{10, 50, 100, 500, 1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000, 10_000_000},
 	})
 
+	m.TradeOdds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "odds",
+		Help:    "Implied odds (1/price) of every ingested trade.",
+		Buckets: []float64{1, 1.5, 2, 3, 5, 10, 25, 50, 100, 1000},
+	})
+
 	m.TradeAnomalyMultiplier = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "anomaly_multiplier",
 		Help:    "Observed notional/baseline multiplier when a single-trade anomaly fires.",
@@ -114,6 +125,11 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "trade", Name: "anomalies_total",
 		Help: "Single-trade anomalies emitted, by severity/category/reason.",
 	}, []string{"severity", "category", "reason"})
+
+	m.HighOddsTrades = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "high_odds_total",
+		Help: "Single-trade anomalies whose reason is HighOddsTrade or HighOddsWhaleDetected.",
+	}, []string{"severity", "category"})
 
 	m.CategoryAnomalousTrades = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "category", Name: "anomalous_trades_total",
@@ -135,6 +151,11 @@ func New() *Metrics {
 		Help: "Number of live (category, market, outcome) baseline buckets.",
 	})
 
+	m.CategoryFilterSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "filter", Name: "category_skipped_total",
+		Help: "Times a category was skipped by the blacklist, by stage (discover|detect).",
+	}, []string{"stage"})
+
 	m.TelegramAlertsSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "telegram", Name: "alerts_sent_total",
 		Help: "Telegram alerts successfully delivered, by severity.",
@@ -150,9 +171,10 @@ func New() *Metrics {
 		m.MarketsTracked,
 		m.TradesIngested, m.NotionalIngested,
 		m.WindowTradeRate, m.WindowNotionalRate, m.WindowAvgSize,
-		m.TradeSizeUSD, m.TradeAnomalyMultiplier, m.TradeAnomalies,
+		m.TradeSizeUSD, m.TradeOdds, m.TradeAnomalyMultiplier, m.TradeAnomalies, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
 		m.BaselineBuckets,
+		m.CategoryFilterSkipped,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
 	)
 	return m

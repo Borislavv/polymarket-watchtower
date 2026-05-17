@@ -2,29 +2,41 @@ package anomaly
 
 import "sort"
 
-// Thresholds defines the two independent single-trade signals:
+// Canonical alert reasons. These appear in the Finding payload (and the
+// rendered Telegram header) so reviewers can route by reason at a glance.
+const (
+	ReasonWhale         = "WhaleAnomaly"
+	ReasonHighOdds      = "HighOddsTrade"
+	ReasonHighOddsWhale = "HighOddsWhaleDetected"
+	ReasonCluster       = "WhaleClusterDetected"
+)
+
+// Thresholds drives per-trade single_cluster scoring. Three independent signals
+// are evaluated; the higher severity wins and the Reason is set accordingly:
 //
-//   - Multipliers: a sorted ladder applied to (trade USD notional / baseline
-//     median USD notional) for the same (category, market, outcome) bucket.
-//     Severity mapping: lowest→info, middle→warning, top→critical. Skipped
-//     entirely when the baseline sample is below MinBaselineTrades to avoid
-//     the divide-by-tiny-N false-positive class.
+//   - Whale (relative): trade USD >= MinTradeUSD AND baseline sample meets
+//     MinBaselineTrades + MinBaselineNotionalUSD floors AND
+//     (notional / baseline.median) crosses MultiplierLadder.
+//   - High odds: 1/price crosses OddsLadder AND notional >= MinTradeUSD/10.
+//     No baseline required — captures asymmetric-payoff insider bets on
+//     cold/illiquid outcomes.
+//   - Combined: both whale + odds fire => Reason = HighOddsWhaleDetected.
 //
-//   - AbsoluteUSDTiers: a sorted ladder applied to the trade's USD notional
-//     directly, regardless of baseline. Catches "$10k bet on a fresh market"
-//     where no baseline exists yet. Same info/warning/critical mapping.
-//
-// Both signals score every trade; the higher severity wins.
+// MinBaselineNotionalUSD complements MinBaselineTrades: even 50 samples are
+// useless if they total $5, so we additionally require a USD floor on the
+// baseline reservoir before trusting the median.
 type Thresholds struct {
-	Multipliers       []float64
-	AbsoluteUSDTiers  []float64
-	MinBaselineTrades int
+	MultiplierLadder       []float64
+	OddsLadder             []float64
+	MinTradeUSD            float64
+	MinBaselineTrades      int
+	MinBaselineNotionalUSD float64
 }
 
 // Normalise sorts and de-dupes both ladders in place.
 func (t *Thresholds) Normalise() {
-	t.Multipliers = sortedUnique(t.Multipliers)
-	t.AbsoluteUSDTiers = sortedUnique(t.AbsoluteUSDTiers)
+	t.MultiplierLadder = sortedUnique(t.MultiplierLadder)
+	t.OddsLadder = sortedUnique(t.OddsLadder)
 }
 
 func sortedUnique(xs []float64) []float64 {
@@ -45,6 +57,11 @@ func sortedUnique(xs []float64) []float64 {
 
 // SeverityForLadder returns the severity for the highest ladder rung that v
 // crosses, plus the rung value. ok=false when v is below every rung.
+//
+// Mapping is fixed at three rungs: lowest=>Info, second-highest=>Warning,
+// highest=>Critical. Ladders longer than 3 collapse intermediate rungs into
+// the next-lower bucket — operators who want a finer mapping should pick
+// three thresholds rather than six.
 func SeverityForLadder(v float64, ladder []float64) (Severity, float64, bool) {
 	if len(ladder) == 0 || v < ladder[0] {
 		return "", 0, false

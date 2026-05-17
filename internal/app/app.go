@@ -11,6 +11,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
@@ -38,10 +39,10 @@ type App struct {
 	registry *aggregate.MarketRegistry
 	engine   *aggregate.Engine
 
-	discover *discover.Loop
-	collect  *collect.Loop
-	detect   *detect.Loop
-	httpSrv  *httpsrv.Server
+	discover  *discover.Loop
+	collect   *collect.Loop
+	detectRun func(context.Context) error // active mode's Run
+	httpSrv   *httpsrv.Server
 
 	telegramPoller *alerting2.Poller // nil when TELEGRAM_UPDATES_ENABLED=false
 }
@@ -136,38 +137,71 @@ func New() (*App, error) {
 		}
 	}
 
-	detectLoop := detect.New(detect.Config{
-		Thresholds: anomaly.Thresholds{
-			Multipliers:       cfg.Anomaly.Multipliers,
-			AbsoluteUSDTiers:  cfg.Anomaly.AbsoluteUSDTiers,
-			MinBaselineTrades: cfg.Anomaly.MinBaselineTrades,
-		},
-		Baseline: baseline.Config{
-			Window:     cfg.Anomaly.BaselineWindow,
-			MaxSamples: cfg.Anomaly.BaselineMaxSamples,
-		},
-		Cluster: cluster.Config{
-			Window:           cfg.Anomaly.HardAlertWindow,
-			MinTrades:        cfg.Anomaly.HardAlertMinTrades,
-			MinUniqueWallets: cfg.Anomaly.HardAlertMinWallets,
-			MinTotalUSD:      cfg.Anomaly.HardAlertMinTotalUSD,
-			Cooldown:         cfg.Anomaly.HardAlertCooldown,
-		},
-		RecentWindows:  cfg.Aggregate.RecentWindows,
-		GaugeInterval:  cfg.Pipeline.CollectInterval,
-		PolymarketBase: cfg.Polymarket.PublicBaseURL,
-		GrafanaBase:    cfg.Alerting.GrafanaBaseURL,
-		GrafanaDashUID: cfg.Alerting.GrafanaDashUID,
-		GrafanaContext: cfg.Alerting.GrafanaContext,
-	}, engine, registry, emitter, met, logger)
+	// Detector wiring depends on ANOMALY_MODE. single_cluster is the primary
+	// product path (per-trade scoring + cluster HARD alert); volume keeps the
+	// legacy aggregate-rate detector for operators who explicitly opt in.
+	var (
+		detectLoop *detect.Loop
+		volumeLoop *detect.VolumeLoop
+		observer   collect.TradeObserver
+		detectRun  func(context.Context) error
+	)
+	switch cfg.Anomaly.Mode {
+	case ModeSingleCluster:
+		detectLoop = detect.New(detect.Config{
+			Thresholds: anomaly.Thresholds{
+				MultiplierLadder:       cfg.Anomaly.SingleMultiplierThresholds,
+				OddsLadder:             cfg.Anomaly.SingleOddsThresholds,
+				MinTradeUSD:            cfg.Anomaly.SingleMinTradeUSD,
+				MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
+				MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
+			},
+			Baseline: baseline.Config{
+				Window:     cfg.Anomaly.BaselineWindow,
+				MaxSamples: cfg.Anomaly.BaselineMaxSamples,
+			},
+			Cluster: cluster.Config{
+				Window:           cfg.Anomaly.ClusterWindow,
+				MinTrades:        cfg.Anomaly.ClusterMinTrades,
+				MinUniqueWallets: cfg.Anomaly.ClusterMinWallets,
+				MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
+				Cooldown:         cfg.Anomaly.ClusterCooldown,
+			},
+			RecentWindows:  cfg.Aggregate.RecentWindows,
+			GaugeInterval:  cfg.Pipeline.CollectInterval,
+			PolymarketBase: cfg.Polymarket.PublicBaseURL,
+			GrafanaBase:    cfg.Alerting.GrafanaBaseURL,
+			GrafanaDashUID: cfg.Alerting.GrafanaDashUID,
+			GrafanaContext: cfg.Alerting.GrafanaContext,
+		}, engine, registry, emitter, met, logger)
+		observer = detectLoop
+		detectRun = detectLoop.Run
+	case ModeVolume:
+		volumeLoop = detect.NewVolume(detect.VolumeConfig{
+			Interval:      cfg.Pipeline.CollectInterval,
+			RecentWindows: cfg.Aggregate.RecentWindows,
+			Multipliers:   cfg.Anomaly.VolumeMultipliers,
+			MinNotional:   cfg.Anomaly.VolumeMinNotional,
+			MinTrades:     cfg.Anomaly.VolumeMinTrades,
+			Cooldown:      cfg.Anomaly.VolumeCooldown,
+		}, engine, registry, emitter, met, logger)
+		observer = volumeLoop
+		detectRun = volumeLoop.Run
+	default:
+		return nil, fmt.Errorf("unknown ANOMALY_MODE %q", cfg.Anomaly.Mode)
+	}
 
 	collectLoop := collect.New(collect.Config{
 		Interval:     cfg.Pipeline.CollectInterval,
 		Concurrency:  cfg.Pipeline.CollectConcurrency,
 		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
-	}, dataClient, engine, registry, detectLoop, met, logger)
+	}, dataClient, engine, registry, observer, met, logger)
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
+
+	logger.Info().Str("mode", string(cfg.Anomaly.Mode)).Msg("anomaly detector mode")
+	_ = volumeLoop // referenced via detectRun
+	_ = detectLoop // referenced via observer / detectRun
 
 	return &App{
 		cfg:            cfg,
@@ -177,7 +211,7 @@ func New() (*App, error) {
 		engine:         engine,
 		discover:       discoverLoop,
 		collect:        collectLoop,
-		detect:         detectLoop,
+		detectRun:      detectRun,
 		httpSrv:        httpSrv,
 		telegramPoller: telegramPoller,
 	}, nil
@@ -191,7 +225,7 @@ func (a *App) Run() error {
 		{Name: "metrics-server", Fn: a.httpSrv.Run},
 		{Name: "discover", Fn: a.discover.Run},
 		{Name: "collect", Fn: a.collect.Run},
-		{Name: "detect", Fn: a.detect.Run}, // refreshes supporting gauges only
+		{Name: "detect", Fn: a.detectRun},
 	}
 	if a.telegramPoller != nil {
 		execs = append(execs, shutdown2.Exec{Name: "telegram-poller", Fn: a.telegramPoller.Run})

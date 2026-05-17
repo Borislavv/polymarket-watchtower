@@ -70,6 +70,7 @@ type TradeRef struct {
 	Side        trade.Side
 	SizeShares  float64
 	Price       float64
+	Odds        float64 // 1/Price; copied so sinks don't redo the math
 	NotionalUSD float64
 	At          time.Time
 }
@@ -122,10 +123,10 @@ type Finding struct {
 	Reason string
 
 	// Single-trade anomaly fields.
-	Trade        *TradeRef
-	Baseline     *BaselineRef
-	Multiplier   float64 // observed NotionalUSD / Baseline.MedianUSD (0 if N/A)
-	AbsoluteTier float64 // USD tier crossed (0 if not applicable)
+	Trade      *TradeRef
+	Baseline   *BaselineRef
+	Multiplier float64 // observed NotionalUSD / Baseline.MedianUSD (0 if N/A)
+	OddsRung   float64 // crossed odds-ladder rung (0 if N/A)
 
 	// Cluster fields.
 	Category *CategoryRef
