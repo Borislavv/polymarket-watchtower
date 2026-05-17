@@ -98,12 +98,15 @@ func New() (*App, error) {
 	gammaClient := gamma.New(gammaHTTP)
 	dataClient := dataapi.New(dataHTTP)
 
+	categoryFilter := category.NewFilter(cfg.CategoryFilter.Blacklist)
+	logger.Info().Str("category_blacklist", categoryFilter.Summary()).Msg("category filter")
+
 	discoverLoop := discover.New(discover.Config{
 		Interval:   cfg.Pipeline.DiscoverInterval,
 		MaxMarkets: cfg.Pipeline.MaxMarkets,
 		ActiveOnly: cfg.Pipeline.ActiveOnly,
 		OrderBy:    cfg.Pipeline.OrderBy,
-	}, gammaClient, registry, engine, met, logger)
+	}, gammaClient, registry, engine, categoryFilter, met, logger)
 
 	sinks := []alerting2.Channel{&alerting2.LogSink{Logger: logger}}
 	if cfg.Alerting.WebhookURL != "" {
@@ -167,6 +170,7 @@ func New() (*App, error) {
 				MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
 				Cooldown:         cfg.Anomaly.ClusterCooldown,
 			},
+			Filter:         categoryFilter,
 			RecentWindows:  cfg.Aggregate.RecentWindows,
 			GaugeInterval:  cfg.Pipeline.CollectInterval,
 			PolymarketBase: cfg.Polymarket.PublicBaseURL,
