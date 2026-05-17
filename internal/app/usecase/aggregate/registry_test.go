@@ -4,7 +4,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/domain/market"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 )
 
