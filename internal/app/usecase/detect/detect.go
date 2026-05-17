@@ -19,6 +19,7 @@ package detect
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -267,7 +268,12 @@ func (l *Loop) marketURL(m market.Market) string {
 	if l.cfg.PolymarketBase == "" || m.Slug == "" {
 		return ""
 	}
-	return l.cfg.PolymarketBase + "/event/" + m.Slug
+	u, err := url.Parse(l.cfg.PolymarketBase)
+	if err != nil {
+		return ""
+	}
+	u.Path = singleSlashJoin(u.Path, "event", m.Slug)
+	return u.String()
 }
 
 // grafanaURL builds a deep-link with from/to ±GrafanaContext around `at` and
@@ -276,18 +282,40 @@ func (l *Loop) grafanaURL(cat anomaly.CategoryRef, m market.Market, at time.Time
 	if l.cfg.GrafanaBase == "" || l.cfg.GrafanaDashUID == "" {
 		return ""
 	}
-	fromMs := at.Add(-l.cfg.GrafanaContext).UnixMilli()
-	toMs := at.Add(l.cfg.GrafanaContext).UnixMilli()
-	u := l.cfg.GrafanaBase + "/d/" + l.cfg.GrafanaDashUID + "/?orgId=1"
-	u += "&from=" + strconv.FormatInt(fromMs, 10)
-	u += "&to=" + strconv.FormatInt(toMs, 10)
+	u, err := url.Parse(l.cfg.GrafanaBase)
+	if err != nil {
+		return ""
+	}
+	u.Path = singleSlashJoin(u.Path, "d", l.cfg.GrafanaDashUID) + "/"
+
+	q := url.Values{}
+	q.Set("orgId", "1")
+	q.Set("from", strconv.FormatInt(at.Add(-l.cfg.GrafanaContext).UnixMilli(), 10))
+	q.Set("to", strconv.FormatInt(at.Add(l.cfg.GrafanaContext).UnixMilli(), 10))
 	if cat.Label != "" {
-		u += "&var-category=" + urlEncode(cat.Label)
+		q.Set("var-category", cat.Label)
 	}
 	if m.Slug != "" {
-		u += "&var-market=" + urlEncode(m.Slug)
+		q.Set("var-market", m.Slug)
 	}
-	return u
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// singleSlashJoin joins path segments with exactly one "/" between them,
+// preserving a leading slash on the base path.
+func singleSlashJoin(base string, segs ...string) string {
+	out := base
+	for _, s := range segs {
+		if s == "" {
+			continue
+		}
+		if len(out) == 0 || out[len(out)-1] != '/' {
+			out += "/"
+		}
+		out += s
+	}
+	return out
 }
 
 // Run periodically refreshes supporting Grafana gauges from the aggregate
@@ -344,24 +372,3 @@ func nonEmpty(a, b string) string {
 	return b
 }
 
-// urlEncode is a minimal query-value escape. Avoids importing net/url to keep
-// the dependency surface small; only handles characters expected in category
-// labels and market slugs.
-func urlEncode(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
-			out = append(out, c)
-		case c == '-' || c == '_' || c == '.' || c == '~':
-			out = append(out, c)
-		case c == ' ':
-			out = append(out, '+')
-		default:
-			const hex = "0123456789ABCDEF"
-			out = append(out, '%', hex[c>>4], hex[c&0xf])
-		}
-	}
-	return string(out)
-}

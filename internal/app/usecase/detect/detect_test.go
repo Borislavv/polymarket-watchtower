@@ -2,6 +2,7 @@ package detect
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -192,6 +193,123 @@ func TestCategoryWatchHardAlertFires(t *testing.T) {
 	}
 	if h.Category == nil || h.Category.Label != "Politics" {
 		t.Fatalf("category: %+v", h.Category)
+	}
+}
+
+// TestGrafanaURLEncoding pins that link building goes through net/url, so any
+// regression that resurrects a homemade encoder is caught here.
+func TestGrafanaURLEncoding(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 5, 17, 14, 30, 0, 0, time.UTC)
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+
+	cases := []struct {
+		name        string
+		categoryLbl string
+		marketSlug  string
+		// Substrings the resulting URL MUST contain (already-encoded form).
+		wantSubstrs []string
+		// Substrings the resulting URL MUST NOT contain.
+		notContains []string
+	}{
+		{
+			name:        "ascii_label_and_slug",
+			categoryLbl: "Politics",
+			marketSlug:  "us-pres",
+			wantSubstrs: []string{"var-category=Politics", "var-market=us-pres", "orgId=1"},
+		},
+		{
+			name:        "label_with_space",
+			categoryLbl: "US Election",
+			marketSlug:  "us-pres-2028",
+			// QueryEscape encodes spaces as '+'.
+			wantSubstrs: []string{"var-category=US+Election", "var-market=us-pres-2028"},
+		},
+		{
+			name:        "label_with_ampersand_and_equals",
+			categoryLbl: "A & B = C",
+			marketSlug:  "x",
+			// & and = must be percent-encoded so they don't break the query.
+			wantSubstrs: []string{"var-category=A+%26+B+%3D+C"},
+			notContains: []string{"var-category=A & B = C"},
+		},
+		{
+			name:        "label_with_slash",
+			categoryLbl: "AI/ML",
+			marketSlug:  "x",
+			wantSubstrs: []string{"var-category=AI%2FML"},
+		},
+		{
+			name:        "label_with_unicode",
+			categoryLbl: "Café — Élections 2024",
+			marketSlug:  "x",
+			// QueryEscape produces uppercase percent-hex for multibyte UTF-8.
+			wantSubstrs: []string{"var-category=Caf%C3%A9+%E2%80%94+%C3%89lections+2024"},
+		},
+		{
+			name:        "label_with_hash",
+			categoryLbl: "#Trending",
+			marketSlug:  "x",
+			wantSubstrs: []string{"var-category=%23Trending"},
+		},
+		{
+			name:        "empty_market_omits_var",
+			categoryLbl: "Politics",
+			marketSlug:  "",
+			wantSubstrs: []string{"var-category=Politics"},
+			notContains: []string{"var-market="},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotStr := loop.grafanaURL(
+				anomaly.CategoryRef{Label: c.categoryLbl},
+				market.Market{Slug: c.marketSlug},
+				at,
+			)
+			// Round-trip through net/url to prove the result is a valid URL.
+			parsed, err := url.Parse(gotStr)
+			if err != nil {
+				t.Fatalf("grafanaURL produced an unparseable URL %q: %v", gotStr, err)
+			}
+			q, err := url.ParseQuery(parsed.RawQuery)
+			if err != nil {
+				t.Fatalf("query did not round-trip: %v (raw=%q)", err, parsed.RawQuery)
+			}
+			if c.categoryLbl != "" && q.Get("var-category") != c.categoryLbl {
+				t.Errorf("var-category round-trip: got %q want %q", q.Get("var-category"), c.categoryLbl)
+			}
+			if c.marketSlug != "" && q.Get("var-market") != c.marketSlug {
+				t.Errorf("var-market round-trip: got %q want %q", q.Get("var-market"), c.marketSlug)
+			}
+			for _, want := range c.wantSubstrs {
+				if !strings.Contains(gotStr, want) {
+					t.Errorf("URL missing %q in: %s", want, gotStr)
+				}
+			}
+			for _, banned := range c.notContains {
+				if strings.Contains(gotStr, banned) {
+					t.Errorf("URL must not contain %q: %s", banned, gotStr)
+				}
+			}
+		})
+	}
+}
+
+func TestMarketURLEncoding(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	loop, _, _ := newLoop(t, now, anomaly.Thresholds{Multipliers: []float64{30}}, cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
+
+	// Polymarket slugs are kebab-case ASCII by convention; verify we still
+	// build a parseable URL even when the base has a trailing slash.
+	loop.cfg.PolymarketBase = "https://polymarket.com/"
+	got := loop.marketURL(market.Market{Slug: "will-argentina-win-the-2026-fifa-world-cup-245"})
+	want := "https://polymarket.com/event/will-argentina-win-the-2026-fifa-world-cup-245"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if _, err := url.Parse(got); err != nil {
+		t.Fatalf("unparseable URL: %v", err)
 	}
 }
 
