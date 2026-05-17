@@ -218,12 +218,13 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 		Cluster: cluster.Config{
 			Window: time.Hour, MinTrades: 3, MinUniqueWallets: 3, MinTotalUSD: 50_000, Cooldown: time.Hour,
 		},
-		RecentWindows:  []time.Duration{time.Hour},
-		PolymarketBase: "https://polymarket.com",
-		GrafanaBase:    "http://grafana.local",
-		GrafanaDashUID: "uid1",
-		GrafanaContext: time.Hour,
-		Clock:          clock,
+		RecentWindows:               []time.Duration{time.Hour},
+		PolymarketBase:              "https://polymarket.com",
+		GrafanaBase:                 "http://grafana.local",
+		GrafanaDashUID:              "uid1",
+		GrafanaContext:              time.Hour,
+		AllowUnknownMarketLifecycle: true, // fake markets have no start/end dates
+		Clock:                       clock,
 	}, eng, reg, fanout, met, &log)
 
 	collectLoop := collect.New(collect.Config{

@@ -30,6 +30,13 @@ type Stats struct {
 	MedianUSD float64
 	P95USD    float64
 	TotalUSD  float64
+	// SpanActual is the observed time between the oldest and newest live
+	// sample (after window trimming). 0 when fewer than two samples exist.
+	// This is the truth that should be displayed in alerts — the configured
+	// Window is just the upper bound, not a requirement.
+	SpanActual time.Duration
+	// OldestAt is the timestamp of the oldest live sample, or zero if empty.
+	OldestAt time.Time
 }
 
 // Config controls memory and freshness.
@@ -68,12 +75,17 @@ type ring struct {
 	sum  float64
 }
 
+// New constructs a Baseline. Window=0 means "no upper bound" — samples are
+// only evicted by the per-bucket ring cap (MaxSamples). That is the right
+// behaviour for very long-lived markets; readiness is still enforced by the
+// detector via MinBaselineTrades, MinBaselineNotionalUSD, and the
+// downstream BaselineMinReadySpan gate.
 func New(cfg Config) *Baseline {
 	if cfg.MaxSamples <= 0 {
 		cfg.MaxSamples = defaultMaxSamples
 	}
-	if cfg.Window <= 0 {
-		cfg.Window = 7 * 24 * time.Hour
+	if cfg.Window < 0 {
+		cfg.Window = 0
 	}
 	now := cfg.Clock
 	if now == nil {
@@ -100,28 +112,44 @@ func (b *Baseline) Add(k Key, notionalUSD float64, at time.Time) {
 }
 
 // Stats returns a snapshot for the bucket after dropping out-of-window samples.
-// Empty bucket → zero Stats.
+// Empty bucket → zero Stats. When cfg.Window == 0 the trim step is skipped —
+// the ring is the only bound.
 func (b *Baseline) Stats(k Key) Stats {
-	cutoff := b.now().Add(-b.cfg.Window)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	r, ok := b.buckets[k]
 	if !ok {
 		return Stats{}
 	}
-	r.trim(cutoff)
+	if b.cfg.Window > 0 {
+		r.trim(b.now().Add(-b.cfg.Window))
+	}
 	if r.size == 0 {
 		return Stats{}
 	}
-	notionals := r.snapshot()
+	notionals := make([]float64, 0, r.size)
+	cap := len(r.buf)
+	var oldest, newest time.Time
+	for i := 0; i < r.size; i++ {
+		s := r.buf[(r.head+i)%cap]
+		notionals = append(notionals, s.notional)
+		if i == 0 || s.at.Before(oldest) {
+			oldest = s.at
+		}
+		if i == 0 || s.at.After(newest) {
+			newest = s.at
+		}
+	}
 	sort.Float64s(notionals)
 	mean := r.sum / float64(r.size)
 	return Stats{
-		Count:     r.size,
-		MeanUSD:   mean,
-		MedianUSD: percentile(notionals, 0.5),
-		P95USD:    percentile(notionals, 0.95),
-		TotalUSD:  r.sum,
+		Count:      r.size,
+		MeanUSD:    mean,
+		MedianUSD:  percentile(notionals, 0.5),
+		P95USD:     percentile(notionals, 0.95),
+		TotalUSD:   r.sum,
+		SpanActual: newest.Sub(oldest),
+		OldestAt:   oldest,
 	}
 }
 

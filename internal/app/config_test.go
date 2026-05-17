@@ -62,9 +62,16 @@ func TestConfigDefaults(t *testing.T) {
 		t.Errorf("warning tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.WarningMinNotionalUSD, cfg.Anomaly.WarningMinOdds, cfg.Anomaly.WarningMinMultiplier)
 	}
-	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 10_000 {
+	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 1_000 {
 		t.Errorf("critical tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.CriticalMinNotionalUSD, cfg.Anomaly.CriticalMinOdds, cfg.Anomaly.CriticalMinMultiplier)
+	}
+	if cfg.Anomaly.HardPromotionMinNotionalUSD != 100_000 || cfg.Anomaly.HardPromotionMinOdds != 8 || cfg.Anomaly.HardPromotionMinMultiplier != 1_000 {
+		t.Errorf("hard-promotion defaults: notional=%v odds=%v mul=%v",
+			cfg.Anomaly.HardPromotionMinNotionalUSD, cfg.Anomaly.HardPromotionMinOdds, cfg.Anomaly.HardPromotionMinMultiplier)
+	}
+	if cfg.Anomaly.AllowUnknownMarketLifecycle {
+		t.Errorf("AllowUnknownMarketLifecycle default must be false (fail-closed)")
 	}
 	if cfg.Anomaly.BaselineMinTradeUSD != 50 {
 		t.Errorf("baseline min trade: %v", cfg.Anomaly.BaselineMinTradeUSD)

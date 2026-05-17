@@ -53,7 +53,8 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 			Float64("baseline_mean_usd", f.Baseline.MeanUSD).
 			Float64("baseline_p95_usd", f.Baseline.P95USD).
 			Int("baseline_n", f.Baseline.SampleN).
-			Dur("baseline_window", f.Baseline.WindowAgo)
+			Dur("baseline_span", f.Baseline.Span).
+			Dur("baseline_window_max", f.Baseline.WindowMax)
 	}
 	if f.Category != nil {
 		evt = evt.

@@ -90,7 +90,12 @@ type BaselineRef struct {
 	MeanUSD   float64
 	P95USD    float64
 	SampleN   int
-	WindowAgo time.Duration // lookback used to compute the baseline
+	// Span is the actual time-span the baseline samples cover (newest minus
+	// oldest). This is what sinks should display — operators must see the
+	// real data span, not a confusingly-large configured cap.
+	Span time.Duration
+	// WindowMax is the configured upper bound; 0 means "no cap".
+	WindowMax time.Duration
 }
 
 // CategoryRef identifies the category that fired a CategoryWatch alert (or the

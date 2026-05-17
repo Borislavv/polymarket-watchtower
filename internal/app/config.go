@@ -108,22 +108,38 @@ type AnomalyConfig struct {
 	WarningMinMultiplier   float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 	CriticalMinNotionalUSD float64 `env:"ALERT_CRITICAL_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
 	CriticalMinOdds        float64 `env:"ALERT_CRITICAL_MIN_ODDS" envDefault:"8" validate:"gte=1"`
-	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
+	// Critical multiplier defaults to 1000× (was 10000×): with conservative-min
+	// composition a $100k bet at odds 8 with 1000× rarity would otherwise
+	// collapse to warning. The HardPromotion rule below handles the truly
+	// extreme cases.
+	CriticalMinMultiplier float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+
+	// HardPromotion (HumanReviewRequired): when a trade clears ALL three
+	// floors it is promoted to Hard severity, bypassing conservative-min.
+	HardPromotionMinNotionalUSD float64 `env:"ALERT_HARD_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
+	HardPromotionMinOdds        float64 `env:"ALERT_HARD_MIN_ODDS" envDefault:"8" validate:"gte=1"`
+	HardPromotionMinMultiplier  float64 `env:"ALERT_HARD_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 
 	// Baseline shape.
 	BaselineMinTradeUSD          float64 `env:"BASELINE_MIN_TRADE_USD" envDefault:"50" validate:"gte=0"`
 	SingleMinBaselineTrades      int     `env:"SINGLE_MIN_BASELINE_TRADES" envDefault:"20" validate:"gte=0"`
 	SingleMinBaselineNotionalUSD float64 `env:"SINGLE_MIN_BASELINE_NOTIONAL_USD" envDefault:"1000" validate:"gte=0"`
-	// BaselineWindow defaults to 1 year so the reservoir captures essentially
-	// all historical activity per (cat, market, outcome). The per-bucket
-	// MaxSamples ring still bounds memory; readiness gates (MinTrades and
-	// MinNotional) guard the cold-start window.
-	BaselineWindow     time.Duration `env:"BASELINE_WINDOW" envDefault:"8760h" validate:"required"`
+	// BaselineWindow is the MAXIMUM lookback the reservoir keeps; 0 means
+	// "no upper bound" (only the per-bucket MaxSamples ring caps memory).
+	// It is NOT a minimum-age requirement on the market — a 1-month-old
+	// market with BASELINE_WINDOW=1y uses the 1 month of available history.
+	BaselineWindow     time.Duration `env:"BASELINE_WINDOW" envDefault:"8760h" validate:"gte=0"`
 	BaselineMaxSamples int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+	// BaselineMinReadySpan requires the observed baseline span (newest minus
+	// oldest sample) to clear this floor before alerts can fire. Distinct
+	// from BaselineWindow which is a *cap*. 0 disables.
+	BaselineMinReadySpan time.Duration `env:"BASELINE_MIN_READY_WINDOW" envDefault:"24h" validate:"gte=0"`
 
 	// Lifecycle gating.
-	LifecycleAlertFromPct float64 `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
-	LifecycleHotFromPct   float64 `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
+	LifecycleAlertFromPct       float64       `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
+	LifecycleHotFromPct         float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
+	MarketMinAge                time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
+	AllowUnknownMarketLifecycle bool          `env:"ALLOW_UNKNOWN_MARKET_LIFECYCLE" envDefault:"false"`
 
 	// Cluster (HARD) alert.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`

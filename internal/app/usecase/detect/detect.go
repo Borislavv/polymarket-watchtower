@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
@@ -60,7 +61,22 @@ type Config struct {
 	// gate.
 	LifecycleAlertFromPct float64
 	LifecycleHotFromPct   float64
-	Clock                 func() time.Time
+	// MarketMinAge gates alerts on absolute market age (now - StartDate).
+	// 0 disables. Markets without StartDate bypass.
+	MarketMinAge time.Duration
+	// BaselineMinReadySpan requires the observed baseline span (newest minus
+	// oldest sample) to clear this floor before alerts can fire. 0 disables.
+	// Distinct from BaselineWindow, which is the *maximum* lookback.
+	BaselineMinReadySpan time.Duration
+	// AllowUnknownMarketLifecycle: when false (default), markets without
+	// StartDate/EndDate are silently skipped — fail-closed. Set true to
+	// allow them through (legacy / debugging).
+	AllowUnknownMarketLifecycle bool
+	// SportsKeywords is consulted against the market title, event slug, and
+	// market slug as a secondary blacklist. Catches sports markets attached
+	// to non-sports categories like Polymarket's "Hide From New".
+	SportsKeywords []string
+	Clock          func() time.Time
 }
 
 // Loop owns the analytics state.
@@ -146,13 +162,30 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	}
 	l.metrics.TradeSizeUSD.Observe(notional)
 
-	// Lifecycle gate: skip markets that aren't deep enough into their lifetime.
-	// Markets without start/end dates pass (we can't gate on missing info).
+	// Alert-eligibility gates. These do NOT block baseline updates — we want
+	// the reservoir to warm continuously so it's ready the moment the market
+	// crosses the lifecycle threshold.
 	lifecyclePct, lifecycleKnown := market.LifecyclePct(trade.Timestamp)
-	if lifecycleKnown && lifecyclePct < l.cfg.LifecycleAlertFromPct {
-		return
-	}
 	hot := lifecycleKnown && lifecyclePct >= l.cfg.LifecycleHotFromPct
+	gateAllowsAlert := true
+	if !lifecycleKnown && !l.cfg.AllowUnknownMarketLifecycle {
+		// Fail-closed: a market without start/end dates can't be lifecycle-gated
+		// and so can't be trusted by default.
+		gateAllowsAlert = false
+	}
+	if lifecycleKnown && lifecyclePct < l.cfg.LifecycleAlertFromPct {
+		gateAllowsAlert = false
+	}
+	if l.cfg.MarketMinAge > 0 && !market.StartDate.IsZero() &&
+		l.now().Sub(market.StartDate) < l.cfg.MarketMinAge {
+		gateAllowsAlert = false
+	}
+	// Secondary sports check on the market itself (title, slug, event slug)
+	// — catches sports markets attached to non-sports categories like
+	// "Hide From New".
+	if gateAllowsAlert && marketLooksLikeSport(market, l.cfg.SportsKeywords) {
+		gateAllowsAlert = false
+	}
 
 	categories := market.Categories
 	if len(categories) == 0 {
@@ -178,6 +211,18 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		bucket := baseline.Key{Category: cat, Market: market.ID, OutcomeToken: trade.Token}
 		stats := l.baseline.Stats(bucket)
 		l.baseline.Add(bucket, notional, trade.Timestamp)
+
+		// Alert-eligibility gates from here down (baseline already updated).
+		if !gateAllowsAlert {
+			continue
+		}
+		// Baseline readiness: insist on a minimum observed span. This is
+		// distinct from BaselineWindow (the maximum cap) — a 1-month market
+		// is fine on a 1y cap, but we still want at least, say, 24h of
+		// observed activity before we trust the median.
+		if l.cfg.BaselineMinReadySpan > 0 && stats.SpanActual < l.cfg.BaselineMinReadySpan {
+			continue
+		}
 
 		sr := score.Score(notional, trade.Price, stats, l.cfg.Thresholds)
 		if !sr.Fired {
@@ -252,7 +297,8 @@ func (l *Loop) emitTradeAnomaly(
 			MeanUSD:   stats.MeanUSD,
 			P95USD:    stats.P95USD,
 			SampleN:   stats.Count,
-			WindowAgo: l.cfg.Baseline.Window,
+			Span:      stats.SpanActual,
+			WindowMax: l.cfg.Baseline.Window,
 		},
 		Multiplier:       sr.Multiplier,
 		AbsoluteTier:     sr.AbsoluteTier,
@@ -303,6 +349,25 @@ func (l *Loop) emitCategoryWatch(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit category-watch failed")
 	}
+}
+
+// marketLooksLikeSport scans the market's title/slug/event-slug for any
+// blacklisted sports keyword (case-insensitive substring). Empty keyword list
+// disables the check.
+func marketLooksLikeSport(m market.Market, keywords []string) bool {
+	if len(keywords) == 0 {
+		return false
+	}
+	hay := strings.ToLower(m.Question + " " + m.Slug + " " + m.EventSlug + " " + m.EventTitle)
+	for _, k := range keywords {
+		if k == "" {
+			continue
+		}
+		if strings.Contains(hay, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // allowed reports whether the category passes the blacklist. Uncategorised

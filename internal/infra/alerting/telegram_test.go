@@ -38,7 +38,9 @@ func sampleTradeFinding() anomaly.Finding {
 		},
 		Baseline: &anomaly.BaselineRef{
 			Scope:     "category=Weather market=rain outcome=Yes",
-			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, SampleN: 1240, WindowAgo: 7 * 24 * time.Hour,
+			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, SampleN: 1240,
+			Span:      30*24*time.Hour + 6*time.Hour,
+			WindowMax: 365 * 24 * time.Hour,
 		},
 		Category:         &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
 		Multiplier:       12_371,
@@ -111,6 +113,7 @@ func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 		"<b>x12371</b> above baseline median ($9.70)",
 		"odds <b>20.0</b>, implied probability <b>5.0%</b>",
 		"baseline: <b>1240</b> trades, median $9.70",
+		"span 30d6h of available history",
 		"tiers: absolute=<code>critical</code> multiplier=<code>critical</code>",
 		"market lifecycle: <b>93.5%</b> elapsed (HOT — final stretch)",
 		"<b>part of a forming cluster</b>: 4 anomalous trades",

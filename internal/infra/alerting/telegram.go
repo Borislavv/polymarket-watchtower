@@ -254,8 +254,9 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 			multiplierFmt(f.Trade.Odds), f.Trade.Price*100)
 	}
 	if f.Baseline != nil {
-		fmt.Fprintf(b, "• baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, window %s\n",
-			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD), money(f.Baseline.P95USD), f.Baseline.WindowAgo)
+		fmt.Fprintf(b, "• baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, span %s of available history\n",
+			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD), money(f.Baseline.P95USD),
+			humanDuration(f.Baseline.Span))
 	}
 	if f.AbsoluteTier != "" || f.MultiplierTier != "" {
 		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> → final=<b>%s</b>\n",
@@ -393,6 +394,30 @@ func money(v float64) string {
 		return string(out)
 	}
 	return fmt.Sprintf("%.2f", v)
+}
+
+// humanDuration prints durations in operator-friendly units. Sub-minute → "<1m".
+func humanDuration(d time.Duration) string {
+	if d <= 0 {
+		return "<1m"
+	}
+	const day = 24 * time.Hour
+	days := int(d / day)
+	hours := int((d % day) / time.Hour)
+	switch {
+	case days >= 1 && hours > 0:
+		return fmt.Sprintf("%dd%dh", days, hours)
+	case days >= 1:
+		return fmt.Sprintf("%dd", days)
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh%dm", int(d/time.Hour), int((d%time.Hour)/time.Minute))
+	default:
+		m := int(d / time.Minute)
+		if m == 0 {
+			return "<1m"
+		}
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 func multiplierFmt(m float64) string {

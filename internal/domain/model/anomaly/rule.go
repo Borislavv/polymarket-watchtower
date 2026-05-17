@@ -28,13 +28,33 @@ type Tier struct {
 //
 // Final severity is the *lower* of the two tier outcomes (conservative AND).
 // Below-info on either side ⇒ no alert.
+//
+// HardPromotion takes precedence: any trade matching ALL three HardPromotion
+// thresholds is promoted straight to Hard severity — the "HumanReviewRequired"
+// signal that bypasses the conservative-min collapse for unambiguous whale
+// activity (e.g. $100k @ odds 8 @ 1000× baseline).
 type Thresholds struct {
 	Info     Tier
 	Warning  Tier
 	Critical Tier
+	// HardPromotion: a single-trade alert is promoted to Hard severity when
+	// notional, odds, and multiplier all clear these floors. Zero-valued
+	// fields disable the promotion path entirely.
+	HardPromotion Tier
 
 	MinBaselineTrades      int
 	MinBaselineNotionalUSD float64
+}
+
+// MeetsHardPromotion reports whether (notional, odds, mul) clears every
+// HardPromotion floor. All three must be configured (non-zero) for the rule
+// to be eligible; otherwise the promotion is disabled.
+func (t Thresholds) MeetsHardPromotion(notional, odds, mul float64) bool {
+	p := t.HardPromotion
+	if p.MinNotionalUSD <= 0 || p.MinOdds <= 0 || p.MinMultiplier <= 0 {
+		return false
+	}
+	return notional >= p.MinNotionalUSD && odds >= p.MinOdds && mul >= p.MinMultiplier
 }
 
 // AbsoluteTier returns the highest tier where notional AND odds both meet the

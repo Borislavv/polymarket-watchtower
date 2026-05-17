@@ -51,9 +51,13 @@ func Score(notionalUSD, price float64, bs baseline.Stats, t anomaly.Thresholds) 
 		return Result{Odds: odds, AbsoluteTier: absTier, Multiplier: mul}
 	}
 
+	finalSev := anomaly.ConservativeMin(absTier, mulTier)
+	if t.MeetsHardPromotion(notionalUSD, odds, mul) {
+		finalSev = anomaly.SeverityHard
+	}
 	return Result{
 		Fired:          true,
-		Severity:       anomaly.ConservativeMin(absTier, mulTier),
+		Severity:       finalSev,
 		AbsoluteTier:   absTier,
 		MultiplierTier: mulTier,
 		Multiplier:     mul,
