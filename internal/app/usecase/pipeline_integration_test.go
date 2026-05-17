@@ -19,7 +19,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
-	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/anomaly"
+	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
