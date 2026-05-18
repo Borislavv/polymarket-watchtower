@@ -28,6 +28,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/statsreport"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
@@ -65,6 +66,7 @@ type App struct {
 	sanity   *sanity.Worker
 	outcomes *outcomes.Worker
 	drift    *drift.Worker
+	stats    *statsreport.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -149,6 +151,7 @@ func New() (*App, error) {
 		sanityWorker   *sanity.Worker
 		outcomesWorker *outcomes.Worker
 		driftWorker    *drift.Worker
+		statsWorker    *statsreport.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -174,6 +177,7 @@ func New() (*App, error) {
 			repository.NewCategoryRepository(pgPool),
 			marketsRepo, tradesRepo, tradersRepo,
 			cfg.CategoryFilter.Whitelist,
+			met,
 		)
 		dbBaseline = dbbaseline.New(dbbaseline.Config{
 			Window: cfg.Anomaly.BaselineWindow,
@@ -273,6 +277,17 @@ func New() (*App, error) {
 			Str("chat_id", cfg.Alerting.TelegramChatID).
 			Int("workers", cfg.AlertSender.Workers).
 			Msg("alertsender: enabled")
+
+		if cfg.StatsReport.Enabled {
+			statsWorker = statsreport.New(statsreport.Config{
+				Interval:     cfg.StatsReport.Interval,
+				ChatID:       cfg.Alerting.TelegramChatID,
+				StartupGrace: cfg.StatsReport.StartupGrace,
+			}, statsreport.NewStore(pgPool), telegramSenderAdapter{bot: bot}, met, logger)
+			logger.Info().
+				Dur("interval", cfg.StatsReport.Interval).
+				Msg("statsreport: enabled (periodic Telegram summary)")
+		}
 	}
 	if cfg.Postgres.Enabled() {
 		backfillWorker = backfill.New(backfill.Config{
@@ -281,7 +296,7 @@ func New() (*App, error) {
 			Concurrency: cfg.Backfill.Workers,
 			PageSize:    cfg.Backfill.PageLimit,
 			StaleAfter:  cfg.Backfill.StaleAfter,
-		}, marketsRepo, tradesRepo, tradersRepo, dataClient, logger)
+		}, marketsRepo, tradesRepo, tradersRepo, dataClient, met, logger)
 		logger.Info().
 			Int("workers", cfg.Backfill.Workers).
 			Dur("interval", cfg.Backfill.Interval).
@@ -291,7 +306,7 @@ func New() (*App, error) {
 			Interval:   cfg.MarketSanity.Interval,
 			Retention:  cfg.MarketSanity.Retention,
 			ClaimLimit: int32(cfg.MarketSanity.ClaimLimit),
-		}, marketsRepo, marketcacheUpstream{cache: cache}, logger)
+		}, marketsRepo, marketcacheUpstream{cache: cache}, met, logger)
 		logger.Info().
 			Dur("interval", cfg.MarketSanity.Interval).
 			Dur("retention", cfg.MarketSanity.Retention).
@@ -431,8 +446,19 @@ func New() (*App, error) {
 		sanity:    sanityWorker,
 		outcomes:  outcomesWorker,
 		drift:     driftWorker,
+		stats:     statsWorker,
 		pgPool:    pgPool,
 	}, nil
+}
+
+// telegramSenderAdapter narrows *telegram.Bot to statsreport.Sender by
+// dropping the SendResult — the stats worker has no use for the
+// upstream Telegram message id.
+type telegramSenderAdapter struct{ bot *telegram.Bot }
+
+func (a telegramSenderAdapter) SendHTML(ctx context.Context, chatID, text string) error {
+	_, err := a.bot.SendHTML(ctx, chatID, text)
+	return err
 }
 
 // marketcacheUpstream adapts *marketcache.Cache to sanity.UpstreamChecker.
@@ -480,6 +506,9 @@ func (a *App) Run() error {
 	}
 	if a.drift != nil {
 		execs = append(execs, shutdown2.Exec{Name: "drift", Fn: a.drift.Run})
+	}
+	if a.stats != nil {
+		execs = append(execs, shutdown2.Exec{Name: "statsreport", Fn: a.stats.Run})
 	}
 
 	return shutdown2.Graceful(

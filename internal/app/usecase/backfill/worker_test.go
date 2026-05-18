@@ -176,7 +176,7 @@ func TestWorker_CompletesWhenLastPageIsShort(t *testing.T) {
 		makePage(123, now.Add(-18*time.Hour)), // short → complete
 	}}
 	w := New(Config{PageSize: 500, Concurrency: 1, BatchSize: 1, Clock: func() time.Time { return now }},
-		ms, tr, td, cl, nopLogger())
+		ms, tr, td, cl, nil, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -206,7 +206,7 @@ func TestWorker_PartialAPILimitOnOffsetCap(t *testing.T) {
 	}
 	cl := &fakeClient{pages: pages, cap: 7}
 	w := New(Config{PageSize: 500, Concurrency: 1, BatchSize: 1, Clock: func() time.Time { return now }},
-		ms, tr, td, cl, nopLogger())
+		ms, tr, td, cl, nil, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -222,7 +222,7 @@ func TestWorker_FailsOnUpstreamError(t *testing.T) {
 	td := &fakeTraders{}
 	cl := &fakeClient{err: errors.New("upstream 500")}
 	w := New(Config{Concurrency: 1, BatchSize: 1, Clock: func() time.Time { return now }},
-		ms, tr, td, cl, nopLogger())
+		ms, tr, td, cl, nil, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -239,7 +239,7 @@ func TestWorker_ContextCancellationLeavesRunning(t *testing.T) {
 	ms := &fakeMarketStore{candidates: []repository.Market{{ID: 1, ConditionID: "0xa"}}}
 	cl := &fakeClient{err: context.Canceled}
 	w := New(Config{Concurrency: 1, BatchSize: 1, Clock: func() time.Time { return now }},
-		ms, &fakeTrades{}, &fakeTraders{}, cl, nopLogger())
+		ms, &fakeTrades{}, &fakeTraders{}, cl, nil, nopLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -258,7 +258,7 @@ func TestWorker_ResetsStaleRunningEveryTick(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	ms := &fakeMarketStore{}
 	w := New(Config{Concurrency: 1, BatchSize: 1, Clock: func() time.Time { return now }},
-		ms, &fakeTrades{}, &fakeTraders{}, &fakeClient{}, nopLogger())
+		ms, &fakeTrades{}, &fakeTraders{}, &fakeClient{}, nil, nopLogger())
 
 	w.Tick(context.Background())
 	w.Tick(context.Background())
@@ -275,7 +275,7 @@ func TestWorker_PersistsTradersBeforeTrades(t *testing.T) {
 	td := &fakeTraders{}
 	cl := &fakeClient{pages: [][]trade.Trade{makePage(3, now, "0xA", "0xB", "0xA")}}
 	w := New(Config{Concurrency: 1, BatchSize: 1, PageSize: 500, Clock: func() time.Time { return now }},
-		ms, tr, td, cl, nopLogger())
+		ms, tr, td, cl, nil, nopLogger())
 
 	w.Tick(context.Background())
 

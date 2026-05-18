@@ -59,6 +59,25 @@ type Metrics struct {
 	// --- Alerting outcomes ---
 	TelegramAlertsSent  *prometheus.CounterVec // severity
 	TelegramAlertErrors *prometheus.CounterVec // severity
+
+	// --- Persistence (Postgres write path) ---
+	// Counters increment exactly once per row inserted / updated. Operators
+	// graph rate(...) over these to see whether the ingest path is keeping
+	// up with the discover/collect/backfill cadence.
+	MarketsUpserted         prometheus.Counter     // every successful UpsertMarket call (incl. ON CONFLICT)
+	MarketOutcomesUpserted  prometheus.Counter     // every UpsertOutcome call (per token row)
+	MarketsSoftDeleted      prometheus.Counter     // sweep-driven `active=false, deleted_at=NOW()` flips
+	MarketsPurged           prometheus.Counter     // sanity reaper terminal state (`purged_at=NOW()`)
+	MarketsResumed          prometheus.Counter     // sanity reaper detected a soft-deleted market back upstream
+	TradesUpserted          prometheus.Counter     // unique trade rows inserted (excludes dedup_key conflicts)
+	TradesDuplicatesSkipped prometheus.Counter     // UpsertBatch attempts that hit ON CONFLICT DO NOTHING
+	TradersUpserted         prometheus.Counter     // distinct wallets persisted into polymarket_traders
+	BackfillPagesFetched    prometheus.Counter     // Data API /trades pages successfully persisted
+	BackfillRunsTotal       *prometheus.CounterVec // status = completed|partial_api_limit|failed
+
+	// --- Stats summary worker ---
+	StatsSummariesSent prometheus.Counter // periodic Telegram stats sends
+	StatsSummaryErrors prometheus.Counter // periodic stats send failures
 }
 
 func New() *Metrics {
@@ -186,6 +205,56 @@ func New() *Metrics {
 		Help: "Telegram alert delivery failures, by severity.",
 	}, []string{"severity"})
 
+	m.MarketsUpserted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "markets_upserted_total",
+		Help: "Successful UpsertMarket calls. Includes both fresh inserts and updates to existing rows (ON CONFLICT path).",
+	})
+	m.MarketOutcomesUpserted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "market_outcomes_upserted_total",
+		Help: "Successful UpsertOutcome calls — one per (market, token) row written.",
+	})
+	m.MarketsSoftDeleted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "markets_soft_deleted_total",
+		Help: "Markets flipped to active=false with deleted_at=NOW() by a discovery sweep (disappeared upstream).",
+	})
+	m.MarketsPurged = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "sanity", Name: "markets_purged_total",
+		Help: "Soft-deleted markets that reached retention and were marked purged_at by the sanity reaper. Trade rows are retained.",
+	})
+	m.MarketsResumed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "sanity", Name: "markets_resumed_total",
+		Help: "Soft-deleted markets that reappeared upstream during the retention window and were requeued for backfill.",
+	})
+	m.TradesUpserted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "trades_upserted_total",
+		Help: "Unique trade rows persisted. Excludes attempts whose dedup_key collided with an existing row.",
+	})
+	m.TradesDuplicatesSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "trades_duplicates_skipped_total",
+		Help: "Trade insert attempts dropped by the dedup_key UNIQUE constraint (ON CONFLICT DO NOTHING). Overlapping collect/backfill sweeps inflate this counter; high values are not an error.",
+	})
+	m.TradersUpserted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "persist", Name: "traders_upserted_total",
+		Help: "Wallets persisted into polymarket_traders. Counts every UpsertSeen row, so per-tick churn is expected as the same wallets reappear.",
+	})
+	m.BackfillPagesFetched = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "backfill", Name: "pages_fetched_total",
+		Help: "Data API /trades pages successfully persisted by the backfill worker. Multiply by configured PageSize for an upper bound on rows touched.",
+	})
+	m.BackfillRunsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "backfill", Name: "runs_total",
+		Help: "Backfill runs that reached a terminal state, labelled by outcome (completed, partial_api_limit, failed).",
+	}, []string{"status"})
+
+	m.StatsSummariesSent = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "stats", Name: "summaries_sent_total",
+		Help: "Periodic Telegram stats summaries delivered (one per interval when the worker is enabled).",
+	})
+	m.StatsSummaryErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "stats", Name: "summary_errors_total",
+		Help: "Periodic stats summary send failures. Non-zero usually means Telegram delivery or a stats query is broken.",
+	})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -198,6 +267,11 @@ func New() *Metrics {
 		m.BaselineBuckets,
 		m.CategoryFilterSkipped, m.AlertMMSuppressed, m.LifecycleUnknownSkipped,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
+		m.MarketsUpserted, m.MarketOutcomesUpserted,
+		m.MarketsSoftDeleted, m.MarketsPurged, m.MarketsResumed,
+		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,
+		m.BackfillPagesFetched, m.BackfillRunsTotal,
+		m.StatsSummariesSent, m.StatsSummaryErrors,
 	)
 	return m
 }

@@ -135,6 +135,19 @@ The Grafana link is a deep-link to the dashboard with `var-category`,
 `var-market`, and `from`/`to` set to `±GRAFANA_CONTEXT_WINDOW` around the
 trade — one click and you're looking at the right time window.
 
+`GRAFANA_BASE_URL` MUST be a host that recipients can reach from their
+phone. The formatter defensively elides any URL whose host is
+`localhost`, a loopback / link-local / unspecified IP, or whose scheme
+is not http/https — those would render as dead-text bullets on mobile
+Telegram. Leave `GRAFANA_BASE_URL` blank to disable Grafana links
+altogether; the rest of the alert still renders.
+
+Each alert ends with a `Data` block carrying the machine-readable
+identifiers: `market_id` (condition id), `outcome_token` (CLOB token id
+on accumulation findings), and `dedup` (the `polymarket_alerts.dedup_key`
+that uniquely names the firing — useful for cross-referencing with logs
+or the database).
+
 ## Metrics
 
 Per-trade and per-category metrics drive the new dashboard. Per-market gauges
@@ -155,6 +168,18 @@ are kept for supporting panels (bounded by `MAX_MARKETS`).
 | `watchtower_collect_notional_usd_total` | `market` | counter | Notional USD ingested per market |
 | `watchtower_window_*` | `market, window` | gauge | Supporting per-market rate gauges (not alerted) |
 | `watchtower_upstream_*` | `api, endpoint, status` | counter / histogram | Upstream traffic |
+| `watchtower_persist_markets_upserted_total` | — | counter | Successful UpsertMarket calls |
+| `watchtower_persist_markets_soft_deleted_total` | — | counter | Markets soft-deleted by a sweep |
+| `watchtower_persist_market_outcomes_upserted_total` | — | counter | UpsertOutcome row writes |
+| `watchtower_persist_trades_upserted_total` | — | counter | Unique trade inserts |
+| `watchtower_persist_trades_duplicates_skipped_total` | — | counter | ON CONFLICT DO NOTHING hits |
+| `watchtower_persist_traders_upserted_total` | — | counter | Traders persisted |
+| `watchtower_sanity_markets_purged_total` | — | counter | Soft-deleted markets that hit retention |
+| `watchtower_sanity_markets_resumed_total` | — | counter | Soft-deleted markets that reappeared upstream |
+| `watchtower_backfill_pages_fetched_total` | — | counter | Data API trade pages persisted |
+| `watchtower_backfill_runs_total` | `status` | counter | Backfill runs by terminal state |
+| `watchtower_stats_summaries_sent_total` | — | counter | Periodic Telegram summaries delivered |
+| `watchtower_stats_summary_errors_total` | — | counter | Periodic summary delivery failures |
 
 Wallet/trade IDs/tx hashes deliberately do **not** appear as label values — they
 go in logs and alert payloads. Polymarket has too many of them to safely use as

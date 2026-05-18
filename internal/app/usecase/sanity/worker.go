@@ -30,6 +30,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
 
@@ -85,11 +86,14 @@ type Worker struct {
 	markets  MarketReaper
 	upstream UpstreamChecker
 	log      *zerolog.Logger
+	metrics  *metrics.Metrics
 }
 
 // New wires the worker. Both reaper and upstream checker are required.
-func New(cfg Config, markets MarketReaper, upstream UpstreamChecker, log *zerolog.Logger) *Worker {
-	return &Worker{cfg: cfg.applyDefaults(), markets: markets, upstream: upstream, log: log}
+// metrics may be nil for tests; production wiring passes the shared
+// handle so MarketsPurged / MarketsResumed surface on Grafana.
+func New(cfg Config, markets MarketReaper, upstream UpstreamChecker, met *metrics.Metrics, log *zerolog.Logger) *Worker {
+	return &Worker{cfg: cfg.applyDefaults(), markets: markets, upstream: upstream, log: log, metrics: met}
 }
 
 // Run blocks until ctx is cancelled. The initial tick fires immediately so
@@ -136,6 +140,9 @@ func (w *Worker) tick(ctx context.Context) {
 				continue
 			}
 			resumed++
+			if w.metrics != nil {
+				w.metrics.MarketsResumed.Inc()
+			}
 			w.log.Info().
 				Int64("market_id", m.ID).
 				Str("condition_id", m.ConditionID).
@@ -150,6 +157,9 @@ func (w *Worker) tick(ctx context.Context) {
 			continue
 		}
 		purged++
+		if w.metrics != nil {
+			w.metrics.MarketsPurged.Inc()
+		}
 		w.log.Info().
 			Int64("market_id", m.ID).
 			Str("condition_id", m.ConditionID).

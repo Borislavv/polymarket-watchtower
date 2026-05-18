@@ -165,7 +165,7 @@ func TestMarketRepository_UpsertAndBackfillState(t *testing.T) {
 
 	// Mark-inactive: a market not present in the latest sweep within the
 	// whitelisted scope becomes inactive.
-	if err := marketRepo.MarkSeenInactive(ctx, []string{"someone-else"}, []int64{politicsID}); err != nil {
+	if _, err := marketRepo.MarkSeenInactive(ctx, []string{"someone-else"}, []int64{politicsID}); err != nil {
 		t.Fatalf("mark inactive: %v", err)
 	}
 	got, _ = marketRepo.GetByConditionID(ctx, "0xCAFE")

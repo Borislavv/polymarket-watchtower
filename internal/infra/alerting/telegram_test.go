@@ -506,3 +506,218 @@ func TestSpecialCharsInHrefAreEscaped(t *testing.T) {
 		t.Fatalf("href escape:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+// TestSanitizeLinkURLRejectsNonReachable pins the load-bearing defence
+// against the bug where the docker-compose default
+// GRAFANA_BASE_URL=http://localhost:3000 leaked into production alerts:
+// Telegram refused to make localhost links clickable and operators saw a
+// "Grafana" anchor that did nothing on mobile.
+//
+// All forms an operator might paste without thinking — localhost,
+// loopback IPv4, loopback IPv6, unspecified, link-local — must be elided
+// at the formatter so the Links section never carries a dead bullet.
+func TestSanitizeLinkURLRejectsNonReachable(t *testing.T) {
+	for _, raw := range []string{
+		"http://localhost:3000",
+		"http://LOCALHOST/d/uid",
+		"https://localhost",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1/d/uid",
+		"http://[::1]:3000",
+		"http://0.0.0.0:3000",
+		"http://169.254.169.254/latest", // EC2 link-local
+	} {
+		if got := sanitizeLinkURL(raw); got != "" {
+			t.Errorf("sanitizeLinkURL(%q) = %q, want empty (non-reachable host)", raw, got)
+		}
+	}
+}
+
+// TestSanitizeLinkURLRejectsUnsafeSchemes blocks javascript:, data:, file:
+// and other schemes that would either be inert in Telegram or, worse,
+// trigger client-side behaviour. Bare strings and obviously-broken URLs
+// also drop to empty so they cannot accidentally render as a link.
+func TestSanitizeLinkURLRejectsUnsafeSchemes(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		"javascript:alert(1)",
+		"data:text/html,<script>alert(1)</script>",
+		"file:///etc/passwd",
+		"ftp://files.example.com/grafana",
+		"grafana.public/d/uid", // no scheme
+		"://broken",
+	} {
+		if got := sanitizeLinkURL(raw); got != "" {
+			t.Errorf("sanitizeLinkURL(%q) = %q, want empty (unsafe / unparseable)", raw, got)
+		}
+	}
+}
+
+// TestSanitizeLinkURLAcceptsPublic confirms the happy path: public http
+// and https URLs survive unchanged, including the query parameters
+// Grafana deep-links lean on (from/to/var-*). The sanitizer must NOT
+// strip or re-encode anything — only validate.
+func TestSanitizeLinkURLAcceptsPublic(t *testing.T) {
+	for _, raw := range []string{
+		"https://polymarket.com/event/rain-tomorrow",
+		"https://grafana.example.com/d/uid123/?from=1&to=2&var-category=Weather&var-severity=critical",
+		"http://grafana.public/d/uid",
+		"http://192.0.2.10/d/uid", // TEST-NET-1, public-routable per IANA
+	} {
+		if got := sanitizeLinkURL(raw); got != raw {
+			t.Errorf("sanitizeLinkURL(%q) = %q, want unchanged", raw, got)
+		}
+	}
+}
+
+// TestLinksElideLocalhostGrafana is the end-to-end regression: an
+// operator running with the docker-compose default
+// GRAFANA_BASE_URL=http://localhost:3000 must not see a Grafana bullet
+// in the rendered Telegram body at all (no anchor, no plain-text label,
+// no orphan bullet). The Links section should still render — the other
+// three URLs are public — but Grafana is invisible.
+func TestLinksElideLocalhostGrafana(t *testing.T) {
+	f := sampleTradeFinding()
+	f.GrafanaURL = "http://localhost:3000/d/uid123/?from=1&to=2&var-severity=critical"
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "Grafana") {
+		t.Fatalf("localhost Grafana URL must not produce any Grafana entry in body:\n%s", msg)
+	}
+	// Other links survive.
+	for _, want := range []string{"Polymarket market", "Polymarket category", "Trader"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing public link %q in:\n%s", want, msg)
+		}
+	}
+}
+
+// TestLinksElideAllLocalhostSkipsSection covers the worst-case operator
+// misconfig: every URL is a localhost / loopback variant. The Links
+// section should be omitted entirely rather than emitting an empty
+// header.
+func TestLinksElideAllLocalhostSkipsSection(t *testing.T) {
+	f := sampleTradeFinding()
+	f.MarketURL = "http://localhost/event/x"
+	f.CategoryURL = "http://127.0.0.1/predictions/x"
+	f.TraderURL = "http://[::1]/profile/0xabc"
+	f.GrafanaURL = "http://localhost:3000/d/uid"
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<b>Links</b>") {
+		t.Fatalf("Links section must be skipped when every URL is non-reachable:\n%s", msg)
+	}
+}
+
+// TestDataBlockOnTradeAnomaly pins the trailing Data block on a
+// single-trade Finding. The block carries the dedup_key (primary join
+// key for log / Grafana correlation) plus the market_id from the
+// firing trade. Values are wrapped in <code> for copy-friendliness.
+func TestDataBlockOnTradeAnomaly(t *testing.T) {
+	f := sampleTradeFinding()
+	f.DedupKey = "single:v1:trade-1"
+	msg := FormatTelegramMessage(f)
+	for _, want := range []string{
+		"<b>Data</b>",
+		"• market_id: <code>0xabc</code>",
+		"• dedup: <code>single:v1:trade-1</code>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+	// Data block must come AFTER Links — operators read top-down: severity,
+	// why, trade, links to act, raw identifiers last.
+	if li, di := strings.Index(msg, "<b>Links</b>"), strings.Index(msg, "<b>Data</b>"); !(li > 0 && di > li) {
+		t.Fatalf("Data must follow Links in layout:\n%s", msg)
+	}
+}
+
+// TestDataBlockOnAccumulation verifies the accumulation Finding
+// surfaces market_id + outcome_token from AccumulationRef. The
+// accumulation Finding is the only kind that carries the CLOB token
+// pre-computed (the line is by construction single-outcome).
+func TestDataBlockOnAccumulation(t *testing.T) {
+	f := anomaly.Finding{
+		Kind:     anomaly.KindAccumulation,
+		Severity: anomaly.SeverityWarning,
+		Reason:   anomaly.ReasonAccumulation,
+		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
+		Accumulation: &anomaly.AccumulationRef{
+			Wallet:           "0xabc1234567890def1234567890abcdef12345678",
+			MarketID:         "0xmarket",
+			OutcomeToken:     "12345678901234567890",
+			Outcome:          "Yes",
+			Side:             "BUY",
+			TradeCount:       7,
+			TotalNotionalUSD: 80_000,
+			Span:             2 * time.Hour,
+		},
+		Trade: &anomaly.TradeRef{
+			Market:      "0xmarket",
+			NotionalUSD: 8_000,
+		},
+		DedupKey: "accumulation:v1:0xabc:1:t:BUY:1747483200",
+	}
+	msg := FormatTelegramMessage(f)
+	for _, want := range []string{
+		"<b>Data</b>",
+		"• market_id: <code>0xmarket</code>",
+		"• outcome_token: <code>12345678901234567890</code>",
+		"• dedup: <code>accumulation:v1:0xabc:1:t:BUY:1747483200</code>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+}
+
+// TestDataBlockOnCluster confirms cluster findings render the dedup
+// key. Cluster findings legitimately have no single market_id (a
+// cluster spans the category), so market_id may be missing — but the
+// block itself must render so the dedup key is visible.
+func TestDataBlockOnCluster(t *testing.T) {
+	f := sampleClusterFinding()
+	f.DedupKey = "cluster:v1:99:1747483200"
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "<b>Data</b>") {
+		t.Fatalf("cluster finding missing Data block:\n%s", msg)
+	}
+	if !strings.Contains(msg, "• dedup: <code>cluster:v1:99:1747483200</code>") {
+		t.Fatalf("cluster dedup not rendered:\n%s", msg)
+	}
+}
+
+// TestDataBlockOmittedWhenAllEmpty keeps the older trade-only fixtures
+// (those that don't set DedupKey) rendering exactly as before — no
+// orphan "Data" header, no empty block.
+func TestDataBlockOmittedWhenAllEmpty(t *testing.T) {
+	f := anomaly.Finding{
+		Kind:     anomaly.KindCategoryWatch,
+		Severity: anomaly.SeverityHard,
+		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
+		Category: &anomaly.CategoryRef{ID: 1, Slug: "x", Label: "X"},
+		Cluster:  &anomaly.ClusterStats{Window: time.Minute, AnomalousTrades: 1, UniqueWallets: 1, TotalUSD: 1},
+	}
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<b>Data</b>") {
+		t.Fatalf("Data block must be skipped when dedup + market + token are all empty:\n%s", msg)
+	}
+}
+
+// TestDataBlockEscapesValues protects against an alert payload that
+// (hypothetically) embedded HTML-unsafe characters in identifier
+// fields. dedup_key today is alphanumeric + ':' + '-', but defence in
+// depth matters: a future strategy version is free to widen the
+// charset and we don't want a stray '<' to break Telegram's HTML
+// parser.
+func TestDataBlockEscapesValues(t *testing.T) {
+	f := sampleTradeFinding()
+	f.Trade.Market = "0x<evil>"
+	f.DedupKey = `single:v1:a&b<c>`
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "• market_id: <code>0x&lt;evil&gt;</code>") {
+		t.Errorf("market_id not HTML-escaped:\n%s", msg)
+	}
+	if !strings.Contains(msg, "• dedup: <code>single:v1:a&amp;b&lt;c&gt;</code>") {
+		t.Errorf("dedup not HTML-escaped:\n%s", msg)
+	}
+}

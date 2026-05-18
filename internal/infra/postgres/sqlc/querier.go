@@ -160,7 +160,7 @@ type Querier interface {
 	// transition — if a market was already inactive we leave its marker alone
 	// so the sanity worker's retention window starts at the original
 	// disappearance, not at every subsequent tick.
-	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) error
+	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) (int64, error)
 	OldestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending

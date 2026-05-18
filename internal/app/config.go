@@ -379,9 +379,23 @@ type AlertingConfig struct {
 	TelegramBaseURL  string        `env:"TELEGRAM_BASE_URL"`
 	TelegramTimeout  time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
 
-	GrafanaBaseURL string        `env:"GRAFANA_BASE_URL" envDefault:"http://localhost:3000"`
+	// GrafanaBaseURL: empty by default to avoid shipping the
+	// docker-compose default (http://localhost:3000), which renders as
+	// a dead link in Telegram on mobile. Set to a host reachable from
+	// alert recipients; loopback / localhost / link-local hosts are
+	// silently elided from the rendered alert.
+	GrafanaBaseURL string        `env:"GRAFANA_BASE_URL" envDefault:""`
 	GrafanaDashUID string        `env:"GRAFANA_DASH_UID" envDefault:""`
 	GrafanaContext time.Duration `env:"GRAFANA_CONTEXT_WINDOW" envDefault:"1h"`
+}
+
+// StatsReportConfig wires the optional periodic stats summary worker.
+// Disabled by default; enable in production to get a "pipeline is
+// alive" heartbeat in the same Telegram chat as per-alert messages.
+type StatsReportConfig struct {
+	Enabled      bool          `env:"TELEGRAM_STATS_ENABLED" envDefault:"false"`
+	Interval     time.Duration `env:"TELEGRAM_STATS_INTERVAL" envDefault:"2h"`
+	StartupGrace time.Duration `env:"TELEGRAM_STATS_STARTUP_GRACE" envDefault:"0"`
 }
 
 type Config struct {
@@ -398,6 +412,7 @@ type Config struct {
 	Anomaly        AnomalyConfig
 	CategoryFilter CategoryFilterConfig
 	Alerting       AlertingConfig
+	StatsReport    StatsReportConfig
 }
 
 func LoadConfig() (*Config, error) {

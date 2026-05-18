@@ -141,10 +141,12 @@ func (r *MarketRepository) upsertOne(ctx context.Context, m UpsertMarketInput) (
 // category scope that did NOT appear in the latest sweep. Scoping by
 // category prevents the worker from inadvertently marking markets in
 // non-whitelisted categories as inactive (they were never in the sweep
-// to begin with).
-func (r *MarketRepository) MarkSeenInactive(ctx context.Context, seenConditionIDs []string, scopeCategoryIDs []int64) error {
+// to begin with). Returns the number of rows flipped this call so the
+// caller can observe a soft-delete counter — the value is informational,
+// callers that don't care can ignore it.
+func (r *MarketRepository) MarkSeenInactive(ctx context.Context, seenConditionIDs []string, scopeCategoryIDs []int64) (int64, error) {
 	if len(scopeCategoryIDs) == 0 {
-		return nil
+		return 0, nil
 	}
 	return r.q.MarkMarketsInactiveNotIn(ctx, sqlc.MarkMarketsInactiveNotInParams{
 		SeenConditionIds: seenConditionIDs,

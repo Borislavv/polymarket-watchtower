@@ -222,4 +222,11 @@ type Finding struct {
 	CategoryURL string
 	TraderURL   string
 	GrafanaURL  string
+
+	// DedupKey is the alert's idempotency key as inserted into
+	// polymarket_alerts. Surfaced to sinks so the rendered payload can
+	// carry it in a `Data` block — operators correlating Telegram
+	// messages with database rows or with Grafana logs use this string
+	// as the primary join key.
+	DedupKey string
 }

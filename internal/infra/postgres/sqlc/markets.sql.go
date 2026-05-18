@@ -378,7 +378,7 @@ func (q *Queries) MarkMarketPurged(ctx context.Context, id int64) error {
 	return err
 }
 
-const markMarketsInactiveNotIn = `-- name: MarkMarketsInactiveNotIn :exec
+const markMarketsInactiveNotIn = `-- name: MarkMarketsInactiveNotIn :execrows
 UPDATE polymarket_markets m
 SET active     = FALSE,
     deleted_at = COALESCE(m.deleted_at, NOW()),
@@ -405,9 +405,12 @@ type MarkMarketsInactiveNotInParams struct {
 // transition — if a market was already inactive we leave its marker alone
 // so the sanity worker's retention window starts at the original
 // disappearance, not at every subsequent tick.
-func (q *Queries) MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) error {
-	_, err := q.db.Exec(ctx, markMarketsInactiveNotIn, arg.SeenConditionIds, arg.ScopeCategoryIds)
-	return err
+func (q *Queries) MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markMarketsInactiveNotIn, arg.SeenConditionIds, arg.ScopeCategoryIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const requeueResumedMarket = `-- name: RequeueResumedMarket :exec

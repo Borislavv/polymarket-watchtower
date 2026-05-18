@@ -55,7 +55,7 @@ func newWorker(reaper *fakeReaper, upstream *fakeUpstream) *Worker {
 		Retention:  720 * time.Hour,
 		ClaimLimit: 100,
 		Clock:      func() time.Time { return time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC) },
-	}, reaper, upstream, &log)
+	}, reaper, upstream, nil, &log)
 }
 
 // TestTick_PurgesStaleSoftDeleted pins: a market still missing upstream
@@ -150,7 +150,7 @@ func TestTick_ContextCancelStopsBatch(t *testing.T) {
 
 // TestDefaults pins applyDefaults wires sane production values.
 func TestDefaults(t *testing.T) {
-	w := New(Config{}, &fakeReaper{}, &fakeUpstream{}, &zerolog.Logger{})
+	w := New(Config{}, &fakeReaper{}, &fakeUpstream{}, nil, &zerolog.Logger{})
 	if w.cfg.Interval != time.Hour {
 		t.Errorf("interval default: %v", w.cfg.Interval)
 	}

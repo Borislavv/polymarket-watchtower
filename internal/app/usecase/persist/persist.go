@@ -17,6 +17,7 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
 
@@ -30,17 +31,20 @@ type Sink struct {
 	trades     *repository.TradeRepository
 	traders    *repository.TraderRepository
 	whitelist  []string
+	metrics    *metrics.Metrics
 }
 
 // NewSink constructs a Sink. The whitelist is applied once on every
 // discovery tick so a newly-discovered category is flagged enabled the
-// first time it appears.
+// first time it appears. metrics may be nil — in that case the Sink
+// runs without instrumentation (useful for in-memory tests).
 func NewSink(
 	categories *repository.CategoryRepository,
 	markets *repository.MarketRepository,
 	trades *repository.TradeRepository,
 	traders *repository.TraderRepository,
 	whitelist []string,
+	met *metrics.Metrics,
 ) *Sink {
 	return &Sink{
 		categories: categories,
@@ -48,6 +52,7 @@ func NewSink(
 		trades:     trades,
 		traders:    traders,
 		whitelist:  whitelist,
+		metrics:    met,
 	}
 }
 
@@ -127,6 +132,9 @@ func (s *Sink) PersistDiscovery(ctx context.Context, cats []market.Category, mar
 	if err != nil {
 		return fmt.Errorf("upsert markets: %w", err)
 	}
+	if s.metrics != nil {
+		s.metrics.MarketsUpserted.Add(float64(len(persistedMarkets)))
+	}
 	// Upsert outcome tokens for every market we just persisted. Outcomes
 	// rarely change after a market opens, so this is mostly a no-op via
 	// ON CONFLICT — but it does mean alerts carry human labels for any
@@ -142,8 +150,12 @@ func (s *Sink) PersistDiscovery(ctx context.Context, cats []market.Category, mar
 	for _, id := range enabledByExternal {
 		scope = append(scope, id)
 	}
-	if err := s.markets.MarkSeenInactive(ctx, seenConditionIDs, scope); err != nil {
+	flipped, err := s.markets.MarkSeenInactive(ctx, seenConditionIDs, scope)
+	if err != nil {
 		return fmt.Errorf("mark inactive: %w", err)
+	}
+	if s.metrics != nil && flipped > 0 {
+		s.metrics.MarketsSoftDeleted.Add(float64(flipped))
 	}
 	return nil
 }
@@ -173,6 +185,10 @@ func (s *Sink) PersistTrades(ctx context.Context, m market.Market, trades []trad
 		idByWallet[tr.WalletAddress] = tr.ID
 	}
 
+	if s.metrics != nil {
+		s.metrics.TradersUpserted.Add(float64(len(persisted)))
+	}
+
 	repoTrades := make([]repository.InsertTradeInput, 0, len(trades))
 	for _, t := range trades {
 		var traderID *int64
@@ -192,8 +208,15 @@ func (s *Sink) PersistTrades(ctx context.Context, m market.Market, trades []trad
 			TxHash:       t.TxHash,
 		})
 	}
-	if _, err := s.trades.UpsertBatch(ctx, repoTrades); err != nil {
+	res, err := s.trades.UpsertBatch(ctx, repoTrades)
+	if err != nil {
 		return fmt.Errorf("upsert trades: %w", err)
+	}
+	if s.metrics != nil {
+		s.metrics.TradesUpserted.Add(float64(res.Inserted))
+		if dup := res.Requested - res.Inserted; dup > 0 {
+			s.metrics.TradesDuplicatesSkipped.Add(float64(dup))
+		}
 	}
 	return nil
 }
@@ -221,6 +244,9 @@ func (s *Sink) upsertMarketOutcomes(ctx context.Context, persisted []repository.
 			}
 			if err := s.markets.UpsertOutcome(ctx, mid, string(tok), label); err != nil {
 				return fmt.Errorf("upsert outcome market=%s token=%s: %w", m.ID, tok, err)
+			}
+			if s.metrics != nil {
+				s.metrics.MarketOutcomesUpserted.Inc()
 			}
 		}
 	}

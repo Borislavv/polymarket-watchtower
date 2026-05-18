@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -138,6 +140,7 @@ func formatAccumulation(f anomaly.Finding) string {
 	writeAccumulationWhy(&b, f)
 	writeAccumulationTraderLine(&b, f)
 	writeLinks(&b, f)
+	writeData(&b, f)
 	return b.String()
 }
 
@@ -218,6 +221,7 @@ func formatTradeAnomaly(f anomaly.Finding) string {
 	writeWhy(&b, f)
 	writeTrade(&b, f)
 	writeLinks(&b, f)
+	writeData(&b, f)
 	return b.String()
 }
 
@@ -226,6 +230,7 @@ func formatCategoryWatch(f anomaly.Finding) string {
 	writeClusterHeader(&b, f)
 	writeCluster(&b, f)
 	writeLinks(&b, f)
+	writeData(&b, f)
 	return b.String()
 }
 
@@ -401,15 +406,23 @@ func writeCluster(b *strings.Builder, f anomaly.Finding) {
 }
 
 // writeLinks renders the bulleted Links section. Every entry is a Telegram
-// HTML <a href> anchor produced by renderLink — entries whose href is empty
-// are omitted entirely (no plain-text label is ever emitted). The whole
-// section is skipped when nothing is renderable.
+// HTML <a href> anchor produced by renderLink — entries whose href is
+// empty OR fails publicReachableURL validation are omitted entirely (no
+// plain-text label is ever emitted). The whole section is skipped when
+// nothing is renderable.
+//
+// publicReachableURL is the load-bearing defence: a typical operator misconfig
+// leaves GRAFANA_BASE_URL pointing at http://localhost:3000, which is
+// the docker-compose default. Telegram refuses to make localhost links
+// clickable on mobile, so the alert recipient sees a useless dead-text
+// "Grafana" entry. The validator fails closed (returns false) for
+// localhost, loopback IPs, link-local IPs, and non-http(s) schemes.
 func writeLinks(b *strings.Builder, f anomaly.Finding) {
 	entries := []struct{ label, href string }{
-		{"Polymarket market", f.MarketURL},
-		{"Polymarket category", f.CategoryURL},
-		{"Trader", f.TraderURL},
-		{"Grafana", f.GrafanaURL},
+		{"Polymarket market", sanitizeLinkURL(f.MarketURL)},
+		{"Polymarket category", sanitizeLinkURL(f.CategoryURL)},
+		{"Trader", sanitizeLinkURL(f.TraderURL)},
+		{"Grafana", sanitizeLinkURL(f.GrafanaURL)},
 	}
 	any := false
 	for _, e := range entries {
@@ -430,6 +443,98 @@ func writeLinks(b *strings.Builder, f anomaly.Finding) {
 		b.WriteString(renderLink(e.label, e.href))
 		b.WriteByte('\n')
 	}
+}
+
+// writeData renders the trailing <b>Data</b> block. The block carries the
+// machine-readable identifiers an operator needs to correlate a Telegram
+// alert with database rows, Grafana logs, or other systems:
+//
+//   - dedup: the polymarket_alerts.dedup_key for this finding. Embeds the
+//     strategy version, so it is the primary key for any cross-system
+//     join.
+//   - market_id: condition_id (vo.MarketID) when known.
+//   - outcome_token: the CLOB token id for the firing outcome.
+//
+// All values are HTML-escaped and rendered inside <code> so Telegram
+// clients format them in a copy-friendly monospace font. The whole
+// section is skipped when none of the three fields are populated — older
+// findings (and tests that didn't set DedupKey) stay unchanged.
+func writeData(b *strings.Builder, f anomaly.Finding) {
+	dedup := f.DedupKey
+	marketID, outcomeToken := dataMarketRefs(f)
+	if dedup == "" && marketID == "" && outcomeToken == "" {
+		return
+	}
+	b.WriteString("\n<b>Data</b>\n")
+	if marketID != "" {
+		fmt.Fprintf(b, "• market_id: <code>%s</code>\n", html.EscapeString(marketID))
+	}
+	if outcomeToken != "" {
+		fmt.Fprintf(b, "• outcome_token: <code>%s</code>\n", html.EscapeString(outcomeToken))
+	}
+	if dedup != "" {
+		fmt.Fprintf(b, "• dedup: <code>%s</code>\n", html.EscapeString(dedup))
+	}
+}
+
+// dataMarketRefs extracts the market_id and outcome_token for the Data
+// block. Accumulation findings carry the canonical pair on
+// AccumulationRef (the line is by definition single-outcome); single-
+// trade and category-watch findings fall back to the firing trade. A
+// cluster Finding may legitimately have neither — clusters span markets.
+func dataMarketRefs(f anomaly.Finding) (marketID, outcomeToken string) {
+	if f.Accumulation != nil {
+		marketID = f.Accumulation.MarketID
+		outcomeToken = f.Accumulation.OutcomeToken
+	}
+	if f.Trade != nil {
+		if marketID == "" {
+			marketID = string(f.Trade.Market)
+		}
+		// TradeRef does not carry the outcome token directly (only the
+		// outcome label). Accumulation is the only kind that ships it
+		// pre-computed; leave outcomeToken blank otherwise.
+	}
+	return marketID, outcomeToken
+}
+
+// sanitizeLinkURL returns the URL when it is safe to put in front of an
+// alert recipient and the empty string when it is not. Safe means:
+//
+//   - non-empty;
+//   - parseable;
+//   - scheme is http or https;
+//   - host is not a loopback, link-local, or unspecified address;
+//   - host is not the literal "localhost".
+//
+// Telegram silently refuses to make loopback links clickable on mobile,
+// and an alert recipient seeing a dead "Grafana" bullet is worse than
+// not seeing it at all. Returning empty here cascades through writeLinks
+// → renderLink and the entry is elided.
+func sanitizeLinkURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ""
+	}
+	if strings.EqualFold(host, "localhost") {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return ""
+		}
+	}
+	return raw
 }
 
 // renderLink returns a Telegram HTML-parse-mode anchor: `<a href="...">label</a>`.

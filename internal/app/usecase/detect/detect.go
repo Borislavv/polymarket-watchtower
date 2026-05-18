@@ -564,6 +564,7 @@ func (l *Loop) emitTradeAnomaly(
 	l.metrics.CategoryAnomalousUSD.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Add(ref.NotionalUSD)
 
 	dedup := l.singleTradeDedupKey(m, t)
+	f.DedupKey = dedup
 	if !l.persistAlert(ctx, repository.AlertKindTrade, dedup, m, t, f) {
 		// DB dedup said "already alerted" — keep realtime sinks in sync.
 		return
@@ -595,6 +596,7 @@ func (l *Loop) emitCategoryWatch(
 	l.metrics.CategoryHardAlerts.WithLabelValues(categoryLabel(catRef)).Inc()
 
 	dedup := l.clusterDedupKey(cat)
+	f.DedupKey = dedup
 	if !l.persistAlert(ctx, repository.AlertKindCluster, dedup, m, t, f) {
 		return
 	}
@@ -870,6 +872,7 @@ func (l *Loop) evaluateAccumulation(
 	l.metrics.AccumulationAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat)).Inc()
 
 	dedup := l.accumulationDedupKey(t.Taker, *mid, string(t.Token), string(t.Side))
+	f.DedupKey = dedup
 	if !l.persistAlert(ctx, repository.AlertKindAccumulation, dedup, m, t, f) {
 		return
 	}

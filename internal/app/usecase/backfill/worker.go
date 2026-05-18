@@ -32,6 +32,7 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
@@ -94,15 +95,19 @@ type Worker struct {
 	client  TradeClient
 	log     *zerolog.Logger
 	now     func() time.Time
+	metrics *metrics.Metrics
 }
 
-// New wires the worker.
+// New wires the worker. met may be nil for tests; production wiring
+// passes the shared metrics handle so BackfillPagesFetched and
+// BackfillRunsTotal surface on Grafana.
 func New(
 	cfg Config,
 	markets MarketStore,
 	trades TradeStore,
 	traders TraderStore,
 	client TradeClient,
+	met *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Worker {
 	if cfg.Interval <= 0 {
@@ -124,7 +129,7 @@ func New(
 	if now == nil {
 		now = time.Now
 	}
-	return &Worker{cfg: cfg, markets: markets, trades: trades, traders: traders, client: client, log: log, now: now}
+	return &Worker{cfg: cfg, markets: markets, trades: trades, traders: traders, client: client, log: log, now: now, metrics: met}
 }
 
 // Run blocks until ctx is cancelled. Initial tick fires immediately so a
@@ -202,12 +207,18 @@ func (w *Worker) backfillOne(ctx context.Context, m repository.Market) {
 		if err := w.markets.FailBackfill(ctx, m.ID, finalErr.Error()); err != nil {
 			w.log.Err(err).Int64("market_id", m.ID).Msg("backfill: fail update failed")
 		}
+		if w.metrics != nil {
+			w.metrics.BackfillRunsTotal.WithLabelValues("failed").Inc()
+		}
 		w.log.Err(finalErr).Int64("market_id", m.ID).Msg("backfill: failed")
 		return
 	}
 	if err := w.markets.CompleteBackfill(ctx, m.ID, status, oldest, newest); err != nil {
 		w.log.Err(err).Int64("market_id", m.ID).Msg("backfill: complete update failed")
 		return
+	}
+	if w.metrics != nil {
+		w.metrics.BackfillRunsTotal.WithLabelValues(string(status)).Inc()
 	}
 	w.log.Info().
 		Int64("market_id", m.ID).
@@ -239,6 +250,9 @@ func (w *Worker) runPages(ctx context.Context, m repository.Market) (oldest, new
 		if perr != nil {
 			return oldest, newest, "", fmt.Errorf("persist page offset=%d: %w", offset, perr)
 		}
+		if w.metrics != nil {
+			w.metrics.BackfillPagesFetched.Inc()
+		}
 		if oldest.IsZero() || pOldest.Before(oldest) {
 			oldest = pOldest
 		}
@@ -261,6 +275,9 @@ func (w *Worker) persistPage(ctx context.Context, marketID int64, page []trade.T
 	traders, err := w.traders.UpsertSeen(ctx, wallets)
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("upsert traders: %w", err)
+	}
+	if w.metrics != nil {
+		w.metrics.TradersUpserted.Add(float64(len(traders)))
 	}
 	idByWallet := make(map[string]int64, len(traders))
 	for _, tr := range traders {
@@ -292,8 +309,15 @@ func (w *Worker) persistPage(ctx context.Context, marketID int64, page []trade.T
 			newest = t.Timestamp
 		}
 	}
-	if _, err := w.trades.UpsertBatch(ctx, rows); err != nil {
+	res, err := w.trades.UpsertBatch(ctx, rows)
+	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("upsert trades: %w", err)
+	}
+	if w.metrics != nil {
+		w.metrics.TradesUpserted.Add(float64(res.Inserted))
+		if dup := res.Requested - res.Inserted; dup > 0 {
+			w.metrics.TradesDuplicatesSkipped.Add(float64(dup))
+		}
 	}
 	return oldest, newest, nil
 }

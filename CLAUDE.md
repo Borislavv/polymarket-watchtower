@@ -411,20 +411,32 @@ Sections (in order):
    ISO timestamp.
 3. `Cluster` (HARD only) — counts, total, window, contributor list.
 4. `Links` — bulleted list of real Telegram HTML anchors built by
-   `renderLink(label, href)` (one helper, one escape rule). Each `<a>` only
-   when URL non-empty. Order: Polymarket market → Polymarket category →
-   Trader → Grafana. Never emit a plain-text label — when a URL is empty,
-   the entry is omitted entirely (no bullet, no orphan section header).
-   Pinned by `telegram_test.go::TestLabelsNeverAppearAsPlainText` and
-   `TestGrafanaLinkClickableInWirePayload` (end-to-end JSON wire payload).
+   `renderLink(label, href)` (one helper, one escape rule). Every URL is
+   first passed through `sanitizeLinkURL` — empty / unparseable / non-
+   http(s) / localhost / loopback / link-local hosts return empty and
+   the entry is elided entirely (no bullet, no orphan section header,
+   no dead-text label). Order: Polymarket market → Polymarket category
+   → Trader → Grafana. Pinned by `telegram_test.go::TestLabelsNeverAppearAsPlainText`,
+   `TestGrafanaLinkClickableInWirePayload`, `TestSanitizeLinkURLRejectsNonReachable`,
+   and `TestLinksElideLocalhostGrafana`.
+5. `Data` — trailing machine-readable block carrying `market_id`,
+   `outcome_token` (accumulation findings only), and `dedup`
+   (`polymarket_alerts.dedup_key`). Each value is HTML-escaped and
+   wrapped in `<code>`. The whole block is skipped when all three are
+   empty. The dedup_key is the primary join key between Telegram
+   messages, logs, and the DB.
 
 Link URLs:
 - Market: `<polymarket-base>/event/<event-slug>`.
 - Category: `<polymarket-base>/predictions/<category-slug>`.
 - Trader: `<polymarket-base>/profile/<wallet>`.
 - Grafana: deep link with `from/to=±GRAFANA_CONTEXT_WINDOW`, `var-category`,
-  `var-market`, `var-severity`. Set `GRAFANA_BASE_URL` to a publicly
-  reachable host or recipients can't open it from a phone.
+  `var-market`, `var-severity`. `GRAFANA_BASE_URL` defaults to empty
+  (rather than the docker-compose `http://localhost:3000`) so a
+  misconfigured deployment fails loud — leaving the docker-compose
+  default in production would silently produce dead-text bullets that
+  the sanitizer now strips. Set it to a host recipients can reach from
+  a phone, or leave blank to disable.
 
 ## PostgreSQL persistence
 
@@ -472,6 +484,45 @@ Link URLs:
 - Without Postgres (local/debug), a synchronous `alerting.TelegramSink`
   is added to the realtime fanout so a developer can still see alerts
   on Telegram without standing up a database.
+
+## Periodic Telegram stats summary
+
+- `internal/app/usecase/statsreport.Worker` posts a single aggregate
+  message to the same Telegram chat on a configurable cadence
+  (`TELEGRAM_STATS_INTERVAL`, default 2h). Disabled by default; turn
+  on in production with `TELEGRAM_STATS_ENABLED=true`.
+- Body sections: `Markets` (total / active / soft-deleted / purged),
+  `Trades` (total / last-2h / unique traders), `Alerts` (sent /
+  pending / failed + per-severity breakdown), `Backfill` (rows per
+  terminal status). Section omitted when its counters are all zero
+  (same omit-on-empty rule as the alert formatter).
+- `Sender` is an interface over `*telegram.Bot.SendHTML`; the worker
+  has no other Telegram coupling.
+- The first send is delayed by `TELEGRAM_STATS_STARTUP_GRACE` (default
+  = Interval) so a freshly-started process doesn't immediately ship
+  "0 trades, 0 alerts" before any work has happened.
+- Metrics: `watchtower_stats_summaries_sent_total` and
+  `watchtower_stats_summary_errors_total`.
+
+## Ingestion / processing metrics
+
+The persist + sanity + backfill paths emit counters so an operator can
+graph `rate(...)` to see whether ingest is keeping up with the
+discover/collect cadence:
+
+- `watchtower_persist_markets_upserted_total`,
+  `watchtower_persist_market_outcomes_upserted_total`,
+  `watchtower_persist_markets_soft_deleted_total`
+- `watchtower_persist_trades_upserted_total`,
+  `watchtower_persist_trades_duplicates_skipped_total`,
+  `watchtower_persist_traders_upserted_total`
+- `watchtower_sanity_markets_purged_total`,
+  `watchtower_sanity_markets_resumed_total`
+- `watchtower_backfill_pages_fetched_total`,
+  `watchtower_backfill_runs_total{status}`
+
+Dashboard panels (`deploy/grafana/dashboards/watchtower-main.json`,
+ids 50-57) render these as rates + 24h stat blocks.
 
 ## Standard library for infrastructure primitives
 

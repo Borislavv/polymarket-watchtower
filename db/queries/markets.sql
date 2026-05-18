@@ -47,7 +47,7 @@ VALUES ($1, $2, $3)
 ON CONFLICT (market_id, token_id) DO UPDATE SET
     label = EXCLUDED.label;
 
--- name: MarkMarketsInactiveNotIn :exec
+-- name: MarkMarketsInactiveNotIn :execrows
 -- Mark active markets inactive AND stamp deleted_at when they did not
 -- appear in the latest whitelisted-categories discovery sweep. Scoped by
 -- category so markets in non-whitelisted categories are untouched.
