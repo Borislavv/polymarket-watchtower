@@ -166,6 +166,91 @@ func TestMapMarketWithoutEventsLeavesSlugEmpty(t *testing.T) {
 	}
 }
 
+// TestListMarketsStopsAtOffsetCap pins the proactive break: ListMarkets
+// must NOT issue a /markets request with offset >= MaxListOffset
+// (10000). Gamma 422s past that, and a 422 mid-tick used to abort the
+// whole discover sweep — losing the ~10k markets we'd already paged.
+//
+// The fake handler counts max observed offset; if the client ever asks
+// for offset 10000, that's a contract break.
+func TestListMarketsStopsAtOffsetCap(t *testing.T) {
+	var maxOffset int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		off, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		if off > maxOffset {
+			maxOffset = off
+		}
+		// Always serve a full page so the pager keeps walking until it
+		// hits its own cap. condition_id varies so mapMarket accepts.
+		page := make([]gammaMarket, 100)
+		for i := range page {
+			page[i] = gammaMarket{ConditionID: "0x" + strconv.Itoa(off+i)}
+		}
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	defer srv.Close()
+	h, _ := httpx.New(httpx.Config{BaseURL: srv.URL, Limiter: ratelimit.Noop{}})
+	c := New(h)
+	got, err := c.ListMarkets(context.Background(), ListMarketsOpts{})
+	if err != nil {
+		t.Fatalf("ListMarkets: %v", err)
+	}
+	if maxOffset >= MaxListOffset {
+		t.Fatalf("client asked for offset=%d, cap is %d — pager must not exceed cap", maxOffset, MaxListOffset)
+	}
+	// The pager fetches in MaxListOffset / pageSize = 100 pages × 100 rows.
+	if len(got) != MaxListOffset {
+		t.Fatalf("got %d markets, want exactly %d (MaxListOffset)", len(got), MaxListOffset)
+	}
+}
+
+// TestListMarketsSwallows422OffsetCap covers the reactive case: if
+// Gamma changes the cap or returns 422 anyway, the pager must
+// recognise the error body and break gracefully, returning what we
+// have so far rather than failing the whole sweep.
+func TestListMarketsSwallows422OffsetCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		off, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		// First two pages succeed, third 422s with the upstream body.
+		if off >= 200 {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"type":"validation error","error":"offset exceeds maximum allowed for markets list queries"}`))
+			return
+		}
+		page := make([]gammaMarket, 100)
+		for i := range page {
+			page[i] = gammaMarket{ConditionID: "0x" + strconv.Itoa(off+i)}
+		}
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	defer srv.Close()
+	h, _ := httpx.New(httpx.Config{BaseURL: srv.URL, Limiter: ratelimit.Noop{}})
+	c := New(h)
+	got, err := c.ListMarkets(context.Background(), ListMarketsOpts{})
+	if err != nil {
+		t.Fatalf("ListMarkets must swallow 422 offset-cap error, got: %v", err)
+	}
+	if len(got) != 200 {
+		t.Fatalf("got %d markets, want 200 (two successful pages before 422)", len(got))
+	}
+}
+
+// TestListMarketsPropagatesUnrelated422 confirms isOffsetCapError is
+// strict: a 422 for an unrelated reason (e.g. a malformed query value)
+// must NOT be swallowed — that would mask a real bug.
+func TestListMarketsPropagatesUnrelated422(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"type":"validation error","error":"order field must be one of..."}`))
+	}))
+	defer srv.Close()
+	h, _ := httpx.New(httpx.Config{BaseURL: srv.URL, Limiter: ratelimit.Noop{}})
+	c := New(h)
+	if _, err := c.ListMarkets(context.Background(), ListMarketsOpts{}); err == nil {
+		t.Fatal("expected unrelated 422 to surface as error")
+	}
+}
+
 func TestMapEventsToMarketCategories(t *testing.T) {
 	evs := []gammaEvent{
 		{Tags: []gammaTag{{ID: 1}, {ID: 2}}, Markets: []gammaMarket{{ConditionID: "0xa"}, {ConditionID: "0xb"}}},

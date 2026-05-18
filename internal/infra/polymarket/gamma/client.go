@@ -9,12 +9,24 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	market2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 )
+
+// MaxListOffset is the Gamma-side cap on /markets and /events offset.
+// Going past this returns a 422 validation error with body
+//
+//	{"type":"validation error","error":"offset exceeds maximum allowed for markets list queries"}
+//
+// The pagers stop at this cap and return whatever they have so far —
+// the discover sweep is best-effort, not all-or-nothing, and a cap-hit
+// must not poison the whole tick (otherwise persistence, baseline and
+// alerting downstream see zero new state).
+const MaxListOffset = 10000
 
 // Client is the Gamma adapter.
 type Client struct {
@@ -24,6 +36,23 @@ type Client struct {
 // New wraps the supplied httpx.Client.
 func New(h *httpx.Client) *Client { return &Client{h: h} }
 
+// isOffsetCapError recognises the Gamma 422 returned when the requested
+// offset is past MaxListOffset. We match on both the status code AND a
+// body substring so a different 422 (a real validation error in the
+// query) still surfaces as a fatal upstream error. The pagers guard
+// against issuing such a request, but the upstream cap can move over
+// time — this is the second line of defence.
+func isOffsetCapError(err error) bool {
+	var apiErr *httpx.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.Status != 422 && apiErr.Status != 400 {
+		return false
+	}
+	return strings.Contains(apiErr.Body, "offset exceeds maximum")
+}
+
 // ListTags returns every category-style tag known to Gamma.
 func (c *Client) ListTags(ctx context.Context) ([]market2.Category, error) {
 	const pageSize = 100
@@ -32,11 +61,17 @@ func (c *Client) ListTags(ctx context.Context) ([]market2.Category, error) {
 		offset int
 	)
 	for {
+		if offset >= MaxListOffset {
+			break
+		}
 		q := url.Values{}
 		q.Set("limit", strconv.Itoa(pageSize))
 		q.Set("offset", strconv.Itoa(offset))
 		var page []gammaTag
 		if err := c.h.GetJSON(ctx, "/tags", q, &page); err != nil {
+			if isOffsetCapError(err) {
+				break
+			}
 			return nil, fmt.Errorf("gamma tags page offset=%d: %w", offset, err)
 		}
 		for _, t := range page {
@@ -72,6 +107,11 @@ func (c *Client) ListMarkets(ctx context.Context, opts ListMarketsOpts) ([]marke
 		offset int
 	)
 	for {
+		if offset >= MaxListOffset {
+			// Reached the documented upstream cap. Treat as a clean stop and
+			// return what we have rather than letting the next request 422.
+			break
+		}
 		q := url.Values{}
 		q.Set("limit", strconv.Itoa(pageSize))
 		q.Set("offset", strconv.Itoa(offset))
@@ -85,6 +125,9 @@ func (c *Client) ListMarkets(ctx context.Context, opts ListMarketsOpts) ([]marke
 		}
 		var page []gammaMarket
 		if err := c.h.GetJSON(ctx, "/markets", q, &page); err != nil {
+			if isOffsetCapError(err) {
+				break
+			}
 			return nil, fmt.Errorf("gamma markets page offset=%d: %w", offset, err)
 		}
 		for _, m := range page {
@@ -114,6 +157,9 @@ func (c *Client) ListEvents(ctx context.Context, opts ListMarketsOpts) ([]gammaE
 		offset int
 	)
 	for {
+		if offset >= MaxListOffset {
+			break
+		}
 		q := url.Values{}
 		q.Set("limit", strconv.Itoa(pageSize))
 		q.Set("offset", strconv.Itoa(offset))
@@ -127,6 +173,9 @@ func (c *Client) ListEvents(ctx context.Context, opts ListMarketsOpts) ([]gammaE
 		}
 		var page []gammaEvent
 		if err := c.h.GetJSON(ctx, "/events", q, &page); err != nil {
+			if isOffsetCapError(err) {
+				break
+			}
 			return nil, fmt.Errorf("gamma events page offset=%d: %w", offset, err)
 		}
 		out = append(out, page...)
