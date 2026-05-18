@@ -164,6 +164,70 @@ func (r *TradeRepository) SummarizeBaseline(ctx context.Context, q BaselineQuery
 	}, nil
 }
 
+// BaselineDistribution is the full statistical roll-up: count, total,
+// mean, median, p95, plus the observed oldest/newest timestamps. Computed
+// server-side in a single roundtrip — callers do not sort or paginate.
+type BaselineDistribution struct {
+	SampleCount       int64
+	TotalNotionalUSD  float64
+	MeanNotionalUSD   float64
+	MedianNotionalUSD float64
+	P95NotionalUSD    float64
+	OldestAt          time.Time // zero when bucket is empty
+	NewestAt          time.Time
+}
+
+// Span returns NewestAt − OldestAt. Zero when fewer than two samples exist.
+func (d BaselineDistribution) Span() time.Duration {
+	if d.SampleCount < 2 {
+		return 0
+	}
+	return d.NewestAt.Sub(d.OldestAt)
+}
+
+// Distribution returns the full per-bucket distribution in one roundtrip.
+// Since=zero lifts the lower bound (use all stored history for the bucket).
+func (r *TradeRepository) Distribution(ctx context.Context, q BaselineQuery) (BaselineDistribution, error) {
+	row, err := r.q.BaselineDistribution(ctx, sqlc.BaselineDistributionParams{
+		MarketID:     q.MarketID,
+		OutcomeToken: q.OutcomeToken,
+		Since:        tsFromTime(q.Since),
+	})
+	if err != nil {
+		return BaselineDistribution{}, fmt.Errorf("baseline distribution: %w", err)
+	}
+	return BaselineDistribution{
+		SampleCount:       row.SampleCount,
+		TotalNotionalUSD:  row.TotalNotionalUsd,
+		MeanNotionalUSD:   row.MeanNotionalUsd,
+		MedianNotionalUSD: row.MedianNotionalUsd,
+		P95NotionalUSD:    row.P95NotionalUsd,
+		OldestAt:          tsTime(row.OldestAt),
+		NewestAt:          tsTime(row.NewestAt),
+	}, nil
+}
+
+// ExistingDedupKeys returns the subset of supplied dedup keys that are
+// already present for the given market. Used by the BackfillWorker to
+// short-circuit pages whose entire content is already persisted.
+func (r *TradeRepository) ExistingDedupKeys(ctx context.Context, marketID int64, keys []string) (map[string]struct{}, error) {
+	if len(keys) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	rows, err := r.q.ListTradesForBackfillPage(ctx, sqlc.ListTradesForBackfillPageParams{
+		MarketID:  marketID,
+		DedupKeys: keys,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list existing dedup keys: %w", err)
+	}
+	out := make(map[string]struct{}, len(rows))
+	for _, k := range rows {
+		out[k] = struct{}{}
+	}
+	return out, nil
+}
+
 // LatestTradedAt returns the newest traded_at for the market, or the zero
 // time when no trades exist yet. Used by the collector to advance its
 // sync cursor without keeping an in-process map.

@@ -1,27 +1,23 @@
 # Persistence
 
-This document specifies the PostgreSQL schema, sqlc layout, repository
-interfaces, and migration plan. Phase 2 has now landed the foundation
-(stages 1–4 below); the live detector still reads in-memory state, with
-DB-backed reads scheduled for the next changeset (stages 5–8).
+PostgreSQL is the source of truth for everything the watchtower's
+decision path consumes: categories, markets, outcomes, traders, trades,
+and alerts. This document describes the schema, the sqlc-generated
+interface, and the queue patterns the workers rely on.
 
-## Phase 2 implementation status
+## What runs against the DB
 
-| # | Stage | Status |
-|---|---|---|
-| 1 | Schema migrations + sqlc.yaml + Postgres compose + `POSTGRES_DSN` env | ✅ shipped |
-| 2 | sqlc generation + repository wrappers + integration tests | ✅ shipped |
-| 3 | CategorySync + MarketDiscovery write-through (alongside in-memory) | ✅ shipped |
-| 4 | CollectWorker writes trades to DB (alongside in-memory feed) | ✅ shipped |
-| 5 | DB-backed baseline (replace `baseline.Baseline` with `TradeRepo.ListBaseline`) | next session |
-| 6 | BackfillWorker (full-history ingest for active whitelisted markets) | next session |
-| 7 | Alert dedup wiring + AlertSenderWorker | next session |
-| 8 | Delete in-memory baseline/cluster state | session after that |
+| Component                | Reads from                                  | Writes to                          |
+|--------------------------|---------------------------------------------|------------------------------------|
+| `discover.Loop`          | —                                           | `polymarket_categories`, `polymarket_markets`, `polymarket_market_categories`, `polymarket_market_outcomes` |
+| `collect.Loop`           | `polymarket_trades` (cursor)                | `polymarket_trades`, `polymarket_traders` |
+| `backfill.Worker`        | `polymarket_markets` (claim)                | `polymarket_markets` (status), `polymarket_trades`, `polymarket_traders` |
+| `detect.Loop`            | `polymarket_trades` (baseline distribution) | `polymarket_alerts` (TryCreatePending) |
+| `alertsender.Worker`     | `polymarket_alerts` (claim, by status)      | `polymarket_alerts` (status, send_attempts) |
 
-Today's commit is **safe to run alongside the existing detector**: when
-`POSTGRES_DSN` is empty the app stays in Phase-1 mode (in-memory only);
-when set, write-through runs on a separate path and a DB-write failure
-never blocks an alert.
+When `POSTGRES_DSN` is empty the app drops into an in-memory shape
+intended for local exploration only — no backfill, no cross-restart
+dedup, no sender worker.
 
 ## Why a database
 
@@ -174,103 +170,130 @@ seen trades.
 
 ## Repository interfaces
 
-```go
-package repo
+The concrete types live in `internal/infra/repository` and wrap the
+sqlc-generated `internal/infra/postgres/sqlc` package. Nothing above this
+layer imports sqlc — every conversion between `pgtype.Timestamptz` and
+`time.Time` happens here. The shipped surface:
 
-type MarketRepo interface {
-    UpsertSeen(ctx context.Context, markets []Market) (inserted, updated int, err error)
-    MarkInactiveMissing(ctx context.Context, seenConditionIDs []string) (int, error)
-    ListActiveForBackfill(ctx context.Context, limit int) ([]Market, error)
-    UpdateBackfillState(ctx context.Context, marketID int64, st BackfillState) error
-}
+```
+CategoryRepository
+    UpsertSeen      MarkSeenInactive    ApplyWhitelist     ListEnabled
 
-type CategoryRepo interface {
-    UpsertSeen(ctx context.Context, cats []Category) (int, error)
-    SetEnabled(ctx context.Context, slugOrName []string) error  // applies CATEGORY_WHITELIST
-    ListEnabled(ctx context.Context) ([]Category, error)
-}
+MarketRepository
+    UpsertSeen      MarkSeenInactive    UpsertOutcome
+    BeginBackfill   CompleteBackfill    FailBackfill       ResetStaleRunning
+    ListActiveForBackfill               ListActiveForCollection
+    GetByConditionID
 
-type TradeRepo interface {
-    UpsertBatch(ctx context.Context, trades []Trade) (inserted int, err error)
-    ListBaseline(ctx context.Context, q BaselineQuery) (BaselineSamples, error)
-    ListClusterWindow(ctx context.Context, marketID int64, outcome string, window time.Duration) ([]Trade, error)
-    LatestTradedAt(ctx context.Context, marketID int64) (time.Time, bool, error)
-}
+TraderRepository
+    UpsertSeen      GetByWallet         Stats(traderID, since)
 
-type TraderRepo interface {
-    UpsertSeen(ctx context.Context, wallets []string) error
-    Stats(ctx context.Context, traderID int64, since time.Time) (TraderStats, error)
-}
+TradeRepository
+    UpsertBatch                      // dedup_key UNIQUE; same trade twice = one row
+    Distribution(BaselineQuery)      // count + total + mean + median + p95 + span (1 roundtrip)
+    SummarizeBaseline(BaselineQuery) // compact roll-up (no median/p95)
+    ListBaseline(BaselineQuery)      // raw samples (used by tests)
+    ExistingDedupKeys(marketID, []string)
+    LatestTradedAt(marketID)         // collector cursor
+    OldestTradedAt(marketID)
 
-type AlertRepo interface {
-    // ON CONFLICT (dedup_key) DO NOTHING returning the row that exists.
-    // created=true when this call inserted; false when it already existed.
-    TryCreatePending(ctx context.Context, a NewAlert) (alert Alert, created bool, err error)
-    ListPending(ctx context.Context, limit int) ([]Alert, error)
-    MarkSent(ctx context.Context, id int64, telegramMessageID int64) error
-    MarkFailed(ctx context.Context, id int64, errMsg string) error
-}
+AlertRepository
+    TryCreatePending(NewAlert)       // ON CONFLICT DO NOTHING
+    ClaimPending(limit)              // UPDATE … FOR UPDATE SKIP LOCKED → 'sending'
+    MarkSent(id, telegramMessageID)  // 'sending' → 'sent'
+    MarkFailed(id, errMsg)           // 'sending' → 'pending' (bump send_attempts)
+    ResetStaleSending(cutoff)        // crash recovery
+    Exists(dedupKey)
+    LatestClusterForMarket(marketID, strategyVersion)
 ```
 
-Repositories are pure data access — no severity decisions, no API calls.
-Detector and worker code orchestrates.
+Repositories are pure data access. Severity decisions, API orchestration,
+worker scheduling — none of it lives here.
+
+## Alert queue mechanics
+
+Two reasons the alert table is shaped as a queue rather than a fire-and-
+forget log:
+
+1. **Cross-restart dedup.** The UNIQUE `dedup_key` index is the single
+   source of truth for "have we already alerted on this?". A detector
+   restart re-observing the same trade can re-create no new row.
+2. **Single-delivery-per-row.** Multiple sender processes must be able
+   to run safely. The naive `SELECT … FOR UPDATE SKIP LOCKED` over an
+   autocommit connection releases the lock the moment the SELECT
+   returns — both processes see the same batch.
+
+The shipped queue avoids this with a transient `sending` status (added
+in `00002_alerts_sending_state.up.sql`):
+
+```
+   pending ─claim─▶ sending ─MarkSent────▶ sent
+                        │
+                        └─MarkFailed────▶ pending (with bumped send_attempts)
+```
+
+`ClaimPending` is:
+
+```sql
+UPDATE polymarket_alerts SET status = 'sending', updated_at = NOW()
+WHERE id IN (
+    SELECT id FROM polymarket_alerts
+    WHERE status = 'pending'
+    ORDER BY created_at
+    LIMIT $1 FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+A concurrent sender races on the inner SELECT, takes a disjoint batch,
+and the UPDATE commits atomically. Crashed senders are recovered by
+`ResetStaleSendingAlerts`, which the worker calls on every tick.
 
 ## sqlc layout
 
 ```
 db/
   migrations/
-    00001_init.up.sql         -- schema above
-    00001_init.down.sql
+    00001_init.up.sql        / 00001_init.down.sql        -- base schema
+    00002_alerts_sending_state.up.sql / .down.sql         -- transient sending status
   queries/
-    categories.sql            -- one query per repo method
+    categories.sql           -- one query per repo method
     markets.sql
-    market_outcomes.sql
     traders.sql
     trades.sql
     alerts.sql
-  sqlc.yaml                   -- engine: postgresql, queries dir, gen dir
+  sqlc.yaml                  -- engine: postgresql; pgx/v5
 internal/
-  repo/                       -- generated by sqlc + hand-written wrappers
-    categories.sql.go
-    markets.sql.go
-    ...
-    repo.go                   -- the Go interfaces above; sqlc impl satisfies them
+  infra/
+    postgres/sqlc/           -- generated by `sqlc generate`
+    repository/              -- hand-written wrappers; this is the boundary
 ```
 
-`sqlc generate` is run locally before commit. CI verifies the generated
-code is up to date via `sqlc diff`.
+`sqlc generate` is run locally before commit. The generated package
+emits pointers for nullable types so the wrappers can use simple
+`*time.Time` / `*string` semantics above the boundary.
 
 ## Migration tool
 
-`golang-migrate/migrate` with the file driver, run from `cmd/migrate`. On
-`docker compose up`, the app container blocks on a one-shot
-`migrate-runner` service that applies pending migrations before
-`watchtower` starts.
-
-## Phase-2 implementation stages (in order)
-
-Each stage is a self-contained PR.
-
-| # | Stage | What | Risk |
-|---|---|---|---|
-| 1 | Schema | migrations + `sqlc.yaml` + queries.sql + compose Postgres service + `POSTGRES_DSN` env. App does not yet connect. | low |
-| 2 | Generated code + repo interfaces | run sqlc; commit generated code; add `internal/repo` interfaces + sqlc impls; unit tests against testcontainers. App still does not use them. | low |
-| 3 | Category + Market sync to DB | new `CategorySyncWorker` + `MarketDiscoveryWorker` writing to DB. The existing in-memory registry continues to feed detect during transition. | medium |
-| 4 | Trade persistence | `CollectWorker` writes trades to DB in addition to feeding the in-memory baseline. Dedup proven. | medium |
-| 5 | DB-backed baseline | swap `baseline.Baseline` for `TradeRepo.ListBaseline`. **High-risk:** every numeric test must pass with the new source. | **high** |
-| 6 | Backfill worker | continuous backfill for markets with `status IN ('pending','partial_api_limit')`. Idempotent on retry. | medium |
-| 7 | Alert dedup table | detect emits via `AlertRepo.TryCreatePending`; new `AlertSenderWorker` drains pending → Telegram. Cluster cooldown moves to DB. | medium |
-| 8 | Delete in-memory state | drop `aggregate.MarketRegistry`, `baseline.Baseline`, `cluster.Detector` once the DB path is proven. | low |
+`golang-migrate/migrate` with the embedded source driver. The migrator
+is invoked from `internal/infra/postgres.Migrate` when `POSTGRES_AUTO_MIGRATE=true`
+(the default) and via `go run ./cmd/cli migrate -dsn …` for ad-hoc runs.
+The binary embeds `db/migrations/` so no external file copy is required.
 
 ## Operational notes
 
 - **Backups:** WAL-archiving recommended for any deployment longer than
-  a demo. Trade volume on whitelisted categories should be modest enough
-  that nightly logical dumps suffice.
-- **Indexes:** every query in `queries/*.sql` is reviewed for an index
-  match before it ships. The CI lint will fail PRs that add a query
-  without a matching index.
-- **Retention:** there is no automatic deletion. A 1-year retention is the
-  practical ceiling for the per-bucket baseline (the multiplier ladder
-  doesn't benefit from older data and median is already robust).
+  a demo. Trade volume on whitelisted categories is small enough that
+  nightly logical dumps suffice for most setups.
+- **Indexes:** every query in `db/queries/*.sql` has a matching index in
+  `00001_init.up.sql`. Adding a hot query that scans the trade table
+  without one will visibly slow the detector.
+- **Retention:** there is no automatic deletion. The per-bucket multiplier
+  ladder gets no benefit from data older than a year (median is already
+  robust); operators who want to cap storage can do so safely with a
+  monthly partition or a periodic DELETE.
+- **Crash recovery:** the backfill worker resets stale `running` markets
+  on every tick (`BACKFILL_STALE_AFTER`, default 15 m); the alert sender
+  resets stale `sending` rows on every tick (`ALERT_SENDER_STALE_AFTER`,
+  default 5 m). Both are idempotent — they cost one UPDATE with no rows
+  matched in the steady state.

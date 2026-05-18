@@ -1,119 +1,145 @@
 # Architecture
 
-Status: **Phase 1 complete + Phase 2 stages 1–4 shipped.** When
-`POSTGRES_DSN` is set the app opens a pool, runs the embedded migrations,
-and writes every discovered category/market and every collected trade
-through to PostgreSQL alongside the existing in-memory pipeline. The live
-detector still reads from in-memory state — the DB-backed read path
-(stages 5–8) lands in the next session. See
-[doc/persistence.md](persistence.md) for the full stage table.
+The watchtower runs as a single Go process that hosts a small set of
+long-running loops and workers, all wired by `internal/app`. PostgreSQL is
+the source of truth for everything decisions are made from: categories,
+markets, outcomes, traders, trades, and alerts.
 
-## Today (Phase 1)
+## Wired graph
 
 ```
-                          ┌──────────────────────┐
-                          │  gamma /tags         │
-                          │  gamma /markets      │
-                          │  data-api /trades    │
-                          └──────────┬───────────┘
-                                     │
-   ┌─────────────────────────────────┼─────────────────────────────────┐
-   │                                 │                                 │
-┌──┴──────────┐                ┌─────┴─────┐                  ┌────────┴────────┐
-│ discover    │  registry      │  collect  │  per-trade obs   │  detect.Loop    │
-│ (10 m tick) ├───────────────▶│ (60 s     ├─────────────────▶│  baseline rings │
-│ whitelist   │  in-process    │  tick)    │                  │  cluster windows│
-└─────────────┘                └───────────┘                  └───────┬─────────┘
-                                                                     │
-                                                          alerts     ▼
-                                                          ┌─────────────────────┐
-                                                          │ Fanout              │
-                                                          │  • LogSink          │
-                                                          │  • WebhookSink      │
-                                                          │  • TelegramSink     │
-                                                          │    (single chat id) │
-                                                          └─────────────────────┘
+                       ┌─────────────────────────────┐
+                       │  gamma /tags + /markets     │
+                       │  data-api /trades           │
+                       └──────────────┬──────────────┘
+                                      │
+   ┌──────────────────────────────────┼──────────────────────────────────┐
+   │                                  │                                  │
+┌──┴─────────────┐               ┌────┴─────┐                  ┌─────────┴──────────┐
+│ discover.Loop  │ registry      │ collect  │ persist BEFORE   │ BackfillWorker     │
+│  (whitelist)   ├──────────────▶│ (60 s)   │ observe          │  fills history     │
+│                │ in-process    │          │                  │  per market        │
+│  persist.Sink: │               │ persist  │                  │  newest → oldest   │
+│  categories +  │               │ trades + │                  │  bounded by API    │
+│  markets +     │               │ traders  │                  │  offset cap 3000   │
+│  outcomes +    │               │ via Sink │                  └────────────────────┘
+│  inactivate    │               │          │
+└────────────────┘               └────┬─────┘
+                                      │ per-trade Observe
+                                      ▼
+                            ┌──────────────────────┐
+                            │ detect.Loop          │
+                            │  • dbbaseline.Provider│
+                            │    (PG-backed stats) │
+                            │  • cluster window    │
+                            │  • TryCreatePending  │
+                            │    (single + cluster │
+                            │     dedup keys)      │
+                            └────────────┬─────────┘
+                                         │ realtime fanout
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ Fanout (log + webhook)   │
+                            │ ── no Telegram here ──   │
+                            └──────────────────────────┘
+                                         │
+                                         │ Telegram is isolated:
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ polymarket_alerts        │
+                            │   status = pending       │
+                            └────────────┬─────────────┘
+                                         │ atomic claim
+                                         │ UPDATE … FOR UPDATE SKIP LOCKED
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ alertsender.Worker       │
+                            │   • render via alerting  │
+                            │     .FormatTelegramMsg   │
+                            │   • Bot.SendHTML(…)      │
+                            │   • MarkSent / MarkFailed│
+                            └────────────┬─────────────┘
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ internal/infra/telegram  │
+                            │   Bot API HTTP transport │
+                            └──────────────────────────┘
 ```
 
-- **State is in-process.** Restart loses baselines, cluster windows, and the
-  `lastTs` cursor.
-- **Backfill is shallow.** First sight of a market pulls the last 24 h of
-  trades via the Data API. After that, only deltas since the last seen
-  timestamp.
-- **Alert dedup is absent.** A restart that re-fetches recent trades will
-  re-fire on them.
-- **Telegram is single-recipient.** No subscriber discovery, no /getUpdates
-  polling. `TELEGRAM_CHAT_ID` is the only recipient.
-- **Category selection is a whitelist.** Default `Politics`. Categories not
-  in the list are skipped at discover and (defence-in-depth) at detect.
+## Loops and workers
 
-## Tomorrow (Phase 2 — PostgreSQL persistence + worker split)
+- **`discover.Loop`** (`internal/app/usecase/discover`): every
+  `DISCOVER_INTERVAL`, pulls `/tags` + `/events` + `/markets` from Gamma,
+  applies `CATEGORY_WHITELIST` (slug+label only), updates the in-process
+  registry, and hands the result to `persist.Sink.PersistDiscovery` which
+  upserts categories, markets, market↔category links, and outcomes, then
+  marks markets that disappeared as inactive within the whitelisted scope.
+- **`collect.Loop`** (`internal/app/usecase/collect`): every
+  `COLLECT_INTERVAL`, fans out per market, pulls new trades since the
+  cursor, **persists the batch FIRST** (so the DB-baseline read sees
+  them), then calls the per-trade detector. The cursor is sourced from
+  `polymarket_trades.MAX(traded_at)` via `persist.Sink.LatestTradedAt`
+  when Postgres is wired.
+- **`backfill.Worker`** (`internal/app/usecase/backfill`): every
+  `BACKFILL_INTERVAL`, resets any market wedged in `running` for longer
+  than `BACKFILL_STALE_AFTER`, claims the next `BACKFILL_WORKERS`
+  candidates (`pending` or `partial_api_limit`), and pages `/trades`
+  newest→oldest until either the upstream returns a short page
+  (`completed`) or the offset-3000 cap is hit (`partial_api_limit`). Each
+  page is persisted before advancing so progress is durable.
+- **`detect.Loop`** (`internal/app/usecase/detect`): per trade, queries
+  `dbbaseline.Provider` for the per-(market, outcome) baseline statistics
+  (count, total, median, mean, p95, observed span), enforces the
+  lifecycle + readiness gates, scores against the absolute and multiplier
+  tier ladders, takes the conservative-MIN, and inserts an alert row via
+  `AlertRepository.TryCreatePending`. On a fresh insert (the alert was
+  not a duplicate), the realtime emitter (log + webhook) is notified.
+- **`alertsender.Worker`** (`internal/app/usecase/alertsender`): every
+  `ALERT_SENDER_INTERVAL`, resets stale `sending` rows back to `pending`,
+  atomically claims a batch of pending alerts (UPDATE … IN (SELECT …
+  FOR UPDATE SKIP LOCKED) RETURNING *), renders each via
+  `alerting.FormatTelegramMessage`, and posts via
+  `internal/infra/telegram.Bot.SendHTML`. Successful sends are marked
+  `sent`; failures bump `send_attempts` and return to `pending` for
+  retry.
 
-```
-                          ┌──────────────────────┐
-                          │  gamma + data-api    │
-                          └──────────┬───────────┘
-                                     │
-        ┌────────────────────────────┼────────────────────────────┐
-        ▼                            ▼                            ▼
-┌───────────────┐         ┌────────────────────┐       ┌─────────────────────┐
-│ CategorySync  │         │ MarketDiscovery    │       │ BackfillWorker      │
-│ (10 m)        │         │ (10 m)             │       │ (continuous,        │
-│ upsert tags   │         │ upsert markets,    │       │  bounded pool)      │
-│ set enabled=  │         │ mark inactive,     │       │ page /trades for    │
-│  whitelist    │         │ schedule backfill  │       │ markets with        │
-└───────┬───────┘         └─────────┬──────────┘       │ status='pending'    │
-        │                           │                  └──────────┬──────────┘
-        ▼                           ▼                             ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                              PostgreSQL                                  │
-│                                                                          │
-│  polymarket_categories  polymarket_markets  polymarket_market_outcomes   │
-│  polymarket_traders     polymarket_trades   polymarket_alerts            │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │
-       ┌─────────────────────────────┼─────────────────────────────────┐
-       ▼                             ▼                                 ▼
-┌──────────────┐         ┌──────────────────────┐         ┌────────────────────┐
-│ CollectWorker│         │ DetectorWorker       │         │ AlertSenderWorker  │
-│ (60 s)       │         │ (event-driven on     │         │ (1 s drain)        │
-│ pull recent  │         │ new-trade)           │         │ ListPending →      │
-│ trades, write│         │ load baseline from   │         │ render → Telegram  │
-│ to DB        │         │ DB, score, try-insert│         │ → MarkSent         │
-│              │         │ dedup-keyed alert    │         │                    │
-└──────────────┘         └──────────────────────┘         └────────────────────┘
-```
+## Persistence model (what the DB owns)
 
-Worker responsibilities are **single-purpose** and communicate via the DB.
-That makes each worker individually testable and restart-safe.
+| Table                           | Rows                                                                        |
+|---------------------------------|-----------------------------------------------------------------------------|
+| `polymarket_categories`         | One per Gamma tag. `enabled` is the local whitelist; `active` is upstream.  |
+| `polymarket_markets`            | One per condition id; carries `backfill_status` lifecycle.                  |
+| `polymarket_market_categories`  | Many-to-many link.                                                          |
+| `polymarket_market_outcomes`    | Per (market, token) human label (Yes/No/…); upserted by `persist.Sink`.     |
+| `polymarket_traders`            | One per wallet, lazy-upserted from trades.                                  |
+| `polymarket_trades`             | Single source of truth for every alerting decision; idempotent via dedup_key. |
+| `polymarket_alerts`             | The Telegram queue; UNIQUE dedup_key prevents double-send.                  |
 
-## Worker invariants (Phase 2 target)
+See [doc/persistence.md](persistence.md) for column-level detail.
 
-| Invariant | How |
-|---|---|
-| context cancellation | every loop selects on `ctx.Done()` |
-| bounded concurrency | bounded `chan struct{}` semaphores; no unbounded goroutines |
-| backoff on errors | exponential, with caps |
-| idempotent writes | `INSERT … ON CONFLICT (dedup_key) DO NOTHING` everywhere |
-| no goroutine leaks | wait groups on shutdown |
-| upstream rate respected | shared `ratelimit.Limiter` injected per upstream |
-| no duplicate alerts | `polymarket_alerts.dedup_key UNIQUE` |
-| restart-safe | all state in DB; nothing important in-process |
-
-## Local development
+## Dedup keys
 
 ```
-docker compose -f deploy/docker-compose.yml up --build
+single:<strategy_version>:<trade_dedup_key>
+cluster:<strategy_version>:<category_id>:<window_start_unix>
 ```
 
-Today this starts `watchtower`, `prometheus`, `grafana`. Phase 2 will add a
-`postgres` service and run migrations on app boot.
+- The trade portion of `<trade_dedup_key>` is computed exactly the same
+  way as the trade row's own `dedup_key` (prefer external_id; fall back to
+  composite SHA-256). So the single-trade alert is idempotent across
+  processes and restarts.
+- For the cluster alert, `window_start_unix` is `floor(now /
+  CLUSTER_COOLDOWN)`. Two cluster fires landing in the same bucket dedup;
+  the next bucket gets a fresh key.
 
-## See also
+## Memory mode (local/debug)
 
-- [persistence.md](persistence.md) — schema, sqlc layout, repository
-  interfaces, migration plan.
-- [strategies/single-cluster.md](strategies/single-cluster.md) — single-
-  trade severity + cluster rule.
-- [strategies/test-scenarios.md](strategies/test-scenarios.md) — canonical
-  numeric table the test suite asserts against.
+When `POSTGRES_DSN` is empty the app drops into an in-memory shape:
+- `discover` and `collect` skip persistence.
+- `detect.Loop` uses the in-process `baseline.Baseline` reservoir.
+- Alerts go straight to the realtime fanout, which re-includes a
+  synchronous `TelegramSink` for developer convenience.
+- No backfill, no cross-restart alert dedup, no alert sender worker.
+
+This shape exists for local exploration only — production must run with
+Postgres and the DB-backed flow above.

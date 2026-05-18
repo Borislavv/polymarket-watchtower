@@ -3,15 +3,17 @@
 // composition root stays clean and the loops never import the
 // repository directly.
 //
-// Phase 2, stage 3/4: persistence runs ALONGSIDE the existing in-memory
-// path. The in-memory observer/registry remains the authoritative source
-// for live alerting until the DB-backed detector lands. DB write failures
-// are operational, not fatal — callers log and continue.
+// Production wiring runs persist BEFORE the per-trade detector (collect.go
+// orders the call). With the DB-backed baseline detector enabled, every
+// trade is in polymarket_trades by the time Observe runs, so the baseline
+// query is consistent. DB write failures are operational, not fatal —
+// callers log and continue.
 package persist
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -121,8 +123,16 @@ func (s *Sink) PersistDiscovery(ctx context.Context, cats []market.Category, mar
 		})
 		seenConditionIDs = append(seenConditionIDs, string(m.ID))
 	}
-	if _, err := s.markets.UpsertSeen(ctx, repoMarkets); err != nil {
+	persistedMarkets, err := s.markets.UpsertSeen(ctx, repoMarkets)
+	if err != nil {
 		return fmt.Errorf("upsert markets: %w", err)
+	}
+	// Upsert outcome tokens for every market we just persisted. Outcomes
+	// rarely change after a market opens, so this is mostly a no-op via
+	// ON CONFLICT — but it does mean alerts carry human labels for any
+	// freshly-discovered outcome.
+	if err := s.upsertMarketOutcomes(ctx, persistedMarkets, markets); err != nil {
+		return fmt.Errorf("upsert outcomes: %w", err)
 	}
 
 	// 4. Mark markets that disappeared from the whitelisted sweep as
@@ -186,6 +196,50 @@ func (s *Sink) PersistTrades(ctx context.Context, m market.Market, trades []trad
 		return fmt.Errorf("upsert trades: %w", err)
 	}
 	return nil
+}
+
+// upsertMarketOutcomes writes (token_id, label) pairs for every persisted
+// market that carried outcome metadata upstream. Each row is upserted
+// individually so a missing token doesn't abort the whole sweep.
+func (s *Sink) upsertMarketOutcomes(ctx context.Context, persisted []repository.Market, source []market.Market) error {
+	idByConditionID := make(map[string]int64, len(persisted))
+	for _, p := range persisted {
+		idByConditionID[p.ConditionID] = p.ID
+	}
+	for _, m := range source {
+		mid, ok := idByConditionID[string(m.ID)]
+		if !ok {
+			continue
+		}
+		for i, tok := range m.TokenIDs {
+			if tok == "" {
+				continue
+			}
+			label := ""
+			if i < len(m.Outcomes) {
+				label = m.Outcomes[i]
+			}
+			if err := s.markets.UpsertOutcome(ctx, mid, string(tok), label); err != nil {
+				return fmt.Errorf("upsert outcome market=%s token=%s: %w", m.ID, tok, err)
+			}
+		}
+	}
+	return nil
+}
+
+// LatestTradedAt is the optional collector cursor source. Returns the
+// newest traded_at for the supplied market condition id, or the zero time
+// when the market is not yet known or has no trades. Wired into
+// collect.Config.Cursor when the DB is configured.
+func (s *Sink) LatestTradedAt(ctx context.Context, conditionID string) (time.Time, error) {
+	if s == nil {
+		return time.Time{}, nil
+	}
+	m, err := s.markets.GetByConditionID(ctx, conditionID)
+	if err != nil {
+		return time.Time{}, nil //nolint:nilerr // market not yet persisted is not an error
+	}
+	return s.trades.LatestTradedAt(ctx, m.ID)
 }
 
 func uniqueWallets(trades []trade.Trade) []string {

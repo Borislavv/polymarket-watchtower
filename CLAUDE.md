@@ -157,24 +157,52 @@ Link URLs:
   `var-market`, `var-severity`. Set `GRAFANA_BASE_URL` to a publicly
   reachable host or recipients can't open it from a phone.
 
-## PostgreSQL persistence (Phase 2)
+## PostgreSQL persistence
 
-- `POSTGRES_DSN` empty → app stays in Phase-1 mode (in-memory only).
+- `POSTGRES_DSN` empty → app runs in-memory only (local/debug). No
+  backfill, no cross-restart alert dedup, no sender worker. Production
+  must run with a DSN set.
 - DSN set → pool opens at startup, `db/migrations` apply (unless
-  `POSTGRES_AUTO_MIGRATE=false`), and every discovered category/market and
-  every collected trade is written through to `polymarket_categories`,
-  `polymarket_markets`, `polymarket_trades`, `polymarket_traders`.
-- Detection still reads from the in-memory baseline ring in this release
-  — the DB-backed detector lands in the next session.
-- Schema lives in `db/migrations/` and is the source for both the runtime
-  migrator (`internal/infra/postgres/migrate.go` via `db.Migrations` embed)
-  and sqlc generation (`sqlc.yaml`).
-- Repositories (`internal/infra/repository/`) wrap sqlc-generated code in
-  `internal/infra/postgres/sqlc/`. Nothing above the repo layer imports
-  sqlc directly — pgtype.* never leaks into domain code.
-- See `doc/persistence.md` for schema, dedup-key formats, and the stage
-  table tracking 5–8 (DB baseline, backfill worker, alert dedup, in-memory
-  state removal).
+  `POSTGRES_AUTO_MIGRATE=false`), and the production graph wires up:
+  - `persist.Sink` writes categories, markets, market_categories,
+    market_outcomes, traders, trades through every discover/collect tick.
+  - `backfill.Worker` fills historical trades for markets in whitelisted
+    categories, driving each market through
+    `pending → running → completed | partial_api_limit | failed`.
+  - `dbbaseline.Provider` serves the detector's baseline reads from
+    `polymarket_trades` (BaselineDistribution computes
+    count/total/mean/median/p95/span server-side in one roundtrip).
+  - Every fired alert is `TryCreatePending`-ed against
+    `polymarket_alerts` with a UNIQUE dedup_key. Conflicts are skipped
+    silently, so concurrent detectors / restarts cannot double-emit.
+  - `alertsender.Worker` drains pending alerts via an atomic queue
+    pattern (`UPDATE … IN (SELECT … FOR UPDATE SKIP LOCKED)` flipping to
+    a transient `sending` status), renders via the alerting formatter,
+    and posts through `internal/infra/telegram.Bot`.
+- `BASELINE_SOURCE=postgres` (default) selects the DB read path.
+  `BASELINE_SOURCE=memory` is local/debug only.
+- `STRATEGY_VERSION` (default `v1`) is woven into every dedup_key so
+  retunes can re-alert on previously seen trades.
+- Schema lives in `db/migrations/` and is the source for both the
+  runtime migrator (`internal/infra/postgres/migrate.go` via the
+  `db.Migrations` embed) and sqlc generation (`sqlc.yaml`).
+- Repositories (`internal/infra/repository/`) wrap sqlc-generated code
+  in `internal/infra/postgres/sqlc/`. Nothing above the repo layer
+  imports sqlc — pgtype.* never leaks into domain code.
+
+## Telegram delivery
+
+- HTTP transport lives in `internal/infra/telegram` (`Bot.SendHTML`).
+  Single endpoint, single chat id, no `/getUpdates`, no subscriber
+  registry.
+- Message rendering (`FormatTelegramMessage`, `renderLink`) lives in
+  `internal/infra/alerting`. It does not import any HTTP code.
+- In production (Postgres wired), the only path that calls Bot.SendHTML
+  is `alertsender.Worker`. `detect.Loop` writes to `polymarket_alerts`
+  and stops there — the sender drains the queue.
+- Without Postgres (local/debug), a synchronous `alerting.TelegramSink`
+  is added to the realtime fanout so a developer can still see alerts
+  on Telegram without standing up a database.
 
 ## Standard library for infrastructure primitives
 

@@ -26,6 +26,18 @@ const (
 	ModeVolume        AnomalyMode = "volume"
 )
 
+// BaselineSource selects where the per-trade scorer reads its baseline
+// statistics from. `postgres` is the production default and the only safe
+// shape for cross-restart correctness — every trade and every alert is
+// persisted, missing history is backfilled, and detection runs against
+// real stored data. `memory` exists for local exploration only.
+type BaselineSource string
+
+const (
+	BaselineSourcePostgres BaselineSource = "postgres"
+	BaselineSourceMemory   BaselineSource = "memory"
+)
+
 // ApplicationConfig holds process-wide settings.
 type ApplicationConfig struct {
 	Env                 Environment   `env:"APP_ENV" envDefault:"dev" validate:"required,oneof=dev local prod"`
@@ -55,6 +67,40 @@ type PostgresConfig struct {
 	// true in dev/local; flip false in production if you manage migrations
 	// via a separate deploy step.
 	AutoMigrate bool `env:"POSTGRES_AUTO_MIGRATE" envDefault:"true"`
+}
+
+// BackfillConfig tunes the BackfillWorker. The worker is enabled whenever
+// Postgres is configured — backfill is the only way to populate the DB
+// with the historical trades the detector relies on.
+type BackfillConfig struct {
+	// Interval is the tick cadence; each tick claims up to BatchSize
+	// markets and runs a full backfill pass per market.
+	Interval time.Duration `env:"BACKFILL_INTERVAL" envDefault:"1m" validate:"required"`
+	// BatchSize is the max number of markets claimed per tick. Lower it
+	// to reduce upstream pressure; higher to speed bootstrap.
+	BatchSize int `env:"BACKFILL_WORKERS" envDefault:"4" validate:"gte=1"`
+	// Concurrency caps in-flight backfills inside one tick.
+	Concurrency int `env:"BACKFILL_CONCURRENCY" envDefault:"2" validate:"gte=1"`
+	// PageLimit is the Data API page size (max 500).
+	PageLimit int `env:"BACKFILL_PAGE_LIMIT" envDefault:"500" validate:"gte=1,lte=500"`
+	// StaleAfter requeues 'running' markets older than this — used to
+	// recover from a crashed previous process.
+	StaleAfter time.Duration `env:"BACKFILL_STALE_AFTER" envDefault:"15m" validate:"required"`
+}
+
+// AlertSenderConfig tunes the alert sender worker that drains
+// polymarket_alerts and delivers each row to Telegram.
+type AlertSenderConfig struct {
+	// Interval is the claim cadence.
+	Interval time.Duration `env:"ALERT_SENDER_INTERVAL" envDefault:"5s" validate:"required"`
+	// Workers is the number of parallel sender goroutines.
+	Workers int `env:"ALERT_SENDER_WORKERS" envDefault:"1" validate:"gte=1"`
+	// ClaimLimit caps the per-tick batch size pulled by ClaimPending.
+	ClaimLimit int32 `env:"ALERT_CLAIM_LIMIT" envDefault:"16" validate:"gte=1"`
+	// StaleSendingAfter is the recovery window for the transient `sending`
+	// status. A row stuck in `sending` longer than this is reset back to
+	// `pending` so the next tick re-issues it.
+	StaleSendingAfter time.Duration `env:"ALERT_SENDER_STALE_AFTER" envDefault:"5m" validate:"required"`
 }
 
 // Enabled reports whether the Postgres layer is configured. The rest of
@@ -132,6 +178,19 @@ type AggregateConfig struct {
 type AnomalyConfig struct {
 	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
 
+	// BaselineSource selects where the per-trade scorer reads its baseline
+	// from. `postgres` (default) is the production shape — every fired
+	// alert has its statistics drawn from persisted history that survives
+	// restarts and is backfilled when missing. `memory` keeps the older
+	// in-process reservoir for local/debug runs where Postgres is absent.
+	BaselineSource BaselineSource `env:"BASELINE_SOURCE" envDefault:"postgres" validate:"required,oneof=postgres memory"`
+
+	// StrategyVersion is stamped on every persisted alert row and woven
+	// into the dedup_key so a config retune cannot resurrect alerts
+	// dropped under the previous strategy. Bump this when changing tier
+	// thresholds, baseline gates, or any other decision input.
+	StrategyVersion string `env:"STRATEGY_VERSION" envDefault:"v1" validate:"required"`
+
 	// Single-trade severity ladders. Both ladders must qualify at the same
 	// rung or higher; final severity is the lower of the two.
 	InfoMinNotionalUSD     float64 `env:"ALERT_INFO_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
@@ -204,6 +263,8 @@ type AlertingConfig struct {
 type Config struct {
 	Application    ApplicationConfig
 	Postgres       PostgresConfig
+	Backfill       BackfillConfig
+	AlertSender    AlertSenderConfig
 	Polymarket     PolymarketConfig
 	RateLimit      RateLimitConfig
 	Pipeline       PipelineConfig

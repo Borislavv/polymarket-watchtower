@@ -17,6 +17,7 @@ type AlertStatus string
 
 const (
 	AlertPending AlertStatus = "pending"
+	AlertSending AlertStatus = "sending"
 	AlertSent    AlertStatus = "sent"
 	AlertFailed  AlertStatus = "failed"
 )
@@ -102,10 +103,12 @@ func (r *AlertRepository) TryCreatePending(ctx context.Context, a NewAlert) (Ale
 	return alertFromSQLC(row), true, nil
 }
 
-// ClaimPending pops up to `limit` pending alerts for the sender worker.
-// Uses FOR UPDATE SKIP LOCKED so concurrent senders never pick the same
-// row. The transaction-bound lock is released when the sender either
-// commits MarkSent/MarkFailed or rolls back.
+// ClaimPending atomically transitions up to `limit` pending alerts into
+// the `sending` state and returns them. The transition uses the standard
+// queue-table pattern: UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP
+// LOCKED). Once flipped to `sending`, a row is invisible to any
+// subsequent ClaimPending until MarkSent / MarkFailed / ResetStaleSending
+// advances it — so concurrent senders cannot double-send.
 func (r *AlertRepository) ClaimPending(ctx context.Context, limit int32) ([]Alert, error) {
 	rows, err := r.q.ClaimPendingAlertsForSend(ctx, limit)
 	if err != nil {
@@ -146,6 +149,13 @@ func (r *AlertRepository) Exists(ctx context.Context, dedupKey string) (bool, er
 		return false, fmt.Errorf("alert exists %q: %w", dedupKey, err)
 	}
 	return got, nil
+}
+
+// ResetStaleSending recovers alerts wedged in the `sending` state by a
+// crashed previous sender. Any row whose updated_at predates `cutoff` is
+// moved back to `pending` so the next ClaimPending tick re-issues it.
+func (r *AlertRepository) ResetStaleSending(ctx context.Context, cutoff time.Time) error {
+	return r.q.ResetStaleSendingAlerts(ctx, tsFromTime(cutoff))
 }
 
 // LatestClusterForMarket returns the most recent cluster alert for the

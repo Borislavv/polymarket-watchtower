@@ -28,25 +28,39 @@ alerts on their own — they were the wrong unit of detection.
 ## Pipeline
 
 ```
-Gamma /events,/markets,/tags      Data API /trades?market=…
-        │                                  │
-        ▼                                  ▼
-   discover  ──▶  MarketRegistry  ──▶  collect (per-market)
-                       │                    │
-                       │                    ├─▶ aggregate engine  (supporting gauges)
-                       ▼                    │
-                  market.Market             ▼
-                  + Outcomes ──▶  detect.Observe(market, trade)
-                                  │
-                                  ├─ baseline.Add / .Stats      (per-(cat,market,outcome))
-                                  ├─ score.Score                (multiplier + absolute USD ladders)
-                                  ├─ cluster.Observe(cat, …)    (per-category sliding window)
-                                  └─ emit                       ─▶ log + webhook + telegram
-                                                                   (with Polymarket + Grafana deep-links)
+Gamma /events,/markets,/tags          Data API /trades?market=…
+        │                                       │
+        ▼                                       ▼
+   discover  ─▶ persist.Sink ─▶ Postgres ◀───┬─ collect (per market)
+   (categories, markets,        ▲           │      ├─ persist BEFORE observe
+    outcomes, mark-inactive)    │           │      ▼
+                                │           │   detect.Observe(market, trade)
+                                │           │      ├─ dbbaseline.Provider      ──▶ polymarket_trades
+                                │           │      ├─ score.Score                  (PERCENTILE_CONT 1 roundtrip)
+                                │           │      ├─ cluster.Observe             (in-process window)
+                                │           │      └─ AlertRepository.TryCreatePending
+                                │           │             └─▶ polymarket_alerts   (UNIQUE dedup_key)
+                                │           │
+                                │           └─ backfill.Worker  (pending → completed | partial_api_limit)
+                                │              fills polymarket_trades up to Data API offset cap 3000
+                                │
+   alertsender.Worker  ◀───────  polymarket_alerts (status = pending)
+       │     atomic claim: UPDATE … IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING *
+       ▼
+   internal/infra/telegram.Bot.SendHTML  ──▶  Telegram chat
+       │
+       ▼
+   MarkSent / MarkFailed  (status → 'sent' / back to 'pending' with bumped attempts)
 ```
 
-Everything is in-process and in-memory. State (baselines, clusters, last-seen
-trade timestamps) is rebuilt from upstream on every restart.
+Postgres is the source of truth for every decision. The detector reads the
+baseline from `polymarket_trades`; the BackfillWorker fills missing history
+within the upstream Data API's offset-3000 cap; alerts are inserted with a
+UNIQUE dedup_key so concurrent detection and restarts cannot double-send;
+the sender worker drains the queue through an atomic claim flow.
+
+Without `POSTGRES_DSN` the app runs in-memory only — for local exploration
+on a single process. Production must run with the DB-backed flow above.
 
 ## Layout
 
@@ -165,19 +179,30 @@ Local URLs after `make up`:
 - Postgres: `postgres://watchtower:watchtower@localhost:5433/watchtower`
   (host port 5433 to avoid clashing with a local 5432)
 
-### PostgreSQL persistence (Phase 2)
+### PostgreSQL persistence (production shape)
 
-When `POSTGRES_DSN` is set the watchtower writes every discovered
-category/market and every collected trade to PostgreSQL. Detection still
-runs from the in-memory baseline in this release — the DB-backed detector
-lands in the next changeset (see `doc/persistence.md` stage table).
+When `POSTGRES_DSN` is set the watchtower runs its production graph:
+write-through of every discovery sweep and collected trade; a continuous
+BackfillWorker filling historical trades; the detector reads its baseline
+from the DB; every fired alert is `INSERT ... ON CONFLICT DO NOTHING`
+into `polymarket_alerts`; an AlertSender worker drains the queue and
+delivers via Telegram. Restart-safe and concurrent-process-safe by
+construction.
 
-Bring just Postgres up, apply migrations, run the repo integration tests:
+Bring just Postgres up, apply migrations, run the repository and DB-
+detector integration tests. Run them serially across packages (`-p 1`):
+every live integration suite TRUNCATEs the shared database on setup, so
+parallel packages collide.
 
 ```bash
 make pg-up          # start the postgres service
 make migrate        # apply embedded SQL migrations
 make pg-test        # run repository integration tests
+POSTGRES_TEST_DSN="postgres://watchtower:watchtower@localhost:5433/watchtower?sslmode=disable" \
+  go test -p 1 -count=1 \
+    ./internal/infra/repository/... \
+    ./internal/app/usecase/analytics/dbbaseline/... \
+    ./internal/app/usecase/detect/...
 make sqlc           # regenerate db code (requires sqlc binary on PATH)
 ```
 

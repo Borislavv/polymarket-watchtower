@@ -49,11 +49,13 @@ func (f FilterType) valid() bool {
 const (
 	defaultPageSize = 100
 	maxPageSize     = 500 // Data API hard cap on ?limit
-	// maxUpstreamOffset is the documented (and observed in 400 responses)
+	// MaxUpstreamOffset is the documented (and observed in 400 responses)
 	// historical-activity offset cap: "max historical activity offset of 3000
 	// exceeded". A request with ?offset>3000 returns HTTP 400. Pagination must
-	// stop before crossing this boundary.
-	maxUpstreamOffset = 3000
+	// stop before crossing this boundary. Exposed because the BackfillWorker
+	// uses it to classify "complete" vs "partial_api_limit" outcomes.
+	MaxUpstreamOffset = 3000
+	maxUpstreamOffset = MaxUpstreamOffset // internal alias to keep diff minimal
 	defaultMaxPages   = 50
 )
 
@@ -176,6 +178,61 @@ func buildTradesQuery(opts ListTradesOpts, pageSize, offset int) (url.Values, er
 	}
 	return q, nil
 }
+
+// ListTradesPage fetches exactly one offset-paged page of trades, newest
+// first. Limit is clamped to [1, MaxPageSize]; offset above MaxUpstreamOffset
+// returns ErrOffsetCapExceeded so the BackfillWorker can flip the market
+// status to partial_api_limit without first absorbing a 400.
+//
+// Unlike ListTradesSince, this method does NOT walk pagination internally —
+// callers (backfill worker) drive it so they can persist each page and
+// commit progress between calls.
+func (c *Client) ListTradesPage(ctx context.Context, market vo.MarketID, offset, limit int) ([]trade.Trade, error) {
+	if market == "" {
+		return nil, errors.New("dataapi: market required")
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("dataapi: offset must be >= 0, got %d", offset)
+	}
+	if offset > MaxUpstreamOffset {
+		return nil, ErrOffsetCapExceeded
+	}
+	if limit <= 0 {
+		limit = defaultPageSize
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
+	}
+	q := url.Values{}
+	q.Set("market", string(market))
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("offset", strconv.Itoa(offset))
+
+	var batch []dataTrade
+	if err := c.h.GetJSON(ctx, "/trades", q, &batch); err != nil {
+		return nil, fmt.Errorf("dataapi /trades market=%s offset=%d: %w", market, offset, err)
+	}
+	out := make([]trade.Trade, 0, len(batch))
+	for _, t := range batch {
+		out = append(out, trade.Trade{
+			ID:        t.ID,
+			Market:    market,
+			Token:     vo.TokenID(t.Asset),
+			Side:      mapSide(t.Side),
+			Price:     t.Price,
+			Size:      t.Size,
+			Timestamp: time.Unix(t.Timestamp, 0).UTC(),
+			TxHash:    t.TransactionHash,
+			Taker:     t.ProxyWallet,
+		})
+	}
+	return out, nil
+}
+
+// ErrOffsetCapExceeded is returned by ListTradesPage when the requested
+// offset is beyond the Data API's documented 3000-row historical cap. The
+// BackfillWorker maps this to BackfillPartialAPILimit.
+var ErrOffsetCapExceeded = errors.New("dataapi: offset exceeds upstream cap")
 
 func mapSide(s string) trade.Side {
 	switch s {

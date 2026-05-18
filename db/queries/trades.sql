@@ -42,6 +42,35 @@ WHERE market_id = $1
   AND outcome_token = $2
   AND traded_at >= $3;
 
+-- name: BaselineDistribution :one
+-- Single-roundtrip statistical summary for the per-bucket reservoir.
+-- Powers the DB-backed detector's hot path: count + total + mean + median
+-- + p95 + observed time-span, server-side. PERCENTILE_CONT does the heavy
+-- lifting so Go code never sorts more than this one row.
+--
+-- $3 is the inclusive lower bound; pass NULL (pgtype.Timestamptz{Valid:false})
+-- to lift the bound (use all stored history for the bucket).
+SELECT
+    COUNT(*)::bigint                                                                           AS sample_count,
+    COALESCE(SUM(notional_usd), 0)::double precision                                           AS total_notional_usd,
+    COALESCE(AVG(notional_usd), 0)::double precision                                           AS mean_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS median_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS p95_notional_usd,
+    MIN(traded_at)::timestamptz                                                                AS oldest_at,
+    MAX(traded_at)::timestamptz                                                                AS newest_at
+FROM polymarket_trades
+WHERE market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text
+  AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);
+
+-- name: ListTradesForBackfillPage :many
+-- Used by the BackfillWorker to verify which fetched trade dedup_keys are
+-- already persisted (defence in depth on top of ON CONFLICT DO NOTHING).
+SELECT dedup_key
+FROM polymarket_trades
+WHERE market_id = $1
+  AND dedup_key = ANY(sqlc.arg(dedup_keys)::text[]);
+
 -- name: ListClusterWindowTrades :many
 -- All trades in the per-category cluster window. Used by the cluster
 -- detector to count distinct wallets and total notional.

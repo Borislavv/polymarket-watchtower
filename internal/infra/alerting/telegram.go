@@ -1,35 +1,30 @@
 package alerting
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"io"
-	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
-// TelegramConfig wires the Telegram sink. The sink sends to a single
-// configured chat — there is no subscriber registry and no /getUpdates
-// polling. That keeps the bot's recipient set deterministic: alerts go to
-// TELEGRAM_CHAT_ID and nowhere else.
+// TelegramConfig wires a TelegramSink. It is kept here for backwards
+// compatibility with the realtime fanout path (log + webhook). Production
+// alert delivery in this release flows through the database queue and the
+// internal/app/usecase/alertsender worker — that path uses telegram.Bot
+// directly, without going through this sink.
 type TelegramConfig struct {
-	// Enabled turns the sink on. When false, Notify is a no-op (the alert is
-	// still rendered to the log sink so debugging stays easy).
+	// Enabled turns the sink on. When false, Notify is a no-op.
 	Enabled bool
 	// BotToken is the bot's API token. Required when Enabled.
 	BotToken string
 	// ChatID is the single recipient (numeric chat id or @channelusername).
-	// Required when Enabled. We keep this as a string so the channel/group
-	// "-100…" form and the @username form both work without quoting tricks.
+	// Required when Enabled.
 	ChatID string
 	// BaseURL defaults to https://api.telegram.org. Override for tests or a
 	// corporate proxy.
@@ -39,12 +34,12 @@ type TelegramConfig struct {
 }
 
 // TelegramSink delivers every Finding to a single Telegram chat as an HTML
-// message. Construction validates the config so a misconfigured Enabled
-// sink fails fast at startup rather than dropping alerts silently at run
-// time.
+// message. It is a thin adapter on top of internal/infra/telegram.Bot: this
+// type owns the alerting-domain Channel interface and the per-severity
+// metrics, the Bot owns the HTTP transport.
 type TelegramSink struct {
 	cfg     TelegramConfig
-	client  *http.Client
+	bot     *telegram.Bot
 	metrics *metrics.Metrics
 }
 
@@ -63,13 +58,15 @@ func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if cfg.ChatID == "" {
 		return nil, errors.New("telegram: chat id required when enabled (TELEGRAM_CHAT_ID)")
 	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = "https://api.telegram.org"
+	bot, err := telegram.New(telegram.Config{
+		BotToken: cfg.BotToken,
+		BaseURL:  cfg.BaseURL,
+		Timeout:  cfg.Timeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("telegram sink: %w", err)
 	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 5 * time.Second
-	}
-	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}}, nil
+	return &TelegramSink{cfg: cfg, bot: bot}, nil
 }
 
 // WithMetrics attaches a Prometheus metrics handle and returns the sink for
@@ -86,54 +83,15 @@ func (s *TelegramSink) Name() string { return "telegram" }
 // the sink is disabled this is a no-op (no error). Delivery errors are
 // surfaced to the fanout for logging; the sink never retries.
 func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
-	if !s.cfg.Enabled {
+	if !s.cfg.Enabled || s.bot == nil {
 		return nil
 	}
 	text := FormatTelegramMessage(f)
-	if err := s.send(ctx, s.cfg.ChatID, text); err != nil {
+	if _, err := s.bot.SendHTML(ctx, s.cfg.ChatID, text); err != nil {
 		s.observeErr(f.Severity)
 		return err
 	}
 	s.observeOK(f.Severity)
-	return nil
-}
-
-// send POSTs one sendMessage call. ChatID is sent as a number when it
-// parses as int64 (Telegram's preferred form for private/group chats) and
-// as a string otherwise (channel @usernames).
-func (s *TelegramSink) send(ctx context.Context, chatID, text string) error {
-	body := map[string]any{
-		"text":                     text,
-		"parse_mode":               "HTML",
-		"disable_web_page_preview": true,
-	}
-	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil {
-		body["chat_id"] = id
-	} else {
-		body["chat_id"] = chatID
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(s.cfg.BaseURL, "/"), s.cfg.BotToken)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("telegram: send to chat %s: %w", chatID, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("telegram: chat %s -> %d: %s", chatID, resp.StatusCode, string(b))
-	}
 	return nil
 }
 

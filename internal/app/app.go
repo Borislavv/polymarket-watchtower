@@ -8,9 +8,15 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/alertsender"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/dbbaseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
@@ -28,8 +34,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	shutdown2 "github.com/Borislavv/polymarket-watchtower/internal/infra/shutdown"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/rs/zerolog"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
 const serviceName = "watchtower"
@@ -47,6 +52,10 @@ type App struct {
 	collect   *collect.Loop
 	detectRun func(context.Context) error // active mode's Run
 	httpSrv   *httpsrv.Server
+
+	// Postgres-backed background workers; nil when DSN is unset.
+	backfill *backfill.Worker
+	sender   *alertsender.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -107,13 +116,28 @@ func New() (*App, error) {
 	categoryFilter := category.NewFilter(cfg.CategoryFilter.Whitelist)
 	logger.Info().Str("category_whitelist", categoryFilter.Summary()).Msg("category filter")
 
-	// Postgres is optional. When DSN is set we open the pool, run
-	// migrations, and build a persist.Sink that writes every discovery
-	// sweep and trade batch to the DB. When DSN is empty the app stays in
-	// Phase-1 mode (in-memory only) — the loops see a nil Persist.
+	// Postgres is optional but is the production shape. When DSN is set we
+	// open the pool, run migrations, and build:
+	//   - persist.Sink: writes discoveries and collected trades through;
+	//   - category/market/trade/trader/alert repositories;
+	//   - dbbaseline.Provider: the DB-backed baseline read path used by
+	//     the detector when BASELINE_SOURCE=postgres (default);
+	//   - backfill.Worker: fills missing history for new markets;
+	//   - alertsender.Worker: delivers persisted alerts to Telegram.
+	//
+	// When DSN is empty the app stays in-memory only — for local
+	// exploration. Production must run with POSTGRES_DSN set; the user
+	// guidance is in README.md and presets/README.md.
 	var (
-		pgPool      *pgxpool.Pool
-		persistSink *persist.Sink
+		pgPool         *pgxpool.Pool
+		persistSink    *persist.Sink
+		alertsRepo     *repository.AlertRepository
+		marketsRepo    *repository.MarketRepository
+		tradesRepo     *repository.TradeRepository
+		tradersRepo    *repository.TraderRepository
+		dbBaseline     *dbbaseline.Provider
+		backfillWorker *backfill.Worker
+		senderWorker   *alertsender.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -131,19 +155,27 @@ func New() (*App, error) {
 		if err != nil {
 			return nil, fmt.Errorf("postgres open: %w", err)
 		}
+		marketsRepo = repository.NewMarketRepository(pgPool)
+		tradesRepo = repository.NewTradeRepository(pgPool)
+		tradersRepo = repository.NewTraderRepository(pgPool)
+		alertsRepo = repository.NewAlertRepository(pgPool)
 		persistSink = persist.NewSink(
 			repository.NewCategoryRepository(pgPool),
-			repository.NewMarketRepository(pgPool),
-			repository.NewTradeRepository(pgPool),
-			repository.NewTraderRepository(pgPool),
+			marketsRepo, tradesRepo, tradersRepo,
 			cfg.CategoryFilter.Whitelist,
 		)
+		dbBaseline = dbbaseline.New(dbbaseline.Config{
+			Window: cfg.Anomaly.BaselineWindow,
+		}, tradesRepo, marketsRepo)
+
 		logger.Info().
 			Int("max_open_conns", cfg.Postgres.MaxOpenConns).
 			Bool("auto_migrate", cfg.Postgres.AutoMigrate).
+			Str("baseline_source", string(cfg.Anomaly.BaselineSource)).
+			Str("strategy_version", cfg.Anomaly.StrategyVersion).
 			Msg("postgres: persistence enabled")
 	} else {
-		logger.Info().Msg("postgres: not configured, running in-memory only (Phase-1 mode)")
+		logger.Warn().Msg("postgres: POSTGRES_DSN not set — running in-memory only (local/debug)")
 	}
 
 	discoverCfg := discover.Config{
@@ -157,23 +189,72 @@ func New() (*App, error) {
 	}
 	discoverLoop := discover.New(discoverCfg, gammaClient, registry, engine, categoryFilter, met, logger)
 
+	// Realtime fanout owns log + optional webhook only. Telegram delivery
+	// flows through the DB queue and the alertsender worker — keeping it
+	// out of this fanout is the "isolated telegram infrastructure" rule.
+	// When Postgres is NOT configured (local/debug), the legacy synchronous
+	// TelegramSink is added back to the fanout so a developer can still see
+	// alerts on Telegram without standing up a database.
 	sinks := []alerting2.Channel{&alerting2.LogSink{Logger: logger}}
 	if cfg.Alerting.WebhookURL != "" {
 		sinks = append(sinks, alerting2.NewWebhookSink(cfg.Alerting.WebhookURL))
 	}
-	telegram, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
-		Enabled:  cfg.Alerting.TelegramEnabled,
-		BotToken: cfg.Alerting.TelegramBotToken,
-		ChatID:   cfg.Alerting.TelegramChatID,
-		BaseURL:  cfg.Alerting.TelegramBaseURL,
-		Timeout:  cfg.Alerting.TelegramTimeout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("telegram sink: %w", err)
+	if !cfg.Postgres.Enabled() && cfg.Alerting.TelegramEnabled {
+		legacyTg, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
+			Enabled:  cfg.Alerting.TelegramEnabled,
+			BotToken: cfg.Alerting.TelegramBotToken,
+			ChatID:   cfg.Alerting.TelegramChatID,
+			BaseURL:  cfg.Alerting.TelegramBaseURL,
+			Timeout:  cfg.Alerting.TelegramTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("telegram sink: %w", err)
+		}
+		legacyTg.WithMetrics(met)
+		sinks = append(sinks, legacyTg)
 	}
-	telegram.WithMetrics(met)
-	sinks = append(sinks, telegram)
 	emitter := &alerting2.Fanout{Sinks: sinks, Logger: logger}
+
+	// Backfill + sender workers exist only when Postgres is wired. The
+	// sender worker also needs Telegram enabled with a valid recipient —
+	// failing fast at boot is the spec.
+	if cfg.Postgres.Enabled() && cfg.Alerting.TelegramEnabled {
+		bot, err := telegram.New(telegram.Config{
+			BotToken: cfg.Alerting.TelegramBotToken,
+			BaseURL:  cfg.Alerting.TelegramBaseURL,
+			Timeout:  cfg.Alerting.TelegramTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("telegram bot: %w", err)
+		}
+		if cfg.Alerting.TelegramChatID == "" {
+			return nil, fmt.Errorf("telegram: chat id required when enabled (TELEGRAM_CHAT_ID)")
+		}
+		senderWorker = alertsender.New(alertsender.Config{
+			Interval:          cfg.AlertSender.Interval,
+			ClaimLimit:        cfg.AlertSender.ClaimLimit,
+			Workers:           cfg.AlertSender.Workers,
+			ChatID:            cfg.Alerting.TelegramChatID,
+			StaleSendingAfter: cfg.AlertSender.StaleSendingAfter,
+		}, alertsRepo, bot, met, logger)
+		logger.Info().
+			Str("chat_id", cfg.Alerting.TelegramChatID).
+			Int("workers", cfg.AlertSender.Workers).
+			Msg("alertsender: enabled")
+	}
+	if cfg.Postgres.Enabled() {
+		backfillWorker = backfill.New(backfill.Config{
+			Interval:    cfg.Backfill.Interval,
+			BatchSize:   cfg.Backfill.BatchSize,
+			Concurrency: cfg.Backfill.Concurrency,
+			PageSize:    cfg.Backfill.PageLimit,
+			StaleAfter:  cfg.Backfill.StaleAfter,
+		}, marketsRepo, tradesRepo, tradersRepo, dataClient, logger)
+		logger.Info().
+			Int("batch_size", cfg.Backfill.BatchSize).
+			Dur("interval", cfg.Backfill.Interval).
+			Msg("backfill: enabled")
+	}
 
 	// Detector wiring depends on ANOMALY_MODE. single_cluster is the primary
 	// product path (per-trade scoring + cluster HARD alert); volume keeps the
@@ -186,7 +267,7 @@ func New() (*App, error) {
 	)
 	switch cfg.Anomaly.Mode {
 	case ModeSingleCluster:
-		detectLoop = detect.New(detect.Config{
+		detectCfg := detect.Config{
 			Thresholds: anomaly.Thresholds{
 				Info: anomaly.Tier{
 					MinNotionalUSD: cfg.Anomaly.InfoMinNotionalUSD,
@@ -229,7 +310,20 @@ func New() (*App, error) {
 			MarketMinAge:                cfg.Anomaly.MarketMinAge,
 			BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
 			AllowUnknownMarketLifecycle: cfg.Anomaly.AllowUnknownMarketLifecycle,
-		}, engine, registry, emitter, met, logger)
+			StrategyVersion:             cfg.Anomaly.StrategyVersion,
+		}
+		// Production: DB baseline + DB-backed alert dedup. Memory mode
+		// keeps the legacy in-process reservoir and skips dedup — only
+		// safe for local exploration without Postgres.
+		if cfg.Postgres.Enabled() && cfg.Anomaly.BaselineSource == BaselineSourcePostgres {
+			detectCfg.Baseliner = dbBaseline
+		}
+		if cfg.Postgres.Enabled() {
+			detectCfg.Alerts = alertsRepo
+			detectCfg.Markets = marketsRepo
+			detectCfg.Traders = tradersRepo
+		}
+		detectLoop = detect.New(detectCfg, engine, registry, emitter, met, logger)
 		observer = detectLoop
 		detectRun = detectLoop.Run
 	case ModeVolume:
@@ -255,6 +349,7 @@ func New() (*App, error) {
 	}
 	if persistSink != nil {
 		collectCfg.Persist = persistSink.PersistTrades
+		collectCfg.Cursor = persistSink.LatestTradedAt
 	}
 	collectLoop := collect.New(collectCfg, dataClient, engine, registry, observer, met, logger)
 
@@ -274,6 +369,8 @@ func New() (*App, error) {
 		collect:   collectLoop,
 		detectRun: detectRun,
 		httpSrv:   httpSrv,
+		backfill:  backfillWorker,
+		sender:    senderWorker,
 		pgPool:    pgPool,
 	}, nil
 }
@@ -294,6 +391,12 @@ func (a *App) Run() error {
 		{Name: "discover", Fn: a.discover.Run},
 		{Name: "collect", Fn: a.collect.Run},
 		{Name: "detect", Fn: a.detectRun},
+	}
+	if a.backfill != nil {
+		execs = append(execs, shutdown2.Exec{Name: "backfill", Fn: a.backfill.Run})
+	}
+	if a.sender != nil {
+		execs = append(execs, shutdown2.Exec{Name: "alertsender", Fn: a.sender.Run})
 	}
 
 	return shutdown2.Graceful(

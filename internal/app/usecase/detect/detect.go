@@ -18,6 +18,8 @@ package detect
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -33,13 +35,47 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	"github.com/rs/zerolog"
 )
 
-// Emitter receives findings. Decoupled so detect doesn't care whether output is
-// logs, telegram, webhooks, or all of them.
+// Emitter receives findings for realtime telemetry sinks (log, webhook).
+// Telegram delivery in production does NOT flow through this emitter — it
+// is dispatched by the alertsender worker reading from polymarket_alerts.
 type Emitter interface {
 	Notify(ctx context.Context, f anomaly.Finding) error
+}
+
+// BaselineFetcher is the read-only baseline statistics interface consumed
+// by the per-trade scorer. In production it is satisfied by
+// internal/app/usecase/analytics/dbbaseline.Provider; tests rely on the
+// embedded in-memory analytics/baseline.Baseline (no fetcher configured).
+type BaselineFetcher interface {
+	Stats(ctx context.Context, k baseline.Key) (baseline.Stats, error)
+}
+
+// AlertCreator is the dedup primitive. TryCreatePending must:
+//   - return created=true with a fresh Alert when the dedup_key is new;
+//   - return created=false (no error) when the dedup_key already exists.
+//
+// Satisfied by *repository.AlertRepository. When nil, the detector emits
+// realtime to the configured Emitter without DB dedup — a memory/debug
+// shape used only by tests.
+type AlertCreator interface {
+	TryCreatePending(ctx context.Context, a repository.NewAlert) (repository.Alert, bool, error)
+}
+
+// MarketResolver maps a Polymarket condition id to the local market row,
+// used to populate alerts.market_id and to namespace cluster dedup keys.
+type MarketResolver interface {
+	GetByConditionID(ctx context.Context, conditionID string) (repository.Market, error)
+}
+
+// TraderResolver maps a wallet to the local trader row, used to populate
+// alerts.trader_id. Returns repository.ErrTraderNotFound when unseen — the
+// detector treats that as "no trader fk" rather than an error.
+type TraderResolver interface {
+	GetByWallet(ctx context.Context, wallet string) (repository.Trader, error)
 }
 
 // Config wires the detector. Defaults fill in for zero-valued fields.
@@ -72,6 +108,26 @@ type Config struct {
 	// allow them through (legacy / debugging).
 	AllowUnknownMarketLifecycle bool
 	Clock                       func() time.Time
+
+	// Baseliner overrides the in-memory baseline reservoir. When set, the
+	// detector queries it on every Observe and does NOT seed the in-process
+	// ring (trade ingestion to the DB is owned by persist.Sink + backfill
+	// worker — that's what the fetcher reads from). Leave nil to use the
+	// embedded baseline.Baseline (local/debug, BASELINE_SOURCE=memory).
+	Baseliner BaselineFetcher
+	// Alerts wires the Postgres dedup primitive. When set, every fired
+	// Finding is INSERT … ON CONFLICT DO NOTHING into polymarket_alerts
+	// before being handed to the realtime Emitter. Conflicts suppress the
+	// emit entirely so log/webhook stay in sync with the DB queue.
+	Alerts AlertCreator
+	// Markets resolves condition_id → DB market id for the alerts row.
+	Markets MarketResolver
+	// Traders resolves wallet → DB trader id for the alerts row.
+	Traders TraderResolver
+	// StrategyVersion is stamped on every alert row and woven into the
+	// dedup_key so a config retune cannot ressurect ignored alerts.
+	// Defaults to "v1".
+	StrategyVersion string
 }
 
 // Loop owns the analytics state.
@@ -112,6 +168,9 @@ func New(
 	if cfg.LifecycleHotFromPct < cfg.LifecycleAlertFromPct {
 		cfg.LifecycleHotFromPct = cfg.LifecycleAlertFromPct
 	}
+	if cfg.StrategyVersion == "" {
+		cfg.StrategyVersion = "v1"
+	}
 	now := cfg.Clock
 	if now == nil {
 		now = time.Now
@@ -136,17 +195,22 @@ func New(
 	}
 }
 
-// Observe is the per-trade hot path called by collect for every ingested trade.
-// Safe for concurrent calls.
+// Observe is the per-trade hot path called by collect for every ingested
+// trade. Safe for concurrent calls.
 //
-// Steps (per category the market belongs to):
-//  1. Read current baseline stats for the bucket.
-//  2. Add the trade to the bucket (post-read so the new sample doesn't
-//     pollute its own baseline).
-//  3. Score; on fire, push into cluster + remember best-severity context for
-//     the single-trade alert.
-//  4. After looping all categories, emit at most one single-trade Finding
-//     (with the highest-severity category as context).
+// Production wiring (cfg.Baseliner + cfg.Alerts set):
+//  1. Read baseline stats from Postgres (the trade was already persisted by
+//     persist.Sink before Observe ran, so the DB reflects the latest state).
+//  2. Score against thresholds; on fire, attempt to insert the alert row
+//     into polymarket_alerts with a dedup_key derived from the trade.
+//  3. On a fresh insert, also notify realtime sinks (log/webhook) and feed
+//     the in-process cluster window for HARD detection. The Telegram sink
+//     is NOT in this fanout — the alertsender worker reads pending rows.
+//
+// Memory wiring (no Baseliner, no Alerts — tests and local debug):
+//   - Baseline stats come from the embedded in-memory reservoir; the trade
+//     is added to that reservoir for future scoring rounds.
+//   - Findings go directly to the realtime emitter; no DB dedup.
 func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Trade) {
 	if trade.Size <= 0 || trade.Price <= 0 {
 		return
@@ -198,8 +262,11 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 			continue
 		}
 		bucket := baseline.Key{Category: cat, Market: market.ID, OutcomeToken: trade.Token}
-		stats := l.baseline.Stats(bucket)
-		l.baseline.Add(bucket, notional, trade.Timestamp)
+		stats, err := l.readBaseline(ctx, bucket, notional, trade.Timestamp)
+		if err != nil {
+			l.log.Err(err).Str("market", string(market.ID)).Msg("detect: baseline read failed")
+			continue
+		}
 
 		// Alert-eligibility gates from here down (baseline already updated).
 		if !gateAllowsAlert {
@@ -234,6 +301,20 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	if bestResult.Fired {
 		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef, lifecyclePct, hot)
 	}
+}
+
+// readBaseline returns the per-bucket statistics. With cfg.Baseliner set
+// (production), the DB is the source of truth and the in-memory ring is
+// not touched — persist.Sink and the backfill worker are the writers.
+// With no fetcher (tests/local), the in-memory reservoir is read and then
+// updated with the current trade so the next call sees it.
+func (l *Loop) readBaseline(ctx context.Context, k baseline.Key, notional float64, at time.Time) (baseline.Stats, error) {
+	if l.cfg.Baseliner != nil {
+		return l.cfg.Baseliner.Stats(ctx, k)
+	}
+	stats := l.baseline.Stats(k)
+	l.baseline.Add(k, notional, at)
+	return stats, nil
 }
 
 func (l *Loop) buildTradeRef(m market.Market, t trade.Trade, notional float64) anomaly.TradeRef {
@@ -310,6 +391,12 @@ func (l *Loop) emitTradeAnomaly(
 	}
 	l.metrics.CategoryAnomalousTrades.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Inc()
 	l.metrics.CategoryAnomalousUSD.WithLabelValues(categoryLabel(catRef), string(sr.Severity)).Add(ref.NotionalUSD)
+
+	dedup := l.singleTradeDedupKey(m, t)
+	if !l.persistAlert(ctx, repository.AlertKindTrade, dedup, m, t, f) {
+		// DB dedup said "already alerted" — keep realtime sinks in sync.
+		return
+	}
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit single-trade failed")
 	}
@@ -335,9 +422,116 @@ func (l *Loop) emitCategoryWatch(
 		GrafanaURL:  l.grafanaURL(catRef, market.Market{}, t.Timestamp, anomaly.SeverityHard),
 	}
 	l.metrics.CategoryHardAlerts.WithLabelValues(categoryLabel(catRef)).Inc()
+
+	dedup := l.clusterDedupKey(cat)
+	if !l.persistAlert(ctx, repository.AlertKindCluster, dedup, m, t, f) {
+		return
+	}
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit category-watch failed")
 	}
+}
+
+// persistAlert is the dedup gate. With cfg.Alerts wired, the alert row is
+// inserted ON CONFLICT DO NOTHING; the bool reports whether this caller
+// won the insert. With no AlertCreator (memory/debug), every call returns
+// true so realtime emit proceeds — there is no DB dedup in that mode.
+func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedupKey string, m market.Market, t trade.Trade, f anomaly.Finding) bool {
+	if l.cfg.Alerts == nil {
+		return true
+	}
+	payload, err := json.Marshal(f)
+	if err != nil {
+		l.log.Err(err).Msg("detect: marshal alert payload failed")
+		return false
+	}
+	row := repository.NewAlert{
+		DedupKey:        dedupKey,
+		StrategyVersion: l.cfg.StrategyVersion,
+		Kind:            kind,
+		Reason:          f.Reason,
+		Severity:        string(f.Severity),
+		Payload:         payload,
+		MarketID:        l.resolveMarketID(ctx, m.ID),
+		TraderID:        l.resolveTraderID(ctx, t.Taker),
+	}
+	_, created, err := l.cfg.Alerts.TryCreatePending(ctx, row)
+	if err != nil {
+		l.log.Err(err).Str("dedup_key", dedupKey).Msg("detect: alert insert failed")
+		return false
+	}
+	return created
+}
+
+// singleTradeDedupKey produces "single:<strategy>:<trade_dedup_key>". The
+// trade_dedup_key matches the row written by repository.DedupKeyForTrade
+// so an alert is exactly idempotent across restarts and concurrent
+// observers.
+func (l *Loop) singleTradeDedupKey(m market.Market, t trade.Trade) string {
+	// The trade dedup_key derivation needs a market_id; for the alert key
+	// the condition_id is equally stable and sidesteps a DB lookup. We
+	// build a synthetic InsertTradeInput with the upstream ExternalID and
+	// fall back to the composite hash when ExternalID is empty (rare).
+	key := repository.DedupKeyForTrade(repository.InsertTradeInput{
+		MarketID:     0, // not used when ExternalID is set; composite path
+		OutcomeToken: string(t.Token) + "@" + string(m.ID),
+		Side:         string(t.Side),
+		Price:        t.Price,
+		SizeShares:   t.Size,
+		TradedAt:     t.Timestamp,
+		ExternalID:   t.ID,
+	})
+	return "single:" + l.cfg.StrategyVersion + ":" + key
+}
+
+// clusterDedupKey produces "cluster:<strategy>:<category_id>:<window_start>".
+// window_start floors `now` to the cluster cooldown so two cluster fires
+// landing in the same cadence bucket dedup; the next bucket gets a fresh
+// key, matching the cooldown contract.
+func (l *Loop) clusterDedupKey(cat vo.CategoryID) string {
+	bucket := l.cfg.Cluster.Cooldown
+	if bucket <= 0 {
+		bucket = l.cfg.Cluster.Window
+	}
+	if bucket <= 0 {
+		bucket = 30 * time.Minute
+	}
+	windowStart := l.now().Truncate(bucket).Unix()
+	return fmt.Sprintf("cluster:%s:%d:%d", l.cfg.StrategyVersion, int64(cat), windowStart)
+}
+
+// resolveMarketID returns a non-nil DB market id when cfg.Markets is wired
+// and the row exists. Returns nil silently otherwise — the alerts.market_id
+// column is nullable so callers can still file an alert against an as-yet-
+// unpersisted market (discovery has not caught up).
+func (l *Loop) resolveMarketID(ctx context.Context, condID vo.MarketID) *int64 {
+	if l.cfg.Markets == nil || condID == "" {
+		return nil
+	}
+	m, err := l.cfg.Markets.GetByConditionID(ctx, string(condID))
+	if err != nil {
+		return nil
+	}
+	id := m.ID
+	return &id
+}
+
+// resolveTraderID returns a non-nil DB trader id when cfg.Traders is wired
+// and the wallet has been seen. Returns nil for ErrTraderNotFound or any
+// other lookup error.
+func (l *Loop) resolveTraderID(ctx context.Context, wallet string) *int64 {
+	if l.cfg.Traders == nil || wallet == "" {
+		return nil
+	}
+	t, err := l.cfg.Traders.GetByWallet(ctx, wallet)
+	if err != nil {
+		if errors.Is(err, repository.ErrTraderNotFound) {
+			return nil
+		}
+		return nil
+	}
+	id := t.ID
+	return &id
 }
 
 // allowed reports whether the category passes the whitelist. Uncategorised

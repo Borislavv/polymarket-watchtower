@@ -39,6 +39,13 @@ func resetTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	// TRUNCATE … CASCADE wipes everything in one statement and respects
 	// FKs without needing per-table DELETE ordering.
+	//
+	// NOTE on parallelism: `go test ./...` runs test packages in parallel
+	// processes, all hitting the same database. The repo, dbbaseline, and
+	// detect integration suites all TRUNCATE on setup — running them in
+	// parallel produces flaky FK violations. The live integration target
+	// in the README always passes `-p 1`; do not run them via plain
+	// `go test ./...`.
 	if _, err := pool.Exec(context.Background(), `
         TRUNCATE TABLE
             polymarket_alerts,
@@ -255,6 +262,227 @@ func TestTradeRepository_UpsertIdempotentAndBaseline(t *testing.T) {
 	}
 	if summary.Span() < 3*time.Hour || summary.Span() > 5*time.Hour {
 		t.Errorf("span: %s want ~4h", summary.Span())
+	}
+}
+
+func TestTradeRepository_DistributionStatistics(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	cats, _ := NewCategoryRepository(pool).UpsertSeen(ctx, []Category{
+		{ExternalID: "1", Slug: "politics", Name: "Politics"},
+	})
+	mkts, _ := NewMarketRepository(pool).UpsertSeen(ctx, []UpsertMarketInput{
+		{ConditionID: "0xd", Slug: "m", Question: "q", CategoryIDs: []int64{cats[0].ID}},
+	})
+	repo := NewTradeRepository(pool)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	// 20 trades: 19 at $100, 1 at $1000 → median ~100, p95 ~1000, mean 145.
+	trades := make([]InsertTradeInput, 0, 20)
+	for i := 0; i < 19; i++ {
+		trades = append(trades, InsertTradeInput{
+			MarketID: mkts[0].ID, OutcomeToken: "tok", Side: "BUY",
+			Price: 0.5, SizeShares: 200, NotionalUSD: 100,
+			TradedAt: now.Add(time.Duration(-i) * time.Hour), ExternalID: "lo-" + string(rune('A'+i)),
+		})
+	}
+	trades = append(trades, InsertTradeInput{
+		MarketID: mkts[0].ID, OutcomeToken: "tok", Side: "BUY",
+		Price: 0.5, SizeShares: 2000, NotionalUSD: 1000,
+		TradedAt: now.Add(-30 * time.Minute), ExternalID: "hi",
+	})
+	if _, err := repo.UpsertBatch(ctx, trades); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	dist, err := repo.Distribution(ctx, BaselineQuery{MarketID: mkts[0].ID, OutcomeToken: "tok"})
+	if err != nil {
+		t.Fatalf("Distribution: %v", err)
+	}
+	if dist.SampleCount != 20 {
+		t.Errorf("count: %d want 20", dist.SampleCount)
+	}
+	if dist.MedianNotionalUSD < 99 || dist.MedianNotionalUSD > 101 {
+		t.Errorf("median: %v want ~100", dist.MedianNotionalUSD)
+	}
+	if dist.P95NotionalUSD < 100 {
+		t.Errorf("p95: %v want >= 100", dist.P95NotionalUSD)
+	}
+	if dist.Span() < 17*time.Hour {
+		t.Errorf("span: %s want >= 17h", dist.Span())
+	}
+
+	// Windowed read excludes older samples.
+	winDist, err := repo.Distribution(ctx, BaselineQuery{
+		MarketID: mkts[0].ID, OutcomeToken: "tok", Since: now.Add(-1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("windowed: %v", err)
+	}
+	if winDist.SampleCount < 2 || winDist.SampleCount >= 20 {
+		t.Errorf("windowed count: %d want < 20", winDist.SampleCount)
+	}
+}
+
+func TestTradeRepository_ExistingDedupKeys(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	cats, _ := NewCategoryRepository(pool).UpsertSeen(ctx, []Category{
+		{ExternalID: "1", Slug: "politics", Name: "Politics"},
+	})
+	mkts, _ := NewMarketRepository(pool).UpsertSeen(ctx, []UpsertMarketInput{
+		{ConditionID: "0xe", Slug: "m", Question: "q", CategoryIDs: []int64{cats[0].ID}},
+	})
+	repo := NewTradeRepository(pool)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	in := []InsertTradeInput{
+		{MarketID: mkts[0].ID, OutcomeToken: "t", Side: "BUY", Price: 0.5, SizeShares: 100, NotionalUSD: 50, TradedAt: now, ExternalID: "ext-1"},
+		{MarketID: mkts[0].ID, OutcomeToken: "t", Side: "BUY", Price: 0.5, SizeShares: 100, NotionalUSD: 50, TradedAt: now, ExternalID: "ext-2"},
+	}
+	if _, err := repo.UpsertBatch(ctx, in); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	keys := []string{DedupKeyForTrade(in[0]), DedupKeyForTrade(in[1]), "ext:does-not-exist"}
+	existing, err := repo.ExistingDedupKeys(ctx, mkts[0].ID, keys)
+	if err != nil {
+		t.Fatalf("ExistingDedupKeys: %v", err)
+	}
+	if len(existing) != 2 {
+		t.Errorf("got %d hits, want 2: %v", len(existing), existing)
+	}
+}
+
+func TestMarketRepository_UpsertOutcome(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	cats, _ := NewCategoryRepository(pool).UpsertSeen(ctx, []Category{
+		{ExternalID: "1", Slug: "politics", Name: "Politics"},
+	})
+	mkts, err := NewMarketRepository(pool).UpsertSeen(ctx, []UpsertMarketInput{
+		{ConditionID: "0xf", Slug: "m", Question: "q", CategoryIDs: []int64{cats[0].ID}},
+	})
+	if err != nil {
+		t.Fatalf("seed market: %v", err)
+	}
+	repo := NewMarketRepository(pool)
+	if err := repo.UpsertOutcome(ctx, mkts[0].ID, "tok-yes", "Yes"); err != nil {
+		t.Fatalf("upsert outcome: %v", err)
+	}
+	// Re-upsert is idempotent (relabel is OK).
+	if err := repo.UpsertOutcome(ctx, mkts[0].ID, "tok-yes", "Yes!"); err != nil {
+		t.Fatalf("re-upsert outcome: %v", err)
+	}
+	// Confirm exactly one row via a direct count.
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM polymarket_market_outcomes WHERE market_id = $1", mkts[0].ID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("outcome rows: %d want 1", n)
+	}
+}
+
+// TestAlertRepository_ConcurrentTryCreatePending pins the cross-restart and
+// cross-process safety contract: dozens of concurrent inserts with the same
+// dedup_key produce exactly ONE alert row, no transaction errors, and
+// exactly one caller observes created=true.
+func TestAlertRepository_ConcurrentTryCreatePending(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	repo := NewAlertRepository(pool)
+
+	const goroutines = 32
+	payload, _ := json.Marshal(map[string]any{"k": "v"})
+	row := NewAlert{
+		DedupKey: "single:v1:race-test", StrategyVersion: "v1",
+		Kind: AlertKindTrade, Reason: "LargeRareBet", Severity: "info",
+		Payload: payload,
+	}
+	type res struct {
+		ok  bool
+		err error
+	}
+	results := make(chan res, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, ok, err := repo.TryCreatePending(ctx, row)
+			results <- res{ok: ok, err: err}
+		}()
+	}
+	winners := 0
+	for i := 0; i < goroutines; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("unexpected error: %v", r.err)
+		}
+		if r.ok {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("expected exactly 1 winner, got %d", winners)
+	}
+
+	// Confirm exactly one row in the DB.
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM polymarket_alerts WHERE dedup_key = $1", row.DedupKey).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("alert rows: %d want 1", n)
+	}
+}
+
+func TestAlertRepository_ClaimSkipsAlreadyLocked(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	repo := NewAlertRepository(pool)
+
+	payload, _ := json.Marshal(map[string]any{"k": "v"})
+	for i := 0; i < 3; i++ {
+		_, _, _ = repo.TryCreatePending(ctx, NewAlert{
+			DedupKey:        "single:v1:" + string(rune('A'+i)),
+			StrategyVersion: "v1",
+			Kind:            AlertKindTrade, Reason: "x", Severity: "info",
+			Payload: payload,
+		})
+	}
+
+	// Two senders claim in parallel; each gets a disjoint subset.
+	type claim struct {
+		ids []int64
+		err error
+	}
+	results := make(chan claim, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			alerts, err := repo.ClaimPending(ctx, 10)
+			ids := make([]int64, 0, len(alerts))
+			for _, a := range alerts {
+				ids = append(ids, a.ID)
+			}
+			results <- claim{ids: ids, err: err}
+		}()
+	}
+	seen := make(map[int64]int)
+	for i := 0; i < 2; i++ {
+		c := <-results
+		if c.err != nil {
+			t.Errorf("claim err: %v", c.err)
+		}
+		for _, id := range c.ids {
+			seen[id]++
+		}
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("alert %d claimed %d times — SKIP LOCKED violated", id, n)
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("expected all 3 alerts claimed, got %d", len(seen))
 	}
 }
 

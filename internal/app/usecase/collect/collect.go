@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -17,7 +19,6 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
-	"github.com/rs/zerolog"
 )
 
 // TradeObserver is the per-trade hook into the detection pipeline. The detect
@@ -27,11 +28,17 @@ type TradeObserver interface {
 	Observe(ctx context.Context, m market.Market, t trade.Trade)
 }
 
-// Persist is the optional Postgres side-channel for collected trades.
-// Called once per pull with the freshly-fetched batch and its market.
-// Errors are logged and the loop continues — the in-memory observer is
-// still the source of truth for live alerting in this stage.
+// Persist is the optional Postgres write-through. Called per pull with the
+// freshly-fetched batch and its market. In production wiring the loop calls
+// Persist BEFORE Observer.Observe so the DB-backed detector sees the trade
+// in its baseline reservoir. Errors are logged; observation still runs so
+// the in-memory aggregate engine stays warm.
 type Persist func(ctx context.Context, m market.Market, trades []trade.Trade) error
+
+// CursorReader returns the newest traded_at already stored for the supplied
+// market, or the zero time when nothing is persisted yet. Optional: when
+// nil, the loop uses an in-process map as the cursor (legacy/memory mode).
+type CursorReader func(ctx context.Context, conditionID string) (time.Time, error)
 
 type Config struct {
 	Interval     time.Duration
@@ -41,6 +48,9 @@ type Config struct {
 	// Persist optionally receives each fetched batch for write-through
 	// to PostgreSQL. Nil = no DB writes.
 	Persist Persist
+	// Cursor optionally sources the per-market "since" cutoff from the DB.
+	// Nil = use the in-process lastTs map (memory mode).
+	Cursor CursorReader
 }
 
 type Loop struct {
@@ -128,7 +138,7 @@ func (l *Loop) tick(ctx context.Context) {
 }
 
 func (l *Loop) pull(ctx context.Context, m market.Market) {
-	since := l.lookback(m.ID)
+	since := l.lookback(ctx, m)
 	trades, err := l.client.ListTradesSince(ctx, dataapi.ListTradesOpts{Market: m.ID, Since: since})
 	if err != nil {
 		var apiErr *httpx.APIError
@@ -148,6 +158,16 @@ func (l *Loop) pull(ctx context.Context, m market.Market) {
 	sort.SliceStable(trades, func(i, j int) bool { return trades[i].Timestamp.Before(trades[j].Timestamp) })
 	l.engine.IngestBatch(trades)
 
+	// Persist BEFORE Observe: in DB-baseline mode the detector queries
+	// polymarket_trades on every Observe and must see this batch already
+	// written. A persist failure does not block observation — it is logged
+	// and the in-memory aggregate engine still gets the data.
+	if l.cfg.Persist != nil {
+		if err := l.cfg.Persist(ctx, m, trades); err != nil {
+			l.log.Err(err).Str("market", string(m.ID)).Msg("collect: persist failed")
+		}
+	}
+
 	var notional float64
 	var newest time.Time
 	for _, t := range trades {
@@ -162,18 +182,24 @@ func (l *Loop) pull(ctx context.Context, m market.Market) {
 	l.metrics.TradesIngested.WithLabelValues(string(m.ID)).Add(float64(len(trades)))
 	l.metrics.NotionalIngested.WithLabelValues(string(m.ID)).Add(notional)
 	l.setLastTs(m.ID, newest)
-
-	if l.cfg.Persist != nil {
-		if err := l.cfg.Persist(ctx, m, trades); err != nil {
-			l.log.Err(err).Str("market", string(m.ID)).Msg("collect: persist failed")
-		}
-	}
 }
 
-func (l *Loop) lookback(id vo.MarketID) time.Time {
+// lookback resolves the per-market "since" cutoff. Order of precedence:
+//  1. cfg.Cursor (DB-backed) when wired — survives restarts.
+//  2. in-process lastTs map — last seen timestamp this run.
+//  3. now − LookbackBoot for a first-sight market.
+//
+// Cursor read errors fall through to the in-process map, so a transient DB
+// hiccup doesn't stall collection.
+func (l *Loop) lookback(ctx context.Context, m market.Market) time.Time {
+	if l.cfg.Cursor != nil {
+		if ts, err := l.cfg.Cursor(ctx, string(m.ID)); err == nil && !ts.IsZero() {
+			return ts.Add(time.Second)
+		}
+	}
 	l.lastTsMu.Lock()
 	defer l.lastTsMu.Unlock()
-	if ts, ok := l.lastTs[id]; ok {
+	if ts, ok := l.lastTs[m.ID]; ok {
 		return ts
 	}
 	return l.now().Add(-l.cfg.LookbackBoot)
