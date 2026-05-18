@@ -50,11 +50,12 @@ type Metrics struct {
 	CategoryAnomalousUSD    *prometheus.CounterVec // category, severity
 	CategoryHardAlerts      *prometheus.CounterVec // category
 	AccumulationAlerts      *prometheus.CounterVec // severity, category — same-trader accumulation lines
+	QuietMarketAlerts       *prometheus.CounterVec // severity, kind — alerts stamped with QUIET_MARKET_WAKEUP context
 	BaselineBuckets         prometheus.Gauge       // total live (category,market,outcome) buckets
 
 	// --- Filtering ---
 	CategoryFilterSkipped *prometheus.CounterVec // stage = discover|detect
-	AlertMMSuppressed     *prometheus.CounterVec // category — single-trade alerts suppressed by MM/arb filter
+	AlertMMSuppressed     *prometheus.CounterVec // category, reason — alerts suppressed by MM/arb filter (reason=POSSIBLE_MARKET_MAKER)
 
 	// --- Alerting outcomes ---
 	TelegramAlertsSent  *prometheus.CounterVec // severity
@@ -166,6 +167,11 @@ func New() *Metrics {
 		Help: "Same-trader accumulation-line alerts emitted, by severity and category.",
 	}, []string{"severity", "category"})
 
+	m.QuietMarketAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "quietmarket", Name: "alerts_total",
+		Help: "Alerts stamped with QUIET_MARKET_WAKEUP context, by severity and finding kind.",
+	}, []string{"severity", "kind"})
+
 	m.BaselineBuckets = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "watchtower", Subsystem: "baseline", Name: "buckets",
 		Help: "Number of live (category, market, outcome) baseline buckets.",
@@ -178,8 +184,8 @@ func New() *Metrics {
 
 	m.AlertMMSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "filter", Name: "alert_mm_suppressed_total",
-		Help: "Single-trade alerts suppressed because the wallet showed balanced two-sided activity (market-making/arbitrage signature).",
-	}, []string{"category"})
+		Help: "Alerts suppressed because the wallet showed balanced two-sided activity (market-making/arbitrage signature). Labelled by category and the structured reason code (POSSIBLE_MARKET_MAKER).",
+	}, []string{"category", "reason"})
 
 	m.TelegramAlertsSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "telegram", Name: "alerts_sent_total",
@@ -200,6 +206,7 @@ func New() *Metrics {
 		m.TradeAnomalies, m.TradeAnomalyAxis, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
 		m.AccumulationAlerts,
+		m.QuietMarketAlerts,
 		m.BaselineBuckets,
 		m.CategoryFilterSkipped, m.AlertMMSuppressed,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,

@@ -18,6 +18,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/dbbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
@@ -352,6 +353,20 @@ func New() (*App, error) {
 			detectCfg.MinTraderHistoryTrades = cfg.Anomaly.MinTraderHistoryTrades
 			if mmFilter != nil {
 				detectCfg.MMFilter = mmFilter
+			}
+			// v4 quiet-market wake-up. Postgres-only — needs LastTradedAtBefore
+			// and the dbbaseline.Provider. Context detector: stamps Findings,
+			// never fires alerts on its own.
+			if cfg.Anomaly.QuietMarketEnabled {
+				detectCfg.QuietMarket = quietmarket.New(quietmarket.Config{
+					Enabled:               true,
+					MaxTradesPerDay:       cfg.Anomaly.QuietMarketMaxTradesPerDay,
+					MaxNotionalPerDayUSD:  cfg.Anomaly.QuietMarketMaxNotionalPerDay,
+					MinIdleDuration:       cfg.Anomaly.QuietMarketMinIdleDuration,
+					MinCurrentNotionalUSD: cfg.Anomaly.QuietMarketMinCurrentNotional,
+					MinMultiplier:         cfg.Anomaly.QuietMarketMinMultiplier,
+				})
+				detectCfg.LastTradeFetcher = tradesRepo
 			}
 			// v4: same-trader accumulation-line detector. Postgres-only —
 			// the entire signal is computed over the persisted

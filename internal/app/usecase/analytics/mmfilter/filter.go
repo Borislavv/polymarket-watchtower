@@ -36,6 +36,13 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
 
+// ReasonPossibleMarketMaker is the structured reason code stamped on log
+// and metric records when the filter suppresses an alert. Kept here so
+// the suppression telemetry path has a single source of truth for the
+// string — tests assert against this constant rather than a string
+// literal duplicated in detect.go.
+const ReasonPossibleMarketMaker = "POSSIBLE_MARKET_MAKER"
+
 // SideActivityFetcher is the slice of *repository.TraderRepository the
 // filter consumes. Abstracted as an interface for tests.
 type SideActivityFetcher interface {

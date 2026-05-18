@@ -30,6 +30,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
@@ -77,6 +78,14 @@ type MMArbFilter interface {
 // *repository.TradeRepository.
 type AccumulationLineFetcher interface {
 	AccumulationLineSummary(ctx context.Context, q repository.AccumulationLineQuery) (repository.AccumulationLine, error)
+}
+
+// LastTradeBeforeFetcher returns the most recent traded_at for a
+// (market, outcome) strictly before the supplied timestamp. Used by the
+// quiet-market wake-up detector to compute idle gap. Satisfied by
+// *repository.TradeRepository.
+type LastTradeBeforeFetcher interface {
+	LastTradedAtBefore(ctx context.Context, marketID int64, outcomeToken string, before time.Time) (time.Time, error)
 }
 
 // AlertCreator is the dedup primitive. TryCreatePending must:
@@ -162,6 +171,16 @@ type Config struct {
 	// the wallet's recent same-side activity. Satisfied by
 	// *repository.TradeRepository.
 	AccumulationLines AccumulationLineFetcher
+
+	// QuietMarket is the quiet-market wake-up detector. nil = disabled.
+	// When set together with LastTradeFetcher and (for single-trade) the
+	// market Baseliner, it stamps Finding.QuietMarket + appends
+	// QUIET_MARKET_WAKEUP to Finding.Reasons on qualifying single-trade
+	// and accumulation alerts.
+	QuietMarket *quietmarket.Detector
+	// LastTradeFetcher backs QuietMarket's idle-gap computation by returning
+	// the most recent traded_at strictly before the wake-up event.
+	LastTradeFetcher LastTradeBeforeFetcher
 	// Alerts wires the Postgres dedup primitive. When set, every fired
 	// Finding is INSERT … ON CONFLICT DO NOTHING into polymarket_alerts
 	// before being handed to the realtime Emitter. Conflicts suppress the
@@ -465,12 +484,14 @@ func (l *Loop) emitTradeAnomaly(
 			l.log.Err(err).Str("wallet", ref.Wallet).Msg("detect: mm filter error; failing open")
 		}
 		if v.Suppress {
-			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabel(catRef)).Inc()
+			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabel(catRef), mmfilter.ReasonPossibleMarketMaker).Inc()
 			l.log.Info().
+				Str("reason_code", mmfilter.ReasonPossibleMarketMaker).
+				Str("kind", string(anomaly.KindTradeAnomaly)).
 				Str("wallet", ref.Wallet).
 				Str("market", string(m.ID)).
 				Str("outcome", string(t.Token)).
-				Str("reason", v.Reason).
+				Str("detail", v.Reason).
 				Int64("buy_count", v.BuyCount).
 				Int64("sell_count", v.SellCount).
 				Float64("buy_notional_usd", v.BuyNotionalUSD).
@@ -524,6 +545,13 @@ func (l *Loop) emitTradeAnomaly(
 			Span:      traderStats.SpanActual,
 		}
 	}
+	// Quiet-market wake-up: tag the alert when the market/outcome was
+	// historically quiet AND the current trade is large enough to wake it.
+	// Context-only — does not change the firing decision (already made
+	// above by score.Score).
+	l.stampQuietMarket(ctx, &f, m, baseline.Key{Category: cat, Market: m.ID, OutcomeToken: t.Token},
+		stats, ref.NotionalUSD, t.Timestamp)
+
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
 	if axis := string(sr.MultiplierAxis); axis != "" {
 		l.metrics.TradeAnomalyAxis.WithLabelValues(axis).Inc()
@@ -738,7 +766,20 @@ func (l *Loop) evaluateAccumulation(
 			l.log.Err(mmErr).Msg("detect: mm filter (accumulation) error; failing open")
 		}
 		if mmv.Suppress {
-			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabelByID(l, cat)).Inc()
+			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabelByID(l, cat), mmfilter.ReasonPossibleMarketMaker).Inc()
+			l.log.Info().
+				Str("reason_code", mmfilter.ReasonPossibleMarketMaker).
+				Str("kind", string(anomaly.KindAccumulation)).
+				Str("wallet", t.Taker).
+				Str("market", string(m.ID)).
+				Str("outcome", string(t.Token)).
+				Str("detail", mmv.Reason).
+				Int64("buy_count", mmv.BuyCount).
+				Int64("sell_count", mmv.SellCount).
+				Float64("buy_notional_usd", mmv.BuyNotionalUSD).
+				Float64("sell_notional_usd", mmv.SellNotionalUSD).
+				Float64("imbalance", mmv.Imbalance).
+				Msg("detect: accumulation alert suppressed (mm/arb signature)")
 			return
 		}
 	}
@@ -813,6 +854,24 @@ func (l *Loop) evaluateAccumulation(
 			Span:      traderStats.SpanActual,
 		}
 	}
+	// Quiet-market wake-up: an accumulation line on a quiet market is the
+	// canonical informed-flow shape. The line's oldest trade is the right
+	// anchor for "when did this wake-up begin" — earlier events make the
+	// idle gap larger and the signal stronger. bk was already declared
+	// upstream when reading the market baseline; reuse it here.
+	marketHist := l.marketHistoryStats(ctx, bk)
+	if marketHist.Count == 0 {
+		// Fall back to the line itself if the market baseline is empty —
+		// gives the detector something to judge against (sample-count=1 is
+		// still below the quiet-market readiness floor unless the operator
+		// has dropped MaxTradesPerDay extremely low).
+		marketHist = baseline.Stats{
+			Count:      int(rep.TradeCount),
+			MedianUSD:  line.MarketMedianUSD,
+			SpanActual: rep.Span(),
+		}
+	}
+	l.stampQuietMarket(ctx, &f, m, bk, marketHist, rep.TotalNotionalUSD, rep.OldestAt)
 	l.metrics.AccumulationAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat)).Inc()
 
 	dedup := l.accumulationDedupKey(t.Taker, *mid, string(t.Token), string(t.Side))
@@ -822,6 +881,79 @@ func (l *Loop) evaluateAccumulation(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit accumulation failed")
 	}
+}
+
+// stampQuietMarket runs the quiet-market wake-up detector against the
+// (market, outcome) and stamps Finding.QuietMarket + appends the canonical
+// reason code to Finding.Reasons when the verdict qualifies. No-op when
+// the detector is disabled or the supporting fetchers aren't wired.
+//
+// The function is intentionally tolerant: a missing LastTradeFetcher or a
+// transient DB error degrades to "no prior trade" (zero LastTradedAt),
+// which is the strongest possible quiet signal — passes the idle gate by
+// default per the detector contract.
+func (l *Loop) stampQuietMarket(
+	ctx context.Context,
+	f *anomaly.Finding,
+	m market.Market,
+	bk baseline.Key,
+	hist baseline.Stats,
+	currentNotionalUSD float64,
+	currentAt time.Time,
+) {
+	if l.cfg.QuietMarket == nil {
+		return
+	}
+	var lastBefore time.Time
+	if l.cfg.LastTradeFetcher != nil {
+		mid := l.resolveMarketID(ctx, m.ID)
+		if mid != nil {
+			t, err := l.cfg.LastTradeFetcher.LastTradedAtBefore(ctx, *mid, string(bk.OutcomeToken), currentAt)
+			if err != nil {
+				l.log.Err(err).Msg("detect: quiet-market last-trade lookup failed; degrading to no-prior")
+			} else {
+				lastBefore = t
+			}
+		}
+	}
+	v := l.cfg.QuietMarket.Decide(
+		quietmarket.History{
+			SampleCount:      int64(hist.Count),
+			TotalNotionalUSD: hist.TotalUSD,
+			Span:             hist.SpanActual,
+			MarketMedianUSD:  hist.MedianUSD,
+			LastTradedAt:     lastBefore,
+		},
+		quietmarket.Event{NotionalUSD: currentNotionalUSD, At: currentAt},
+	)
+	if !v.Qualifies {
+		return
+	}
+	f.QuietMarket = &anomaly.QuietMarketRef{
+		TradesPerDay:      v.TradesPerDay,
+		NotionalPerDayUSD: v.NotionalPerDayUSD,
+		IdleDuration:      v.IdleDuration,
+		BaselineSpan:      v.BaselineSpan,
+	}
+	f.Reasons = append(f.Reasons, v.Reason)
+	if l.metrics != nil && l.metrics.QuietMarketAlerts != nil {
+		l.metrics.QuietMarketAlerts.WithLabelValues(string(f.Severity), string(f.Kind)).Inc()
+	}
+}
+
+// marketHistoryStats returns the per-bucket baseline stats used by the
+// quiet-market detector. Prefers the production Baseliner; falls back to
+// the in-process reservoir for dev/test.
+func (l *Loop) marketHistoryStats(ctx context.Context, bk baseline.Key) baseline.Stats {
+	if l.cfg.Baseliner != nil {
+		s, err := l.cfg.Baseliner.Stats(ctx, bk)
+		if err != nil {
+			l.log.Err(err).Msg("detect: quiet-market baseline read failed")
+			return baseline.Stats{}
+		}
+		return s
+	}
+	return l.baseline.Stats(bk)
 }
 
 // accumulationDedupKey produces

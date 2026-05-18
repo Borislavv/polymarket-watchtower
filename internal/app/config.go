@@ -289,6 +289,21 @@ type AnomalyConfig struct {
 	AccumulationHardMultiplier       float64       `env:"ACCUMULATION_HARD_MULTIPLIER" envDefault:"3" validate:"gt=1"`
 	AccumulationCooldown             time.Duration `env:"ACCUMULATION_COOLDOWN" envDefault:"30m" validate:"gt=0"`
 
+	// Quiet-market wake-up (Strategy v4). Context detector — does NOT fire
+	// alerts on its own. After a single-trade alert or accumulation line
+	// alert qualifies, the detector tags it with QUIET_MARKET_WAKEUP when
+	// the (market, outcome) was historically quiet AND the event is large
+	// enough to constitute a wake-up. See doc/strategies/single-cluster.md.
+	//
+	// Ceilings + idle floor + per-event size + optional multiplier — all
+	// must clear for the wake-up tag to attach.
+	QuietMarketEnabled            bool          `env:"QUIET_MARKET_ENABLED" envDefault:"true"`
+	QuietMarketMaxTradesPerDay    float64       `env:"QUIET_MARKET_MAX_TRADES_PER_DAY" envDefault:"10" validate:"gte=0"`
+	QuietMarketMaxNotionalPerDay  float64       `env:"QUIET_MARKET_MAX_NOTIONAL_PER_DAY_USD" envDefault:"5000" validate:"gte=0"`
+	QuietMarketMinIdleDuration    time.Duration `env:"QUIET_MARKET_MIN_IDLE_DURATION" envDefault:"6h" validate:"gte=0"`
+	QuietMarketMinCurrentNotional float64       `env:"QUIET_MARKET_MIN_CURRENT_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
+	QuietMarketMinMultiplier      float64       `env:"QUIET_MARKET_MIN_MULTIPLIER" envDefault:"50" validate:"gte=0"`
+
 	// Cluster (HARD) alert. Fires when several already-firing single-trade
 	// alerts converge on one category within ClusterWindow.
 	ClusterWindow      time.Duration `env:"CLUSTER_WINDOW" envDefault:"30m" validate:"required"`

@@ -110,6 +110,17 @@ type CategoryRef struct {
 	Label string
 }
 
+// QuietMarketRef carries the structured "quiet-market wake-up" context.
+// Populated by internal/app/usecase/analytics/quietmarket.Detector when
+// the firing single-trade or accumulation event lands on a historically
+// quiet (market, outcome). Nil when the gate did not qualify.
+type QuietMarketRef struct {
+	TradesPerDay      float64
+	NotionalPerDayUSD float64
+	IdleDuration      time.Duration
+	BaselineSpan      time.Duration
+}
+
 // AccumulationRef summarises a same-trader accumulation-line alert.
 // Carries enough context for the Telegram formatter to render the alert
 // without re-querying the DB.
@@ -183,6 +194,19 @@ type Finding struct {
 	// Accumulation fields (KindAccumulation only). Populated by
 	// internal/app/usecase/analytics/accumulation.Detector.
 	Accumulation *AccumulationRef
+
+	// QuietMarket is the context tag attached when the firing event landed
+	// on a historically quiet (market, outcome). Nil otherwise. Applies to
+	// single-trade and accumulation Findings; cluster Findings do not
+	// carry it because a multi-wallet cluster is intrinsically not quiet.
+	QuietMarket *QuietMarketRef
+
+	// Reasons is the flat list of structured reason codes that contributed
+	// to this Finding. Accumulation Findings populate it from the
+	// accumulation detector verdict; quiet-market wake-up appends its
+	// canonical code when the QuietMarket gate qualifies. Single-trade
+	// Findings carry only the quiet-market reason when applicable.
+	Reasons []string
 
 	// Lifecycle.
 	LifecyclePct float64 // 0..100; 0 when unknown (no start/end on the market)

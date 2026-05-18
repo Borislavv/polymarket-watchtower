@@ -213,6 +213,82 @@ the alert to fire again if the line has materially grown.
   balanced two-sided BUY+SELL on the same `(market, outcome)` is
   suppressed. Cluster alerts remain unaffected (multi-wallet shape).
 
+## Quiet-market wake-up (v4)
+
+A **context** detector — does not fire alerts on its own. After a single-
+trade alert or accumulation line alert qualifies, this detector tags the
+Finding with `QUIET_MARKET_WAKEUP` when the (market, outcome) was
+historically quiet AND the firing event is large enough to be a "wake-up".
+
+Source: `internal/app/usecase/analytics/quietmarket`. Pure detector;
+inputs come from the same `dbbaseline.Provider` + a new
+`LastTradeAtBefore` SQL query (backed by `idx_trades_market_outcome_time`).
+
+### Gate ladder (all must clear)
+
+1. `cfg.Enabled` is true.
+2. **History readiness** — baseline `SampleCount ≥ 1` and `Span > 0`.
+   Without these the per-day rates are undefined; the detector cannot
+   judge "quiet" so it declines.
+3. **Event size** — `event.NotionalUSD ≥ MinCurrentNotionalUSD`.
+   A $50 trade on a quiet market is not a wake-up signal.
+4. **Activity ceilings** — `tradesPerDay ≤ MaxTradesPerDay` AND
+   `notionalPerDay ≤ MaxNotionalPerDayUSD`. Both must hold; a market with
+   many tiny trades can be quiet by dollars or vice versa.
+5. **Idle floor** — `now − LastTradedAt ≥ MinIdleDuration`. Zero
+   `LastTradedAt` (no prior trade at all) passes by default — strongest
+   possible quiet signal.
+6. **Rarity floor** — `event.NotionalUSD / marketMedian ≥ MinMultiplier`.
+   Optional (0 disables). Catches "quiet market, but the event is close
+   to the median" which is normal trickle activity.
+
+### Production defaults (balanced preset)
+
+| Knob                                       | Value     |
+|--------------------------------------------|-----------|
+| `QUIET_MARKET_MAX_TRADES_PER_DAY`          | 10        |
+| `QUIET_MARKET_MAX_NOTIONAL_PER_DAY_USD`    | 5,000     |
+| `QUIET_MARKET_MIN_IDLE_DURATION`           | 6h        |
+| `QUIET_MARKET_MIN_CURRENT_NOTIONAL_USD`    | 10,000    |
+| `QUIET_MARKET_MIN_MULTIPLIER`              | 50        |
+
+### Telegram render
+
+```
+• quiet-market wake-up: historical activity ≈ 1 trades/day, $100/day, idle 12h
+```
+
+The line appears in the Why section of both single-trade and accumulation
+Telegram messages, between the lifecycle line and the cluster-context
+line.
+
+### Interaction with other signals
+
+- **vs single-trade.** Adds context only. The single-trade alert fires
+  on its own (`score.Score` returns Fired=true); quiet-market just
+  stamps the Finding so operators see why the alert is interesting.
+- **vs accumulation.** Same role: the accumulation line is already
+  qualifying; quiet-market adds the context tag.
+- **vs cluster.** Not applied. A multi-wallet cluster is intrinsically
+  not quiet.
+- **vs MM suppression.** Quiet-market runs **after** MM checks, so an
+  MM-suppressed wallet never receives a quiet-market tag (the alert
+  itself is dropped).
+
+## MM/arb suppression — `POSSIBLE_MARKET_MAKER` (v4 telemetry)
+
+`mmfilter.ReasonPossibleMarketMaker` is the canonical reason code emitted
+when an alert is suppressed for balanced two-sided activity. It is
+surfaced two ways:
+
+- **Metric label** — `watchtower_filter_alert_mm_suppressed_total{category, reason="POSSIBLE_MARKET_MAKER"}`.
+- **Structured log** — info-level entry with `reason_code` +
+  `kind` (trade_anomaly / accumulation) + buy/sell breakdown so an
+  operator can audit a suppressed alert without re-querying.
+
+There is no Telegram path for suppressed alerts and no DB write — the
+suppression is a no-op from the recipient's perspective, by design.
+
 ## Cluster alert (`cluster` package)
 
 When a single-trade alert fires it is pushed into the per-category cluster

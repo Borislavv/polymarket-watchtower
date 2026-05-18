@@ -58,6 +58,12 @@ type Querier interface {
 	// constraint and exactly one wins. The caller maps pgx.ErrNoRows to
 	// "already existed".
 	InsertTrade(ctx context.Context, arg InsertTradeParams) (PolymarketTrades, error)
+	// Returns the most recent traded_at for a (market, outcome) STRICTLY before
+	// the supplied timestamp. NULL when no prior trade exists. Powers the
+	// quiet-market wake-up detector — given the current trade's timestamp it
+	// yields the gap to the previous historical trade so the detector can
+	// judge "idle for how long?" without re-listing rows.
+	LastTradeAtBefore(ctx context.Context, arg LastTradeAtBeforeParams) (pgtype.Timestamptz, error)
 	// Used by the cluster cooldown gate. Returns NULL when there's been no
 	// cluster alert for this market+outcome under the current strategy.
 	LatestClusterAlertForCategory(ctx context.Context, arg LatestClusterAlertForCategoryParams) (PolymarketAlerts, error)

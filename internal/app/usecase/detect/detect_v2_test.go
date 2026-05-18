@@ -15,6 +15,8 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rs/zerolog"
 )
 
@@ -54,6 +56,21 @@ func newLoopV2(
 	mm MMArbFilter,
 	minTraderHistory int,
 ) (*Loop, market.Market, *capturingEmitter) {
+	return newLoopV2WithMetrics(t, now, th, tb, mm, minTraderHistory, metrics.New())
+}
+
+// newLoopV2WithMetrics is the metrics-aware variant — tests that assert
+// against counters pass in their own Metrics so they can read individual
+// counter values.
+func newLoopV2WithMetrics(
+	t *testing.T,
+	now time.Time,
+	th anomaly.Thresholds,
+	tb TraderBaselineFetcher,
+	mm MMArbFilter,
+	minTraderHistory int,
+	met *metrics.Metrics,
+) (*Loop, market.Market, *capturingEmitter) {
 	t.Helper()
 	reg := aggregate.NewRegistry()
 	reg.Replace(
@@ -77,9 +94,25 @@ func newLoopV2(
 		TraderBaseliner:             tb,
 		MinTraderHistoryTrades:      minTraderHistory,
 		MMFilter:                    mm,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, met, &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit
+}
+
+// getCounter reads a single labelled counter value from a CounterVec.
+// Tests use this when they want to assert a counter incremented under a
+// specific label tuple.
+func getCounter(t *testing.T, cv *prometheus.CounterVec, lvs ...string) float64 {
+	t.Helper()
+	c, err := cv.GetMetricWithLabelValues(lvs...)
+	if err != nil {
+		t.Fatalf("counter %v: %v", lvs, err)
+	}
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("counter write: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 // TestTraderAxisDrivesAlertOnSmallWallet pins the v2 capability: a market
@@ -194,6 +227,27 @@ func TestTraderHistoryReadinessGate(t *testing.T) {
 	loop.Observe(context.Background(), m, bet(25_000, 1.0/5, "0xnew", now))
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 0 {
 		t.Fatalf("expected no fire — trader history below readiness gate: %+v", got)
+	}
+}
+
+// TestMMSuppression_StampsPossibleMarketMakerReason pins the v4 contract:
+// when the MM filter suppresses an alert, the structured reason code
+// POSSIBLE_MARKET_MAKER must be emitted on the metric label and (by
+// construction in detect.go) on the structured log line. The metric path
+// is what an operator scrapes; the constant is the single source of truth.
+func TestMMSuppression_StampsPossibleMarketMakerReason(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	mm := &fakeMM{suppressFor: map[string]bool{"0xmm": true}}
+	met := metrics.New()
+	loop, m, _ := newLoopV2WithMetrics(t, now, defaultThresholds(), nil, mm, 0, met)
+	warm(loop, m, 30, 50, 0.5, now.Add(-24*time.Hour))
+
+	loop.Observe(context.Background(), m, bet(10_000, 1.0/3, "0xmm", now))
+
+	c := getCounter(t, met.AlertMMSuppressed, "Politics", mmfilter.ReasonPossibleMarketMaker)
+	if c < 1 {
+		t.Fatalf("expected %s suppression counter ≥ 1, got %v",
+			mmfilter.ReasonPossibleMarketMaker, c)
 	}
 }
 

@@ -190,6 +190,7 @@ func writeAccumulationWhy(b *strings.Builder, f anomaly.Finding) {
 	}
 	fmt.Fprintf(b, "• score: <b>%d/100</b>, confidence: <b>%.2f</b>, size path: <code>%s</code>\n",
 		a.Score, a.Confidence, nonEmptyOr(a.SizePath, "n/a"))
+	writeQuietMarket(b, f)
 	if len(a.Reasons) > 0 {
 		fmt.Fprintf(b, "• reasons: <code>%s</code>\n", html.EscapeString(strings.Join(a.Reasons, ", ")))
 	}
@@ -311,12 +312,38 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 		}
 		fmt.Fprintf(b, "• market lifecycle: <b>%.1f%%</b> elapsed%s\n", f.LifecyclePct, hot)
 	}
+	writeQuietMarket(b, f)
 	switch {
 	case f.Kind == anomaly.KindTradeAnomaly && f.InCluster:
 		fmt.Fprintf(b, "• <b>part of a forming cluster</b>: %d anomalous trades in the current window\n", f.ClusterPeerCount)
 	case f.Kind == anomaly.KindTradeAnomaly:
 		b.WriteString("• single trade (no peers in cluster window yet)\n")
 	}
+}
+
+// writeQuietMarket renders the "quiet-market wake-up" context line when
+// the corresponding gate qualified. Shared between single-trade and
+// accumulation alerts so the operator-facing format is identical.
+func writeQuietMarket(b *strings.Builder, f anomaly.Finding) {
+	if f.QuietMarket == nil {
+		return
+	}
+	q := f.QuietMarket
+	idle := ""
+	if q.IdleDuration > 0 {
+		idle = ", idle " + humanDuration(q.IdleDuration)
+	}
+	fmt.Fprintf(b, "• <b>quiet-market wake-up</b>: historical activity ≈ %s trades/day, $%s/day%s\n",
+		ratePerDay(q.TradesPerDay), money(q.NotionalPerDayUSD), idle)
+}
+
+// ratePerDay formats a per-day trade count. ≥10 → integer; otherwise one
+// decimal (so 0.4 trades/day reads correctly).
+func ratePerDay(v float64) string {
+	if v >= 10 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.1f", v)
 }
 
 func nonEmptyOr(a, b string) string {

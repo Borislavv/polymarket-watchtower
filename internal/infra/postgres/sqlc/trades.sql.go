@@ -246,6 +246,32 @@ func (q *Queries) InsertTrade(ctx context.Context, arg InsertTradeParams) (Polym
 	return i, err
 }
 
+const lastTradeAtBefore = `-- name: LastTradeAtBefore :one
+SELECT MAX(traded_at)::timestamptz AS last_at
+FROM polymarket_trades
+WHERE market_id     = $1::bigint
+  AND outcome_token = $2::text
+  AND traded_at     < $3::timestamptz
+`
+
+type LastTradeAtBeforeParams struct {
+	MarketID     int64
+	OutcomeToken string
+	Before       pgtype.Timestamptz
+}
+
+// Returns the most recent traded_at for a (market, outcome) STRICTLY before
+// the supplied timestamp. NULL when no prior trade exists. Powers the
+// quiet-market wake-up detector — given the current trade's timestamp it
+// yields the gap to the previous historical trade so the detector can
+// judge "idle for how long?" without re-listing rows.
+func (q *Queries) LastTradeAtBefore(ctx context.Context, arg LastTradeAtBeforeParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, lastTradeAtBefore, arg.MarketID, arg.OutcomeToken, arg.Before)
+	var last_at pgtype.Timestamptz
+	err := row.Scan(&last_at)
+	return last_at, err
+}
+
 const latestTradeAt = `-- name: LatestTradeAt :one
 SELECT MAX(traded_at)::timestamptz AS latest_at
 FROM polymarket_trades

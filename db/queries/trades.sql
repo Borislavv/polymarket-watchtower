@@ -93,6 +93,18 @@ SELECT MIN(traded_at)::timestamptz AS oldest_at
 FROM polymarket_trades
 WHERE market_id = $1;
 
+-- name: LastTradeAtBefore :one
+-- Returns the most recent traded_at for a (market, outcome) STRICTLY before
+-- the supplied timestamp. NULL when no prior trade exists. Powers the
+-- quiet-market wake-up detector — given the current trade's timestamp it
+-- yields the gap to the previous historical trade so the detector can
+-- judge "idle for how long?" without re-listing rows.
+SELECT MAX(traded_at)::timestamptz AS last_at
+FROM polymarket_trades
+WHERE market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text
+  AND traded_at     < sqlc.arg(before)::timestamptz;
+
 -- name: AccumulationLineSummary :one
 -- Server-side aggregate over one wallet's recent trades on a single
 -- (market, outcome, side) bucket. Powers the same-trader accumulation

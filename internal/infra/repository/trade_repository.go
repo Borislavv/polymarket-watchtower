@@ -248,6 +248,22 @@ func (r *TradeRepository) OldestTradedAt(ctx context.Context, marketID int64) (t
 	return tsTime(row), nil
 }
 
+// LastTradedAtBefore returns the most recent traded_at strictly before the
+// supplied timestamp on the given (market, outcome). Returns the zero
+// time when no prior trade exists. Used by the quiet-market wake-up
+// detector to compute the idle gap.
+func (r *TradeRepository) LastTradedAtBefore(ctx context.Context, marketID int64, outcomeToken string, before time.Time) (time.Time, error) {
+	row, err := r.q.LastTradeAtBefore(ctx, sqlc.LastTradeAtBeforeParams{
+		MarketID:     marketID,
+		OutcomeToken: outcomeToken,
+		Before:       tsFromTime(before),
+	})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("last trade at before: %w", err)
+	}
+	return tsTime(row), nil
+}
+
 // AccumulationLineQuery scopes a single same-trader same-(market,outcome,side)
 // roll-up. Used by internal/app/usecase/analytics/accumulation.
 type AccumulationLineQuery struct {

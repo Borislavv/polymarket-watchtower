@@ -53,9 +53,12 @@ const (
 	ReasonLineLargeVsSelf        ReasonCode = "LINE_LARGE_VS_SELF"
 	ReasonLateMarketAccumulation ReasonCode = "LATE_MARKET_ACCUMULATION"
 	ReasonHotMarketAccumulation  ReasonCode = "HOT_MARKET_ACCUMULATION"
-	ReasonPossibleMarketMaker    ReasonCode = "POSSIBLE_MARKET_MAKER"
 	ReasonLowSampleSize          ReasonCode = "LOW_SAMPLE_SIZE"
 )
+
+// POSSIBLE_MARKET_MAKER lives in package mmfilter (the semantic owner —
+// it's emitted on MM-suppression telemetry, not on accumulation alerts).
+// See internal/app/usecase/analytics/mmfilter.ReasonPossibleMarketMaker.
 
 // Line is the input the scorer needs. Repositories project their server-
 // side roll-up into this shape so the math runs once over a single value

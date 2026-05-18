@@ -178,15 +178,34 @@ Query: `repository.AccumulationLineSummary` (sqlc) — backed by
 
 MM filter applies. Cluster path is unaffected.
 
-### Quiet-market wake-up (not shipped)
+### Quiet-market wake-up (v4)
 
-The original v3 spec mentioned a "quiet-market wake-up" signal as an
-intended additional detector. **It is not implemented in v4.** The
-accumulation detector covers a large fraction of the wake-up case — a
-quiet market that suddenly sees a wallet building a position — without a
-parallel "quiet market detection" code path. If a dedicated wake-up
-signal is added later, it should reuse `dbbaseline.Provider` for the
-"quiet" measurement and the existing tier ladder.
+Context detector — never fires alerts on its own. Runs AFTER a single-
+trade or accumulation alert has qualified and stamps
+`Finding.QuietMarket` + appends `QUIET_MARKET_WAKEUP` to
+`Finding.Reasons` when:
+
+- baseline tradesPerDay ≤ `MaxTradesPerDay` AND notionalPerDay ≤
+  `MaxNotionalPerDayUSD`
+- now − LastTradedAt ≥ `MinIdleDuration` (zero LastTradedAt passes by
+  default — strongest quiet signal)
+- event notional ≥ `MinCurrentNotionalUSD`
+- event notional / marketMedian ≥ `MinMultiplier` (optional)
+
+Package: `internal/app/usecase/analytics/quietmarket`. Pure (no I/O);
+detect.Loop fetches `LastTradedAtBefore` from `repository.TradeRepository`
+(new sqlc query backed by `idx_trades_market_outcome_time`).
+
+Cluster alerts are not tagged — a multi-wallet cluster is intrinsically
+not quiet.
+
+### POSSIBLE_MARKET_MAKER reason code
+
+Lives in `mmfilter.ReasonPossibleMarketMaker`. Emitted on the MM-
+suppression metric label (`watchtower_filter_alert_mm_suppressed_total{category, reason}`)
+and the structured log line whenever the MM filter suppresses a single-
+trade or accumulation alert. No Telegram path — suppression is
+intentionally silent to recipients.
 
 ### Compatibility
 
