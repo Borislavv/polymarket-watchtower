@@ -11,6 +11,18 @@ import (
 )
 
 type Querier interface {
+	// Server-side aggregate over one wallet's recent trades on a single
+	// (market, outcome, side) bucket. Powers the same-trader accumulation
+	// detector — the entire line scoring runs from this one row, with no
+	// per-trade transfer. Backed by idx_trades_trader_market_outcome_side_time.
+	//
+	// $5 is the inclusive lower bound on traded_at; pass NULL to lift the
+	// bound (use the wallet's full stored history on this bucket).
+	//
+	// avg_price is the mean of `price`. Callers convert to mean odds via
+	// 1/avg_price when price > 0. max_odds is computed server-side as the
+	// minimum price's inverse (price closest to 0 ⇒ largest odds).
+	AccumulationLineSummary(ctx context.Context, arg AccumulationLineSummaryParams) (AccumulationLineSummaryRow, error)
 	AlertExistsByDedupKey(ctx context.Context, dedupKey string) (bool, error)
 	// Single-roundtrip statistical summary for the per-bucket reservoir.
 	// Powers the DB-backed detector's hot path: count + total + mean + median
@@ -101,8 +113,25 @@ type Querier interface {
 	// supplied cutoff is moved back to 'pending'. Called by the sender worker
 	// on each tick (cheap when zero rows match).
 	ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.Timestamptz) error
-	// Aggregate stats for one trader since the given timestamp. Used to enrich
-	// the alert payload ("this wallet's typical bet size over the last 90d").
+	// Per-(trader, market, outcome) two-sided activity over the supplied
+	// lookback. Powers the MM/arbitrage suppression filter: a wallet that
+	// has been hitting BUY and SELL on the same outcome in roughly balanced
+	// notional is almost certainly a market maker or arbitrageur, not an
+	// informed-flow candidate, so the detector suppresses single-trade
+	// alerts on that wallet/market/outcome.
+	//
+	// $4 is the inclusive lower bound on traded_at; pass NULL to lift the
+	// bound (use the trader's full stored history on this bucket).
+	TraderMarketSideActivity(ctx context.Context, arg TraderMarketSideActivityParams) (TraderMarketSideActivityRow, error)
+	// Per-wallet distributional summary computed server-side in a single
+	// roundtrip. Powers the trader-history multiplier in the detector — a
+	// $50k bet from a wallet whose typical trade is $200 is qualitatively
+	// different from a $50k bet from a $1M whale, and that distinction is
+	// what this query exposes. Shape mirrors BaselineDistribution so callers
+	// can reuse the same readiness gates and Stats type.
+	//
+	// $2 is the inclusive lower bound on traded_at; pass NULL to lift the
+	// bound (use the trader's full stored history).
 	TraderStats(ctx context.Context, arg TraderStatsParams) (TraderStatsRow, error)
 	// Atomic dedup primitive. INSERT ON CONFLICT DO NOTHING returns zero rows
 	// when an alert with the same dedup_key already exists — the caller maps

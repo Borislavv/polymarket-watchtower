@@ -26,8 +26,9 @@ const (
 type AlertKind string
 
 const (
-	AlertKindTrade   AlertKind = "trade_anomaly"
-	AlertKindCluster AlertKind = "category_watch"
+	AlertKindTrade        AlertKind = "trade_anomaly"
+	AlertKindCluster      AlertKind = "category_watch"
+	AlertKindAccumulation AlertKind = "accumulation"
 )
 
 // Alert is the repository view of a polymarket_alerts row.

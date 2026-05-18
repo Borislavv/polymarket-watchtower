@@ -69,8 +69,24 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 			Int("cluster_wallets", f.Cluster.UniqueWallets).
 			Float64("cluster_total_usd", f.Cluster.TotalUSD)
 	}
-	if f.Multiplier > 0 {
-		evt = evt.Float64("multiplier", f.Multiplier)
+	if f.EffectiveMultiplier > 0 {
+		evt = evt.Float64("multiplier_effective", f.EffectiveMultiplier)
+	}
+	if f.MarketMultiplier > 0 {
+		evt = evt.Float64("multiplier_market", f.MarketMultiplier)
+	}
+	if f.TraderMultiplier > 0 {
+		evt = evt.Float64("multiplier_trader", f.TraderMultiplier)
+	}
+	if f.MultiplierAxis != "" {
+		evt = evt.Str("multiplier_axis", f.MultiplierAxis)
+	}
+	if f.TraderBaseline != nil {
+		evt = evt.
+			Float64("trader_baseline_median_usd", f.TraderBaseline.MedianUSD).
+			Float64("trader_baseline_p95_usd", f.TraderBaseline.P95USD).
+			Int("trader_baseline_n", f.TraderBaseline.SampleN).
+			Dur("trader_baseline_span", f.TraderBaseline.Span)
 	}
 	if f.AbsoluteTier != "" {
 		evt = evt.Str("absolute_tier", string(f.AbsoluteTier))

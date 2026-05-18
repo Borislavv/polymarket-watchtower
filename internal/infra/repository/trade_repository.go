@@ -248,6 +248,88 @@ func (r *TradeRepository) OldestTradedAt(ctx context.Context, marketID int64) (t
 	return tsTime(row), nil
 }
 
+// AccumulationLineQuery scopes a single same-trader same-(market,outcome,side)
+// roll-up. Used by internal/app/usecase/analytics/accumulation.
+type AccumulationLineQuery struct {
+	TraderID     int64
+	MarketID     int64
+	OutcomeToken string
+	Side         string // "BUY" or "SELL"
+	Since        time.Time
+}
+
+// AccumulationLine is the server-side roll-up over the wallet's recent
+// trades on one (market, outcome, side). Empty (TradeCount=0) when no
+// trades exist for the bucket.
+type AccumulationLine struct {
+	TradeCount        int64
+	TotalNotionalUSD  float64
+	MeanNotionalUSD   float64
+	MedianNotionalUSD float64
+	MaxNotionalUSD    float64
+	MinNotionalUSD    float64
+	// AvgPrice is the arithmetic mean of trade prices. Callers convert to
+	// odds via 1/AvgPrice when AvgPrice > 0. Note: this is NOT the same as
+	// the mean of (1/price), but it is the right summary statistic for
+	// reporting "the wallet's average implied probability on this side."
+	AvgPrice float64
+	MinPrice float64
+	OldestAt time.Time
+	NewestAt time.Time
+}
+
+// Span returns NewestAt − OldestAt. Zero when fewer than two samples exist.
+func (l AccumulationLine) Span() time.Duration {
+	if l.TradeCount < 2 {
+		return 0
+	}
+	return l.NewestAt.Sub(l.OldestAt)
+}
+
+// AvgOdds returns 1/AvgPrice, or 0 when no trades (AvgPrice == 0).
+func (l AccumulationLine) AvgOdds() float64 {
+	if l.AvgPrice <= 0 {
+		return 0
+	}
+	return 1.0 / l.AvgPrice
+}
+
+// MaxOdds returns 1/MinPrice, or 0 when no trades.
+func (l AccumulationLine) MaxOdds() float64 {
+	if l.MinPrice <= 0 {
+		return 0
+	}
+	return 1.0 / l.MinPrice
+}
+
+// AccumulationLineSummary returns the server-side roll-up for one wallet's
+// recent same-side activity on a (market, outcome) bucket. Empty result
+// when the bucket has no trades.
+func (r *TradeRepository) AccumulationLineSummary(ctx context.Context, q AccumulationLineQuery) (AccumulationLine, error) {
+	row, err := r.q.AccumulationLineSummary(ctx, sqlc.AccumulationLineSummaryParams{
+		TraderID:     q.TraderID,
+		MarketID:     q.MarketID,
+		OutcomeToken: q.OutcomeToken,
+		Side:         q.Side,
+		Since:        tsFromTime(q.Since),
+	})
+	if err != nil {
+		return AccumulationLine{}, fmt.Errorf("accumulation line summary: %w", err)
+	}
+	return AccumulationLine{
+		TradeCount:        row.TradeCount,
+		TotalNotionalUSD:  row.TotalNotionalUsd,
+		MeanNotionalUSD:   row.MeanNotionalUsd,
+		MedianNotionalUSD: row.MedianNotionalUsd,
+		MaxNotionalUSD:    row.MaxNotionalUsd,
+		MinNotionalUSD:    row.MinNotionalUsd,
+		AvgPrice:          row.AvgPrice,
+		MinPrice:          row.MinPrice,
+		OldestAt:          tsTime(row.OldestAt),
+		NewestAt:          tsTime(row.NewestAt),
+	}, nil
+}
+
 func tradeFromSQLC(row sqlc.PolymarketTrades) Trade {
 	return Trade{
 		ID:           row.ID,

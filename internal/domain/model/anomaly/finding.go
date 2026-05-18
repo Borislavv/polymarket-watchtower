@@ -24,6 +24,10 @@ const (
 	// KindCategoryWatch is a category cluster: N anomalous trades by M unique
 	// wallets in a single category within a sliding window.
 	KindCategoryWatch Kind = "category_watch"
+	// KindAccumulation is a same-trader same-(market,outcome,side) line: one
+	// wallet repeatedly building exposure on a single side. Detected by
+	// internal/app/usecase/analytics/accumulation.
+	KindAccumulation Kind = "accumulation"
 )
 
 // Severity is a coarse classification routed by sinks and dashboards.
@@ -106,6 +110,37 @@ type CategoryRef struct {
 	Label string
 }
 
+// AccumulationRef summarises a same-trader accumulation-line alert.
+// Carries enough context for the Telegram formatter to render the alert
+// without re-querying the DB.
+type AccumulationRef struct {
+	Wallet            string
+	MarketID          string
+	OutcomeToken      string
+	Outcome           string // "Yes"/"No"/... from market metadata
+	Side              string // "BUY" or "SELL"
+	TradeCount        int
+	TotalNotionalUSD  float64
+	MeanNotionalUSD   float64
+	MedianNotionalUSD float64
+	MaxNotionalUSD    float64
+	AvgOdds           float64
+	MaxOdds           float64
+	Span              time.Duration
+	// Line-level multipliers — line total over baseline median.
+	MarketMultiplier float64
+	TraderMultiplier float64
+	// Score is the 0..100 triage heuristic. Confidence is 0..1.
+	Score      int
+	Confidence float64
+	// Reasons is a list of REASON_CODEs surfaced as structured tags in
+	// the Telegram payload.
+	Reasons []string
+	// SizePath names which size-path qualified the line — "meaningful"
+	// or "many-smalls". Empty when not fired.
+	SizePath string
+}
+
 // ClusterStats summarises a category-cluster alert.
 type ClusterStats struct {
 	Window          time.Duration
@@ -124,19 +159,30 @@ type Finding struct {
 	Severity Severity
 	At       time.Time
 
-	// Reason names the rule that fired ("multiplier", "absolute_tier", "cluster").
+	// Reason names the rule that fired ("LargeRareBet", "WhaleClusterDetected").
 	Reason string
 
 	// Single-trade anomaly fields.
 	Trade          *TradeRef
-	Baseline       *BaselineRef
-	Multiplier     float64  // observed NotionalUSD / Baseline.MedianUSD (0 if N/A)
-	AbsoluteTier   Severity // tier crossed by the (notional, odds) pair
-	MultiplierTier Severity // tier crossed by the multiplier ladder
+	Baseline       *BaselineRef // per-(category,market,outcome) market distribution
+	TraderBaseline *BaselineRef // wallet's full-history distribution (nil when trader axis disabled)
+	AbsoluteTier   Severity     // tier crossed by the (notional, odds) pair
+	MultiplierTier Severity     // tier crossed by the effective multiplier (max of market, trader)
+	// Multiplier components. EffectiveMultiplier is what the tier was
+	// evaluated on; MultiplierAxis names which baseline contributed it
+	// ("market", "trader", "both", or "" when neither axis was ready).
+	MarketMultiplier    float64
+	TraderMultiplier    float64
+	EffectiveMultiplier float64
+	MultiplierAxis      string
 
 	// Cluster fields.
 	Category *CategoryRef
 	Cluster  *ClusterStats
+
+	// Accumulation fields (KindAccumulation only). Populated by
+	// internal/app/usecase/analytics/accumulation.Detector.
+	Accumulation *AccumulationRef
 
 	// Lifecycle.
 	LifecyclePct float64 // 0..100; 0 when unknown (no start/end on the market)

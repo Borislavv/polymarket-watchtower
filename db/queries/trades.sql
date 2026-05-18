@@ -92,3 +92,33 @@ WHERE market_id = $1;
 SELECT MIN(traded_at)::timestamptz AS oldest_at
 FROM polymarket_trades
 WHERE market_id = $1;
+
+-- name: AccumulationLineSummary :one
+-- Server-side aggregate over one wallet's recent trades on a single
+-- (market, outcome, side) bucket. Powers the same-trader accumulation
+-- detector — the entire line scoring runs from this one row, with no
+-- per-trade transfer. Backed by idx_trades_trader_market_outcome_side_time.
+--
+-- $5 is the inclusive lower bound on traded_at; pass NULL to lift the
+-- bound (use the wallet's full stored history on this bucket).
+--
+-- avg_price is the mean of `price`. Callers convert to mean odds via
+-- 1/avg_price when price > 0. max_odds is computed server-side as the
+-- minimum price's inverse (price closest to 0 ⇒ largest odds).
+SELECT
+    COUNT(*)::bigint                                                                          AS trade_count,
+    COALESCE(SUM(notional_usd), 0)::double precision                                          AS total_notional_usd,
+    COALESCE(AVG(notional_usd), 0)::double precision                                          AS mean_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS median_notional_usd,
+    COALESCE(MAX(notional_usd), 0)::double precision                                          AS max_notional_usd,
+    COALESCE(MIN(notional_usd), 0)::double precision                                          AS min_notional_usd,
+    COALESCE(AVG(price), 0)::double precision                                                 AS avg_price,
+    COALESCE(MIN(price), 0)::double precision                                                 AS min_price,
+    MIN(traded_at)::timestamptz                                                               AS oldest_at,
+    MAX(traded_at)::timestamptz                                                               AS newest_at
+FROM polymarket_trades
+WHERE trader_id     = sqlc.arg(trader_id)::bigint
+  AND market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text
+  AND side          = sqlc.arg(side)::text
+  AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);

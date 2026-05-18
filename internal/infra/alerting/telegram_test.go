@@ -41,18 +41,20 @@ func sampleTradeFinding() anomaly.Finding {
 			Span:      30*24*time.Hour + 6*time.Hour,
 			WindowMax: 365 * 24 * time.Hour,
 		},
-		Category:         &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
-		Multiplier:       12_371,
-		AbsoluteTier:     anomaly.SeverityCritical,
-		MultiplierTier:   anomaly.SeverityCritical,
-		MarketURL:        "https://polymarket.com/event/rain-tomorrow",
-		CategoryURL:      "https://polymarket.com/predictions/weather",
-		TraderURL:        "https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678",
-		GrafanaURL:       "http://grafana.public/d/uid123/?from=1&to=2&var-category=Weather&var-market=rain-tomorrow&var-severity=critical",
-		LifecyclePct:     93.5,
-		Hot:              true,
-		InCluster:        true,
-		ClusterPeerCount: 4,
+		Category:            &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
+		MarketMultiplier:    12_371,
+		EffectiveMultiplier: 12_371,
+		MultiplierAxis:      "market",
+		AbsoluteTier:        anomaly.SeverityCritical,
+		MultiplierTier:      anomaly.SeverityCritical,
+		MarketURL:           "https://polymarket.com/event/rain-tomorrow",
+		CategoryURL:         "https://polymarket.com/predictions/weather",
+		TraderURL:           "https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678",
+		GrafanaURL:          "http://grafana.public/d/uid123/?from=1&to=2&var-category=Weather&var-market=rain-tomorrow&var-severity=critical",
+		LifecyclePct:        93.5,
+		Hot:                 true,
+		InCluster:           true,
+		ClusterPeerCount:    4,
 	}
 }
 
@@ -116,10 +118,10 @@ func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	for _, want := range []string{
 		"<b>Why</b>",
-		"<b>x12371</b> above baseline median ($9.70)",
+		"<b>x12371</b> above market baseline median ($9.70)",
 		"odds <b>20.0</b>, implied probability <b>5.0%</b>",
 		"baseline: <b>1240</b> trades, median $9.70",
-		"span 30d6h of available history",
+		"span 30d6h",
 		"tiers: absolute=<code>critical</code> multiplier=<code>critical</code>",
 		"market lifecycle: <b>93.5%</b> elapsed (HOT — final stretch)",
 		"<b>part of a forming cluster</b>: 4 anomalous trades",
@@ -256,6 +258,46 @@ func TestTelegramAcceptsChannelUsername(t *testing.T) {
 	if body["chat_id"] != "@watchtower-alerts" {
 		t.Errorf("non-numeric chat id must be forwarded as string, got %v (%T)",
 			body["chat_id"], body["chat_id"])
+	}
+}
+
+// TestHumanDurationSubMinuteIsHTMLSafe pins the regression fixed for the
+// Bot API "Unsupported start tag \"1m\"" error: humanDuration must never
+// emit a literal `<` that lands in HTML-parse-mode output. The previous
+// implementation returned the raw string "<1m" for sub-minute spans, which
+// Telegram parsed as the start of an unknown tag named "1m" and rejected
+// the entire message with HTTP 400.
+func TestHumanDurationSubMinuteIsHTMLSafe(t *testing.T) {
+	cases := []time.Duration{0, -1, time.Second, 30 * time.Second, time.Minute - 1}
+	for _, d := range cases {
+		out := humanDuration(d)
+		if strings.Contains(out, "<") && !strings.Contains(out, "&lt;") {
+			t.Errorf("humanDuration(%v) emitted raw '<': %q", d, out)
+		}
+		// Cheap structural check: anything containing `<` MUST also contain `&lt;`
+		// (we only ever emit the entity, never a real tag).
+		if strings.Contains(out, "<") {
+			if !strings.HasPrefix(out, "&lt;") {
+				t.Errorf("humanDuration(%v) must start with '&lt;' when sub-minute, got %q", d, out)
+			}
+		}
+	}
+}
+
+// TestFormatTelegramMessageNeverEmitsRawLT walks the formatted output for
+// a Finding whose baseline span is sub-minute (the trigger condition in
+// production that broke v4 alerts) and asserts the message contains no
+// literal `<1m` token. The Telegram HTML parser is strict — any unknown
+// `<…>` short-circuits the whole message.
+func TestFormatTelegramMessageNeverEmitsRawLT(t *testing.T) {
+	f := sampleTradeFinding()
+	f.Baseline.Span = 30 * time.Second // sub-minute span
+	if got := FormatTelegramMessage(f); strings.Contains(got, "<1m") {
+		t.Fatalf("formatted message contains raw '<1m' (would break Telegram HTML parser):\n%s", got)
+	}
+	// Confirm the visible-text form is preserved as an HTML entity.
+	if got := FormatTelegramMessage(f); !strings.Contains(got, "&lt;1m") {
+		t.Errorf("expected '&lt;1m' entity in sub-minute baseline span output:\n%s", got)
 	}
 }
 

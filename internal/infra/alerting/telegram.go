@@ -119,9 +119,96 @@ func FormatTelegramMessage(f anomaly.Finding) string {
 	switch f.Kind {
 	case anomaly.KindCategoryWatch:
 		return formatCategoryWatch(f)
+	case anomaly.KindAccumulation:
+		return formatAccumulation(f)
 	default:
 		return formatTradeAnomaly(f)
 	}
+}
+
+// formatAccumulation renders the same-trader accumulation-line alert
+// payload. Distinct shape from single-trade and cluster: the header
+// surfaces line count + total notional, and the body explains what the
+// wallet has been doing (median trade, max trade, span, axis multipliers,
+// score / confidence). Reason codes are listed verbatim so operators can
+// correlate with the metric labels.
+func formatAccumulation(f anomaly.Finding) string {
+	var b strings.Builder
+	writeAccumulationHeader(&b, f)
+	writeAccumulationWhy(&b, f)
+	writeAccumulationTraderLine(&b, f)
+	writeLinks(&b, f)
+	return b.String()
+}
+
+func writeAccumulationHeader(b *strings.Builder, f anomaly.Finding) {
+	title := tradeTitle(f)
+	hot := ""
+	if f.Hot {
+		hot = " · HOT"
+	}
+	total, count := 0.0, 0
+	if f.Accumulation != nil {
+		total = f.Accumulation.TotalNotionalUSD
+		count = f.Accumulation.TradeCount
+	}
+	fmt.Fprintf(b, "<b>%s: accumulation · $%s across %d trades%s · %s</b>\n",
+		strings.ToUpper(string(f.Severity)),
+		money(total),
+		count,
+		hot,
+		html.EscapeString(title),
+	)
+}
+
+func writeAccumulationWhy(b *strings.Builder, f anomaly.Finding) {
+	a := f.Accumulation
+	if a == nil {
+		return
+	}
+	b.WriteString("\n<b>Why</b>\n")
+	b.WriteString("• same wallet accumulated one outcome\n")
+	fmt.Fprintf(b, "• total line: <b>$%s</b> across <b>%d</b> trades\n", money(a.TotalNotionalUSD), a.TradeCount)
+	fmt.Fprintf(b, "• avg trade: $%s, median: $%s, max trade: $%s\n",
+		money(a.MeanNotionalUSD), money(a.MedianNotionalUSD), money(a.MaxNotionalUSD))
+	if a.AvgOdds > 0 {
+		fmt.Fprintf(b, "• avg odds: <b>x%s</b>, max odds: x%s\n",
+			multiplierFmt(a.AvgOdds), multiplierFmt(a.MaxOdds))
+	}
+	if a.MarketMultiplier > 0 {
+		fmt.Fprintf(b, "• line is <b>%sx</b> above market baseline median\n", multiplierFmt(a.MarketMultiplier))
+	}
+	if a.TraderMultiplier > 0 {
+		fmt.Fprintf(b, "• line is <b>%sx</b> above wallet's typical trade\n", multiplierFmt(a.TraderMultiplier))
+	}
+	if f.LifecyclePct > 0 {
+		hot := ""
+		if f.Hot {
+			hot = " (HOT — final stretch)"
+		}
+		fmt.Fprintf(b, "• market lifecycle: <b>%.1f%%</b> elapsed%s\n", f.LifecyclePct, hot)
+	}
+	fmt.Fprintf(b, "• score: <b>%d/100</b>, confidence: <b>%.2f</b>, size path: <code>%s</code>\n",
+		a.Score, a.Confidence, nonEmptyOr(a.SizePath, "n/a"))
+	if len(a.Reasons) > 0 {
+		fmt.Fprintf(b, "• reasons: <code>%s</code>\n", html.EscapeString(strings.Join(a.Reasons, ", ")))
+	}
+}
+
+func writeAccumulationTraderLine(b *strings.Builder, f anomaly.Finding) {
+	a := f.Accumulation
+	if a == nil {
+		return
+	}
+	b.WriteString("\n<b>Trader line</b>\n")
+	fmt.Fprintf(b, "• wallet: <code>%s</code>\n", html.EscapeString(a.Wallet))
+	fmt.Fprintf(b, "• outcome: <b>%s</b> (%s)\n", html.EscapeString(a.Outcome), html.EscapeString(a.Side))
+	fmt.Fprintf(b, "• trades in line: <b>%d</b>\n", a.TradeCount)
+	fmt.Fprintf(b, "• span: %s\n", humanDuration(a.Span))
+	// Same-side ratio is 1.0 by construction (the query filters by side).
+	// We surface it explicitly so an operator reviewing a near-miss in a
+	// future debug log sees the figure.
+	b.WriteString("• same-side ratio: 100%\n")
 }
 
 func formatTradeAnomaly(f anomaly.Finding) string {
@@ -151,7 +238,7 @@ func writeTradeHeader(b *strings.Builder, f anomaly.Finding) {
 	}
 	fmt.Fprintf(b, "<b>%s: x%s · $%s%s · %s</b>\n",
 		strings.ToUpper(string(f.Severity)),
-		multiplierFmt(f.Multiplier),
+		multiplierFmt(f.EffectiveMultiplier),
 		money(notional(f)),
 		hot,
 		html.EscapeString(title),
@@ -179,22 +266,43 @@ func writeClusterHeader(b *strings.Builder, f anomaly.Finding) {
 
 func writeWhy(b *strings.Builder, f anomaly.Finding) {
 	b.WriteString("\n<b>Why</b>\n")
-	if f.Multiplier > 0 && f.Baseline != nil {
-		fmt.Fprintf(b, "• <b>x%s</b> above baseline median ($%s)\n",
-			multiplierFmt(f.Multiplier), money(f.Baseline.MedianUSD))
+	if f.EffectiveMultiplier > 0 {
+		axis := f.MultiplierAxis
+		switch axis {
+		case "market":
+			if f.Baseline != nil {
+				fmt.Fprintf(b, "• <b>x%s</b> above market baseline median ($%s)\n",
+					multiplierFmt(f.MarketMultiplier), money(f.Baseline.MedianUSD))
+			}
+		case "trader":
+			if f.TraderBaseline != nil {
+				fmt.Fprintf(b, "• <b>x%s</b> above wallet's typical trade ($%s median)\n",
+					multiplierFmt(f.TraderMultiplier), money(f.TraderBaseline.MedianUSD))
+			}
+		case "both":
+			fmt.Fprintf(b, "• <b>x%s</b> above both market and wallet medians (rare on both axes)\n",
+				multiplierFmt(f.EffectiveMultiplier))
+		default:
+			fmt.Fprintf(b, "• <b>x%s</b> above baseline median\n", multiplierFmt(f.EffectiveMultiplier))
+		}
 	}
 	if f.Trade != nil && f.Trade.Odds > 0 {
 		fmt.Fprintf(b, "• odds <b>%s</b>, implied probability <b>%.1f%%</b>\n",
 			multiplierFmt(f.Trade.Odds), f.Trade.Price*100)
 	}
 	if f.Baseline != nil {
-		fmt.Fprintf(b, "• baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, span %s of available history\n",
+		fmt.Fprintf(b, "• market baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, span %s\n",
 			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD), money(f.Baseline.P95USD),
 			humanDuration(f.Baseline.Span))
 	}
+	if f.TraderBaseline != nil {
+		fmt.Fprintf(b, "• trader history: <b>%d</b> trades, median $%s, p95 $%s, span %s\n",
+			f.TraderBaseline.SampleN, money(f.TraderBaseline.MedianUSD), money(f.TraderBaseline.P95USD),
+			humanDuration(f.TraderBaseline.Span))
+	}
 	if f.AbsoluteTier != "" || f.MultiplierTier != "" {
-		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> → final=<b>%s</b>\n",
-			string(f.AbsoluteTier), string(f.MultiplierTier), string(f.Severity))
+		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> (axis=%s) → final=<b>%s</b>\n",
+			string(f.AbsoluteTier), string(f.MultiplierTier), nonEmptyOr(f.MultiplierAxis, "n/a"), string(f.Severity))
 	}
 	if f.LifecyclePct > 0 {
 		hot := ""
@@ -209,6 +317,13 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 	case f.Kind == anomaly.KindTradeAnomaly:
 		b.WriteString("• single trade (no peers in cluster window yet)\n")
 	}
+}
+
+func nonEmptyOr(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func writeTrade(b *strings.Builder, f anomaly.Finding) {
@@ -356,10 +471,16 @@ func money(v float64) string {
 	return fmt.Sprintf("%.2f", v)
 }
 
-// humanDuration prints durations in operator-friendly units. Sub-minute → "<1m".
+// humanDuration prints durations in operator-friendly units. Sub-minute is
+// rendered as "&lt;1m" — the literal `<1m` would be interpreted by
+// Telegram's HTML parser as the start of an unknown tag named "1m" and
+// the whole message would be rejected with a 400 from the Bot API. Using
+// the HTML entity keeps the visual ("<1m") while staying parseable.
+//
+// Regression: TestHumanDurationIsHTMLSafe + TestFormatTelegramMessageNeverEmitsRawLT.
 func humanDuration(d time.Duration) string {
 	if d <= 0 {
-		return "<1m"
+		return "&lt;1m"
 	}
 	const day = 24 * time.Hour
 	days := int(d / day)
@@ -374,7 +495,7 @@ func humanDuration(d time.Duration) string {
 	default:
 		m := int(d / time.Minute)
 		if m == 0 {
-			return "<1m"
+			return "&lt;1m"
 		}
 		return fmt.Sprintf("%dm", m)
 	}

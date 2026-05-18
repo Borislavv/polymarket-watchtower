@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
@@ -172,8 +173,10 @@ func (l *VolumeLoop) evalMetric(
 			NotionalUSD: recent.Notional,
 			At:          now,
 		},
-		Category:   &catRef,
-		Multiplier: ratio,
+		Category:            &catRef,
+		MarketMultiplier:    ratio,
+		EffectiveMultiplier: ratio,
+		MultiplierAxis:      string(score.MultiplierAxisMarket),
 	}
 	l.metrics.TradeAnomalies.WithLabelValues(string(sev), categoryLabelOrDefault(catRef), "volume:"+metric).Inc()
 	if err := l.emit.Notify(ctx, f); err != nil && l.log != nil {

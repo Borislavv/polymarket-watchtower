@@ -182,8 +182,8 @@ func TestCriticalRequiresAllThree(t *testing.T) {
 	if tr == nil || tr.NotionalUSD < 699_000 || tr.Odds < 7.99 {
 		t.Fatalf("trade ref: %+v", tr)
 	}
-	if got[0].Multiplier < 10_000 {
-		t.Fatalf("multiplier: %v", got[0].Multiplier)
+	if got[0].EffectiveMultiplier < 10_000 {
+		t.Fatalf("multiplier: %v", got[0].EffectiveMultiplier)
 	}
 	if got[0].MarketURL != "https://polymarket.com/event/us-pres-2028" {
 		t.Fatalf("market URL: %q", got[0].MarketURL)
@@ -625,7 +625,7 @@ func TestSeverityTableFromStrategy(t *testing.T) {
 			}
 			if fired && got[0].Severity != c.wantSev {
 				t.Fatalf("severity=%s want=%s (multiplier=%v abs=%s mul=%s)",
-					got[0].Severity, c.wantSev, got[0].Multiplier, got[0].AbsoluteTier, got[0].MultiplierTier)
+					got[0].Severity, c.wantSev, got[0].EffectiveMultiplier, got[0].AbsoluteTier, got[0].MultiplierTier)
 			}
 		})
 	}
@@ -752,8 +752,8 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 	if f.Trade == nil || f.Trade.NotionalUSD < 26_998 || f.Trade.NotionalUSD > 27_000 {
 		t.Errorf("trade notional: %+v", f.Trade)
 	}
-	if f.Multiplier < 200 || f.Multiplier > 350 {
-		t.Errorf("multiplier must reflect 26999/100 ≈ 270, got %v", f.Multiplier)
+	if f.EffectiveMultiplier < 200 || f.EffectiveMultiplier > 350 {
+		t.Errorf("multiplier must reflect 26999/100 ≈ 270, got %v", f.EffectiveMultiplier)
 	}
 	if !f.Hot && f.LifecyclePct < 75 {
 		t.Errorf("expected lifecycle past 75%%, got %v hot=%v", f.LifecyclePct, f.Hot)

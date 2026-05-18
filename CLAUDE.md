@@ -78,12 +78,121 @@ Defaults:
 | Warning  | $25,000    | 5      | 1,000×       |
 | Critical | $100,000   | 8      | 10,000×      |
 
+The multiplier ladder is evaluated on `max(marketMultiplier,
+traderMultiplier)`. The market axis (per-bucket distribution) is the v1
+signal "is this big relative to this market?"; the trader axis (wallet's
+full-history distribution) is the v2 signal "is this big relative to this
+wallet's normal trades?". A trade fires if it is anomalous on **either**
+axis. The absolute ladder remains the spam filter.
+
+`Finding.MultiplierAxis` records which axis contributed (`market`,
+`trader`, `both`, or empty when neither was ready). Surfaced in the
+Telegram "Why" section so an operator sees "x125 above wallet's typical
+trade" vs "x500 above market baseline median" without reading source.
+
 No promotion-override ladders (HardPromotion, HugeWhale, MegaWhale,
 sub-cluster) live in the model anymore. Earlier iterations stacked them on
 top of conservative-MIN and produced four overlapping ways to reach `hard`
 on a single trade — too many independent knobs to reason about. Operators
 who want a single $1M bet to wake them up should set the Critical
 thresholds to a shape it clears.
+
+## Persistence model (Strategy v4 — finalized)
+
+Production is Postgres-only. When `POSTGRES_DSN` is set the detector
+queries `dbbaseline.Provider` unconditionally, alerts are deduped via
+`polymarket_alerts.dedup_key`, and accumulation reads
+`polymarket_trades` directly. The previous `BASELINE_SOURCE` runtime
+switch is removed — there is no configuration path that runs production
+on an in-memory baseline.
+
+When `POSTGRES_DSN` is empty the binary boots a dev-only mode with the
+embedded `baseline.Baseline` reservoir, no dedup, no backfill, no
+accumulation. Boot logs are loud about this. Production must run with a
+DSN set; CI integration tests opt in via `POSTGRES_TEST_DSN`.
+
+## Strategy v2 additions
+
+### Trader-history multiplier
+
+- `TraderRepository.Distribution(traderID, since)` returns the wallet's
+  full-history distribution (count, median, p95, mean, total, span). Same
+  shape as `BaselineDistribution` so the scorer flows trader stats through
+  the existing `baseline.Stats` type and the existing readiness gates.
+- `traderbaseline.Provider` is the Postgres adapter; mirrors
+  `dbbaseline.Provider`. Wallet→id is resolved with a `sync.Map` cache.
+- `TRADER_BASELINE_WINDOW` (default `2160h` = 90 days) is the MAX lookback
+  over the wallet's stored history; 0 lifts the cap.
+- `TRADER_MIN_HISTORY_TRADES` (default 5) gates the trader axis. Below this
+  count the trader axis is silently disabled and v1 market-only scoring
+  applies — sensible because a 2-trade median is too noisy. Set 0 to
+  disable the trader axis entirely.
+- Each axis has its own readiness; when only one is ready the trade can
+  still fire on the ready axis alone.
+
+### MM/arbitrage suppression
+
+- `mmfilter.Filter.Decide(wallet, market, outcome)` examines the wallet's
+  two-sided BUY+SELL activity on the same `(market, outcome)` over
+  `MM_LOOKBACK`. Suppresses the single-trade alert when both:
+  1. `count(BUY) ≥ MM_MIN_TRADES_PER_SIDE` AND `count(SELL) ≥ MM_MIN_TRADES_PER_SIDE`
+  2. `|buy − sell| / max(buy, sell) ≤ MM_NEUTRALITY_TOL`
+- Cluster alerts are deliberately not filtered — multiple wallets converging
+  is meaningful even if some are MMs.
+- Fails open on DB errors (a hiccup must not swallow a real alert).
+- `MM_FILTER_ENABLED=false` disables suppression entirely.
+- Metrics: `watchtower_filter_alert_mm_suppressed_total{category}`.
+- Log line at info level with the buy/sell breakdown for every
+  suppression so a reviewer can audit.
+
+### Strategy version
+
+`STRATEGY_VERSION` default is now `v4`. Woven into every alert dedup key —
+older alerts cannot block newer ones on the same trade. Bump again when
+changing decision inputs.
+
+## Strategy v4 additions
+
+### Same-trader accumulation line
+
+A new signal class: one wallet repeatedly building exposure on a single
+`(market, outcome, side)` inside `ACCUMULATION_WINDOW`. Severity anchored
+on the existing Info/Warning/Critical thresholds via two size paths:
+
+- **meaningful**: `medianTrade ≥ FRACTION × T.MinNotionalUSD` AND
+  `lineTotal ≥ TotalMultiplier × T.MinNotionalUSD`
+- **many-smalls**: `lineTotal ≥ ManySmallsMultiplier × T.MinNotionalUSD`
+  (catches 200 × $200 = $40k vs Info $5k)
+
+Plus all tiers require `trades ≥ tier_min_trades(T)`, `avg_odds ≥
+T.MinOdds`, and `lineTotal/marketMedian ≥ T.MinMultiplier`. Hard is
+reserved for very large lines in HOT lifecycle.
+
+Dedup key:
+`accumulation:<sv>:<wallet>:<mid>:<token>:<side>:<window_bucket>`.
+
+Package: `internal/app/usecase/analytics/accumulation` — `Detector.Decide`
+is pure (no I/O); the repository read happens in `detect.Loop`.
+Query: `repository.AccumulationLineSummary` (sqlc) — backed by
+`idx_trades_trader_market_outcome_side_time`.
+
+MM filter applies. Cluster path is unaffected.
+
+### Quiet-market wake-up (not shipped)
+
+The original v3 spec mentioned a "quiet-market wake-up" signal as an
+intended additional detector. **It is not implemented in v4.** The
+accumulation detector covers a large fraction of the wake-up case — a
+quiet market that suddenly sees a wallet building a position — without a
+parallel "quiet market detection" code path. If a dedicated wake-up
+signal is added later, it should reuse `dbbaseline.Provider` for the
+"quiet" measurement and the existing tier ladder.
+
+### Compatibility
+
+The v2 additions are gated on Postgres being wired. In memory/debug mode
+the detector falls back cleanly to v1 behaviour (market-only scoring, no
+MM suppression). Tests do not need either axis configured.
 
 ## Cluster rule
 

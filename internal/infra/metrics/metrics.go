@@ -41,16 +41,20 @@ type Metrics struct {
 	// --- Per-trade anomaly model (primary signal) ---
 	TradeSizeUSD            prometheus.Histogram   // every trade's USD notional
 	TradeOdds               prometheus.Histogram   // every trade's 1/price odds
-	TradeAnomalyMultiplier  prometheus.Histogram   // observed multiplier for fired anomalies
+	TradeAnomalyMultiplier  prometheus.Histogram   // observed effective multiplier for fired anomalies
+	TraderMultiplier        prometheus.Histogram   // observed trader-axis multiplier when known
 	TradeAnomalies          *prometheus.CounterVec // severity, category, reason
+	TradeAnomalyAxis        *prometheus.CounterVec // axis = market|trader|both — which baseline drove the alert
 	HighOddsTrades          *prometheus.CounterVec // severity, category — odds-driven anomalies
 	CategoryAnomalousTrades *prometheus.CounterVec // category, severity
 	CategoryAnomalousUSD    *prometheus.CounterVec // category, severity
 	CategoryHardAlerts      *prometheus.CounterVec // category
+	AccumulationAlerts      *prometheus.CounterVec // severity, category — same-trader accumulation lines
 	BaselineBuckets         prometheus.Gauge       // total live (category,market,outcome) buckets
 
 	// --- Filtering ---
 	CategoryFilterSkipped *prometheus.CounterVec // stage = discover|detect
+	AlertMMSuppressed     *prometheus.CounterVec // category — single-trade alerts suppressed by MM/arb filter
 
 	// --- Alerting outcomes ---
 	TelegramAlertsSent  *prometheus.CounterVec // severity
@@ -117,14 +121,25 @@ func New() *Metrics {
 
 	m.TradeAnomalyMultiplier = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "anomaly_multiplier",
-		Help:    "Observed notional/baseline multiplier when a single-trade anomaly fires.",
+		Help:    "Observed effective notional/baseline multiplier when a single-trade anomaly fires (max of market and trader axes).",
 		Buckets: []float64{10, 30, 100, 300, 1_000, 3_000, 10_000, 100_000, 1_000_000},
+	})
+
+	m.TraderMultiplier = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "trader_multiplier",
+		Help:    "Observed trader-axis multiplier (notional / trader history median) when the trader baseline was available.",
+		Buckets: []float64{1, 3, 10, 30, 100, 300, 1_000, 3_000, 10_000, 100_000},
 	})
 
 	m.TradeAnomalies = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "anomalies_total",
 		Help: "Single-trade anomalies emitted, by severity/category/reason.",
 	}, []string{"severity", "category", "reason"})
+
+	m.TradeAnomalyAxis = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "anomaly_axis_total",
+		Help: "Single-trade anomalies by the multiplier axis that drove the tier (market|trader|both).",
+	}, []string{"axis"})
 
 	m.HighOddsTrades = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "high_odds_total",
@@ -146,6 +161,11 @@ func New() *Metrics {
 		Help: "CategoryWatchRequired (HARD) alerts emitted, by category.",
 	}, []string{"category"})
 
+	m.AccumulationAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "accumulation", Name: "alerts_total",
+		Help: "Same-trader accumulation-line alerts emitted, by severity and category.",
+	}, []string{"severity", "category"})
+
 	m.BaselineBuckets = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "watchtower", Subsystem: "baseline", Name: "buckets",
 		Help: "Number of live (category, market, outcome) baseline buckets.",
@@ -155,6 +175,11 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "filter", Name: "category_skipped_total",
 		Help: "Times a category was skipped by the whitelist, by stage (discover|detect).",
 	}, []string{"stage"})
+
+	m.AlertMMSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "filter", Name: "alert_mm_suppressed_total",
+		Help: "Single-trade alerts suppressed because the wallet showed balanced two-sided activity (market-making/arbitrage signature).",
+	}, []string{"category"})
 
 	m.TelegramAlertsSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "telegram", Name: "alerts_sent_total",
@@ -171,10 +196,12 @@ func New() *Metrics {
 		m.MarketsTracked,
 		m.TradesIngested, m.NotionalIngested,
 		m.WindowTradeRate, m.WindowNotionalRate, m.WindowAvgSize,
-		m.TradeSizeUSD, m.TradeOdds, m.TradeAnomalyMultiplier, m.TradeAnomalies, m.HighOddsTrades,
+		m.TradeSizeUSD, m.TradeOdds, m.TradeAnomalyMultiplier, m.TraderMultiplier,
+		m.TradeAnomalies, m.TradeAnomalyAxis, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
+		m.AccumulationAlerts,
 		m.BaselineBuckets,
-		m.CategoryFilterSkipped,
+		m.CategoryFilterSkipped, m.AlertMMSuppressed,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
 	)
 	return m

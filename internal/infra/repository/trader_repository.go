@@ -20,18 +20,44 @@ type Trader struct {
 	LastSeenAt    time.Time
 }
 
-// TraderStats is the per-trader aggregate computed by SQL.
-type TraderStats struct {
-	TradeCount        int64
+// TraderDistribution is the full server-side statistical roll-up for one
+// wallet's trade history. Shape mirrors BaselineDistribution intentionally
+// so the detector can flow trader stats through the same baseline.Stats
+// type and reuse the same readiness gates (count, span, total).
+type TraderDistribution struct {
+	SampleCount       int64
 	TotalNotionalUSD  float64
 	MeanNotionalUSD   float64
 	MedianNotionalUSD float64
+	P95NotionalUSD    float64
+	OldestAt          time.Time
+	NewestAt          time.Time
+}
+
+// Span returns NewestAt − OldestAt. Zero when fewer than two samples exist.
+func (d TraderDistribution) Span() time.Duration {
+	if d.SampleCount < 2 {
+		return 0
+	}
+	return d.NewestAt.Sub(d.OldestAt)
+}
+
+// TraderSideActivity is the two-sided BUY/SELL roll-up for one wallet on
+// one (market, outcome) over a window. Powers the MM/arbitrage filter:
+// near-balanced two-sided activity is the textbook signature of liquidity
+// provision or arb, not informed flow.
+type TraderSideActivity struct {
+	BuyCount        int64
+	SellCount       int64
+	BuyNotionalUSD  float64
+	SellNotionalUSD float64
 }
 
 // ErrTraderNotFound is returned by GetByWallet when no row matches.
 var ErrTraderNotFound = errors.New("trader not found")
 
-// TraderRepository owns reads and writes for polymarket_traders.
+// TraderRepository owns reads and writes for polymarket_traders and the
+// trader-scoped views over polymarket_trades.
 type TraderRepository struct {
 	q *sqlc.Queries
 }
@@ -71,22 +97,46 @@ func (r *TraderRepository) GetByWallet(ctx context.Context, wallet string) (Trad
 	return traderFromSQLC(row), nil
 }
 
-// Stats returns aggregate trade stats for one trader since `since`. The
-// SQL uses PERCENTILE_CONT for the median; mean is plain AVG.
-func (r *TraderRepository) Stats(ctx context.Context, traderID int64, since time.Time) (TraderStats, error) {
-	id := traderID
+// Distribution returns the full trader-history distribution over the
+// supplied lookback window. Pass time.Time{} as `since` to lift the lower
+// bound and aggregate over the wallet's full stored history.
+func (r *TraderRepository) Distribution(ctx context.Context, traderID int64, since time.Time) (TraderDistribution, error) {
 	row, err := r.q.TraderStats(ctx, sqlc.TraderStatsParams{
-		TraderID: &id,
-		TradedAt: tsFromTime(since),
+		TraderID: traderID,
+		Since:    tsFromTime(since),
 	})
 	if err != nil {
-		return TraderStats{}, fmt.Errorf("trader stats %d: %w", traderID, err)
+		return TraderDistribution{}, fmt.Errorf("trader distribution %d: %w", traderID, err)
 	}
-	return TraderStats{
-		TradeCount:        row.TradeCount,
+	return TraderDistribution{
+		SampleCount:       row.TradeCount,
 		TotalNotionalUSD:  row.TotalNotionalUsd,
 		MeanNotionalUSD:   row.MeanNotionalUsd,
 		MedianNotionalUSD: row.MedianNotionalUsd,
+		P95NotionalUSD:    row.P95NotionalUsd,
+		OldestAt:          tsTime(row.OldestAt),
+		NewestAt:          tsTime(row.NewestAt),
+	}, nil
+}
+
+// SideActivity returns the wallet's two-sided BUY/SELL roll-up on one
+// (market, outcome) since the supplied cutoff. Pass time.Time{} as
+// `since` to lift the lower bound. Used by the MM/arbitrage filter.
+func (r *TraderRepository) SideActivity(ctx context.Context, traderID, marketID int64, outcomeToken string, since time.Time) (TraderSideActivity, error) {
+	row, err := r.q.TraderMarketSideActivity(ctx, sqlc.TraderMarketSideActivityParams{
+		TraderID:     traderID,
+		MarketID:     marketID,
+		OutcomeToken: outcomeToken,
+		Since:        tsFromTime(since),
+	})
+	if err != nil {
+		return TraderSideActivity{}, fmt.Errorf("trader side activity %d/%d/%s: %w", traderID, marketID, outcomeToken, err)
+	}
+	return TraderSideActivity{
+		BuyCount:        row.BuyCount,
+		SellCount:       row.SellCount,
+		BuyNotionalUSD:  row.BuyNotionalUsd,
+		SellNotionalUSD: row.SellNotionalUsd,
 	}, nil
 }
 

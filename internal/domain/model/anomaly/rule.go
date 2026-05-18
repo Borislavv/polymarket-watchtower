@@ -2,8 +2,9 @@ package anomaly
 
 // Canonical alert reasons rendered in the Telegram header and metric labels.
 const (
-	ReasonSingle  = "LargeRareBet"
-	ReasonCluster = "WhaleClusterDetected"
+	ReasonSingle       = "LargeRareBet"
+	ReasonCluster      = "WhaleClusterDetected"
+	ReasonAccumulation = "SameTraderAccumulationLine"
 )
 
 // Tier is one rung on either the absolute (notional+odds) or multiplier ladder.

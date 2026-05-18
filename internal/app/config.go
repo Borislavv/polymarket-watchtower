@@ -26,17 +26,22 @@ const (
 	ModeVolume        AnomalyMode = "volume"
 )
 
-// BaselineSource selects where the per-trade scorer reads its baseline
-// statistics from. `postgres` is the production default and the only safe
-// shape for cross-restart correctness — every trade and every alert is
-// persisted, missing history is backfilled, and detection runs against
-// real stored data. `memory` exists for local exploration only.
-type BaselineSource string
-
-const (
-	BaselineSourcePostgres BaselineSource = "postgres"
-	BaselineSourceMemory   BaselineSource = "memory"
-)
+// Production persistence model (Strategy v4):
+//
+//   - When POSTGRES_DSN is set, the baseline is sourced from Postgres
+//     unconditionally. There is no runtime knob that flips this off — the
+//     detector queries dbbaseline.Provider, all trades are persisted by
+//     persist.Sink + backfill.Worker, and alerts are deduped via
+//     polymarket_alerts.dedup_key.
+//   - When POSTGRES_DSN is empty, the binary runs a dev/debug mode using
+//     the in-memory reservoir embedded in baseline.Baseline. This mode
+//     loses state on restart, does no dedup, and is unsuitable for
+//     production. Boot logs make this loud.
+//
+// Strategy v3 used a `BASELINE_SOURCE` env switch (postgres|memory). That
+// switch is removed — it created two production modes and a configuration
+// way to silently disable Postgres-backed decisions. The decision is now
+// implicit from DSN presence.
 
 // ApplicationConfig holds process-wide settings.
 type ApplicationConfig struct {
@@ -178,18 +183,13 @@ type AggregateConfig struct {
 type AnomalyConfig struct {
 	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
 
-	// BaselineSource selects where the per-trade scorer reads its baseline
-	// from. `postgres` (default) is the production shape — every fired
-	// alert has its statistics drawn from persisted history that survives
-	// restarts and is backfilled when missing. `memory` keeps the older
-	// in-process reservoir for local/debug runs where Postgres is absent.
-	BaselineSource BaselineSource `env:"BASELINE_SOURCE" envDefault:"postgres" validate:"required,oneof=postgres memory"`
-
 	// StrategyVersion is stamped on every persisted alert row and woven
 	// into the dedup_key so a config retune cannot resurrect alerts
-	// dropped under the previous strategy. Bump this when changing tier
-	// thresholds, baseline gates, or any other decision input.
-	StrategyVersion string `env:"STRATEGY_VERSION" envDefault:"v1" validate:"required"`
+	// dropped under the previous strategy. v4 adds same-trader
+	// accumulation-line detection on top of v2's trader-history
+	// multiplier + MM/arbitrage suppression. Bump this when changing
+	// tier thresholds, baseline gates, or any other decision input.
+	StrategyVersion string `env:"STRATEGY_VERSION" envDefault:"v4" validate:"required"`
 
 	// Single-trade severity ladders. Both ladders must qualify at the same
 	// rung or higher; final severity is the lower of the two.
@@ -227,6 +227,67 @@ type AnomalyConfig struct {
 	LifecycleHotFromPct         float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
 	MarketMinAge                time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
 	AllowUnknownMarketLifecycle bool          `env:"ALLOW_UNKNOWN_MARKET_LIFECYCLE" envDefault:"false"`
+
+	// Trader-history multiplier (v2). Scoring adds a second multiplier:
+	// notional / wallet's median historical trade. A trade fires when it
+	// is anomalous on EITHER the market axis or the trader axis (the
+	// surveillance literature treats them as complementary signals).
+	//
+	// TraderBaselineWindow caps the lookback over the wallet's stored
+	// history; 0 means "no upper bound" (use the wallet's full history).
+	// MinTraderHistoryTrades is the count gate: below this count the
+	// trader axis is silently disabled and v1 market-only scoring applies.
+	TraderBaselineWindow   time.Duration `env:"TRADER_BASELINE_WINDOW" envDefault:"2160h" validate:"gte=0"`
+	MinTraderHistoryTrades int           `env:"TRADER_MIN_HISTORY_TRADES" envDefault:"5" validate:"gte=0"`
+
+	// Market-maker / arbitrage suppression (v2). When a wallet has been
+	// running balanced two-sided BUY+SELL activity on the same (market,
+	// outcome) over the lookback, single-trade alerts on that wallet are
+	// suppressed — it is almost certainly a liquidity provider or
+	// arbitrageur, not an informed-flow candidate. Cluster alerts are
+	// unaffected (they have their own gates).
+	//
+	// MMFilterEnabled is the master switch. MMLookback is the activity
+	// window. MMMinTradesPerSide is the minimum BUY and minimum SELL trade
+	// count required before two-sided classification can apply (guards
+	// against thin/noisy histories). MMNeutralityTol is the maximum
+	// allowed |buy − sell| / max(buy, sell) — at or below this the book
+	// is "balanced enough" to suppress; above this the bias is
+	// directional and the alert passes through.
+	MMFilterEnabled    bool          `env:"MM_FILTER_ENABLED" envDefault:"true"`
+	MMLookback         time.Duration `env:"MM_LOOKBACK" envDefault:"24h" validate:"gte=0"`
+	MMMinTradesPerSide int           `env:"MM_MIN_TRADES_PER_SIDE" envDefault:"4" validate:"gte=1"`
+	MMNeutralityTol    float64       `env:"MM_NEUTRALITY_TOL" envDefault:"0.3" validate:"gte=0,lte=1"`
+
+	// Same-trader accumulation-line detection (Strategy v4). The signal
+	// is: one wallet repeatedly building exposure on a single
+	// (market, outcome, side) inside the accumulation window. Severity
+	// is anchored on the existing Info/Warning/Critical thresholds — no
+	// parallel threshold universe. Two size paths can qualify a tier:
+	//
+	//   meaningful  : medianTrade ≥ AccumulationMinTradeFraction × tier_notional
+	//                 AND lineTotal ≥ AccumulationTotalMultiplier × tier_notional
+	//   many-smalls : lineTotal ≥ AccumulationManySmallsMultiplier × tier_notional
+	//
+	// Plus, all tiers require:
+	//   trades ≥ tier_min_trades(T)        (Info=3, Warning=4, Critical=5)
+	//   avg_odds ≥ T.MinOdds
+	//   lineTotal / marketMedian ≥ T.MinMultiplier
+	//
+	// Hard accumulation: trades ≥ 5 AND lineTotal ≥ HardMultiplier ×
+	// Critical.MinNotionalUSD AND HOT lifecycle. Reserved for rare cases
+	// where a wallet is clearly accumulating into a market about to close.
+	//
+	// Accumulation is Postgres-only — the detector reads
+	// AccumulationLineSummary from polymarket_trades.
+	AccumulationEnabled              bool          `env:"ACCUMULATION_ENABLED" envDefault:"true"`
+	AccumulationWindow               time.Duration `env:"ACCUMULATION_WINDOW" envDefault:"24h" validate:"gt=0"`
+	AccumulationMinTrades            int           `env:"ACCUMULATION_MIN_TRADES" envDefault:"3" validate:"gte=2"`
+	AccumulationMinTradeFraction     float64       `env:"ACCUMULATION_MIN_TRADE_FRACTION_OF_INFO" envDefault:"0.6" validate:"gt=0,lte=1"`
+	AccumulationTotalMultiplier      float64       `env:"ACCUMULATION_TOTAL_MULTIPLIER" envDefault:"2" validate:"gt=1"`
+	AccumulationManySmallsMultiplier float64       `env:"ACCUMULATION_MANY_SMALLS_MULTIPLIER" envDefault:"4" validate:"gt=1"`
+	AccumulationHardMultiplier       float64       `env:"ACCUMULATION_HARD_MULTIPLIER" envDefault:"3" validate:"gt=1"`
+	AccumulationCooldown             time.Duration `env:"ACCUMULATION_COOLDOWN" envDefault:"30m" validate:"gt=0"`
 
 	// Cluster (HARD) alert. Fires when several already-firing single-trade
 	// alerts converge on one category within ClusterWindow.

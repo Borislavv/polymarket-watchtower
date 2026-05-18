@@ -13,9 +13,12 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/alertsender"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/dbbaseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
@@ -120,8 +123,9 @@ func New() (*App, error) {
 	// open the pool, run migrations, and build:
 	//   - persist.Sink: writes discoveries and collected trades through;
 	//   - category/market/trade/trader/alert repositories;
-	//   - dbbaseline.Provider: the DB-backed baseline read path used by
-	//     the detector when BASELINE_SOURCE=postgres (default);
+	//   - dbbaseline.Provider: the DB-backed baseline read path the
+	//     detector queries unconditionally when Postgres is wired
+	//     (Strategy v4 removed the BASELINE_SOURCE runtime switch);
 	//   - backfill.Worker: fills missing history for new markets;
 	//   - alertsender.Worker: delivers persisted alerts to Telegram.
 	//
@@ -136,6 +140,8 @@ func New() (*App, error) {
 		tradesRepo     *repository.TradeRepository
 		tradersRepo    *repository.TraderRepository
 		dbBaseline     *dbbaseline.Provider
+		traderBaseline *traderbaseline.Provider
+		mmFilter       *mmfilter.Filter
 		backfillWorker *backfill.Worker
 		senderWorker   *alertsender.Worker
 	)
@@ -167,15 +173,29 @@ func New() (*App, error) {
 		dbBaseline = dbbaseline.New(dbbaseline.Config{
 			Window: cfg.Anomaly.BaselineWindow,
 		}, tradesRepo, marketsRepo)
+		traderBaseline = traderbaseline.New(traderbaseline.Config{
+			Window: cfg.Anomaly.TraderBaselineWindow,
+		}, tradersRepo, tradersRepo)
+		mmFilter = mmfilter.New(mmfilter.Config{
+			Enabled:          cfg.Anomaly.MMFilterEnabled,
+			Lookback:         cfg.Anomaly.MMLookback,
+			MinTradesPerSide: cfg.Anomaly.MMMinTradesPerSide,
+			NeutralityTol:    cfg.Anomaly.MMNeutralityTol,
+		}, tradersRepo, tradersRepo)
 
 		logger.Info().
 			Int("max_open_conns", cfg.Postgres.MaxOpenConns).
 			Bool("auto_migrate", cfg.Postgres.AutoMigrate).
-			Str("baseline_source", string(cfg.Anomaly.BaselineSource)).
+			Str("baseline_source", "postgres").
 			Str("strategy_version", cfg.Anomaly.StrategyVersion).
-			Msg("postgres: persistence enabled")
+			Bool("trader_axis_enabled", cfg.Anomaly.MinTraderHistoryTrades > 0).
+			Bool("mm_filter_enabled", cfg.Anomaly.MMFilterEnabled).
+			Dur("mm_lookback", cfg.Anomaly.MMLookback).
+			Bool("accumulation_enabled", cfg.Anomaly.AccumulationEnabled).
+			Dur("accumulation_window", cfg.Anomaly.AccumulationWindow).
+			Msg("postgres: persistence enabled (production: db-backed)")
 	} else {
-		logger.Warn().Msg("postgres: POSTGRES_DSN not set — running in-memory only (local/debug)")
+		logger.Warn().Msg("postgres: POSTGRES_DSN not set — running DEV-ONLY in-memory mode. State is lost on restart, alerts are NOT deduped, accumulation is DISABLED. Do not use in production.")
 	}
 
 	discoverCfg := discover.Config{
@@ -312,16 +332,43 @@ func New() (*App, error) {
 			AllowUnknownMarketLifecycle: cfg.Anomaly.AllowUnknownMarketLifecycle,
 			StrategyVersion:             cfg.Anomaly.StrategyVersion,
 		}
-		// Production: DB baseline + DB-backed alert dedup. Memory mode
-		// keeps the legacy in-process reservoir and skips dedup — only
-		// safe for local exploration without Postgres.
-		if cfg.Postgres.Enabled() && cfg.Anomaly.BaselineSource == BaselineSourcePostgres {
+		// Production: DB baseline + DB-backed alert dedup. The detector
+		// only uses the in-memory reservoir embedded in baseline.Baseline
+		// when Postgres is unwired (dev/debug only — there is no longer a
+		// runtime knob that selects "memory" while Postgres is available).
+		if cfg.Postgres.Enabled() {
 			detectCfg.Baseliner = dbBaseline
 		}
 		if cfg.Postgres.Enabled() {
 			detectCfg.Alerts = alertsRepo
 			detectCfg.Markets = marketsRepo
 			detectCfg.Traders = tradersRepo
+			// v2 additions: trader-axis multiplier + MM/arb suppression.
+			// Both are Postgres-only — the trader-history multiplier needs
+			// persisted trader_id↔trades and the MM filter needs the
+			// two-sided activity query. Memory mode degrades gracefully to
+			// v1 (market-only scoring, no suppression).
+			detectCfg.TraderBaseliner = traderBaseline
+			detectCfg.MinTraderHistoryTrades = cfg.Anomaly.MinTraderHistoryTrades
+			if mmFilter != nil {
+				detectCfg.MMFilter = mmFilter
+			}
+			// v4: same-trader accumulation-line detector. Postgres-only —
+			// the entire signal is computed over the persisted
+			// per-(wallet, market, outcome, side) bucket.
+			if cfg.Anomaly.AccumulationEnabled {
+				detectCfg.Accumulator = accumulation.New(accumulation.Config{
+					Enabled:              true,
+					Window:               cfg.Anomaly.AccumulationWindow,
+					MinTrades:            cfg.Anomaly.AccumulationMinTrades,
+					TradeFractionOfInfo:  cfg.Anomaly.AccumulationMinTradeFraction,
+					TotalMultiplier:      cfg.Anomaly.AccumulationTotalMultiplier,
+					ManySmallsMultiplier: cfg.Anomaly.AccumulationManySmallsMultiplier,
+					HardMultiplier:       cfg.Anomaly.AccumulationHardMultiplier,
+					Cooldown:             cfg.Anomaly.AccumulationCooldown,
+				}, detectCfg.Thresholds)
+				detectCfg.AccumulationLines = tradesRepo
+			}
 		}
 		detectLoop = detect.New(detectCfg, engine, registry, emitter, met, logger)
 		observer = detectLoop

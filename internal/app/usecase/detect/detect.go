@@ -26,8 +26,10 @@ import (
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
@@ -52,6 +54,29 @@ type Emitter interface {
 // embedded in-memory analytics/baseline.Baseline (no fetcher configured).
 type BaselineFetcher interface {
 	Stats(ctx context.Context, k baseline.Key) (baseline.Stats, error)
+}
+
+// TraderBaselineFetcher serves the wallet's full-history distribution to
+// the per-trade scorer. Satisfied in production by
+// internal/app/usecase/analytics/traderbaseline.Provider. When nil, the
+// trader axis is disabled and scoring falls back to v1 behaviour
+// (market-only multiplier).
+type TraderBaselineFetcher interface {
+	Stats(ctx context.Context, wallet string) (baseline.Stats, error)
+}
+
+// MMArbFilter decides whether a fired single-trade candidate looks like
+// market-making or arbitrage activity that should be suppressed before
+// emission. Satisfied by *mmfilter.Filter. nil disables suppression.
+type MMArbFilter interface {
+	Decide(ctx context.Context, wallet string, marketID int64, outcomeToken string) (mmfilter.Verdict, error)
+}
+
+// AccumulationLineFetcher returns the server-side roll-up of one wallet's
+// recent same-side trades on a (market, outcome) bucket. Satisfied by
+// *repository.TradeRepository.
+type AccumulationLineFetcher interface {
+	AccumulationLineSummary(ctx context.Context, q repository.AccumulationLineQuery) (repository.AccumulationLine, error)
 }
 
 // AlertCreator is the dedup primitive. TryCreatePending must:
@@ -109,12 +134,34 @@ type Config struct {
 	AllowUnknownMarketLifecycle bool
 	Clock                       func() time.Time
 
-	// Baseliner overrides the in-memory baseline reservoir. When set, the
-	// detector queries it on every Observe and does NOT seed the in-process
-	// ring (trade ingestion to the DB is owned by persist.Sink + backfill
-	// worker — that's what the fetcher reads from). Leave nil to use the
-	// embedded baseline.Baseline (local/debug, BASELINE_SOURCE=memory).
+	// Baseliner is the Postgres-backed baseline fetcher. Wired in
+	// production whenever POSTGRES_DSN is set. Leave nil only in the
+	// dev/local-only mode where the embedded baseline.Baseline reservoir
+	// is read/written in-process (no persistence, no dedup, no
+	// accumulation).
 	Baseliner BaselineFetcher
+	// TraderBaseliner serves the trader-history leg of the multiplier
+	// ladder. Leave nil to disable the trader axis (v1 market-only
+	// behaviour) — sensible default for local/debug paths and tests.
+	TraderBaseliner TraderBaselineFetcher
+	// MinTraderHistoryTrades is the count gate the trader baseline must
+	// clear before its multiplier contributes to scoring. 0 disables the
+	// trader axis regardless of TraderBaseliner availability.
+	MinTraderHistoryTrades int
+	// MMFilter suppresses single-trade alerts on wallets showing balanced
+	// two-sided BUY+SELL activity on the same (market, outcome). nil =
+	// disabled.
+	MMFilter MMArbFilter
+
+	// Accumulator is the same-trader accumulation-line detector. nil =
+	// disabled. When both Accumulator and AccumulationLines are set the
+	// detector evaluates an accumulation line per ingested trade after
+	// the single-trade emit path.
+	Accumulator *accumulation.Detector
+	// AccumulationLines is the DB read path the detector uses to materialise
+	// the wallet's recent same-side activity. Satisfied by
+	// *repository.TradeRepository.
+	AccumulationLines AccumulationLineFetcher
 	// Alerts wires the Postgres dedup primitive. When set, every fired
 	// Finding is INSERT … ON CONFLICT DO NOTHING into polymarket_alerts
 	// before being handed to the realtime Emitter. Conflicts suppress the
@@ -126,7 +173,8 @@ type Config struct {
 	Traders TraderResolver
 	// StrategyVersion is stamped on every alert row and woven into the
 	// dedup_key so a config retune cannot ressurect ignored alerts.
-	// Defaults to "v1".
+	// Defaults to "v2" (strategy upgrade adds trader-axis multiplier +
+	// MM/arb suppression on top of v1).
 	StrategyVersion string
 }
 
@@ -169,7 +217,7 @@ func New(
 		cfg.LifecycleHotFromPct = cfg.LifecycleAlertFromPct
 	}
 	if cfg.StrategyVersion == "" {
-		cfg.StrategyVersion = "v1"
+		cfg.StrategyVersion = "v4"
 	}
 	now := cfg.Clock
 	if now == nil {
@@ -247,6 +295,13 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		categories = []vo.CategoryID{0}
 	}
 
+	// Trader-history baseline is independent of category, so fetch it once per
+	// trade (not per-category). When the trader axis is disabled or the wallet
+	// is unknown the result is an empty baseline.Stats; the scorer treats that
+	// as "this leg does not contribute" and falls back to the market-only
+	// behaviour of v1.
+	traderStats := l.readTraderBaseline(ctx, trade.Taker)
+
 	var (
 		bestCat    vo.CategoryID
 		bestStats  baseline.Stats
@@ -272,15 +327,24 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		if !gateAllowsAlert {
 			continue
 		}
-		// Baseline readiness: insist on a minimum observed span. This is
-		// distinct from BaselineWindow (the maximum cap) — a 1-month market
-		// is fine on a 1y cap, but we still want at least, say, 24h of
-		// observed activity before we trust the median.
+
+		// Market-baseline readiness gate. v2: when the market baseline is
+		// unready (cold market, thin span) we mask the MARKET axis only,
+		// leaving the trader axis free to contribute. Passing empty stats to
+		// the scorer disables the market leg cleanly.
+		marketStats := stats
 		if l.cfg.BaselineMinReadySpan > 0 && stats.SpanActual < l.cfg.BaselineMinReadySpan {
-			continue
+			marketStats = baseline.Stats{}
 		}
 
-		sr := score.Score(notional, trade.Price, stats, l.cfg.Thresholds)
+		// Trader-axis readiness gate: count floor enforced HERE (the scorer
+		// itself only checks median > 0 and the shared count/total floors).
+		traderInput := traderStats
+		if l.cfg.MinTraderHistoryTrades > 0 && traderStats.Count < l.cfg.MinTraderHistoryTrades {
+			traderInput = baseline.Stats{}
+		}
+
+		sr := score.Score(notional, trade.Price, marketStats, traderInput, l.cfg.Thresholds)
 		if !sr.Fired {
 			continue
 		}
@@ -299,7 +363,20 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		}
 	}
 	if bestResult.Fired {
-		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, bestResult, bestRef, lifecyclePct, hot)
+		l.emitTradeAnomaly(ctx, market, trade, bestCat, bestStats, traderStats, bestResult, bestRef, lifecyclePct, hot)
+	}
+
+	// Same-trader accumulation line. Runs after the single-trade decision
+	// and is intentionally independent of it — a wallet building exposure
+	// in small slices can fire accumulation even when no individual trade
+	// reached the single-trade threshold. The line query is per-(wallet,
+	// market, outcome, side) and backed by a composite index.
+	//
+	// Lifecycle / category whitelist are applied; trader stats are reused.
+	// MM filter is also reused — balanced two-sided activity is the same
+	// false-positive shape here as it is for single-trade.
+	if gateAllowsAlert {
+		l.evaluateAccumulation(ctx, market, trade, categories, traderStats, lifecyclePct, hot)
 	}
 }
 
@@ -315,6 +392,23 @@ func (l *Loop) readBaseline(ctx context.Context, k baseline.Key, notional float6
 	stats := l.baseline.Stats(k)
 	l.baseline.Add(k, notional, at)
 	return stats, nil
+}
+
+// readTraderBaseline returns the wallet's full-history distribution. When
+// cfg.TraderBaseliner is nil (local/debug, or wallet unknown) the trader
+// axis is disabled and v1 market-only scoring applies. Errors are logged
+// and treated as "axis disabled" so a DB hiccup never blocks emission of
+// a market-side alert.
+func (l *Loop) readTraderBaseline(ctx context.Context, wallet string) baseline.Stats {
+	if l.cfg.TraderBaseliner == nil || wallet == "" {
+		return baseline.Stats{}
+	}
+	stats, err := l.cfg.TraderBaseliner.Stats(ctx, wallet)
+	if err != nil {
+		l.log.Err(err).Str("wallet", wallet).Msg("detect: trader baseline read failed; trader axis disabled for this trade")
+		return baseline.Stats{}
+	}
+	return stats
 }
 
 func (l *Loop) buildTradeRef(m market.Market, t trade.Trade, notional float64) anomaly.TradeRef {
@@ -345,6 +439,7 @@ func (l *Loop) emitTradeAnomaly(
 	t trade.Trade,
 	cat vo.CategoryID,
 	stats baseline.Stats,
+	traderStats baseline.Stats,
 	sr score.Result,
 	ref anomaly.TradeRef,
 	lifecyclePct float64,
@@ -354,6 +449,38 @@ func (l *Loop) emitTradeAnomaly(
 	scope := fmt.Sprintf("category=%s market=%s outcome=%s",
 		nonEmpty(catRef.Label, "uncategorised"), m.Slug, nonEmpty(ref.Outcome, "?"))
 	peerCount := l.cluster.Count(cat)
+
+	// MM/arbitrage suppression: a candidate that fires single-trade is
+	// blocked from emission when the wallet's two-sided activity on the
+	// same (market, outcome) looks like liquidity provision / arbitrage.
+	// Cluster alerts are unaffected (they have their own gates).
+	if l.cfg.MMFilter != nil && ref.Wallet != "" {
+		mid := l.resolveMarketID(ctx, m.ID)
+		var midVal int64
+		if mid != nil {
+			midVal = *mid
+		}
+		v, err := l.cfg.MMFilter.Decide(ctx, ref.Wallet, midVal, string(t.Token))
+		if err != nil {
+			l.log.Err(err).Str("wallet", ref.Wallet).Msg("detect: mm filter error; failing open")
+		}
+		if v.Suppress {
+			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabel(catRef)).Inc()
+			l.log.Info().
+				Str("wallet", ref.Wallet).
+				Str("market", string(m.ID)).
+				Str("outcome", string(t.Token)).
+				Str("reason", v.Reason).
+				Int64("buy_count", v.BuyCount).
+				Int64("sell_count", v.SellCount).
+				Float64("buy_notional_usd", v.BuyNotionalUSD).
+				Float64("sell_notional_usd", v.SellNotionalUSD).
+				Float64("imbalance", v.Imbalance).
+				Msg("detect: single-trade alert suppressed (mm/arb signature)")
+			return
+		}
+	}
+
 	f := anomaly.Finding{
 		Kind:     anomaly.KindTradeAnomaly,
 		Severity: sr.Severity,
@@ -370,21 +497,42 @@ func (l *Loop) emitTradeAnomaly(
 			Span:      stats.SpanActual,
 			WindowMax: l.cfg.Baseline.Window,
 		},
-		Multiplier:       sr.Multiplier,
-		AbsoluteTier:     sr.AbsoluteTier,
-		MultiplierTier:   sr.MultiplierTier,
-		LifecyclePct:     lifecyclePct,
-		Hot:              hot,
-		InCluster:        peerCount >= 2,
-		ClusterPeerCount: peerCount,
-		MarketURL:        l.marketURL(m),
-		CategoryURL:      l.categoryURL(catRef),
-		TraderURL:        l.traderURL(ref.Wallet),
-		GrafanaURL:       l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
+		MarketMultiplier:    sr.MarketMultiplier,
+		TraderMultiplier:    sr.TraderMultiplier,
+		EffectiveMultiplier: sr.EffectiveMultiplier,
+		MultiplierAxis:      string(sr.MultiplierAxis),
+		AbsoluteTier:        sr.AbsoluteTier,
+		MultiplierTier:      sr.MultiplierTier,
+		LifecyclePct:        lifecyclePct,
+		Hot:                 hot,
+		InCluster:           peerCount >= 2,
+		ClusterPeerCount:    peerCount,
+		MarketURL:           l.marketURL(m),
+		CategoryURL:         l.categoryURL(catRef),
+		TraderURL:           l.traderURL(ref.Wallet),
+		GrafanaURL:          l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
+	}
+	// Trader-history context (when available) — operators want to see "this
+	// wallet's typical trade is $X" alongside the market-side baseline.
+	if traderStats.Count > 0 {
+		f.TraderBaseline = &anomaly.BaselineRef{
+			Scope:     "trader=" + ref.Wallet,
+			MedianUSD: traderStats.MedianUSD,
+			MeanUSD:   traderStats.MeanUSD,
+			P95USD:    traderStats.P95USD,
+			SampleN:   traderStats.Count,
+			Span:      traderStats.SpanActual,
+		}
 	}
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
-	if sr.Multiplier > 0 {
-		l.metrics.TradeAnomalyMultiplier.Observe(sr.Multiplier)
+	if axis := string(sr.MultiplierAxis); axis != "" {
+		l.metrics.TradeAnomalyAxis.WithLabelValues(axis).Inc()
+	}
+	if sr.EffectiveMultiplier > 0 {
+		l.metrics.TradeAnomalyMultiplier.Observe(sr.EffectiveMultiplier)
+	}
+	if sr.TraderMultiplier > 0 {
+		l.metrics.TraderMultiplier.Observe(sr.TraderMultiplier)
 	}
 	if ref.Odds > 0 {
 		l.metrics.TradeOdds.Observe(ref.Odds)
@@ -461,6 +609,249 @@ func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedu
 		return false
 	}
 	return created
+}
+
+// evaluateAccumulation runs the same-trader accumulation detector for the
+// trade's (wallet, market, outcome, side) bucket. Per-trade trigger keeps
+// the alert latency low; the DB query is backed by
+// idx_trades_trader_market_outcome_side_time.
+//
+// Skips quietly when:
+//   - the accumulator is disabled or unwired (cfg.Accumulator / cfg.AccumulationLines nil);
+//   - the wallet has not been persisted yet (no trader_id);
+//   - no category in the trade's set passes the whitelist;
+//   - the line summary returned no trades or fewer than the detector floor;
+//   - the MM/arb filter classifies the wallet two-sided.
+//
+// Severity emission, metrics, dedup, and realtime sink fanout follow the
+// same shape as the single-trade path so the two signals are operationally
+// uniform.
+func (l *Loop) evaluateAccumulation(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	categories []vo.CategoryID,
+	traderStats baseline.Stats,
+	lifecyclePct float64,
+	hot bool,
+) {
+	if l.cfg.Accumulator == nil || l.cfg.AccumulationLines == nil {
+		return
+	}
+	if t.Taker == "" || t.Token == "" {
+		return
+	}
+	// Need the persisted trader id to even query the line — accumulation
+	// is intrinsically wallet-scoped.
+	tid := l.resolveTraderID(ctx, t.Taker)
+	if tid == nil {
+		return
+	}
+	mid := l.resolveMarketID(ctx, m.ID)
+	if mid == nil {
+		return
+	}
+
+	// Pick the first whitelisted category in the trade's set as the
+	// reporting category. Accumulation isn't per-category in the model,
+	// but the Telegram payload and metrics want one.
+	var cat vo.CategoryID
+	for _, c := range categories {
+		if l.allowed(c) {
+			cat = c
+			break
+		}
+	}
+	if cat == 0 && len(categories) > 0 {
+		// Whitelist didn't match any category for this market — accumulation
+		// stays silent. (Defense-in-depth: discover should have stripped
+		// non-whitelisted ids before they ever got here.)
+		return
+	}
+
+	since := l.now().Add(-l.cfg.Accumulator.Config().Window)
+	rep, err := l.cfg.AccumulationLines.AccumulationLineSummary(ctx, repository.AccumulationLineQuery{
+		TraderID:     *tid,
+		MarketID:     *mid,
+		OutcomeToken: string(t.Token),
+		Side:         string(t.Side),
+		Since:        since,
+	})
+	if err != nil {
+		l.log.Err(err).Str("wallet", t.Taker).Msg("detect: accumulation line read failed")
+		return
+	}
+	if rep.TradeCount == 0 {
+		return
+	}
+
+	// Project repository roll-up into the detector's Line shape.
+	line := accumulation.Line{
+		Wallet:            t.Taker,
+		MarketID:          string(m.ID),
+		OutcomeToken:      string(t.Token),
+		Side:              t.Side,
+		TradeCount:        int(rep.TradeCount),
+		TotalNotionalUSD:  rep.TotalNotionalUSD,
+		MeanNotionalUSD:   rep.MeanNotionalUSD,
+		MedianNotionalUSD: rep.MedianNotionalUSD,
+		MaxNotionalUSD:    rep.MaxNotionalUSD,
+		MinNotionalUSD:    rep.MinNotionalUSD,
+		AvgOdds:           rep.AvgOdds(),
+		MaxOdds:           rep.MaxOdds(),
+		OldestAt:          rep.OldestAt,
+		NewestAt:          rep.NewestAt,
+		MarketMedianUSD:   0,
+		MarketP95USD:      0,
+		TraderMedianUSD:   traderStats.MedianUSD,
+		TraderP95USD:      traderStats.P95USD,
+		LifecyclePct:      lifecyclePct,
+		Hot:               hot,
+	}
+	// Market baseline for the multiplier check. Use the production
+	// Baseliner when wired (Postgres). In dev/test mode fall back to the
+	// in-process reservoir so accumulation still works without a DB.
+	bk := baseline.Key{Category: cat, Market: m.ID, OutcomeToken: t.Token}
+	var marketStats baseline.Stats
+	if l.cfg.Baseliner != nil {
+		var mErr error
+		marketStats, mErr = l.cfg.Baseliner.Stats(ctx, bk)
+		if mErr != nil {
+			l.log.Err(mErr).Msg("detect: baseline read for accumulation failed")
+		}
+	} else {
+		marketStats = l.baseline.Stats(bk)
+	}
+	line.MarketMedianUSD = marketStats.MedianUSD
+	line.MarketP95USD = marketStats.P95USD
+
+	v := l.cfg.Accumulator.Decide(line)
+	if !v.Fired {
+		return
+	}
+
+	// MM/arb suppression — balanced two-sided activity is the same FP shape
+	// here as for single-trade.
+	if l.cfg.MMFilter != nil {
+		mmv, mmErr := l.cfg.MMFilter.Decide(ctx, t.Taker, *mid, string(t.Token))
+		if mmErr != nil {
+			l.log.Err(mmErr).Msg("detect: mm filter (accumulation) error; failing open")
+		}
+		if mmv.Suppress {
+			l.metrics.AlertMMSuppressed.WithLabelValues(categoryLabelByID(l, cat)).Inc()
+			return
+		}
+	}
+
+	catRef := l.categoryRef(cat)
+	reasonStrs := make([]string, 0, len(v.Reasons))
+	for _, r := range v.Reasons {
+		reasonStrs = append(reasonStrs, string(r))
+	}
+	f := anomaly.Finding{
+		Kind:     anomaly.KindAccumulation,
+		Severity: v.Severity,
+		At:       l.now(),
+		Reason:   anomaly.ReasonAccumulation,
+		Trade: &anomaly.TradeRef{
+			ID:          t.ID,
+			TxHash:      t.TxHash,
+			Wallet:      t.Taker,
+			Market:      m.ID,
+			Slug:        m.Slug,
+			Question:    m.Question,
+			Outcome:     m.OutcomeLabel(t.Token),
+			Side:        t.Side,
+			SizeShares:  t.Size,
+			Price:       t.Price,
+			Odds:        line.MaxOdds,
+			NotionalUSD: rep.TotalNotionalUSD, // line total for sink convenience
+			At:          t.Timestamp,
+		},
+		Category: &catRef,
+		Accumulation: &anomaly.AccumulationRef{
+			Wallet:            t.Taker,
+			MarketID:          string(m.ID),
+			OutcomeToken:      string(t.Token),
+			Outcome:           m.OutcomeLabel(t.Token),
+			Side:              string(t.Side),
+			TradeCount:        int(rep.TradeCount),
+			TotalNotionalUSD:  rep.TotalNotionalUSD,
+			MeanNotionalUSD:   rep.MeanNotionalUSD,
+			MedianNotionalUSD: rep.MedianNotionalUSD,
+			MaxNotionalUSD:    rep.MaxNotionalUSD,
+			AvgOdds:           line.AvgOdds,
+			MaxOdds:           line.MaxOdds,
+			Span:              rep.Span(),
+			MarketMultiplier:  v.LineMarketMultiplier,
+			TraderMultiplier:  v.LineTraderMultiplier,
+			Score:             v.Score,
+			Confidence:        v.Confidence,
+			Reasons:           reasonStrs,
+			SizePath:          v.SizePath,
+		},
+		Baseline: &anomaly.BaselineRef{
+			Scope:     fmt.Sprintf("category=%s market=%s outcome=%s", nonEmpty(catRef.Label, "uncategorised"), m.Slug, nonEmpty(m.OutcomeLabel(t.Token), "?")),
+			MedianUSD: line.MarketMedianUSD,
+			P95USD:    line.MarketP95USD,
+			Span:      0, // not directly relevant on a line-level alert
+		},
+		LifecyclePct: lifecyclePct,
+		Hot:          hot,
+		MarketURL:    l.marketURL(m),
+		CategoryURL:  l.categoryURL(catRef),
+		TraderURL:    l.traderURL(t.Taker),
+		GrafanaURL:   l.grafanaURL(catRef, m, t.Timestamp, v.Severity),
+	}
+	if traderStats.Count > 0 {
+		f.TraderBaseline = &anomaly.BaselineRef{
+			Scope:     "trader=" + t.Taker,
+			MedianUSD: traderStats.MedianUSD,
+			MeanUSD:   traderStats.MeanUSD,
+			P95USD:    traderStats.P95USD,
+			SampleN:   traderStats.Count,
+			Span:      traderStats.SpanActual,
+		}
+	}
+	l.metrics.AccumulationAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat)).Inc()
+
+	dedup := l.accumulationDedupKey(t.Taker, *mid, string(t.Token), string(t.Side))
+	if !l.persistAlert(ctx, repository.AlertKindAccumulation, dedup, m, t, f) {
+		return
+	}
+	if err := l.emit.Notify(ctx, f); err != nil {
+		l.log.Err(err).Msg("detect: emit accumulation failed")
+	}
+}
+
+// accumulationDedupKey produces
+// "accumulation:<strategy>:<wallet>:<market_id>:<outcome_token>:<side>:<bucket>".
+// bucket is floor(now / cooldown), so two accumulation alerts on the same
+// line landing inside one cooldown window dedup; the next bucket gets a
+// fresh key, matching the cooldown contract.
+func (l *Loop) accumulationDedupKey(wallet string, marketID int64, outcomeToken, side string) string {
+	bucket := l.cfg.Accumulator.Config().Cooldown
+	if bucket <= 0 {
+		bucket = 30 * time.Minute
+	}
+	bucketStart := l.now().Truncate(bucket).Unix()
+	return fmt.Sprintf("accumulation:%s:%s:%d:%s:%s:%d",
+		l.cfg.StrategyVersion, wallet, marketID, outcomeToken, side, bucketStart)
+}
+
+// categoryLabelByID returns the category label for the registry id, or
+// "uncategorized" when the registry doesn't know it. Helper for metric
+// labels in paths that don't already build a CategoryRef.
+func categoryLabelByID(l *Loop, cat vo.CategoryID) string {
+	if cat == 0 {
+		return "uncategorized"
+	}
+	if c, ok := l.registry.Category(cat); ok {
+		if c.Label != "" {
+			return c.Label
+		}
+	}
+	return "uncategorized"
 }
 
 // singleTradeDedupKey produces "single:<strategy>:<trade_dedup_key>". The

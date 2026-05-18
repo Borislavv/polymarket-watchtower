@@ -11,6 +11,82 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const accumulationLineSummary = `-- name: AccumulationLineSummary :one
+SELECT
+    COUNT(*)::bigint                                                                          AS trade_count,
+    COALESCE(SUM(notional_usd), 0)::double precision                                          AS total_notional_usd,
+    COALESCE(AVG(notional_usd), 0)::double precision                                          AS mean_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS median_notional_usd,
+    COALESCE(MAX(notional_usd), 0)::double precision                                          AS max_notional_usd,
+    COALESCE(MIN(notional_usd), 0)::double precision                                          AS min_notional_usd,
+    COALESCE(AVG(price), 0)::double precision                                                 AS avg_price,
+    COALESCE(MIN(price), 0)::double precision                                                 AS min_price,
+    MIN(traded_at)::timestamptz                                                               AS oldest_at,
+    MAX(traded_at)::timestamptz                                                               AS newest_at
+FROM polymarket_trades
+WHERE trader_id     = $1::bigint
+  AND market_id     = $2::bigint
+  AND outcome_token = $3::text
+  AND side          = $4::text
+  AND ($5::timestamptz IS NULL OR traded_at >= $5::timestamptz)
+`
+
+type AccumulationLineSummaryParams struct {
+	TraderID     int64
+	MarketID     int64
+	OutcomeToken string
+	Side         string
+	Since        pgtype.Timestamptz
+}
+
+type AccumulationLineSummaryRow struct {
+	TradeCount        int64
+	TotalNotionalUsd  float64
+	MeanNotionalUsd   float64
+	MedianNotionalUsd float64
+	MaxNotionalUsd    float64
+	MinNotionalUsd    float64
+	AvgPrice          float64
+	MinPrice          float64
+	OldestAt          pgtype.Timestamptz
+	NewestAt          pgtype.Timestamptz
+}
+
+// Server-side aggregate over one wallet's recent trades on a single
+// (market, outcome, side) bucket. Powers the same-trader accumulation
+// detector — the entire line scoring runs from this one row, with no
+// per-trade transfer. Backed by idx_trades_trader_market_outcome_side_time.
+//
+// $5 is the inclusive lower bound on traded_at; pass NULL to lift the
+// bound (use the wallet's full stored history on this bucket).
+//
+// avg_price is the mean of `price`. Callers convert to mean odds via
+// 1/avg_price when price > 0. max_odds is computed server-side as the
+// minimum price's inverse (price closest to 0 ⇒ largest odds).
+func (q *Queries) AccumulationLineSummary(ctx context.Context, arg AccumulationLineSummaryParams) (AccumulationLineSummaryRow, error) {
+	row := q.db.QueryRow(ctx, accumulationLineSummary,
+		arg.TraderID,
+		arg.MarketID,
+		arg.OutcomeToken,
+		arg.Side,
+		arg.Since,
+	)
+	var i AccumulationLineSummaryRow
+	err := row.Scan(
+		&i.TradeCount,
+		&i.TotalNotionalUsd,
+		&i.MeanNotionalUsd,
+		&i.MedianNotionalUsd,
+		&i.MaxNotionalUsd,
+		&i.MinNotionalUsd,
+		&i.AvgPrice,
+		&i.MinPrice,
+		&i.OldestAt,
+		&i.NewestAt,
+	)
+	return i, err
+}
+
 const baselineDistribution = `-- name: BaselineDistribution :one
 SELECT
     COUNT(*)::bigint                                                                           AS sample_count,
