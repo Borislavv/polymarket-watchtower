@@ -25,12 +25,12 @@ import (
 // Every gate also accepts a CLI flag override, so two configs can be
 // compared against the same DB snapshot without editing `.env`:
 //
-//   cli diagnose-alerts \
-//     --baseline-min-trades 20 --baseline-min-notional 2000 --baseline-min-span 3h \
-//     --lifecycle-from 60 --market-min-age 6h \
-//     --info-min-notional 2500 --info-min-odds 2 --info-min-multiplier 20 \
-//     --warning-min-notional 10000 --warning-min-multiplier 50 \
-//     --critical-min-notional 25000 --critical-min-multiplier 100
+//	cli diagnose-alerts \
+//	  --baseline-min-trades 20 --baseline-min-notional 2000 --baseline-min-span 3h \
+//	  --lifecycle-from 60 --market-min-age 6h \
+//	  --info-min-notional 2500 --info-min-odds 2 --info-min-multiplier 20 \
+//	  --warning-min-notional 10000 --warning-min-multiplier 50 \
+//	  --critical-min-notional 25000 --critical-min-multiplier 100
 func runDiagnoseAlerts(args []string) {
 	fs := flag.NewFlagSet("diagnose-alerts", flag.ExitOnError)
 	dsn := fs.String("dsn", os.Getenv("POSTGRES_DSN"), "Postgres DSN (defaults to $POSTGRES_DSN)")

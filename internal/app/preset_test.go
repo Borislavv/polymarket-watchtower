@@ -96,20 +96,37 @@ func TestPresetConservativeIsStricter(t *testing.T) {
 	}
 }
 
+// TestPresetAggressiveIsLooser pins that the aggressive preset is in
+// fact looser than the balanced preset on the load-bearing knobs. The
+// exact values are an operator-tuned surface (re-derived from
+// diagnose-alerts sweeps against the live DB); the invariant the test
+// guards is "aggressive < balanced", not specific numerics.
 func TestPresetAggressiveIsLooser(t *testing.T) {
-	loadPresetEnv(t, filepath.Join("..", "..", "presets", "aggressive.env"))
-	cfg, err := LoadConfig()
+	loadPresetEnv(t, filepath.Join("..", "..", "presets", "balanced.env"))
+	bal, err := LoadConfig()
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Fatalf("LoadConfig balanced: %v", err)
 	}
-	if cfg.Anomaly.InfoMinNotionalUSD >= 10_000 {
-		t.Errorf("aggressive notional should be lower than balanced, got %v", cfg.Anomaly.InfoMinNotionalUSD)
+	loadPresetEnv(t, filepath.Join("..", "..", "presets", "aggressive.env"))
+	agg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig aggressive: %v", err)
 	}
-	if cfg.Anomaly.LifecycleAlertFromPct >= 75 {
-		t.Errorf("aggressive lifecycle should fire earlier, got %v", cfg.Anomaly.LifecycleAlertFromPct)
+	if !(agg.Anomaly.InfoMinNotionalUSD < bal.Anomaly.InfoMinNotionalUSD) {
+		t.Errorf("aggressive Info notional must be lower than balanced: %v vs %v",
+			agg.Anomaly.InfoMinNotionalUSD, bal.Anomaly.InfoMinNotionalUSD)
 	}
-	if cfg.Anomaly.SingleMinBaselineTrades > 10 {
-		t.Errorf("aggressive baseline-trade floor should be small, got %d", cfg.Anomaly.SingleMinBaselineTrades)
+	if !(agg.Anomaly.LifecycleAlertFromPct < bal.Anomaly.LifecycleAlertFromPct) {
+		t.Errorf("aggressive lifecycle gate must fire earlier than balanced: %v vs %v",
+			agg.Anomaly.LifecycleAlertFromPct, bal.Anomaly.LifecycleAlertFromPct)
+	}
+	if !(agg.Anomaly.SingleMinBaselineTrades < bal.Anomaly.SingleMinBaselineTrades) {
+		t.Errorf("aggressive baseline-trade floor must be lower than balanced: %d vs %d",
+			agg.Anomaly.SingleMinBaselineTrades, bal.Anomaly.SingleMinBaselineTrades)
+	}
+	if !(agg.Anomaly.BaselineMinReadySpan < bal.Anomaly.BaselineMinReadySpan) {
+		t.Errorf("aggressive baseline span must be shorter than balanced: %v vs %v",
+			agg.Anomaly.BaselineMinReadySpan, bal.Anomaly.BaselineMinReadySpan)
 	}
 }
 

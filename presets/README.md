@@ -9,8 +9,8 @@ before `make run`.
 | Preset         | Info notional ≥ | Info multiplier ≥ | Lifecycle gate | HOT marker | Cluster trigger              | Intended use |
 |----------------|-----------------|-------------------|----------------|------------|------------------------------|--------------|
 | `conservative` | $50,000         | 500×              | 85%            | 95%        | 5 trades, 3 wallets, $100k   | Pager-grade — strongest signals only. |
-| `balanced`     | $10,000         | 100×              | 75%            | 90%        | 3 trades, 2 wallets, $50k    | Day-to-day product alerting (default). |
-| `aggressive`   | $2,500          | 30×               | 60%            | 85%        | 2 trades, 2 wallets, $5k     | Local exploration / debugging — expect noise. |
+| `balanced`     | $5,000          | 75×               | 75%            | 90%        | 3 trades, 2 wallets, $50k    | Day-to-day production alerting after the first-week validation period. |
+| `aggressive`   | $2,000          | 20×               | 60%            | 85%        | 3 trades, 2 wallets, $25k    | Live validation profile — Info volume large enough to see end-to-end signal without becoming retail-spam. Projection sized from the live DB via `cli diagnose-alerts`. |
 
 ## Worked examples — does this trade alert?
 
