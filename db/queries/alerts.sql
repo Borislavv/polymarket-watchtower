@@ -132,6 +132,35 @@ SET outcome_checked_at = NOW(),
     updated_at         = NOW()
 WHERE id = $1;
 
+-- name: ListAlertsForReaction :many
+-- Returns sent alerts with a known outcome that haven't yet had a
+-- Telegram reaction applied. The index idx_alerts_reaction_pending
+-- (migration 00007) makes this a partial-index scan. Ordering by
+-- resolved_at keeps the reactor processing newest-resolution-first so
+-- recent reactions appear before historical backfill.
+SELECT a.*
+FROM polymarket_alerts a
+WHERE a.status                   = 'sent'
+  AND a.telegram_message_id     IS NOT NULL
+  AND a.outcome_status          IN ('resolved_correct','resolved_wrong','unknown')
+  AND a.telegram_reaction_status IN ('pending','failed')
+ORDER BY a.resolved_at DESC NULLS LAST, a.id
+LIMIT sqlc.arg(claim_limit)::integer;
+
+-- name: MarkAlertReactionApplied :exec
+-- Stamps a successful setMessageReaction result on the alert row.
+-- Status MUST be one of the CHECK-constrained values
+-- (applied/unsupported/failed/disabled); the caller maps the verdict.
+UPDATE polymarket_alerts
+SET telegram_reaction_status = sqlc.arg(status)::text,
+    telegram_reaction_emoji  = sqlc.narg(emoji)::text,
+    last_reaction_at         = CASE
+                                  WHEN sqlc.arg(status)::text = 'applied' THEN NOW()
+                                  ELSE last_reaction_at
+                               END,
+    updated_at               = NOW()
+WHERE id = $1;
+
 -- name: ListSentAlertsForDrift :many
 -- Used by the drift worker. Returns sent alerts whose drift is still
 -- pending AND whose oldest reference window (15m by convention) has

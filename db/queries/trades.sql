@@ -63,6 +63,25 @@ WHERE market_id     = sqlc.arg(market_id)::bigint
   AND outcome_token = sqlc.arg(outcome_token)::text
   AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);
 
+-- name: OwnershipShares :one
+-- Server-side aggregate of (wallet, market, outcome) share-count flow
+-- vs the outcome's total BUY-side flow. Powers the trade-flow
+-- approximation of market-ownership concentration.
+--
+-- IMPORTANT: this is an APPROXIMATION, not a holders read. The CLOB
+-- API holders endpoint is not wired upstream. `wallet_buy_shares` and
+-- `wallet_sell_shares` are summed only over trades the watchtower
+-- ingested; a wallet that transferred shares off-chain or sold to a
+-- counterparty whose trade we didn't observe is invisible to this
+-- query. Treat the percentage as directional, not authoritative.
+SELECT
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'BUY'  AND trader_id = sqlc.arg(trader_id)::bigint), 0)::double precision AS wallet_buy_shares,
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'SELL' AND trader_id = sqlc.arg(trader_id)::bigint), 0)::double precision AS wallet_sell_shares,
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'BUY'),                                              0)::double precision AS market_buy_shares
+FROM polymarket_trades
+WHERE market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text;
+
 -- name: ListTradesForBackfillPage :many
 -- Used by the BackfillWorker to verify which fetched trade dedup_keys are
 -- already persisted (defence in depth on top of ON CONFLICT DO NOTHING).

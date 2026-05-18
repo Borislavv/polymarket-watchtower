@@ -354,6 +354,41 @@ The v2 additions are gated on Postgres being wired. In memory/debug mode
 the detector falls back cleanly to v1 behaviour (market-only scoring, no
 MM suppression). Tests do not need either axis configured.
 
+## Strategies A, B, E — lifetime accumulation, new-wallet context, ownership concentration
+
+Strategy A widens the accumulation detector to evaluate BOTH a recent
+window (24h default) AND a lifetime window (full stored history). The
+math is identical; per-window dedup keeps them from spamming:
+
+  - `accumulation:<sv>:recent:<wallet>:<mid>:<token>:<side>:<bucket>`
+    — cooldown-bucket dedup (existing behaviour)
+  - `accumulation:<sv>:lifetime:<wallet>:<mid>:<token>:<side>:<severity>`
+    — exactly one alert per severity tier per line. Severity upgrades
+    emit one new alert per tier.
+
+Strategy B is a CONTEXT BOOSTER only. After a single-trade or
+accumulation alert qualifies, the detector reads
+`polymarket_traders.first_seen_at` and the wallet's trade count, and
+attaches `NEW_WALLET_LARGE_BET` / `NEW_WALLET_ACCUMULATION` /
+`LOW_TRADER_HISTORY` reason codes when EITHER `age < NEW_WALLET_MAX_AGE`
+OR `historyTrades ≤ NEW_WALLET_MAX_HISTORY_TRADES`. Never standalone,
+never promotes severity.
+
+Strategy E is a DISTINCT ALERT KIND `ownership_concentration` fired
+alongside the accumulation path (not standalone, not a separate
+worker). APPROXIMATION — no holders endpoint is wired upstream; the
+percentage is `(wallet_net_BUY_shares / market_total_BUY_shares) × 100`
+from polymarket_trades. Per-tier dedup; severity upgrades emit one
+new alert at each tier.
+
+Deferred: Strategy D persisted watchlist + worker. Available
+per-wallet outcome data is `polymarket_alerts.outcome_status` only —
+biased toward already-alerted wallets. A persisted watchlist driven
+by alerts-on-alerts would mislead. Build when per-trade resolved-PnL
+data lands.
+
+Full doc: `doc/strategies/lifetime-and-context.md`.
+
 ## Cluster rule
 
 `Cluster.Detector` accumulates fired `TradeRef`s per category in a sliding

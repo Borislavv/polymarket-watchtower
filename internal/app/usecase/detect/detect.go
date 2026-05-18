@@ -29,6 +29,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/ownership"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
@@ -86,6 +87,13 @@ type AccumulationLineFetcher interface {
 // *repository.TradeRepository.
 type LastTradeBeforeFetcher interface {
 	LastTradedAtBefore(ctx context.Context, marketID int64, outcomeToken string, before time.Time) (time.Time, error)
+}
+
+// OwnershipSharesFetcher returns the trade-flow approximation of a
+// wallet's position vs the outcome's total recorded BUY flow. Satisfied
+// by *repository.TradeRepository.
+type OwnershipSharesFetcher interface {
+	OwnershipShares(ctx context.Context, q repository.OwnershipSharesQuery) (repository.OwnershipShares, error)
 }
 
 // AlertCreator is the dedup primitive. TryCreatePending must:
@@ -166,6 +174,20 @@ type Config struct {
 	// *repository.TradeRepository.
 	AccumulationLines AccumulationLineFetcher
 
+	// Ownership is the market-ownership concentration detector (Strategy
+	// E). nil = disabled. The detector piggybacks on the accumulation
+	// path — when an accumulation alert fires AND OwnershipShares is
+	// wired, the share-flow approximation is evaluated, and a SEPARATE
+	// KindOwnership Finding is emitted at the qualifying tier. Per-tier
+	// dedup keeps it from spamming. By coupling to the accumulation
+	// firing condition we avoid a standalone worker AND ensure
+	// ownership only fires on wallets with a meaningful position
+	// shape — micro-trades cannot trigger it.
+	Ownership *ownership.Detector
+	// OwnershipShares satisfies the (wallet, market, outcome) share-flow
+	// read; in production it's *repository.TradeRepository.
+	OwnershipShares OwnershipSharesFetcher
+
 	// QuietMarket is the quiet-market wake-up detector. nil = disabled.
 	// When set together with LastTradeFetcher and (for single-trade) the
 	// market Baseliner, it stamps Finding.QuietMarket + appends
@@ -189,6 +211,30 @@ type Config struct {
 	// Defaults to "v2" (strategy upgrade adds trader-axis multiplier +
 	// MM/arb suppression on top of v1).
 	StrategyVersion string
+
+	// NewWallet gates the wallet-age context booster. A wallet is "new"
+	// when its FirstSeenAt is younger than NewWallet.MaxAge OR its
+	// stored history is shorter than NewWallet.MaxHistoryTrades. New-
+	// wallet status is attached to single-trade and accumulation
+	// Findings as reason codes — never as a standalone alert. Disabled
+	// when NewWallet.Enabled is false OR cfg.Traders is nil.
+	NewWallet NewWalletConfig
+}
+
+// NewWalletConfig tunes the new-wallet context booster (Strategy B).
+// The gate uses two complementary signals — recency of first activity
+// (age from FirstSeenAt) and depth of history (trade count). A wallet
+// is "new" when EITHER signal trips, so a long-dormant wallet that just
+// reactivated with a single big bet still qualifies.
+type NewWalletConfig struct {
+	Enabled bool
+	// MaxAge is the cutoff for "new" by FirstSeenAt. 168h (7d) is the
+	// default. 0 disables the age leg (history-only).
+	MaxAge time.Duration
+	// MaxHistoryTrades is the cutoff for "new" by trade count. A wallet
+	// with ≤ this many stored trades is flagged regardless of age. 10
+	// is the default. 0 disables the history leg (age-only).
+	MaxHistoryTrades int
 }
 
 // Loop owns the analytics state.
@@ -390,7 +436,12 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	// MM filter is also reused — balanced two-sided activity is the same
 	// false-positive shape here as it is for single-trade.
 	if gateAllowsAlert {
-		l.evaluateAccumulation(ctx, market, trade, categories, traderStats, lifecyclePct, hot)
+		// Evaluate BOTH accumulation horizons. Recent catches bursty
+		// accumulation inside the Cooldown window; lifetime catches
+		// slow-drip conviction across days/weeks/months. Per-window
+		// dedup keys keep them from spamming each other.
+		l.evaluateAccumulationWindow(ctx, market, trade, categories, traderStats, lifecyclePct, hot, accumulation.WindowKindRecent)
+		l.evaluateAccumulationWindow(ctx, market, trade, categories, traderStats, lifecyclePct, hot, accumulation.WindowKindLifetime)
 	}
 }
 
@@ -546,6 +597,19 @@ func (l *Loop) emitTradeAnomaly(
 	// above by score.Score).
 	l.stampQuietMarket(ctx, &f, m, baseline.Key{Category: cat, Market: m.ID, OutcomeToken: t.Token},
 		stats, ref.NotionalUSD, t.Timestamp)
+	// New-wallet context booster: attaches NEW_WALLET_LARGE_BET (and
+	// LOW_TRADER_HISTORY when the wallet's stored history is thin) when
+	// the firing wallet matches Config.NewWallet thresholds.
+	if nw := l.newWalletRef(ctx, ref.Wallet, traderStats.Count); nw != nil {
+		f.NewWallet = nw
+		f.Reasons = append(f.Reasons, anomaly.ReasonNewWalletLargeBet)
+		if l.cfg.NewWallet.MaxHistoryTrades > 0 && traderStats.Count <= l.cfg.NewWallet.MaxHistoryTrades {
+			f.Reasons = append(f.Reasons, anomaly.ReasonLowTraderHistory)
+		}
+		if l.metrics != nil && l.metrics.NewWalletReasons != nil {
+			l.metrics.NewWalletReasons.WithLabelValues(string(anomaly.KindTradeAnomaly), string(sr.Severity)).Inc()
+		}
+	}
 
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
 	if axis := string(sr.MultiplierAxis); axis != "" {
@@ -636,10 +700,10 @@ func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedu
 	return created
 }
 
-// evaluateAccumulation runs the same-trader accumulation detector for the
-// trade's (wallet, market, outcome, side) bucket. Per-trade trigger keeps
-// the alert latency low; the DB query is backed by
-// idx_trades_trader_market_outcome_side_time.
+// evaluateAccumulationWindow runs the same-trader accumulation detector
+// for the trade's (wallet, market, outcome, side) bucket against a
+// specific horizon. The horizon controls only the SQL Since cutoff and
+// the dedup-key namespace; the detector math is identical for both.
 //
 // Skips quietly when:
 //   - the accumulator is disabled or unwired (cfg.Accumulator / cfg.AccumulationLines nil);
@@ -649,9 +713,9 @@ func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedu
 //   - the MM/arb filter classifies the wallet two-sided.
 //
 // Severity emission, metrics, dedup, and realtime sink fanout follow the
-// same shape as the single-trade path so the two signals are operationally
-// uniform.
-func (l *Loop) evaluateAccumulation(
+// same shape as the single-trade path so the two signals are
+// operationally uniform.
+func (l *Loop) evaluateAccumulationWindow(
 	ctx context.Context,
 	m market.Market,
 	t trade.Trade,
@@ -659,6 +723,7 @@ func (l *Loop) evaluateAccumulation(
 	traderStats baseline.Stats,
 	lifecyclePct float64,
 	hot bool,
+	wk accumulation.WindowKind,
 ) {
 	if l.cfg.Accumulator == nil || l.cfg.AccumulationLines == nil {
 		return
@@ -694,7 +759,13 @@ func (l *Loop) evaluateAccumulation(
 		return
 	}
 
-	since := l.now().Add(-l.cfg.Accumulator.Config().Window)
+	// Recent windows are bounded by the configured Cooldown-window; the
+	// lifetime window passes a zero time so the SQL's NULL-since branch
+	// reads every stored trade for this (wallet, market, outcome, side).
+	var since time.Time
+	if wk == accumulation.WindowKindRecent {
+		since = l.now().Add(-l.cfg.Accumulator.Config().Window)
+	}
 	rep, err := l.cfg.AccumulationLines.AccumulationLineSummary(ctx, repository.AccumulationLineQuery{
 		TraderID:     *tid,
 		MarketID:     *mid,
@@ -716,6 +787,7 @@ func (l *Loop) evaluateAccumulation(
 		MarketID:          string(m.ID),
 		OutcomeToken:      string(t.Token),
 		Side:              t.Side,
+		Window:            wk,
 		TradeCount:        int(rep.TradeCount),
 		TotalNotionalUSD:  rep.TotalNotionalUSD,
 		MeanNotionalUSD:   rep.MeanNotionalUSD,
@@ -827,6 +899,7 @@ func (l *Loop) evaluateAccumulation(
 			Confidence:        v.Confidence,
 			Reasons:           reasonStrs,
 			SizePath:          v.SizePath,
+			Window:            string(wk),
 		},
 		Baseline: &anomaly.BaselineRef{
 			Scope:     fmt.Sprintf("category=%s market=%s outcome=%s", nonEmpty(catRef.Label, "uncategorised"), m.Slug, nonEmpty(m.OutcomeLabel(t.Token), "?")),
@@ -869,15 +942,147 @@ func (l *Loop) evaluateAccumulation(
 		}
 	}
 	l.stampQuietMarket(ctx, &f, m, bk, marketHist, rep.TotalNotionalUSD, rep.OldestAt)
-	l.metrics.AccumulationAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat)).Inc()
+	// Append a window-tagging reason so an operator reading the alert in
+	// Telegram can tell a 24h burst (RECENT_ACCUMULATION) from a slow
+	// drip (LIFETIME_ACCUMULATION). The accumulation Finding renderer
+	// flattens these into the Why block alongside the detector's
+	// per-tier reasons.
+	switch wk {
+	case accumulation.WindowKindLifetime:
+		f.Reasons = append(f.Reasons, anomaly.ReasonLifetimeAccumulation)
+	case accumulation.WindowKindRecent:
+		f.Reasons = append(f.Reasons, anomaly.ReasonRecentAccumulation)
+	}
+	// New-wallet context booster: a fresh wallet that has already built
+	// a meaningful line is qualitatively more suspicious than the same
+	// line from a long-history wallet.
+	if nw := l.newWalletRef(ctx, t.Taker, traderStats.Count); nw != nil {
+		f.NewWallet = nw
+		f.Reasons = append(f.Reasons, anomaly.ReasonNewWalletAccumulation)
+		if l.cfg.NewWallet.MaxHistoryTrades > 0 && traderStats.Count <= l.cfg.NewWallet.MaxHistoryTrades {
+			f.Reasons = append(f.Reasons, anomaly.ReasonLowTraderHistory)
+		}
+		if l.metrics != nil && l.metrics.NewWalletReasons != nil {
+			l.metrics.NewWalletReasons.WithLabelValues(string(anomaly.KindAccumulation), string(v.Severity)).Inc()
+		}
+	}
+	l.metrics.AccumulationAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat), string(wk)).Inc()
 
-	dedup := l.accumulationDedupKey(t.Taker, *mid, string(t.Token), string(t.Side))
+	dedup := l.accumulationDedupKey(wk, t.Taker, *mid, string(t.Token), string(t.Side), v.Severity)
 	f.DedupKey = dedup
 	if !l.persistAlert(ctx, repository.AlertKindAccumulation, dedup, m, t, f) {
 		return
 	}
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit accumulation failed")
+	}
+
+	// Strategy E hook: once an accumulation alert is established, check
+	// whether the wallet's net position has crossed an ownership-
+	// concentration tier. Coupling ownership to the accumulation firing
+	// condition is the harmonization mechanic — ownership cannot fire
+	// on micro-trades and never spams on its own. Only invoked from the
+	// recent-window emission so a long-history line doesn't double-
+	// emit ownership across both windows.
+	if wk == accumulation.WindowKindRecent {
+		l.evaluateOwnership(ctx, m, t, *tid, *mid, cat, t.Price)
+	}
+}
+
+// evaluateOwnership runs the Strategy-E concentration check for the
+// (wallet, market, outcome) the accumulation path just alerted on.
+// Emits a separate KindOwnership Finding when the wallet's trade-flow-
+// approximated share crossed at least the Info tier AND the absolute-
+// notional floor. Per-tier dedup prevents repeated alerts at the same
+// level; an upgrade (Info → Warning → Critical) emits one new alert at
+// each tier.
+//
+// Returns silently when:
+//   - the detector or its repository read is unwired;
+//   - the trade-flow query returns zero denominator (impossible on a
+//     real accumulating wallet but defensive);
+//   - the verdict didn't fire.
+func (l *Loop) evaluateOwnership(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	traderID, marketID int64,
+	cat vo.CategoryID,
+	priceHint float64,
+) {
+	if l.cfg.Ownership == nil || l.cfg.OwnershipShares == nil {
+		return
+	}
+	row, err := l.cfg.OwnershipShares.OwnershipShares(ctx, repository.OwnershipSharesQuery{
+		TraderID:     traderID,
+		MarketID:     marketID,
+		OutcomeToken: string(t.Token),
+	})
+	if err != nil {
+		l.log.Err(err).Str("wallet", t.Taker).Msg("detect: ownership read failed")
+		return
+	}
+	v := l.cfg.Ownership.Decide(ownership.Shares{
+		WalletBuyShares:  row.WalletBuyShares,
+		WalletSellShares: row.WalletSellShares,
+		MarketBuyShares:  row.MarketBuyShares,
+		PriceHint:        priceHint,
+	})
+	if !v.Fired {
+		return
+	}
+	reasonStrs := make([]string, 0, len(v.Reasons))
+	for _, r := range v.Reasons {
+		reasonStrs = append(reasonStrs, string(r))
+	}
+	catRef := l.categoryRef(cat)
+	f := anomaly.Finding{
+		Kind:     anomaly.KindOwnership,
+		Severity: v.Severity,
+		At:       l.now(),
+		Reason:   anomaly.ReasonOwnership,
+		Trade: &anomaly.TradeRef{
+			ID:          t.ID,
+			Wallet:      t.Taker,
+			Market:      m.ID,
+			Slug:        m.Slug,
+			Question:    m.Question,
+			Outcome:     m.OutcomeLabel(t.Token),
+			Side:        t.Side,
+			SizeShares:  t.Size,
+			Price:       t.Price,
+			NotionalUSD: v.NotionalUSD, // wallet's position dollar estimate
+			At:          t.Timestamp,
+		},
+		Category: &catRef,
+		Ownership: &anomaly.OwnershipRef{
+			Wallet:            t.Taker,
+			MarketID:          string(m.ID),
+			OutcomeToken:      string(t.Token),
+			Outcome:           m.OutcomeLabel(t.Token),
+			SharePct:          v.SharePct,
+			WalletNetShares:   v.NetShares,
+			MarketTotalShares: row.MarketBuyShares,
+			NotionalUSD:       v.NotionalUSD,
+			Approximate:       true,
+		},
+		Reasons:     reasonStrs,
+		MarketURL:   l.marketURL(m),
+		CategoryURL: l.categoryURL(catRef),
+		TraderURL:   l.traderURL(t.Taker),
+		GrafanaURL:  l.grafanaURL(catRef, m, t.Timestamp, v.Severity),
+	}
+	dedup := fmt.Sprintf("ownership:%s:%s:%d:%s:%s",
+		l.cfg.StrategyVersion, t.Taker, marketID, string(t.Token), v.Severity)
+	f.DedupKey = dedup
+	if !l.persistAlert(ctx, repository.AlertKindOwnership, dedup, m, t, f) {
+		return
+	}
+	if l.metrics != nil && l.metrics.OwnershipAlerts != nil {
+		l.metrics.OwnershipAlerts.WithLabelValues(string(v.Severity), categoryLabelByID(l, cat)).Inc()
+	}
+	if err := l.emit.Notify(ctx, f); err != nil {
+		l.log.Err(err).Msg("detect: emit ownership failed")
 	}
 }
 
@@ -954,19 +1159,34 @@ func (l *Loop) marketHistoryStats(ctx context.Context, bk baseline.Key) baseline
 	return l.baseline.Stats(bk)
 }
 
-// accumulationDedupKey produces
-// "accumulation:<strategy>:<wallet>:<market_id>:<outcome_token>:<side>:<bucket>".
-// bucket is floor(now / cooldown), so two accumulation alerts on the same
-// line landing inside one cooldown window dedup; the next bucket gets a
-// fresh key, matching the cooldown contract.
-func (l *Loop) accumulationDedupKey(wallet string, marketID int64, outcomeToken, side string) string {
-	bucket := l.cfg.Accumulator.Config().Cooldown
-	if bucket <= 0 {
-		bucket = 30 * time.Minute
+// accumulationDedupKey produces a window- and severity-aware dedup key.
+//
+//   - WindowKindRecent → "accumulation:<sv>:recent:<wallet>:<mid>:<token>:<side>:<bucket>"
+//     bucket is floor(now / cooldown). Two firings on the same line
+//     inside one cooldown window collide; the next bucket gets a fresh
+//     key, matching the cooldown contract.
+//
+//   - WindowKindLifetime → "accumulation:<sv>:lifetime:<wallet>:<mid>:<token>:<side>:<severity>"
+//     no bucket — exactly one alert per line per severity tier ever. A
+//     line that crosses Info → Warning → Critical emits THREE distinct
+//     alerts, one at each tier; a line that stays at Info emits exactly
+//     one Info alert across its entire lifetime.
+func (l *Loop) accumulationDedupKey(wk accumulation.WindowKind, wallet string, marketID int64, outcomeToken, side string, severity anomaly.Severity) string {
+	switch wk {
+	case accumulation.WindowKindLifetime:
+		return fmt.Sprintf("accumulation:%s:lifetime:%s:%d:%s:%s:%s",
+			l.cfg.StrategyVersion, wallet, marketID, outcomeToken, side, severity)
+	default:
+		// Recent (and any unknown kind) keeps the time-bucket dedup
+		// behaviour that the cooldown contract expects.
+		bucket := l.cfg.Accumulator.Config().Cooldown
+		if bucket <= 0 {
+			bucket = 30 * time.Minute
+		}
+		bucketStart := l.now().Truncate(bucket).Unix()
+		return fmt.Sprintf("accumulation:%s:recent:%s:%d:%s:%s:%d",
+			l.cfg.StrategyVersion, wallet, marketID, outcomeToken, side, bucketStart)
 	}
-	bucketStart := l.now().Truncate(bucket).Unix()
-	return fmt.Sprintf("accumulation:%s:%s:%d:%s:%s:%d",
-		l.cfg.StrategyVersion, wallet, marketID, outcomeToken, side, bucketStart)
 }
 
 // categoryLabelByID returns the category label for the registry id, or
@@ -1053,6 +1273,48 @@ func (l *Loop) resolveTraderID(ctx context.Context, wallet string) *int64 {
 	}
 	id := t.ID
 	return &id
+}
+
+// newWalletRef evaluates the Strategy-B context booster: wallet age and
+// trade-count are read against the configured thresholds; a wallet that
+// trips EITHER gate is flagged as new. Returns nil when:
+//
+//   - the booster is disabled (Config.NewWallet.Enabled=false),
+//   - cfg.Traders is unwired (no source for FirstSeenAt),
+//   - the wallet is empty or unknown to the DB.
+//
+// historyTrades comes from the trader-baseline stats (already fetched
+// once per Observe call), so this helper does ONE extra DB call per
+// scored trade — the GetByWallet primary-key lookup on
+// polymarket_traders.
+//
+// Surveillance read: a wallet first seen 4 hours ago placing a $10k bet
+// at 10x odds is a stronger informed-flow shape than the same trade
+// from a 3-year-old wallet with thousands of trades. The booster
+// attaches a reason code so the operator sees the shape at a glance.
+func (l *Loop) newWalletRef(ctx context.Context, wallet string, historyTrades int) *anomaly.NewWalletRef {
+	if !l.cfg.NewWallet.Enabled || l.cfg.Traders == nil || wallet == "" {
+		return nil
+	}
+	tr, err := l.cfg.Traders.GetByWallet(ctx, wallet)
+	if err != nil {
+		// ErrTraderNotFound and any transient error degrade silently —
+		// the booster is informational, the alert must still fire.
+		return nil
+	}
+	now := l.now()
+	age := now.Sub(tr.FirstSeenAt)
+	ageGate := l.cfg.NewWallet.MaxAge > 0 && age <= l.cfg.NewWallet.MaxAge
+	historyGate := l.cfg.NewWallet.MaxHistoryTrades > 0 && historyTrades <= l.cfg.NewWallet.MaxHistoryTrades
+	if !ageGate && !historyGate {
+		return nil
+	}
+	return &anomaly.NewWalletRef{
+		FirstSeenAt:   tr.FirstSeenAt,
+		AgeAtTrade:    age,
+		HistoryTrades: int64(historyTrades),
+		IsNew:         true,
+	}
 }
 
 // allowed reports whether the category passes the whitelist. Uncategorised

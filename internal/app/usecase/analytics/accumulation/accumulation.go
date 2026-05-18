@@ -60,6 +60,25 @@ const (
 // it's emitted on MM-suppression telemetry, not on accumulation alerts).
 // See internal/app/usecase/analytics/mmfilter.ReasonPossibleMarketMaker.
 
+// WindowKind names the time horizon the line was aggregated over. The
+// detector's math is identical for both — the kind exists only so the
+// caller can carry it through to the dedup namespace and the alert
+// payload (an operator should be able to tell at a glance whether a
+// firing is a 24h burst or a 90-day slow drip).
+type WindowKind string
+
+const (
+	// WindowKindRecent is the bursty short-window line (default 24h).
+	// Detects fast accumulation; emissions are bucketed by Cooldown so a
+	// continuing burst dedupes within the same bucket.
+	WindowKindRecent WindowKind = "recent"
+	// WindowKindLifetime is the full-history line (since=NULL on the SQL
+	// side). Detects slow-drip conviction across days/weeks/months.
+	// Emissions dedupe per (line, severity tier) so a line that crosses
+	// Info → Warning → Critical emits exactly once at each tier.
+	WindowKindLifetime WindowKind = "lifetime"
+)
+
 // Line is the input the scorer needs. Repositories project their server-
 // side roll-up into this shape so the math runs once over a single value
 // type and stays trivially testable.
@@ -68,6 +87,11 @@ type Line struct {
 	MarketID     string
 	OutcomeToken string
 	Side         trade.Side
+	// Window names the horizon this line covers. Purely a tag — does not
+	// affect the gating math. The detector passes it through to Verdict
+	// so the caller can build a window-aware dedup key without re-
+	// deriving the kind from the Since cutoff.
+	Window WindowKind
 
 	TradeCount        int
 	TotalNotionalUSD  float64
@@ -193,6 +217,9 @@ type Verdict struct {
 	Score      int     // 0..100 — heuristic surfaced for triage; not a probability
 	Confidence float64 // 0..1 — sample-size + readiness adjustment
 	Reasons    []ReasonCode
+	// Window echoes Line.Window so callers can build a window-aware
+	// dedup key off the Verdict alone.
+	Window WindowKind
 	// Diagnostic fields (always populated, even when Fired=false).
 	LineMarketMultiplier float64
 	LineTraderMultiplier float64
@@ -221,6 +248,7 @@ func (d *Detector) Config() Config { return d.cfg }
 // payload (operators inspecting a near-miss find the numbers there).
 func (d *Detector) Decide(line Line) Verdict {
 	v := Verdict{
+		Window:               line.Window,
 		LineMarketMultiplier: line.MarketMultiplier(),
 		LineTraderMultiplier: line.TraderMultiplier(),
 	}

@@ -39,6 +39,26 @@ type PolymarketAlerts struct {
 	Clv1h               *float64
 	Clv6h               *float64
 	Clv24h              *float64
+	// Telegram outcome-reaction state. Added by migration 00007.
+	TelegramReactionStatus string
+	TelegramReactionEmoji  *string
+	LastReactionAt         pgtype.Timestamptz
+}
+
+type PolymarketSignalReports struct {
+	ID                int64
+	PeriodType        string
+	PeriodStart       pgtype.Timestamptz
+	PeriodEnd         pgtype.Timestamptz
+	ScheduledAt       pgtype.Timestamptz
+	SentAt            pgtype.Timestamptz
+	Status            string
+	TelegramMessageID *int64
+	LastError         *string
+	Payload           []byte
+	DedupKey          string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
 }
 
 type PolymarketCategories struct {

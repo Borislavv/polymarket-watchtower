@@ -346,6 +346,45 @@ func (r *TradeRepository) AccumulationLineSummary(ctx context.Context, q Accumul
 	}, nil
 }
 
+// OwnershipSharesQuery scopes an ownership-shares aggregate read.
+type OwnershipSharesQuery struct {
+	TraderID     int64
+	MarketID     int64
+	OutcomeToken string
+}
+
+// OwnershipShares is the repository projection of the per-(wallet,
+// market, outcome) flow totals used by the ownership-concentration
+// detector. APPROXIMATION — the watchtower has no holders endpoint
+// wired upstream, so these are summed only over ingested trades. A
+// wallet that transferred shares off-chain or traded with a wallet we
+// didn't observe is invisible here. See the package doc on
+// internal/app/usecase/analytics/ownership for the surveillance
+// caveat.
+type OwnershipShares struct {
+	WalletBuyShares  float64
+	WalletSellShares float64
+	MarketBuyShares  float64
+}
+
+// OwnershipShares returns the trade-flow approximation of the wallet's
+// position vs the outcome's total recorded BUY flow.
+func (r *TradeRepository) OwnershipShares(ctx context.Context, q OwnershipSharesQuery) (OwnershipShares, error) {
+	row, err := r.q.OwnershipShares(ctx, sqlc.OwnershipSharesParams{
+		TraderID:     q.TraderID,
+		MarketID:     q.MarketID,
+		OutcomeToken: q.OutcomeToken,
+	})
+	if err != nil {
+		return OwnershipShares{}, fmt.Errorf("ownership shares: %w", err)
+	}
+	return OwnershipShares{
+		WalletBuyShares:  row.WalletBuyShares,
+		WalletSellShares: row.WalletSellShares,
+		MarketBuyShares:  row.MarketBuyShares,
+	}, nil
+}
+
 func tradeFromSQLC(row sqlc.PolymarketTrades) Trade {
 	return Trade{
 		ID:           row.ID,

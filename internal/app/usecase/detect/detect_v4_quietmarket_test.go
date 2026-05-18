@@ -260,14 +260,20 @@ func TestQuietMarket_Accumulation_AppliesToLineFinding(t *testing.T) {
 	loop.Observe(context.Background(), m, bet(200, 0.25, "0xwhale", now))
 
 	got := emit.of(anomaly.KindAccumulation)
-	if len(got) != 1 {
-		t.Fatalf("expected accumulation alert: %d", len(got))
+	// Strategy-A: dual-window evaluation emits both recent + lifetime
+	// accumulation Findings for a line that clears both. Both must
+	// carry the quiet-market stamp because both passed the same context
+	// gate.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 accumulation alerts (recent + lifetime), got %d", len(got))
 	}
-	if got[0].QuietMarket == nil {
-		t.Fatalf("accumulation Finding must carry QuietMarket context: %+v", got[0])
-	}
-	if !contains(got[0].Reasons, quietmarket.ReasonQuietMarketWakeup) {
-		t.Errorf("accumulation Finding.Reasons must include quiet wake-up: %v", got[0].Reasons)
+	for i, g := range got {
+		if g.QuietMarket == nil {
+			t.Fatalf("accumulation Finding[%d] (%s) must carry QuietMarket context: %+v", i, g.Accumulation.Window, g)
+		}
+		if !contains(g.Reasons, quietmarket.ReasonQuietMarketWakeup) {
+			t.Errorf("accumulation Finding[%d] (%s) Reasons must include quiet wake-up: %v", i, g.Accumulation.Window, g.Reasons)
+		}
 	}
 }
 

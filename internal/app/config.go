@@ -365,6 +365,26 @@ type AnomalyConfig struct {
 	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
 	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
 	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
+
+	// New-wallet context booster (Strategy B). Attaches NEW_WALLET_*
+	// reason codes to single-trade and accumulation Findings when the
+	// firing wallet is "new" — first seen within MaxAge OR with ≤
+	// MaxHistoryTrades stored trades. Never a standalone alert.
+	NewWalletEnabled          bool          `env:"NEW_WALLET_ENABLED" envDefault:"true"`
+	NewWalletMaxAge           time.Duration `env:"NEW_WALLET_MAX_AGE" envDefault:"168h" validate:"gte=0"`
+	NewWalletMaxHistoryTrades int           `env:"NEW_WALLET_MAX_HISTORY_TRADES" envDefault:"10" validate:"gte=0"`
+
+	// Ownership concentration (Strategy E). Distinct alert kind
+	// `ownership_concentration`. Fired alongside the accumulation path
+	// when a wallet's trade-flow share crosses a tier AND the absolute
+	// position notional clears the floor. APPROXIMATION — no holders
+	// endpoint is wired upstream; see
+	// internal/app/usecase/analytics/ownership doc.
+	OwnershipEnabled        bool    `env:"OWNERSHIP_CONCENTRATION_ENABLED" envDefault:"true"`
+	OwnershipInfoPct        float64 `env:"OWNERSHIP_INFO_PCT" envDefault:"10" validate:"gt=0,lt=100"`
+	OwnershipWarningPct     float64 `env:"OWNERSHIP_WARNING_PCT" envDefault:"15" validate:"gt=0,lt=100"`
+	OwnershipCriticalPct    float64 `env:"OWNERSHIP_CRITICAL_PCT" envDefault:"25" validate:"gt=0,lt=100"`
+	OwnershipMinNotionalUSD float64 `env:"OWNERSHIP_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
 }
 
 // AlertingConfig wires sinks. The Telegram sink sends to a single configured
@@ -398,21 +418,59 @@ type StatsReportConfig struct {
 	StartupGrace time.Duration `env:"TELEGRAM_STATS_STARTUP_GRACE" envDefault:"0"`
 }
 
+// SignalReportConfig wires the scheduled signal-quality reports
+// (daily / weekly / monthly / quarterly / yearly). Decisions:
+//
+//   - Timezone is operator-controlled. Etc/GMT-3 = UTC+3 in the IANA
+//     database (the sign is inverted by historical convention).
+//   - Send time is per-period because the daily report at 08:00 and a
+//     yearly report at 09:00 might be reasonable for a different team.
+//     Defaults are all 08:00 to match the spec.
+//   - YearlyDelay (72h default) gives late upstream resolution one
+//     business cycle to settle before the year-end report locks in.
+type SignalReportConfig struct {
+	Enabled      bool          `env:"SIGNAL_REPORTS_ENABLED" envDefault:"false"`
+	Timezone     string        `env:"SIGNAL_REPORTS_TIMEZONE" envDefault:"Etc/GMT-3"`
+	DailyAt      string        `env:"SIGNAL_REPORTS_DAILY_AT" envDefault:"08:00"`
+	WeeklyAt     string        `env:"SIGNAL_REPORTS_WEEKLY_AT" envDefault:"08:00"`
+	MonthlyAt    string        `env:"SIGNAL_REPORTS_MONTHLY_AT" envDefault:"08:00"`
+	QuarterlyAt  string        `env:"SIGNAL_REPORTS_QUARTERLY_AT" envDefault:"08:00"`
+	YearlyAt     string        `env:"SIGNAL_REPORTS_YEARLY_AT" envDefault:"08:00"`
+	YearlyDelay  time.Duration `env:"SIGNAL_REPORTS_YEARLY_DELAY" envDefault:"72h"`
+	TickInterval time.Duration `env:"SIGNAL_REPORTS_TICK_INTERVAL" envDefault:"1m"`
+}
+
+// TelegramReactionsConfig wires the outcome-reaction pass on the
+// outcomes worker. Reactions are sent to the same chat the alerts
+// were sent to (TELEGRAM_CHAT_ID); the reaction emoji is operator-
+// configurable so a deployment in a channel that disabled the
+// default ✅/💭 emojis can swap in something else from the allowed
+// set.
+type TelegramReactionsConfig struct {
+	Enabled          bool   `env:"TELEGRAM_OUTCOME_REACTIONS_ENABLED" envDefault:"true"`
+	SuccessEmoji     string `env:"TELEGRAM_OUTCOME_SUCCESS_REACTION" envDefault:"👍"`
+	FailureEmoji     string `env:"TELEGRAM_OUTCOME_FAILURE_REACTION" envDefault:"👎"`
+	AmbiguousEmoji   string `env:"TELEGRAM_OUTCOME_AMBIGUOUS_REACTION" envDefault:"🤔"`
+	DisableAmbiguous bool   `env:"TELEGRAM_OUTCOME_DISABLE_AMBIGUOUS" envDefault:"false"`
+}
+
 type Config struct {
-	Application    ApplicationConfig
-	Postgres       PostgresConfig
-	Backfill       BackfillConfig
-	MarketSanity   MarketSanityConfig
-	Outcomes       OutcomesConfig
-	Drift          DriftConfig
-	AlertSender    AlertSenderConfig
-	Polymarket     PolymarketConfig
-	RateLimit      RateLimitConfig
-	Pipeline       PipelineConfig
-	Anomaly        AnomalyConfig
-	CategoryFilter CategoryFilterConfig
-	Alerting       AlertingConfig
-	StatsReport    StatsReportConfig
+	Application       ApplicationConfig
+	Postgres          PostgresConfig
+	Backfill          BackfillConfig
+	MarketSanity      MarketSanityConfig
+	Outcomes          OutcomesConfig
+	Drift             DriftConfig
+	AlertSender       AlertSenderConfig
+	SignalReport      SignalReportConfig
+	TelegramReactions TelegramReactionsConfig
+	Polymarket        PolymarketConfig
+	RateLimit         RateLimitConfig
+	Pipeline          PipelineConfig
+	Anomaly           AnomalyConfig
+	CategoryFilter    CategoryFilterConfig
+	Alerting          AlertingConfig
+	StatsReport       StatsReportConfig
 }
 
 func LoadConfig() (*Config, error) {

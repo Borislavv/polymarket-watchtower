@@ -13,12 +13,21 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
 type fakeAlerts struct {
-	candidates []repository.Alert
-	updates    []repository.OutcomeUpdate
-	touches    []int64
+	candidates    []repository.Alert
+	updates       []repository.OutcomeUpdate
+	touches       []int64
+	reactionCands []repository.Alert
+	reactionMarks []reactionMark
+}
+
+type reactionMark struct {
+	alertID int64
+	status  repository.ReactionStatus
+	emoji   string
 }
 
 func (f *fakeAlerts) ListSentForOutcomeCheck(_ context.Context, _ int32) ([]repository.Alert, error) {
@@ -32,6 +41,15 @@ func (f *fakeAlerts) MarkOutcome(_ context.Context, u repository.OutcomeUpdate) 
 
 func (f *fakeAlerts) TouchOutcomeUnavailable(_ context.Context, id int64) error {
 	f.touches = append(f.touches, id)
+	return nil
+}
+
+func (f *fakeAlerts) ListAlertsForReaction(_ context.Context, _ int32) ([]repository.Alert, error) {
+	return f.reactionCands, nil
+}
+
+func (f *fakeAlerts) MarkReaction(_ context.Context, id int64, status repository.ReactionStatus, emoji string) error {
+	f.reactionMarks = append(f.reactionMarks, reactionMark{alertID: id, status: status, emoji: emoji})
 	return nil
 }
 
@@ -254,5 +272,186 @@ func TestTick_TransientErrorTouches(t *testing.T) {
 	}
 	if len(alerts.touches) != 1 {
 		t.Errorf("expected touch on transient error, got %v", alerts.touches)
+	}
+}
+
+// fakeReactionBot satisfies ReactionSender for the reactor tests.
+type fakeReactionBot struct {
+	calls       []reactionCall
+	err         error
+	unsupported bool
+}
+
+type reactionCall struct {
+	chatID    string
+	messageID int64
+	emoji     string
+}
+
+func (f *fakeReactionBot) SetMessageReaction(_ context.Context, chatID string, messageID int64, emoji string) error {
+	f.calls = append(f.calls, reactionCall{chatID: chatID, messageID: messageID, emoji: emoji})
+	if f.unsupported {
+		return telegram.ErrReactionUnsupported
+	}
+	return f.err
+}
+
+// reactionWorker wires a Worker with reactions enabled.
+func reactionWorker(t *testing.T, alerts AlertStore, bot ReactionSender, disableAmbig bool) *Worker {
+	t.Helper()
+	log := zerolog.Nop()
+	return New(Config{
+		Interval:              time.Minute,
+		ClaimLimit:            64,
+		WinningPriceThreshold: 0.99,
+		Reactions: ReactionsConfig{
+			Enabled:          true,
+			ChatID:           "-1001",
+			SuccessEmoji:     "✅",
+			FailureEmoji:     "💭",
+			AmbiguousEmoji:   "⚠️",
+			Bot:              bot,
+			DisableAmbiguous: disableAmbig,
+		},
+	}, alerts, &fakeMarkets{}, &fakeGamma{}, &log)
+}
+
+// TestReaction_SuccessAppliesEmoji pins: a resolved-correct alert with a
+// stored message_id gets the configured success emoji on the upstream
+// message and the row flips to `applied`.
+func TestReaction_SuccessAppliesEmoji(t *testing.T) {
+	msgID := int64(99)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 1, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeCorrect},
+	}}
+	bot := &fakeReactionBot{}
+	w := reactionWorker(t, alerts, bot, false)
+
+	w.Tick(context.Background())
+
+	if len(bot.calls) != 1 {
+		t.Fatalf("expected exactly 1 setMessageReaction call, got %d", len(bot.calls))
+	}
+	if got := bot.calls[0]; got.emoji != "✅" || got.messageID != msgID || got.chatID != "-1001" {
+		t.Errorf("call mismatch: %+v", got)
+	}
+	if len(alerts.reactionMarks) != 1 {
+		t.Fatalf("expected exactly 1 MarkReaction, got %d", len(alerts.reactionMarks))
+	}
+	if mark := alerts.reactionMarks[0]; mark.status != repository.ReactionApplied || mark.emoji != "✅" {
+		t.Errorf("mark mismatch: %+v", mark)
+	}
+}
+
+// TestReaction_FailureAppliesEmoji confirms the failure-path mapping.
+func TestReaction_FailureAppliesEmoji(t *testing.T) {
+	msgID := int64(100)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 2, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeWrong},
+	}}
+	bot := &fakeReactionBot{}
+	w := reactionWorker(t, alerts, bot, false)
+
+	w.Tick(context.Background())
+
+	if bot.calls[0].emoji != "💭" {
+		t.Errorf("emoji: got %q want 💭", bot.calls[0].emoji)
+	}
+	if alerts.reactionMarks[0].status != repository.ReactionApplied {
+		t.Errorf("status: got %s want applied", alerts.reactionMarks[0].status)
+	}
+}
+
+// TestReaction_AmbiguousAppliesEmoji confirms unknown outcomes pick up
+// the ambiguous emoji when enabled.
+func TestReaction_AmbiguousAppliesEmoji(t *testing.T) {
+	msgID := int64(101)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 3, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeUnknown},
+	}}
+	bot := &fakeReactionBot{}
+	w := reactionWorker(t, alerts, bot, false)
+
+	w.Tick(context.Background())
+
+	if bot.calls[0].emoji != "⚠️" {
+		t.Errorf("emoji: got %q want ⚠️", bot.calls[0].emoji)
+	}
+}
+
+// TestReaction_AmbiguousSkippedWhenDisabled pins: with
+// DisableAmbiguous=true an unknown-outcome row is stamped `disabled`
+// and no Telegram call happens.
+func TestReaction_AmbiguousSkippedWhenDisabled(t *testing.T) {
+	msgID := int64(102)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 4, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeUnknown},
+	}}
+	bot := &fakeReactionBot{}
+	w := reactionWorker(t, alerts, bot, true)
+
+	w.Tick(context.Background())
+
+	if len(bot.calls) != 0 {
+		t.Fatalf("must not call Telegram when ambiguous is disabled: %+v", bot.calls)
+	}
+	if mark := alerts.reactionMarks[0]; mark.status != repository.ReactionDisabled {
+		t.Errorf("status: got %s want disabled", mark.status)
+	}
+}
+
+// TestReaction_UnsupportedIsTerminal confirms a Telegram unsupported
+// response persists `unsupported` (terminal — no further retries).
+func TestReaction_UnsupportedIsTerminal(t *testing.T) {
+	msgID := int64(103)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 5, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeCorrect},
+	}}
+	bot := &fakeReactionBot{unsupported: true}
+	w := reactionWorker(t, alerts, bot, false)
+
+	w.Tick(context.Background())
+
+	if alerts.reactionMarks[0].status != repository.ReactionUnsupported {
+		t.Errorf("status: got %s want unsupported", alerts.reactionMarks[0].status)
+	}
+}
+
+// TestReaction_TransientFailureRetries confirms generic errors stamp
+// `failed` so the next tick retries.
+func TestReaction_TransientFailureRetries(t *testing.T) {
+	msgID := int64(104)
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 6, TelegramMessageID: &msgID, OutcomeStatus: repository.OutcomeCorrect},
+	}}
+	bot := &fakeReactionBot{err: errors.New("network timeout")}
+	w := reactionWorker(t, alerts, bot, false)
+
+	w.Tick(context.Background())
+
+	if alerts.reactionMarks[0].status != repository.ReactionFailed {
+		t.Errorf("status: got %s want failed", alerts.reactionMarks[0].status)
+	}
+}
+
+// TestReaction_DisabledMasterSwitchIsNoop confirms reactions.Enabled=false
+// is a pure no-op — no SQL query, no Bot call, no MarkReaction.
+func TestReaction_DisabledMasterSwitchIsNoop(t *testing.T) {
+	alerts := &fakeAlerts{reactionCands: []repository.Alert{
+		{ID: 7, OutcomeStatus: repository.OutcomeCorrect},
+	}}
+	bot := &fakeReactionBot{}
+	log := zerolog.Nop()
+	w := New(Config{
+		Interval:              time.Minute,
+		ClaimLimit:            64,
+		WinningPriceThreshold: 0.99,
+		// Reactions: zero-value → Enabled=false
+	}, alerts, &fakeMarkets{}, &fakeGamma{}, &log)
+
+	w.Tick(context.Background())
+
+	if len(bot.calls) != 0 || len(alerts.reactionMarks) != 0 {
+		t.Fatalf("disabled reactions must do nothing: calls=%v marks=%v", bot.calls, alerts.reactionMarks)
 	}
 }

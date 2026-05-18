@@ -123,9 +123,77 @@ func FormatTelegramMessage(f anomaly.Finding) string {
 		return formatCategoryWatch(f)
 	case anomaly.KindAccumulation:
 		return formatAccumulation(f)
+	case anomaly.KindOwnership:
+		return formatOwnership(f)
 	default:
 		return formatTradeAnomaly(f)
 	}
+}
+
+// formatOwnership renders the Strategy-E market-ownership concentration
+// alert. The body is visually distinct from the other kinds: header
+// carries the share percentage, the Why block surfaces the approximation
+// caveat, and the Data block carries dedup + market_id + outcome_token.
+//
+// The percentage rendering is deliberately blunt about the approximation —
+// no holders endpoint is wired upstream, so the figure is computed from
+// trade-flow share counts only. An operator must read "17.4% of recorded
+// flow" not "17.4% of the market".
+func formatOwnership(f anomaly.Finding) string {
+	var b strings.Builder
+	writeOwnershipHeader(&b, f)
+	writeOwnershipWhy(&b, f)
+	writeLinks(&b, f)
+	writeData(&b, f)
+	return b.String()
+}
+
+func writeOwnershipHeader(b *strings.Builder, f anomaly.Finding) {
+	pct := 0.0
+	if f.Ownership != nil {
+		pct = f.Ownership.SharePct
+	}
+	title := tradeTitle(f)
+	fmt.Fprintf(b, "<b>%s: ownership concentration · %.1f%% · %s</b>\n",
+		strings.ToUpper(string(f.Severity)), pct, html.EscapeString(title))
+}
+
+func writeOwnershipWhy(b *strings.Builder, f anomaly.Finding) {
+	if f.Ownership == nil {
+		return
+	}
+	o := f.Ownership
+	b.WriteString("\n<b>Why</b>\n")
+	fmt.Fprintf(b, "• wallet owns <b>%.1f%%</b> of recorded BUY-side flow on this outcome\n", o.SharePct)
+	if o.NotionalUSD > 0 {
+		fmt.Fprintf(b, "• position value estimate: <b>$%s</b> (net %s shares × last price)\n",
+			money(o.NotionalUSD), formatShareCount(o.WalletNetShares))
+	}
+	if o.MarketTotalShares > 0 {
+		fmt.Fprintf(b, "• market total recorded BUY shares: %s\n", formatShareCount(o.MarketTotalShares))
+	}
+	if o.Outcome != "" {
+		fmt.Fprintf(b, "• outcome: <b>%s</b>\n", html.EscapeString(o.Outcome))
+	}
+	if o.Approximate {
+		b.WriteString("• <i>trade-flow approximation</i> — no holders endpoint wired; figure is directional, not authoritative\n")
+	}
+	for _, r := range f.Reasons {
+		if r == "" {
+			continue
+		}
+		fmt.Fprintf(b, "• reason: <code>%s</code>\n", html.EscapeString(r))
+	}
+}
+
+// formatShareCount renders a share count with thousand separators (no
+// decimals — fractional shares are rare on Polymarket and the operator
+// doesn't read them). 0 → "0".
+func formatShareCount(v float64) string {
+	if v < 1000 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return money(v)
 }
 
 // formatAccumulation renders the same-trader accumulation-line alert
@@ -193,7 +261,11 @@ func writeAccumulationWhy(b *strings.Builder, f anomaly.Finding) {
 	}
 	fmt.Fprintf(b, "• score: <b>%d/100</b>, confidence: <b>%.2f</b>, size path: <code>%s</code>\n",
 		a.Score, a.Confidence, nonEmptyOr(a.SizePath, "n/a"))
+	if a.Window != "" {
+		fmt.Fprintf(b, "• window: <b>%s</b>\n", html.EscapeString(a.Window))
+	}
 	writeQuietMarket(b, f)
+	writeNewWallet(b, f)
 	if len(a.Reasons) > 0 {
 		fmt.Fprintf(b, "• reasons: <code>%s</code>\n", html.EscapeString(strings.Join(a.Reasons, ", ")))
 	}
@@ -318,6 +390,7 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 		fmt.Fprintf(b, "• market lifecycle: <b>%.1f%%</b> elapsed%s\n", f.LifecyclePct, hot)
 	}
 	writeQuietMarket(b, f)
+	writeNewWallet(b, f)
 	switch {
 	case f.Kind == anomaly.KindTradeAnomaly && f.InCluster:
 		fmt.Fprintf(b, "• <b>part of a forming cluster</b>: %d anomalous trades in the current window\n", f.ClusterPeerCount)
@@ -340,6 +413,25 @@ func writeQuietMarket(b *strings.Builder, f anomaly.Finding) {
 	}
 	fmt.Fprintf(b, "• <b>quiet-market wake-up</b>: historical activity ≈ %s trades/day, $%s/day%s\n",
 		ratePerDay(q.TradesPerDay), money(q.NotionalPerDayUSD), idle)
+}
+
+// writeNewWallet renders the Strategy-B new-wallet context line on
+// single-trade and accumulation alerts. Surveillance read: a $10k bet
+// from a wallet first seen 4 hours ago with 2 prior trades is a
+// qualitatively stronger informed-flow shape than the same trade from a
+// long-history wallet.
+func writeNewWallet(b *strings.Builder, f anomaly.Finding) {
+	if f.NewWallet == nil || !f.NewWallet.IsNew {
+		return
+	}
+	nw := f.NewWallet
+	if !nw.FirstSeenAt.IsZero() && nw.AgeAtTrade > 0 {
+		fmt.Fprintf(b, "• <b>new wallet</b>: first seen %s ago, %d stored trades\n",
+			humanDuration(nw.AgeAtTrade), nw.HistoryTrades)
+		return
+	}
+	// Fallback for the history-only path (FirstSeenAt missing).
+	fmt.Fprintf(b, "• <b>new wallet</b>: %d stored trades\n", nw.HistoryTrades)
 }
 
 // ratePerDay formats a per-day trade count. ≥10 → integer; otherwise one
@@ -478,8 +570,8 @@ func writeData(b *strings.Builder, f anomaly.Finding) {
 }
 
 // dataMarketRefs extracts the market_id and outcome_token for the Data
-// block. Accumulation findings carry the canonical pair on
-// AccumulationRef (the line is by definition single-outcome); single-
+// block. AccumulationRef and OwnershipRef both carry the canonical
+// pair (the line / position is by definition single-outcome); single-
 // trade and category-watch findings fall back to the firing trade. A
 // cluster Finding may legitimately have neither — clusters span markets.
 func dataMarketRefs(f anomaly.Finding) (marketID, outcomeToken string) {
@@ -487,12 +579,20 @@ func dataMarketRefs(f anomaly.Finding) (marketID, outcomeToken string) {
 		marketID = f.Accumulation.MarketID
 		outcomeToken = f.Accumulation.OutcomeToken
 	}
+	if f.Ownership != nil {
+		if marketID == "" {
+			marketID = f.Ownership.MarketID
+		}
+		if outcomeToken == "" {
+			outcomeToken = f.Ownership.OutcomeToken
+		}
+	}
 	if f.Trade != nil {
 		if marketID == "" {
 			marketID = string(f.Trade.Market)
 		}
 		// TradeRef does not carry the outcome token directly (only the
-		// outcome label). Accumulation is the only kind that ships it
+		// outcome label). Accumulation / ownership Findings ship it
 		// pre-computed; leave outcomeToken blank otherwise.
 	}
 	return marketID, outcomeToken

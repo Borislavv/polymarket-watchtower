@@ -29,6 +29,10 @@ const (
 	AlertKindTrade        AlertKind = "trade_anomaly"
 	AlertKindCluster      AlertKind = "category_watch"
 	AlertKindAccumulation AlertKind = "accumulation"
+	// AlertKindOwnership is Strategy E — market-ownership concentration
+	// approximated from trade-flow share counts. CHECK constraint added
+	// in migration 00006.
+	AlertKindOwnership AlertKind = "ownership_concentration"
 )
 
 // OutcomeStatus is the typed string used by polymarket_alerts.outcome_status.
@@ -83,6 +87,12 @@ type Alert struct {
 	CLV24h              *float64
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+
+	// Reaction state (migration 00007). ReactionStatus defaults to
+	// `pending` for every freshly-inserted alert.
+	ReactionStatus ReactionStatus
+	ReactionEmoji  string
+	LastReactionAt time.Time
 }
 
 // NewAlert is the per-insert input for TryCreatePending. The repo derives
@@ -266,6 +276,46 @@ func (r *AlertRepository) TouchOutcomeUnavailable(ctx context.Context, alertID i
 	return r.q.MarkAlertOutcomeUnavailableTouch(ctx, alertID)
 }
 
+// ReactionStatus is the typed string used by
+// polymarket_alerts.telegram_reaction_status. Defined by migration 00007.
+type ReactionStatus string
+
+const (
+	ReactionPending     ReactionStatus = "pending"
+	ReactionApplied     ReactionStatus = "applied"
+	ReactionUnsupported ReactionStatus = "unsupported"
+	ReactionFailed      ReactionStatus = "failed"
+	ReactionDisabled    ReactionStatus = "disabled"
+)
+
+// ListAlertsForReaction returns sent alerts whose outcome is known and
+// whose Telegram reaction state is pending (or previously failed and
+// thus retry-eligible). The query is backed by
+// idx_alerts_reaction_pending so the partial-index scan stays small as
+// the alerts table grows.
+func (r *AlertRepository) ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]Alert, error) {
+	rows, err := r.q.ListAlertsForReaction(ctx, claimLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list alerts for reaction: %w", err)
+	}
+	out := make([]Alert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, alertFromSQLC(row))
+	}
+	return out, nil
+}
+
+// MarkReaction stamps the setMessageReaction outcome on the alert row.
+// status MUST be one of the constants above. emoji is persisted as-is
+// when status=ReactionApplied; for other statuses it is informational.
+func (r *AlertRepository) MarkReaction(ctx context.Context, alertID int64, status ReactionStatus, emoji string) error {
+	return r.q.MarkAlertReactionApplied(ctx, sqlc.MarkAlertReactionAppliedParams{
+		ID:     alertID,
+		Status: string(status),
+		Emoji:  strPtr(emoji),
+	})
+}
+
 // ListSentForDrift returns sent alerts whose drift is still pending and
 // whose oldest reference window (`minWindow`, typically 15m) has elapsed.
 func (r *AlertRepository) ListSentForDrift(ctx context.Context, minWindow time.Duration, claimLimit int32) ([]Alert, error) {
@@ -346,5 +396,8 @@ func alertFromSQLC(row sqlc.PolymarketAlerts) Alert {
 		CLV24h:              row.Clv24h,
 		CreatedAt:           row.CreatedAt.Time,
 		UpdatedAt:           row.UpdatedAt.Time,
+		ReactionStatus:      ReactionStatus(row.TelegramReactionStatus),
+		ReactionEmoji:       derefStr(row.TelegramReactionEmoji),
+		LastReactionAt:      tsTime(row.LastReactionAt),
 	}
 }

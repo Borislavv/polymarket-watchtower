@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -16,6 +17,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/dbbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/ownership"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
@@ -28,6 +30,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/statsreport"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -61,12 +64,13 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill *backfill.Worker
-	sender   *alertsender.Worker
-	sanity   *sanity.Worker
-	outcomes *outcomes.Worker
-	drift    *drift.Worker
-	stats    *statsreport.Worker
+	backfill     *backfill.Worker
+	sender       *alertsender.Worker
+	sanity       *sanity.Worker
+	outcomes     *outcomes.Worker
+	drift        *drift.Worker
+	stats        *statsreport.Worker
+	signalReport *signalreport.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -137,21 +141,22 @@ func New() (*App, error) {
 	// exploration. Production must run with POSTGRES_DSN set; the user
 	// guidance is in README.md and presets/README.md.
 	var (
-		pgPool         *pgxpool.Pool
-		persistSink    *persist.Sink
-		alertsRepo     *repository.AlertRepository
-		marketsRepo    *repository.MarketRepository
-		tradesRepo     *repository.TradeRepository
-		tradersRepo    *repository.TraderRepository
-		dbBaseline     *dbbaseline.Provider
-		traderBaseline *traderbaseline.Provider
-		mmFilter       *mmfilter.Filter
-		backfillWorker *backfill.Worker
-		senderWorker   *alertsender.Worker
-		sanityWorker   *sanity.Worker
-		outcomesWorker *outcomes.Worker
-		driftWorker    *drift.Worker
-		statsWorker    *statsreport.Worker
+		pgPool             *pgxpool.Pool
+		persistSink        *persist.Sink
+		alertsRepo         *repository.AlertRepository
+		marketsRepo        *repository.MarketRepository
+		tradesRepo         *repository.TradeRepository
+		tradersRepo        *repository.TraderRepository
+		dbBaseline         *dbbaseline.Provider
+		traderBaseline     *traderbaseline.Provider
+		mmFilter           *mmfilter.Filter
+		backfillWorker     *backfill.Worker
+		senderWorker       *alertsender.Worker
+		sanityWorker       *sanity.Worker
+		outcomesWorker     *outcomes.Worker
+		driftWorker        *drift.Worker
+		statsWorker        *statsreport.Worker
+		signalReportWorker *signalreport.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -247,8 +252,14 @@ func New() (*App, error) {
 	// Backfill + sender workers exist only when Postgres is wired. The
 	// sender worker also needs Telegram enabled with a valid recipient —
 	// failing fast at boot is the spec.
+	//
+	// `bot` is hoisted into the outer Postgres-enabled block so the
+	// outcomes-reactor pass and the signal-report worker can both
+	// reach the same handle without re-constructing it.
+	var bot *telegram.Bot
 	if cfg.Postgres.Enabled() && cfg.Alerting.TelegramEnabled {
-		bot, err := telegram.New(telegram.Config{
+		var err error
+		bot, err = telegram.New(telegram.Config{
 			BotToken: cfg.Alerting.TelegramBotToken,
 			BaseURL:  cfg.Alerting.TelegramBaseURL,
 			Timeout:  cfg.Alerting.TelegramTimeout,
@@ -288,6 +299,42 @@ func New() (*App, error) {
 				Dur("interval", cfg.StatsReport.Interval).
 				Msg("statsreport: enabled (periodic Telegram summary)")
 		}
+
+		if cfg.SignalReport.Enabled {
+			loc, err := time.LoadLocation(cfg.SignalReport.Timezone)
+			if err != nil {
+				return nil, fmt.Errorf("signal_reports: invalid timezone %q: %w", cfg.SignalReport.Timezone, err)
+			}
+			sendAt := map[signalreport.PeriodType]signalreport.TimeOfDay{}
+			for k, raw := range map[signalreport.PeriodType]string{
+				signalreport.PeriodDaily:     cfg.SignalReport.DailyAt,
+				signalreport.PeriodWeekly:    cfg.SignalReport.WeeklyAt,
+				signalreport.PeriodMonthly:   cfg.SignalReport.MonthlyAt,
+				signalreport.PeriodQuarterly: cfg.SignalReport.QuarterlyAt,
+				signalreport.PeriodYearly:    cfg.SignalReport.YearlyAt,
+			} {
+				tod, err := signalreport.ParseTimeOfDay(raw)
+				if err != nil {
+					return nil, fmt.Errorf("signal_reports: %s: %w", k, err)
+				}
+				sendAt[k] = tod
+			}
+			signalReportWorker = signalreport.New(signalreport.Config{
+				Enabled:      true,
+				Location:     loc,
+				ChatID:       cfg.Alerting.TelegramChatID,
+				TickInterval: cfg.SignalReport.TickInterval,
+				SendAt:       sendAt,
+				YearlyDelay:  cfg.SignalReport.YearlyDelay,
+			}, repository.NewSignalReportRepository(pgPool),
+				telegramSignalSenderAdapter{bot: bot},
+				signalReportMetricsAdapter{m: met},
+				logger)
+			logger.Info().
+				Str("timezone", cfg.SignalReport.Timezone).
+				Dur("yearly_delay", cfg.SignalReport.YearlyDelay).
+				Msg("signalreport: enabled (signal-quality reports)")
+		}
 	}
 	if cfg.Postgres.Enabled() {
 		backfillWorker = backfill.New(backfill.Config{
@@ -313,13 +360,34 @@ func New() (*App, error) {
 			Msg("sanity: enabled (soft-delete reaper)")
 
 		if cfg.Outcomes.Enabled {
+			// The reactor pass only wires when Telegram is configured
+			// (it needs a Bot to call setMessageReaction). When it's
+			// not wired, the outcomes worker still classifies — rows
+			// just stay in telegram_reaction_status='pending' until an
+			// operator flips reactions back on.
+			reactionsCfg := outcomes.ReactionsConfig{}
+			if cfg.TelegramReactions.Enabled && bot != nil && cfg.Alerting.TelegramChatID != "" {
+				reactionsCfg = outcomes.ReactionsConfig{
+					Enabled:          true,
+					ChatID:           cfg.Alerting.TelegramChatID,
+					SuccessEmoji:     cfg.TelegramReactions.SuccessEmoji,
+					FailureEmoji:     cfg.TelegramReactions.FailureEmoji,
+					AmbiguousEmoji:   cfg.TelegramReactions.AmbiguousEmoji,
+					DisableAmbiguous: cfg.TelegramReactions.DisableAmbiguous,
+					Bot:              bot,
+					Metrics:          reactionMetricsAdapter{m: met},
+				}
+			}
 			outcomesWorker = outcomes.New(outcomes.Config{
 				Interval:              cfg.Outcomes.Interval,
 				ClaimLimit:            int32(cfg.Outcomes.ClaimLimit),
 				WinningPriceThreshold: cfg.Outcomes.WinningPriceThreshold,
+				Reactions:             reactionsCfg,
+				OutcomeMetrics:        outcomeMetricsAdapter{m: met},
 			}, alertsRepo, marketsRepo, gammaClient, logger)
 			logger.Info().
 				Dur("interval", cfg.Outcomes.Interval).
+				Bool("reactions_enabled", reactionsCfg.Enabled).
 				Msg("outcomes: enabled (post-alert resolution tracking)")
 		}
 		if cfg.Drift.Enabled {
@@ -416,6 +484,28 @@ func New() (*App, error) {
 			}, detectCfg.Thresholds)
 			detectCfg.AccumulationLines = tradesRepo
 		}
+		// Strategy E (market-ownership concentration) wires whenever
+		// Postgres is configured AND the operator hasn't disabled it.
+		// The detector is invoked from the accumulation path so it
+		// can never spam on its own.
+		if cfg.Anomaly.OwnershipEnabled {
+			detectCfg.Ownership = ownership.New(ownership.Config{
+				Enabled:        true,
+				InfoPct:        cfg.Anomaly.OwnershipInfoPct,
+				WarningPct:     cfg.Anomaly.OwnershipWarningPct,
+				CriticalPct:    cfg.Anomaly.OwnershipCriticalPct,
+				MinNotionalUSD: cfg.Anomaly.OwnershipMinNotionalUSD,
+			})
+			detectCfg.OwnershipShares = tradesRepo
+		}
+		// Strategy B (new-wallet context booster). Reads Trader.FirstSeenAt
+		// through cfg.Traders (already wired above for the alert FK), so
+		// no new DB dependency.
+		detectCfg.NewWallet = detect.NewWalletConfig{
+			Enabled:          cfg.Anomaly.NewWalletEnabled,
+			MaxAge:           cfg.Anomaly.NewWalletMaxAge,
+			MaxHistoryTrades: cfg.Anomaly.NewWalletMaxHistoryTrades,
+		}
 	}
 	detectLoop := detect.New(detectCfg, cache, emitter, met, logger)
 
@@ -433,21 +523,22 @@ func New() (*App, error) {
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
 	return &App{
-		cfg:       cfg,
-		logger:    logger,
-		metrics:   met,
-		cache:     cache,
-		discover:  discoverLoop,
-		collect:   collectLoop,
-		detectRun: detectLoop.Run,
-		httpSrv:   httpSrv,
-		backfill:  backfillWorker,
-		sender:    senderWorker,
-		sanity:    sanityWorker,
-		outcomes:  outcomesWorker,
-		drift:     driftWorker,
-		stats:     statsWorker,
-		pgPool:    pgPool,
+		cfg:          cfg,
+		logger:       logger,
+		metrics:      met,
+		cache:        cache,
+		discover:     discoverLoop,
+		collect:      collectLoop,
+		detectRun:    detectLoop.Run,
+		httpSrv:      httpSrv,
+		backfill:     backfillWorker,
+		sender:       senderWorker,
+		sanity:       sanityWorker,
+		outcomes:     outcomesWorker,
+		drift:        driftWorker,
+		stats:        statsWorker,
+		signalReport: signalReportWorker,
+		pgPool:       pgPool,
 	}, nil
 }
 
@@ -459,6 +550,53 @@ type telegramSenderAdapter struct{ bot *telegram.Bot }
 func (a telegramSenderAdapter) SendHTML(ctx context.Context, chatID, text string) error {
 	_, err := a.bot.SendHTML(ctx, chatID, text)
 	return err
+}
+
+// telegramSignalSenderAdapter is the signalreport.Sender adapter. The
+// signal-report worker DOES need the upstream message_id (it persists
+// it on the polymarket_signal_reports row), so this adapter returns
+// the int64 directly rather than dropping it.
+type telegramSignalSenderAdapter struct{ bot *telegram.Bot }
+
+func (a telegramSignalSenderAdapter) SendHTML(ctx context.Context, chatID, text string) (int64, error) {
+	res, err := a.bot.SendHTML(ctx, chatID, text)
+	if err != nil {
+		return 0, err
+	}
+	return res.MessageID, nil
+}
+
+// reactionMetricsAdapter shims metrics.TelegramReactions over the
+// outcomes.ReactionMetrics shape.
+type reactionMetricsAdapter struct{ m *metrics.Metrics }
+
+func (r reactionMetricsAdapter) ObserveReaction(status, reaction string) {
+	if r.m == nil || r.m.TelegramReactions == nil {
+		return
+	}
+	r.m.TelegramReactions.WithLabelValues(status, reaction).Inc()
+}
+
+// outcomeMetricsAdapter shims metrics.AlertOutcomes over the
+// outcomes.OutcomeMetrics shape.
+type outcomeMetricsAdapter struct{ m *metrics.Metrics }
+
+func (o outcomeMetricsAdapter) ObserveOutcome(status, severity, kind string) {
+	if o.m == nil || o.m.AlertOutcomes == nil {
+		return
+	}
+	o.m.AlertOutcomes.WithLabelValues(status, severity, kind).Inc()
+}
+
+// signalReportMetricsAdapter shims metrics.SignalReportsSent over the
+// signalreport.Metrics shape.
+type signalReportMetricsAdapter struct{ m *metrics.Metrics }
+
+func (s signalReportMetricsAdapter) ObserveReportSent(periodType, status string) {
+	if s.m == nil || s.m.SignalReportsSent == nil {
+		return
+	}
+	s.m.SignalReportsSent.WithLabelValues(periodType, status).Inc()
 }
 
 // marketcacheUpstream adapts *marketcache.Cache to sanity.UpstreamChecker.
@@ -509,6 +647,9 @@ func (a *App) Run() error {
 	}
 	if a.stats != nil {
 		execs = append(execs, shutdown2.Exec{Name: "statsreport", Fn: a.stats.Run})
+	}
+	if a.signalReport != nil {
+		execs = append(execs, shutdown2.Exec{Name: "signalreport", Fn: a.signalReport.Run})
 	}
 
 	return shutdown2.Graceful(

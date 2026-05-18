@@ -47,7 +47,9 @@ type Metrics struct {
 	CategoryAnomalousTrades *prometheus.CounterVec // category, severity
 	CategoryAnomalousUSD    *prometheus.CounterVec // category, severity
 	CategoryHardAlerts      *prometheus.CounterVec // category
-	AccumulationAlerts      *prometheus.CounterVec // severity, category — same-trader accumulation lines
+	AccumulationAlerts      *prometheus.CounterVec // severity, category, window={recent|lifetime}
+	OwnershipAlerts         *prometheus.CounterVec // severity, category — Strategy-E ownership_concentration fires
+	NewWalletReasons        *prometheus.CounterVec // kind, severity — context boosters attached
 	QuietMarketAlerts       *prometheus.CounterVec // severity, kind — alerts stamped with QUIET_MARKET_WAKEUP context
 	BaselineBuckets         prometheus.Gauge       // total live (category,market,outcome) buckets
 
@@ -78,6 +80,20 @@ type Metrics struct {
 	// --- Stats summary worker ---
 	StatsSummariesSent prometheus.Counter // periodic Telegram stats sends
 	StatsSummaryErrors prometheus.Counter // periodic stats send failures
+
+	// --- Signal-quality reports + reactions (Strategy reporting) ---
+	// SignalReportsSent: labelled by period_type (daily / weekly /
+	// monthly / quarterly / yearly) and status (sent / failed).
+	// TelegramReactions: labelled by status (applied / unsupported /
+	// failed / disabled) and reaction (the emoji applied, or "" when
+	// the call never reached Telegram).
+	// AlertOutcomes: labelled by status (resolved_correct /
+	// resolved_wrong / unknown / unavailable), severity, kind — used
+	// by Grafana to show signal quality over time without re-running
+	// the aggregate SQL.
+	SignalReportsSent *prometheus.CounterVec // period_type, status
+	TelegramReactions *prometheus.CounterVec // status, reaction
+	AlertOutcomes     *prometheus.CounterVec // status, severity, kind
 }
 
 func New() *Metrics {
@@ -167,8 +183,18 @@ func New() *Metrics {
 
 	m.AccumulationAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "accumulation", Name: "alerts_total",
-		Help: "Same-trader accumulation-line alerts emitted, by severity and category.",
+		Help: "Same-trader accumulation-line alerts emitted, by severity, category, and window (recent|lifetime).",
+	}, []string{"severity", "category", "window"})
+
+	m.OwnershipAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ownership", Name: "alerts_total",
+		Help: "Market-ownership concentration alerts emitted, by severity and category. Trade-flow approximation — see strategy doc.",
 	}, []string{"severity", "category"})
+
+	m.NewWalletReasons = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "newwallet", Name: "reasons_attached_total",
+		Help: "New-wallet context booster: count of Findings that picked up a NEW_WALLET_* reason, by parent alert kind and severity.",
+	}, []string{"kind", "severity"})
 
 	m.QuietMarketAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "quietmarket", Name: "alerts_total",
@@ -246,6 +272,21 @@ func New() *Metrics {
 		Help: "Backfill runs that reached a terminal state, labelled by outcome (completed, partial_api_limit, failed).",
 	}, []string{"status"})
 
+	m.SignalReportsSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "signal", Name: "reports_sent_total",
+		Help: "Scheduled signal-quality reports delivered to Telegram, by period_type (daily / weekly / monthly / quarterly / yearly) and status (sent / failed).",
+	}, []string{"period_type", "status"})
+
+	m.TelegramReactions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "reactions_total",
+		Help: "Outcome reactions applied to original alert messages, by status (applied / unsupported / failed / disabled) and reaction (the emoji used; empty when the call did not reach Telegram).",
+	}, []string{"status", "reaction"})
+
+	m.AlertOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "outcomes_total",
+		Help: "Resolved alert verdicts, by status (resolved_correct / resolved_wrong / unknown / unavailable), severity, and alert kind. Drives the Grafana signal-quality panels.",
+	}, []string{"status", "severity", "kind"})
+
 	m.StatsSummariesSent = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "stats", Name: "summaries_sent_total",
 		Help: "Periodic Telegram stats summaries delivered (one per interval when the worker is enabled).",
@@ -263,6 +304,8 @@ func New() *Metrics {
 		m.TradeAnomalies, m.TradeAnomalyAxis, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
 		m.AccumulationAlerts,
+		m.OwnershipAlerts,
+		m.NewWalletReasons,
 		m.QuietMarketAlerts,
 		m.BaselineBuckets,
 		m.CategoryFilterSkipped, m.AlertMMSuppressed, m.LifecycleUnknownSkipped,
@@ -272,6 +315,7 @@ func New() *Metrics {
 		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,
 		m.BackfillPagesFetched, m.BackfillRunsTotal,
 		m.StatsSummariesSent, m.StatsSummaryErrors,
+		m.SignalReportsSent, m.TelegramReactions, m.AlertOutcomes,
 	)
 	return m
 }

@@ -721,3 +721,85 @@ func TestDataBlockEscapesValues(t *testing.T) {
 		t.Errorf("dedup not HTML-escaped:\n%s", msg)
 	}
 }
+
+// TestOwnershipFindingRendersDistinctHeader pins the Strategy-E
+// renderer: an ownership_concentration alert produces a header that
+// explicitly carries "ownership concentration · X.X%" and a Why block
+// that surfaces the trade-flow approximation caveat.
+func TestOwnershipFindingRendersDistinctHeader(t *testing.T) {
+	f := anomaly.Finding{
+		Kind:     anomaly.KindOwnership,
+		Severity: anomaly.SeverityWarning,
+		Reason:   anomaly.ReasonOwnership,
+		At:       time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC),
+		Trade: &anomaly.TradeRef{
+			Market:   "0xabc",
+			Question: "Will it rain tomorrow?",
+		},
+		Ownership: &anomaly.OwnershipRef{
+			Wallet:            "0xwhale",
+			MarketID:          "0xabc",
+			OutcomeToken:      "12345",
+			Outcome:           "Yes",
+			SharePct:          17.4,
+			WalletNetShares:   17400,
+			MarketTotalShares: 100000,
+			NotionalUSD:       42000,
+			Approximate:       true,
+		},
+		Reasons:  []string{"MARKET_OWNERSHIP_CONCENTRATION"},
+		DedupKey: "ownership:v4:0xwhale:1:tok:warning",
+	}
+	msg := FormatTelegramMessage(f)
+	for _, want := range []string{
+		"<b>WARNING: ownership concentration · 17.4%",
+		"• wallet owns <b>17.4%</b> of recorded BUY-side flow on this outcome",
+		"• position value estimate: <b>$42,000</b>",
+		"• outcome: <b>Yes</b>",
+		"<i>trade-flow approximation</i>",
+		"• reason: <code>MARKET_OWNERSHIP_CONCENTRATION</code>",
+		"<b>Data</b>",
+		"• dedup: <code>ownership:v4:0xwhale:1:tok:warning</code>",
+		"• outcome_token: <code>12345</code>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in ownership message:\n%s", want, msg)
+		}
+	}
+}
+
+// TestNewWalletContextRendersInAccumulationWhy pins the Strategy-B
+// renderer hook: an accumulation Finding carrying a NewWalletRef
+// surfaces the "new wallet: first seen X ago" line in the Why block.
+func TestNewWalletContextRendersInAccumulationWhy(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	f := anomaly.Finding{
+		Kind:     anomaly.KindAccumulation,
+		Severity: anomaly.SeverityInfo,
+		Reason:   anomaly.ReasonAccumulation,
+		At:       now,
+		Accumulation: &anomaly.AccumulationRef{
+			Wallet:           "0xfresh",
+			MarketID:         "0xabc",
+			OutcomeToken:     "12345",
+			Outcome:          "Yes",
+			Side:             "BUY",
+			TradeCount:       7,
+			TotalNotionalUSD: 50_000,
+			Window:           "recent",
+		},
+		NewWallet: &anomaly.NewWalletRef{
+			FirstSeenAt:   now.Add(-12 * time.Hour),
+			AgeAtTrade:    12 * time.Hour,
+			HistoryTrades: 7,
+			IsNew:         true,
+		},
+	}
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "• <b>new wallet</b>: first seen 12h0m ago, 7 stored trades") {
+		t.Errorf("missing new-wallet context line in accumulation Why:\n%s", msg)
+	}
+	if !strings.Contains(msg, "• window: <b>recent</b>") {
+		t.Errorf("missing window line in accumulation Why:\n%s", msg)
+	}
+}

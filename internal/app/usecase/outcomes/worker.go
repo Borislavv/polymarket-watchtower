@@ -24,6 +24,7 @@ package outcomes
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
 // AlertStore is the subset of *repository.AlertRepository the worker uses.
@@ -40,6 +42,11 @@ type AlertStore interface {
 	ListSentForOutcomeCheck(ctx context.Context, claimLimit int32) ([]repository.Alert, error)
 	MarkOutcome(ctx context.Context, u repository.OutcomeUpdate) error
 	TouchOutcomeUnavailable(ctx context.Context, alertID int64) error
+	// ListAlertsForReaction returns sent alerts with a known outcome
+	// still awaiting a Telegram reaction. Used by the reaction pass.
+	ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]repository.Alert, error)
+	// MarkReaction persists the verdict of the setMessageReaction call.
+	MarkReaction(ctx context.Context, alertID int64, status repository.ReactionStatus, emoji string) error
 }
 
 // MarketResolver returns the upstream resolution snapshot for one
@@ -64,6 +71,51 @@ type Config struct {
 	// case while ignoring late-trading noise.
 	WinningPriceThreshold float64
 	Clock                 func() time.Time
+
+	// Reactions configures the post-classify pass that calls Telegram
+	// setMessageReaction on every newly-resolved alert. When
+	// Reactions.Enabled is false, the worker still classifies outcomes
+	// — only the upstream reaction call is skipped (rows are stamped
+	// telegram_reaction_status='disabled' so the partial index stays
+	// small).
+	Reactions ReactionsConfig
+
+	// OutcomeMetrics observes every classified verdict. nil disables.
+	OutcomeMetrics OutcomeMetrics
+}
+
+// ReactionsConfig controls the Telegram reaction pass.
+type ReactionsConfig struct {
+	Enabled          bool
+	ChatID           string
+	SuccessEmoji     string // e.g. "✅"
+	FailureEmoji     string // e.g. "💭"
+	AmbiguousEmoji   string // e.g. "⚠️"
+	ClaimLimit       int32  // rows per tick; 0 -> uses Worker.ClaimLimit
+	Bot              ReactionSender
+	Metrics          ReactionMetrics
+	DisableAmbiguous bool // set true to skip reactions on 'unknown' outcomes
+}
+
+// ReactionSender is the subset of *telegram.Bot needed by the reactor.
+// Satisfied by *telegram.Bot itself; the interface keeps the worker
+// testable without spinning up an HTTP fake.
+type ReactionSender interface {
+	SetMessageReaction(ctx context.Context, chatID string, messageID int64, emoji string) error
+}
+
+// ReactionMetrics is a tiny shim over the global Prometheus collector
+// so the worker doesn't transitively depend on the metrics package.
+// Set to nil to disable.
+type ReactionMetrics interface {
+	ObserveReaction(status, reaction string)
+}
+
+// OutcomeMetrics is the shim for the alert-outcome counter. Stamped
+// once per classified alert so Grafana can graph signal-quality
+// without re-running the aggregate SQL on every dashboard refresh.
+type OutcomeMetrics interface {
+	ObserveOutcome(status, severity, kind string)
 }
 
 func (c Config) applyDefaults() Config {
@@ -121,14 +173,105 @@ func (w *Worker) tick(ctx context.Context) {
 		w.log.Err(err).Msg("outcomes: list candidates failed")
 		return
 	}
-	if len(candidates) == 0 {
-		return
-	}
 	for _, a := range candidates {
 		if ctx.Err() != nil {
 			return
 		}
 		w.processOne(ctx, a)
+	}
+	// Reaction pass — independent claim list, so a tick that finds zero
+	// candidates above can still react to alerts a previous tick
+	// classified. Per-row idempotent via the dedup_status state machine.
+	w.reactionPass(ctx)
+}
+
+// reactionPass claims sent alerts with a known outcome whose Telegram
+// reaction is still pending (or previously failed) and applies the
+// configured emoji via setMessageReaction. The pass is best-effort —
+// individual failures do not block other alerts.
+func (w *Worker) reactionPass(ctx context.Context) {
+	if !w.cfg.Reactions.Enabled {
+		// Reactions are off — leave rows in their default 'pending'
+		// state so flipping the flag back on can resume processing.
+		return
+	}
+	if w.cfg.Reactions.Bot == nil || w.cfg.Reactions.ChatID == "" {
+		w.log.Warn().Msg("outcomes: reaction pass enabled but bot/chat unwired; skipping")
+		return
+	}
+	limit := w.cfg.Reactions.ClaimLimit
+	if limit <= 0 {
+		limit = w.cfg.ClaimLimit
+	}
+	rows, err := w.alerts.ListAlertsForReaction(ctx, limit)
+	if err != nil {
+		w.log.Err(err).Msg("outcomes: list reaction candidates failed")
+		return
+	}
+	for _, a := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		w.applyReaction(ctx, a)
+	}
+}
+
+// applyReaction picks the emoji for the alert's outcome status, calls
+// setMessageReaction, and persists the verdict. Telegram explicit
+// "unsupported" errors are terminal (the row will never be retried);
+// transient errors are persisted as `failed` so the next tick retries.
+func (w *Worker) applyReaction(ctx context.Context, a repository.Alert) {
+	if a.TelegramMessageID == nil || *a.TelegramMessageID == 0 {
+		// Defensive — the SQL filter already excludes this case.
+		_ = w.alerts.MarkReaction(ctx, a.ID, repository.ReactionUnsupported, "")
+		w.observeReaction("unsupported", "")
+		return
+	}
+	emoji := w.emojiForOutcome(a.OutcomeStatus)
+	if emoji == "" {
+		// Configured to skip this outcome class (e.g. ambiguous reactions
+		// disabled). Stamp 'disabled' so the row leaves the partial index.
+		_ = w.alerts.MarkReaction(ctx, a.ID, repository.ReactionDisabled, "")
+		w.observeReaction("disabled", "")
+		return
+	}
+	err := w.cfg.Reactions.Bot.SetMessageReaction(ctx, w.cfg.Reactions.ChatID, *a.TelegramMessageID, emoji)
+	switch {
+	case err == nil:
+		_ = w.alerts.MarkReaction(ctx, a.ID, repository.ReactionApplied, emoji)
+		w.observeReaction("applied", emoji)
+	case errors.Is(err, telegram.ErrReactionUnsupported):
+		_ = w.alerts.MarkReaction(ctx, a.ID, repository.ReactionUnsupported, emoji)
+		w.observeReaction("unsupported", emoji)
+		w.log.Info().Int64("alert_id", a.ID).Str("emoji", emoji).Msg("outcomes: reaction unsupported on this target; marking terminal")
+	default:
+		_ = w.alerts.MarkReaction(ctx, a.ID, repository.ReactionFailed, emoji)
+		w.observeReaction("failed", emoji)
+		w.log.Err(err).Int64("alert_id", a.ID).Str("emoji", emoji).Msg("outcomes: reaction failed; will retry next tick")
+	}
+}
+
+// emojiForOutcome maps the persisted outcome_status to the configured
+// emoji. Empty return signals "skip this outcome class".
+func (w *Worker) emojiForOutcome(status repository.OutcomeStatus) string {
+	switch status {
+	case repository.OutcomeCorrect:
+		return w.cfg.Reactions.SuccessEmoji
+	case repository.OutcomeWrong:
+		return w.cfg.Reactions.FailureEmoji
+	case repository.OutcomeUnknown:
+		if w.cfg.Reactions.DisableAmbiguous {
+			return ""
+		}
+		return w.cfg.Reactions.AmbiguousEmoji
+	default:
+		return ""
+	}
+}
+
+func (w *Worker) observeReaction(status, reaction string) {
+	if w.cfg.Reactions.Metrics != nil {
+		w.cfg.Reactions.Metrics.ObserveReaction(status, reaction)
 	}
 }
 
@@ -172,6 +315,9 @@ func (w *Worker) processOne(ctx context.Context, a repository.Alert) {
 	verdict := w.classify(a, res)
 	if err := w.alerts.MarkOutcome(ctx, verdict); err != nil {
 		w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomes: mark outcome failed")
+	}
+	if w.cfg.OutcomeMetrics != nil {
+		w.cfg.OutcomeMetrics.ObserveOutcome(string(verdict.Status), a.Severity, string(a.Kind))
 	}
 }
 

@@ -87,6 +87,39 @@ func (q *Queries) AccumulationLineSummary(ctx context.Context, arg AccumulationL
 	return i, err
 }
 
+const ownershipShares = `-- name: OwnershipShares :one
+SELECT
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'BUY'  AND trader_id = $1::bigint), 0)::double precision AS wallet_buy_shares,
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'SELL' AND trader_id = $1::bigint), 0)::double precision AS wallet_sell_shares,
+    COALESCE(SUM(size_shares) FILTER (WHERE side = 'BUY'),                              0)::double precision AS market_buy_shares
+FROM polymarket_trades
+WHERE market_id     = $2::bigint
+  AND outcome_token = $3::text
+`
+
+type OwnershipSharesParams struct {
+	TraderID     int64
+	MarketID     int64
+	OutcomeToken string
+}
+
+type OwnershipSharesRow struct {
+	WalletBuyShares  float64
+	WalletSellShares float64
+	MarketBuyShares  float64
+}
+
+// Server-side aggregate of (wallet, market, outcome) share-count flow
+// vs the outcome's total BUY-side flow. APPROXIMATION — the CLOB
+// holders endpoint is not wired upstream; treat the percentage as
+// directional, not authoritative.
+func (q *Queries) OwnershipShares(ctx context.Context, arg OwnershipSharesParams) (OwnershipSharesRow, error) {
+	row := q.db.QueryRow(ctx, ownershipShares, arg.TraderID, arg.MarketID, arg.OutcomeToken)
+	var i OwnershipSharesRow
+	err := row.Scan(&i.WalletBuyShares, &i.WalletSellShares, &i.MarketBuyShares)
+	return i, err
+}
+
 const baselineDistribution = `-- name: BaselineDistribution :one
 SELECT
     COUNT(*)::bigint                                                                           AS sample_count,

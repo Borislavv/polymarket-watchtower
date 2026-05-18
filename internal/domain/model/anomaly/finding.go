@@ -28,6 +28,12 @@ const (
 	// wallet repeatedly building exposure on a single side. Detected by
 	// internal/app/usecase/analytics/accumulation.
 	KindAccumulation Kind = "accumulation"
+	// KindOwnership is a market-ownership concentration alert: one
+	// wallet's net (BUY − SELL) share count crossed a percentage of the
+	// outcome's total flow. Trade-flow approximation — there is no
+	// holders endpoint wired upstream, so the percentage is approximate.
+	// Detected alongside KindAccumulation in the same detect tick.
+	KindOwnership Kind = "ownership_concentration"
 )
 
 // Severity is a coarse classification routed by sinks and dashboards.
@@ -150,6 +156,68 @@ type AccumulationRef struct {
 	// SizePath names which size-path qualified the line — "meaningful"
 	// or "many-smalls". Empty when not fired.
 	SizePath string
+	// Window names the horizon the line was aggregated over ("recent" or
+	// "lifetime"). Surfaces in the alert header so an operator can tell a
+	// 24h burst apart from a 90-day slow drip without re-deriving from
+	// Span.
+	Window string
+}
+
+// NewWalletRef is the context-booster payload attached to single-trade
+// and accumulation Findings when the firing wallet is new (first seen
+// recently, or thin history). Populated by the detector — empty wallet
+// means the trader was not persisted yet, so wallet-age cannot be read.
+// Surveillance read: a one-week-old wallet placing a $10k bet at 10x
+// odds is qualitatively more suspicious than the same trade from a
+// wallet with thousands of trades.
+type NewWalletRef struct {
+	// FirstSeenAt is the earliest persisted trade timestamp for this
+	// wallet across all markets.
+	FirstSeenAt time.Time
+	// AgeAtTrade is now − FirstSeenAt. Zero when FirstSeenAt is zero
+	// (wallet not yet persisted).
+	AgeAtTrade time.Duration
+	// HistoryTrades is the wallet's total trade count in
+	// polymarket_trades at the time of the firing trade.
+	HistoryTrades int64
+	// IsNew is the boolean verdict: AgeAtTrade < NEW_WALLET_MAX_AGE OR
+	// HistoryTrades ≤ NEW_WALLET_MAX_HISTORY_TRADES.
+	IsNew bool
+}
+
+// OwnershipRef summarises a market-ownership concentration alert. The
+// alert kind that carries this is the only standalone alert built from
+// trade-flow approximation — there is no holders endpoint wired, so the
+// percentage is "wallet's net BUY-share count divided by the market's
+// total BUY-side share count". Documented limitation; consult the
+// strategy doc before drawing inference from the exact percentage.
+type OwnershipRef struct {
+	Wallet       string
+	MarketID     string
+	OutcomeToken string
+	Outcome      string
+	// SharePct is the approximate percentage of the outcome's net-BUY
+	// share count the wallet has accumulated (0..100). Approximation —
+	// it reads BUYs minus SELLs across all stored trades for this
+	// (market, outcome). Real on-chain holdings can differ.
+	SharePct float64
+	// WalletNetShares is the wallet's (BUY-side − SELL-side) share
+	// count for this outcome. Used in the Telegram payload to convey
+	// raw position size alongside the percentage.
+	WalletNetShares float64
+	// MarketTotalShares is the denominator: SUM(size_shares) for BUY
+	// trades on this outcome. Useful for operators to sanity-check the
+	// percentage.
+	MarketTotalShares float64
+	// NotionalUSD is the dollar value of the wallet's position
+	// estimated as (net shares × current trade price). A weak estimate
+	// — the wallet may have accumulated at very different prices — but
+	// useful as an order-of-magnitude figure.
+	NotionalUSD float64
+	// Approximate flags this as a trade-flow approximation, not a true
+	// holders read. Surfaced in Telegram so the operator never
+	// mistakes the percentage for an authoritative position.
+	Approximate bool
 }
 
 // ClusterStats summarises a category-cluster alert.
@@ -194,6 +262,16 @@ type Finding struct {
 	// Accumulation fields (KindAccumulation only). Populated by
 	// internal/app/usecase/analytics/accumulation.Detector.
 	Accumulation *AccumulationRef
+
+	// NewWallet is the wallet-age context booster, attached to single-
+	// trade and accumulation Findings when the firing wallet matches the
+	// "new wallet" gates. Nil when the wallet has substantial history
+	// or when the booster is disabled.
+	NewWallet *NewWalletRef
+
+	// Ownership is populated on KindOwnership Findings — never on
+	// trade_anomaly / accumulation / category_watch.
+	Ownership *OwnershipRef
 
 	// QuietMarket is the context tag attached when the firing event landed
 	// on a historically quiet (market, outcome). Nil otherwise. Applies to

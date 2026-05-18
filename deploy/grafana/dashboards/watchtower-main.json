@@ -346,6 +346,134 @@
         "legendFormat": "{{status}}",
         "refId": "A"
       }]
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Accumulation alerts by window (rate / 15m)",
+      "gridPos": {"x": 0, "y": 76, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (window, severity) (rate(watchtower_accumulation_alerts_total[15m]))",
+        "legendFormat": "{{window}} · {{severity}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Ownership concentration alerts (rate / 15m)",
+      "gridPos": {"x": 12, "y": 76, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (severity) (rate(watchtower_ownership_alerts_total[15m]))",
+        "legendFormat": "{{severity}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "New-wallet reasons attached (rate / 15m)",
+      "gridPos": {"x": 0, "y": 84, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (kind, severity) (rate(watchtower_newwallet_reasons_attached_total[15m]))",
+        "legendFormat": "{{kind}} · {{severity}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 70,
+      "type": "timeseries",
+      "title": "Signal quality · directional correctness (24h rolling rate)",
+      "description": "Resolved-alert success rate over the last 24h, computed from watchtower_alert_outcomes_total. Bias-aware: pending and unavailable outcomes are excluded from the denominator. Read as 'of alerts whose markets have resolved in the last 24h, what fraction were directionally correct?'",
+      "gridPos": {"x": 0, "y": 92, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_alert_outcomes_total{status=\"resolved_correct\"}[24h])) / clamp_min(sum(increase(watchtower_alert_outcomes_total{status=~\"resolved_correct|resolved_wrong\"}[24h])), 1)",
+        "legendFormat": "success rate (24h)",
+        "refId": "A"
+      }],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "Signal quality · resolved vs pending (count / 1h)",
+      "description": "Stacked counts of new outcome verdicts per hour. Pending = market hasn't resolved yet; ambiguous = winning price never cleared the threshold; unavailable = market not in upstream snapshot.",
+      "gridPos": {"x": 12, "y": 92, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (increase(watchtower_alert_outcomes_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "Signal quality by severity (24h success rate)",
+      "description": "Per-severity directional-correctness rate. Sample sizes are usually small at Critical/Hard; treat as directional, not statistically stable.",
+      "gridPos": {"x": 0, "y": 100, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (severity) (increase(watchtower_alert_outcomes_total{status=\"resolved_correct\"}[24h])) / clamp_min(sum by (severity) (increase(watchtower_alert_outcomes_total{status=~\"resolved_correct|resolved_wrong\"}[24h])), 1)",
+        "legendFormat": "{{severity}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 73,
+      "type": "timeseries",
+      "title": "Signal quality by alert kind (24h success rate)",
+      "description": "Per-alert-kind directional-correctness rate. trade_anomaly vs accumulation vs category_watch vs ownership_concentration.",
+      "gridPos": {"x": 12, "y": 100, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (kind) (increase(watchtower_alert_outcomes_total{status=\"resolved_correct\"}[24h])) / clamp_min(sum by (kind) (increase(watchtower_alert_outcomes_total{status=~\"resolved_correct|resolved_wrong\"}[24h])), 1)",
+        "legendFormat": "{{kind}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Telegram outcome reactions (rate / 15m)",
+      "description": "setMessageReaction results. 'unsupported' = Telegram refused (channel doesn't allow reactions, bot has no rights, paid reaction needed); 'failed' = retryable transport error.",
+      "gridPos": {"x": 0, "y": 108, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_telegram_reactions_total[15m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 75,
+      "type": "stat",
+      "title": "Signal reports sent (24h)",
+      "description": "Scheduled signal-quality reports successfully delivered to Telegram in the last 24h.",
+      "gridPos": {"x": 12, "y": 108, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_signal_reports_sent_total{status=\"sent\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 76,
+      "type": "stat",
+      "title": "Signal reports failed (24h)",
+      "description": "Scheduled reports that failed to send. Non-zero usually means Telegram chat misconfigured or upstream rate-limit.",
+      "gridPos": {"x": 18, "y": 108, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_signal_reports_sent_total{status=\"failed\"}[24h]))",
+        "refId": "A"
+      }]
     }
   ]
 }

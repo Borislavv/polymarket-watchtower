@@ -5,6 +5,52 @@ const (
 	ReasonSingle       = "LargeRareBet"
 	ReasonCluster      = "WhaleClusterDetected"
 	ReasonAccumulation = "SameTraderAccumulationLine"
+	ReasonOwnership    = "MarketOwnershipConcentration"
+)
+
+// Structured reason codes attached to Finding.Reasons (and to
+// AccumulationRef.Reasons) so an operator can read the firing shape at a
+// glance without re-deriving it from raw numbers. The detector layer
+// emits these; the formatter renders them verbatim.
+//
+// Conventions:
+//   - Strategy-A codes describe the accumulation window.
+//   - Strategy-B codes describe wallet age/history (context boosters
+//     attached to single-trade or accumulation Findings — never
+//     standalone).
+//   - Strategy-E codes describe ownership concentration (only on
+//     KindOwnership Findings).
+//
+// Codes that originate in a sub-package (e.g. POSSIBLE_MARKET_MAKER from
+// mmfilter, QUIET_MARKET_WAKEUP from quietmarket) are owned by the
+// emitting package and re-exported here only when widely referenced.
+const (
+	// ReasonLifetimeAccumulation — accumulation Finding with
+	// Window=lifetime: a slow-drip line spanning the wallet's full
+	// stored history on this (market, outcome, side).
+	ReasonLifetimeAccumulation = "LIFETIME_ACCUMULATION"
+	// ReasonRecentAccumulation — accumulation Finding with
+	// Window=recent: a burst line inside the short-window cap.
+	ReasonRecentAccumulation = "RECENT_ACCUMULATION"
+
+	// ReasonNewWalletLargeBet — single-trade Finding fired on a wallet
+	// with very short stored history. Context booster — does not
+	// promote severity, only annotates the alert.
+	ReasonNewWalletLargeBet = "NEW_WALLET_LARGE_BET"
+	// ReasonNewWalletAccumulation — accumulation Finding on a new
+	// wallet. Same booster semantics as ReasonNewWalletLargeBet.
+	ReasonNewWalletAccumulation = "NEW_WALLET_ACCUMULATION"
+	// ReasonLowTraderHistory — wallet has fewer than the new-wallet
+	// trade-count threshold. Surfaced on either Finding kind.
+	ReasonLowTraderHistory = "LOW_TRADER_HISTORY"
+
+	// ReasonMarketOwnershipConcentration — wallet has accumulated a
+	// significant share of the outcome's trade-flow volume. Attached
+	// only to KindOwnership Findings.
+	ReasonMarketOwnershipConcentration = "MARKET_OWNERSHIP_CONCENTRATION"
+	// ReasonWalletDominatesOutcome — wallet's share crossed the
+	// highest (Critical) ownership tier.
+	ReasonWalletDominatesOutcome = "WALLET_DOMINATES_OUTCOME"
 )
 
 // Tier is one rung on either the absolute (notional+odds) or multiplier ladder.

@@ -114,3 +114,104 @@ func (b *Bot) SendHTML(ctx context.Context, chatID, text string) (SendResult, er
 	}
 	return SendResult{MessageID: parsed.Result.MessageID}, nil
 }
+
+// ErrReactionUnsupported is returned by SetMessageReaction when the
+// Telegram API explicitly rejects the call because of capability /
+// permission / target-type limits. Callers persist this as a terminal
+// `unsupported` state and never retry. Generic transport / 5xx / rate-
+// limit errors are returned as ordinary errors so the caller can retry.
+var ErrReactionUnsupported = errors.New("telegram: setMessageReaction unsupported on target")
+
+// SetMessageReaction posts a single emoji reaction onto the message
+// identified by (chatID, messageID). Telegram's Bot API
+// `setMessageReaction` accepts a `reaction` array of reaction-type
+// objects; we pass exactly one ReactionTypeEmoji entry per call so the
+// shape stays simple and only the chosen success/failure/ambiguous
+// emoji ever appears.
+//
+// Permission / capability errors (channel reactions disabled, bot
+// missing rights, paid reactions, emoji not in the allowed list)
+// return ErrReactionUnsupported so callers mark the row terminally
+// `unsupported`. Network / 5xx / rate-limit errors are returned as
+// ordinary errors so the caller can retry.
+//
+// Telegram API reference:
+//
+//	POST https://api.telegram.org/bot<token>/setMessageReaction
+//	  chat_id   int64 | "@channelusername"
+//	  message_id int
+//	  reaction  array of ReactionType (we send 1 emoji item)
+//	  is_big    bool (false — we want quiet reactions on history)
+//
+// Per the Bot API: bot reactions require the bot to be a member of
+// the chat. Channels with reactions disabled, private channels where
+// the bot has no rights, and certain group setups will reject the
+// call — that path is mapped to ErrReactionUnsupported.
+func (b *Bot) SetMessageReaction(ctx context.Context, chatID string, messageID int64, emoji string) error {
+	if strings.TrimSpace(chatID) == "" {
+		return errors.New("telegram: chat id required")
+	}
+	if messageID <= 0 {
+		return errors.New("telegram: message id required")
+	}
+	if strings.TrimSpace(emoji) == "" {
+		return errors.New("telegram: emoji required")
+	}
+	body := map[string]any{
+		"message_id": messageID,
+		"reaction": []map[string]string{
+			{"type": "emoji", "emoji": emoji},
+		},
+		"is_big": false,
+	}
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil {
+		body["chat_id"] = id
+	} else {
+		body["chat_id"] = chatID
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("telegram: marshal: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/setMessageReaction",
+		strings.TrimRight(b.cfg.BaseURL, "/"), b.cfg.BotToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram: setMessageReaction: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	bodyStr := string(snippet)
+	// 400 / 403 with one of these substrings means the reaction cannot
+	// be applied on this target — the caller persists `unsupported`
+	// and stops trying.
+	lower := strings.ToLower(bodyStr)
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusForbidden {
+		for _, marker := range []string{
+			"reaction_invalid",
+			"reactions_too_many",
+			"reactions_not_enabled",
+			"chat_admin_required",
+			"have no rights",
+			"not enough rights",
+			"message_not_modified", // already reacted, treat as success-ish — but cleaner as unsupported so we stop
+			"message to react not found",
+			"bot was kicked",
+			"bot is not a member",
+		} {
+			if strings.Contains(lower, marker) {
+				return fmt.Errorf("%w: %s", ErrReactionUnsupported, bodyStr)
+			}
+		}
+	}
+	return fmt.Errorf("telegram: setMessageReaction chat=%s msg=%d -> %d: %s",
+		chatID, messageID, resp.StatusCode, bodyStr)
+}

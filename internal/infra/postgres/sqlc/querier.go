@@ -127,6 +127,15 @@ type Querier interface {
 	// worker after it has consulted Polymarket's market state. status must
 	// be one of: resolved_correct, resolved_wrong, unknown, unavailable.
 	MarkAlertOutcome(ctx context.Context, arg MarkAlertOutcomeParams) error
+	// Stamps a setMessageReaction verdict on the alert row.
+	MarkAlertReactionApplied(ctx context.Context, arg MarkAlertReactionAppliedParams) error
+	// Returns sent alerts with a known outcome that still need a reaction.
+	ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
+	// Signal-quality scheduled reports (migration 00008).
+	TryCreatePendingSignalReport(ctx context.Context, arg TryCreatePendingSignalReportParams) (int64, error)
+	MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error
+	MarkSignalReportFailed(ctx context.Context, arg MarkSignalReportFailedParams) error
+	LatestSignalReportByPeriodType(ctx context.Context, periodType string) (PolymarketSignalReports, error)
 	// Bumps outcome_checked_at on alerts where the upstream check failed
 	// transiently (e.g. Polymarket /markets/{id} returned an error or a
 	// not-yet-resolved market). Keeps the row scheduled for re-check at the
@@ -162,6 +171,9 @@ type Querier interface {
 	// disappearance, not at every subsequent tick.
 	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) (int64, error)
 	OldestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
+	// Server-side aggregate of (wallet, market, outcome) share-count flow
+	// vs the outcome's total BUY-side flow. Approximation — see SQL comment.
+	OwnershipShares(ctx context.Context, arg OwnershipSharesParams) (OwnershipSharesRow, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending
 	// so the BackfillWorker picks up missing history on the next tick.
