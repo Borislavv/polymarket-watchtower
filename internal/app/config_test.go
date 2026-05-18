@@ -18,17 +18,15 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"GAMMA_API_URL", "DATA_API_URL", "CLOB_API_URL",
 		"POLYMARKET_HTTP_TIMEOUT", "POLYMARKET_USER_AGENT", "POLYMARKET_PUBLIC_BASE_URL",
 		"RL_GAMMA_PER_SEC", "RL_GAMMA_BURST", "RL_DATAAPI_PER_SEC", "RL_DATAAPI_BURST",
-		"DISCOVER_INTERVAL", "COLLECT_INTERVAL", "MAX_MARKETS", "ACTIVE_ONLY",
-		"DISCOVER_ORDER", "COLLECT_CONCURRENCY",
-		"AGG_BUCKET", "AGG_BASELINE_WINDOW", "AGG_RECENT_WINDOWS",
-		"ANOMALY_MODE",
+		"DISCOVER_INTERVAL", "COLLECT_INTERVAL", "DISCOVERY_SAFETY_MAX_MARKETS", "ACTIVE_ONLY",
+		"DISCOVER_ORDER", "COLLECT_CONCURRENCY", "COLLECT_BOOTSTRAP_LOOKBACK",
 		"ALERT_INFO_MIN_NOTIONAL_USD", "ALERT_INFO_MIN_ODDS", "ALERT_INFO_MIN_MULTIPLIER",
 		"ALERT_WARNING_MIN_NOTIONAL_USD", "ALERT_WARNING_MIN_ODDS", "ALERT_WARNING_MIN_MULTIPLIER",
 		"ALERT_CRITICAL_MIN_NOTIONAL_USD", "ALERT_CRITICAL_MIN_ODDS", "ALERT_CRITICAL_MIN_MULTIPLIER",
 		"SINGLE_MIN_BASELINE_TRADES", "SINGLE_MIN_BASELINE_NOTIONAL_USD",
-		"BASELINE_WINDOW", "BASELINE_MAX_SAMPLES", "BASELINE_MIN_READY_WINDOW",
+		"BASELINE_WINDOW", "BASELINE_MIN_READY_WINDOW",
 		"LIFECYCLE_ALERT_FROM_PCT", "LIFECYCLE_HOT_FROM_PCT",
-		"MARKET_MIN_AGE", "ALLOW_UNKNOWN_MARKET_LIFECYCLE",
+		"MARKET_MIN_AGE",
 		"CLUSTER_WINDOW", "CLUSTER_MIN_ANOMALOUS_TRADES",
 		"CLUSTER_MIN_UNIQUE_TRADERS", "CLUSTER_MIN_TOTAL_NOTIONAL_USD",
 		"CLUSTER_COOLDOWN",
@@ -53,9 +51,6 @@ func TestConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Anomaly.Mode != ModeSingleCluster {
-		t.Errorf("default mode: %q", cfg.Anomaly.Mode)
-	}
 	if cfg.Anomaly.InfoMinNotionalUSD != 10_000 || cfg.Anomaly.InfoMinOdds != 3 || cfg.Anomaly.InfoMinMultiplier != 100 {
 		t.Errorf("info tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.InfoMinNotionalUSD, cfg.Anomaly.InfoMinOdds, cfg.Anomaly.InfoMinMultiplier)
@@ -67,9 +62,6 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.Anomaly.CriticalMinNotionalUSD != 100_000 || cfg.Anomaly.CriticalMinOdds != 8 || cfg.Anomaly.CriticalMinMultiplier != 10_000 {
 		t.Errorf("critical tier defaults: notional=%v odds=%v mul=%v",
 			cfg.Anomaly.CriticalMinNotionalUSD, cfg.Anomaly.CriticalMinOdds, cfg.Anomaly.CriticalMinMultiplier)
-	}
-	if cfg.Anomaly.AllowUnknownMarketLifecycle {
-		t.Errorf("AllowUnknownMarketLifecycle default must be false (fail-closed)")
 	}
 	if cfg.Anomaly.SingleMinBaselineTrades != 20 {
 		t.Errorf("baseline trade-count gate: %d", cfg.Anomaly.SingleMinBaselineTrades)
@@ -157,19 +149,32 @@ func TestConfigCategoryWhitelistOverride(t *testing.T) {
 	}
 }
 
-func TestConfigVolumeMode(t *testing.T) {
-	cfg, err := loadConfigWithEnv(t, map[string]string{"ANOMALY_MODE": "volume"})
+// TestConfigRejectsLegacyEnvVars pins the v4 cleanup contract: env vars
+// from the removed in-memory aggregate engine and the deleted volume
+// mode must not appear in production configuration. The presence of any
+// of these strings in .env / .env.example would be silently ignored by
+// the binary — better to flag them via the dedicated PRESETSHaveNoRemovedEnvVars
+// test (see preset_test.go) so operators notice.
+//
+// Functionally the env loader ignores unknown variables, so this test
+// just documents the removal — see CLAUDE.md and doc/architecture.md
+// for the v4 cleanup migration notes.
+func TestConfigLegacyEnvVarsAreIgnored(t *testing.T) {
+	cfg, err := loadConfigWithEnv(t, map[string]string{
+		"ANOMALY_MODE":         "volume",
+		"AGG_BUCKET":           "5m",
+		"AGG_BASELINE_WINDOW":  "1h",
+		"AGG_RECENT_WINDOWS":   "1h",
+		"BASELINE_MAX_SAMPLES": "999",
+		"MAX_MARKETS":          "10",
+		"VOLUME_MULTIPLIERS":   "1,2,3",
+	})
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Fatalf("legacy env vars should be ignored, not rejected: %v", err)
 	}
-	if cfg.Anomaly.Mode != ModeVolume {
-		t.Errorf("mode: %q", cfg.Anomaly.Mode)
-	}
-}
-
-func TestConfigRejectsInvalidMode(t *testing.T) {
-	if _, err := loadConfigWithEnv(t, map[string]string{"ANOMALY_MODE": "rate"}); err == nil {
-		t.Fatal("expected error for ANOMALY_MODE=rate")
+	// Same as defaults; nothing leaked.
+	if cfg.Pipeline.DiscoverySafetyMaxMarkets != 0 {
+		t.Errorf("safety cap default: got %d want 0", cfg.Pipeline.DiscoverySafetyMaxMarkets)
 	}
 }
 

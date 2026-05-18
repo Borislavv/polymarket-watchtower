@@ -1,8 +1,14 @@
 -- name: UpsertMarket :one
 -- Insert or update a market by condition_id. Backfill state fields are
 -- preserved on update — only discovery-sourced fields are touched. A
--- previously-inactive market that reappears flips `active=TRUE` and the
--- next BackfillWorker tick will pick up missing history.
+-- market resurfacing after a soft-delete:
+--   - active flips to TRUE
+--   - deleted_at is cleared (the sanity worker would otherwise hard-purge
+--     the row at retention; clearing the marker reactivates processing)
+--   - purged_at is left as-is (purged markets stay purged forever; trades
+--     remain queryable but the market is excluded from collect/backfill)
+-- The next BackfillWorker tick picks up missing history because
+-- ApplyWhitelist callers re-stamp backfill_status='pending' on resume.
 INSERT INTO polymarket_markets (
     condition_id, slug, question, event_slug, event_title,
     start_date, end_date, active, closed, last_seen_at
@@ -21,6 +27,7 @@ ON CONFLICT (condition_id) DO UPDATE SET
     active       = TRUE,
     closed       = EXCLUDED.closed,
     last_seen_at = NOW(),
+    deleted_at   = NULL,
     updated_at   = NOW()
 RETURNING *;
 
@@ -41,11 +48,17 @@ ON CONFLICT (market_id, token_id) DO UPDATE SET
     label = EXCLUDED.label;
 
 -- name: MarkMarketsInactiveNotIn :exec
--- Mark active markets inactive when they did not appear in the latest
--- whitelisted-categories discovery sweep. Scoped by category to avoid
--- penalising markets in categories we don't currently sync.
+-- Mark active markets inactive AND stamp deleted_at when they did not
+-- appear in the latest whitelisted-categories discovery sweep. Scoped by
+-- category so markets in non-whitelisted categories are untouched.
+-- The soft-delete marker (deleted_at) is set only on the active→inactive
+-- transition — if a market was already inactive we leave its marker alone
+-- so the sanity worker's retention window starts at the original
+-- disappearance, not at every subsequent tick.
 UPDATE polymarket_markets m
-SET active = FALSE, updated_at = NOW()
+SET active     = FALSE,
+    deleted_at = COALESCE(m.deleted_at, NOW()),
+    updated_at = NOW()
 WHERE m.active = TRUE
   AND NOT (m.condition_id = ANY(sqlc.arg(seen_condition_ids)::text[]))
   AND EXISTS (
@@ -58,9 +71,12 @@ WHERE m.active = TRUE
 -- name: ListActiveMarketsForBackfill :many
 -- Pick the next batch of markets to backfill, prioritised by upcoming
 -- end_date (markets nearer resolution have the most actionable history).
--- Limit is the per-tick claim count.
+-- Excludes soft-deleted and purged markets — backfill never wastes API
+-- pages on a market we have no intent to monitor.
 SELECT * FROM polymarket_markets
 WHERE active = TRUE
+  AND deleted_at IS NULL
+  AND purged_at IS NULL
   AND backfill_status IN ('pending','partial_api_limit')
 ORDER BY end_date ASC NULLS LAST
 LIMIT $1;
@@ -68,8 +84,11 @@ LIMIT $1;
 -- name: ListActiveMarketsForCollection :many
 -- Active markets that have at least started backfill — collection of
 -- recent trades only makes sense once we know how far back history goes.
+-- Excludes soft-deleted and purged markets.
 SELECT * FROM polymarket_markets
 WHERE active = TRUE
+  AND deleted_at IS NULL
+  AND purged_at IS NULL
   AND backfill_status IN ('completed','partial_api_limit')
 ORDER BY id;
 
@@ -119,3 +138,44 @@ SELECT * FROM polymarket_markets WHERE id = $1;
 
 -- name: ListMarketCategoryIDs :many
 SELECT category_id FROM polymarket_market_categories WHERE market_id = $1;
+
+-- name: ListSoftDeletedForPurge :many
+-- Used by the sanity worker (internal/app/usecase/sanity) to find markets
+-- whose soft-delete retention window has elapsed. Returns markets that:
+--   - have been soft-deleted (deleted_at IS NOT NULL)
+--   - are not already purged (purged_at IS NULL)
+--   - crossed the retention cutoff
+-- The worker then re-checks the market against the latest discover sweep;
+-- a market that has resumed flips back via UpsertMarket; one that is
+-- still gone gets stamped purged_at.
+SELECT * FROM polymarket_markets
+WHERE deleted_at IS NOT NULL
+  AND deleted_at <= sqlc.arg(cutoff)::timestamptz
+  AND purged_at IS NULL
+ORDER BY deleted_at ASC
+LIMIT sqlc.arg(claim_limit)::integer;
+
+-- name: MarkMarketPurged :exec
+-- Stamps purged_at and leaves the row intact. Trades retained for
+-- analytics — the FK from polymarket_trades.market_id does not CASCADE
+-- on the trade side, so a row delete would orphan trades.
+UPDATE polymarket_markets
+SET purged_at  = NOW(),
+    active     = FALSE,
+    updated_at = NOW()
+WHERE id = $1
+  AND purged_at IS NULL;
+
+-- name: RequeueResumedMarket :exec
+-- Called by the sanity worker (or future supervised paths) when a market
+-- is resumed: clears deleted_at, flips active, resets backfill to pending
+-- so the BackfillWorker picks up missing history on the next tick.
+-- Discovery's UpsertMarket already handles the live-sweep case; this
+-- query covers the path where the sanity worker confirms resumption via
+-- a fresh DB read.
+UPDATE polymarket_markets
+SET active          = TRUE,
+    deleted_at      = NULL,
+    backfill_status = 'pending',
+    updated_at      = NOW()
+WHERE id = $1;

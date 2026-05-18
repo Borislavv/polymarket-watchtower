@@ -76,7 +76,7 @@ func (q *Queries) FailMarketBackfill(ctx context.Context, arg FailMarketBackfill
 }
 
 const getMarketByConditionID = `-- name: GetMarketByConditionID :one
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at FROM polymarket_markets WHERE condition_id = $1
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets WHERE condition_id = $1
 `
 
 func (q *Queries) GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error) {
@@ -103,12 +103,14 @@ func (q *Queries) GetMarketByConditionID(ctx context.Context, conditionID string
 		&i.BackfillCompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.PurgedAt,
 	)
 	return i, err
 }
 
 const getMarketByID = `-- name: GetMarketByID :one
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at FROM polymarket_markets WHERE id = $1
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets WHERE id = $1
 `
 
 func (q *Queries) GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error) {
@@ -135,6 +137,8 @@ func (q *Queries) GetMarketByID(ctx context.Context, id int64) (PolymarketMarket
 		&i.BackfillCompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.PurgedAt,
 	)
 	return i, err
 }
@@ -156,8 +160,10 @@ func (q *Queries) LinkMarketCategory(ctx context.Context, arg LinkMarketCategory
 }
 
 const listActiveMarketsForBackfill = `-- name: ListActiveMarketsForBackfill :many
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at FROM polymarket_markets
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
 WHERE active = TRUE
+  AND deleted_at IS NULL
+  AND purged_at IS NULL
   AND backfill_status IN ('pending','partial_api_limit')
 ORDER BY end_date ASC NULLS LAST
 LIMIT $1
@@ -165,7 +171,8 @@ LIMIT $1
 
 // Pick the next batch of markets to backfill, prioritised by upcoming
 // end_date (markets nearer resolution have the most actionable history).
-// Limit is the per-tick claim count.
+// Excludes soft-deleted and purged markets — backfill never wastes API
+// pages on a market we have no intent to monitor.
 func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32) ([]PolymarketMarkets, error) {
 	rows, err := q.db.Query(ctx, listActiveMarketsForBackfill, limit)
 	if err != nil {
@@ -196,6 +203,8 @@ func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32)
 			&i.BackfillCompletedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.PurgedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -208,14 +217,17 @@ func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32)
 }
 
 const listActiveMarketsForCollection = `-- name: ListActiveMarketsForCollection :many
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at FROM polymarket_markets
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
 WHERE active = TRUE
+  AND deleted_at IS NULL
+  AND purged_at IS NULL
   AND backfill_status IN ('completed','partial_api_limit')
 ORDER BY id
 `
 
 // Active markets that have at least started backfill — collection of
 // recent trades only makes sense once we know how far back history goes.
+// Excludes soft-deleted and purged markets.
 func (q *Queries) ListActiveMarketsForCollection(ctx context.Context) ([]PolymarketMarkets, error) {
 	rows, err := q.db.Query(ctx, listActiveMarketsForCollection)
 	if err != nil {
@@ -246,6 +258,8 @@ func (q *Queries) ListActiveMarketsForCollection(ctx context.Context) ([]Polymar
 			&i.BackfillCompletedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.PurgedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -281,9 +295,94 @@ func (q *Queries) ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]
 	return items, nil
 }
 
+const listSoftDeletedForPurge = `-- name: ListSoftDeletedForPurge :many
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
+WHERE deleted_at IS NOT NULL
+  AND deleted_at <= $1::timestamptz
+  AND purged_at IS NULL
+ORDER BY deleted_at ASC
+LIMIT $2::integer
+`
+
+type ListSoftDeletedForPurgeParams struct {
+	Cutoff     pgtype.Timestamptz
+	ClaimLimit int32
+}
+
+// Used by the sanity worker (internal/app/usecase/sanity) to find markets
+// whose soft-delete retention window has elapsed. Returns markets that:
+//   - have been soft-deleted (deleted_at IS NOT NULL)
+//   - are not already purged (purged_at IS NULL)
+//   - crossed the retention cutoff
+//
+// The worker then re-checks the market against the latest discover sweep;
+// a market that has resumed flips back via UpsertMarket; one that is
+// still gone gets stamped purged_at.
+func (q *Queries) ListSoftDeletedForPurge(ctx context.Context, arg ListSoftDeletedForPurgeParams) ([]PolymarketMarkets, error) {
+	rows, err := q.db.Query(ctx, listSoftDeletedForPurge, arg.Cutoff, arg.ClaimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PolymarketMarkets
+	for rows.Next() {
+		var i PolymarketMarkets
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConditionID,
+			&i.Slug,
+			&i.Question,
+			&i.EventSlug,
+			&i.EventTitle,
+			&i.StartDate,
+			&i.EndDate,
+			&i.Active,
+			&i.Closed,
+			&i.LastSeenAt,
+			&i.BackfillStatus,
+			&i.BackfillOldestFetchedAt,
+			&i.BackfillNewestFetchedAt,
+			&i.BackfillAttempts,
+			&i.BackfillLastError,
+			&i.BackfillStartedAt,
+			&i.BackfillCompletedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.PurgedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markMarketPurged = `-- name: MarkMarketPurged :exec
+UPDATE polymarket_markets
+SET purged_at  = NOW(),
+    active     = FALSE,
+    updated_at = NOW()
+WHERE id = $1
+  AND purged_at IS NULL
+`
+
+// Stamps purged_at and leaves the row intact. Trades retained for
+// analytics — the FK from polymarket_trades.market_id does not CASCADE
+// on the trade side, so a row delete would orphan trades.
+func (q *Queries) MarkMarketPurged(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, markMarketPurged, id)
+	return err
+}
+
 const markMarketsInactiveNotIn = `-- name: MarkMarketsInactiveNotIn :exec
 UPDATE polymarket_markets m
-SET active = FALSE, updated_at = NOW()
+SET active     = FALSE,
+    deleted_at = COALESCE(m.deleted_at, NOW()),
+    updated_at = NOW()
 WHERE m.active = TRUE
   AND NOT (m.condition_id = ANY($1::text[]))
   AND EXISTS (
@@ -299,11 +398,35 @@ type MarkMarketsInactiveNotInParams struct {
 	ScopeCategoryIds []int64
 }
 
-// Mark active markets inactive when they did not appear in the latest
-// whitelisted-categories discovery sweep. Scoped by category to avoid
-// penalising markets in categories we don't currently sync.
+// Mark active markets inactive AND stamp deleted_at when they did not
+// appear in the latest whitelisted-categories discovery sweep. Scoped by
+// category so markets in non-whitelisted categories are untouched.
+// The soft-delete marker (deleted_at) is set only on the active→inactive
+// transition — if a market was already inactive we leave its marker alone
+// so the sanity worker's retention window starts at the original
+// disappearance, not at every subsequent tick.
 func (q *Queries) MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) error {
 	_, err := q.db.Exec(ctx, markMarketsInactiveNotIn, arg.SeenConditionIds, arg.ScopeCategoryIds)
+	return err
+}
+
+const requeueResumedMarket = `-- name: RequeueResumedMarket :exec
+UPDATE polymarket_markets
+SET active          = TRUE,
+    deleted_at      = NULL,
+    backfill_status = 'pending',
+    updated_at      = NOW()
+WHERE id = $1
+`
+
+// Called by the sanity worker (or future supervised paths) when a market
+// is resumed: clears deleted_at, flips active, resets backfill to pending
+// so the BackfillWorker picks up missing history on the next tick.
+// Discovery's UpsertMarket already handles the live-sweep case; this
+// query covers the path where the sanity worker confirms resumption via
+// a fresh DB read.
+func (q *Queries) RequeueResumedMarket(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, requeueResumedMarket, id)
 	return err
 }
 
@@ -357,8 +480,9 @@ ON CONFLICT (condition_id) DO UPDATE SET
     active       = TRUE,
     closed       = EXCLUDED.closed,
     last_seen_at = NOW(),
+    deleted_at   = NULL,
     updated_at   = NOW()
-RETURNING id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at
+RETURNING id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at
 `
 
 type UpsertMarketParams struct {
@@ -374,8 +498,15 @@ type UpsertMarketParams struct {
 
 // Insert or update a market by condition_id. Backfill state fields are
 // preserved on update — only discovery-sourced fields are touched. A
-// previously-inactive market that reappears flips `active=TRUE` and the
-// next BackfillWorker tick will pick up missing history.
+// market resurfacing after a soft-delete:
+//   - active flips to TRUE
+//   - deleted_at is cleared (the sanity worker would otherwise hard-purge
+//     the row at retention; clearing the marker reactivates processing)
+//   - purged_at is left as-is (purged markets stay purged forever; trades
+//     remain queryable but the market is excluded from collect/backfill)
+//
+// The next BackfillWorker tick picks up missing history because
+// ApplyWhitelist callers re-stamp backfill_status='pending' on resume.
 func (q *Queries) UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error) {
 	row := q.db.QueryRow(ctx, upsertMarket,
 		arg.ConditionID,
@@ -409,6 +540,8 @@ func (q *Queries) UpsertMarket(ctx context.Context, arg UpsertMarketParams) (Pol
 		&i.BackfillCompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.PurgedAt,
 	)
 	return i, err
 }

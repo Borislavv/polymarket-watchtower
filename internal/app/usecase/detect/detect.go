@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
@@ -33,6 +32,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -118,12 +118,10 @@ type Config struct {
 	Baseline       baseline.Config
 	Cluster        cluster.Config
 	Filter         *category.Filter // nil => allow all (no filtering)
-	RecentWindows  []time.Duration
-	GaugeInterval  time.Duration // how often Run() refreshes supporting gauges
-	PolymarketBase string        // "https://polymarket.com" (no trailing slash)
-	GrafanaBase    string        // public base URL for Grafana deep-links; "" disables
-	GrafanaDashUID string        // dashboard UID for deep-link
-	GrafanaContext time.Duration // ±window around trade time in Grafana link
+	PolymarketBase string           // "https://polymarket.com" (no trailing slash)
+	GrafanaBase    string           // public base URL for Grafana deep-links; "" disables
+	GrafanaDashUID string           // dashboard UID for deep-link
+	GrafanaContext time.Duration    // ±window around trade time in Grafana link
 	// Lifecycle gating: alerts only fire when the market is at or past
 	// LifecycleAlertFromPct of its lifetime, and are marked Hot when at or
 	// past LifecycleHotFromPct. Markets without start/end dates bypass the
@@ -137,11 +135,7 @@ type Config struct {
 	// oldest sample) to clear this floor before alerts can fire. 0 disables.
 	// Distinct from BaselineWindow, which is the *maximum* lookback.
 	BaselineMinReadySpan time.Duration
-	// AllowUnknownMarketLifecycle: when false (default), markets without
-	// StartDate/EndDate are silently skipped — fail-closed. Set true to
-	// allow them through (legacy / debugging).
-	AllowUnknownMarketLifecycle bool
-	Clock                       func() time.Time
+	Clock func() time.Time
 
 	// Baseliner is the Postgres-backed baseline fetcher. Wired in
 	// production whenever POSTGRES_DSN is set. Leave nil only in the
@@ -200,8 +194,7 @@ type Config struct {
 // Loop owns the analytics state.
 type Loop struct {
 	cfg      Config
-	engine   *aggregate.Engine
-	registry *aggregate.MarketRegistry
+	cache    *marketcache.Cache
 	baseline *baseline.Baseline
 	cluster  *cluster.Detector
 	emit     Emitter
@@ -214,15 +207,11 @@ type Loop struct {
 // per-(category, market, outcome) reservoirs.
 func New(
 	cfg Config,
-	eng *aggregate.Engine,
-	reg *aggregate.MarketRegistry,
+	cache *marketcache.Cache,
 	emit Emitter,
 	m *metrics.Metrics,
 	log *zerolog.Logger,
 ) *Loop {
-	if cfg.GaugeInterval <= 0 {
-		cfg.GaugeInterval = time.Minute
-	}
 	if cfg.GrafanaContext <= 0 {
 		cfg.GrafanaContext = time.Hour
 	}
@@ -236,7 +225,7 @@ func New(
 		cfg.LifecycleHotFromPct = cfg.LifecycleAlertFromPct
 	}
 	if cfg.StrategyVersion == "" {
-		cfg.StrategyVersion = "v4"
+		cfg.StrategyVersion = anomaly.StrategyIdentity
 	}
 	now := cfg.Clock
 	if now == nil {
@@ -251,8 +240,7 @@ func New(
 	}
 	return &Loop{
 		cfg:      cfg,
-		engine:   eng,
-		registry: reg,
+		cache:    cache,
 		baseline: baseline.New(cfg.Baseline),
 		cluster:  cluster.New(cfg.Cluster),
 		emit:     emit,
@@ -294,10 +282,17 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	lifecyclePct, lifecycleKnown := market.LifecyclePct(trade.Timestamp)
 	hot := lifecycleKnown && lifecyclePct >= l.cfg.LifecycleHotFromPct
 	gateAllowsAlert := true
-	if !lifecycleKnown && !l.cfg.AllowUnknownMarketLifecycle {
-		// Fail-closed: a market without start/end dates can't be lifecycle-gated
-		// and so can't be trusted by default.
+	if !lifecycleKnown {
+		// Fail-closed by design — a market without start/end dates cannot
+		// be lifecycle-gated, and the lifecycle gate is the single most
+		// load-bearing precision floor of the entire pipeline. There is
+		// no env override; bumping baseline volume on the upstream
+		// `MarketsTracked` metric tells the operator how many markets
+		// fall into this bucket.
 		gateAllowsAlert = false
+		if l.metrics != nil && l.metrics.LifecycleUnknownSkipped != nil {
+			l.metrics.LifecycleUnknownSkipped.Inc()
+		}
 	}
 	if lifecycleKnown && lifecyclePct < l.cfg.LifecycleAlertFromPct {
 		gateAllowsAlert = false
@@ -978,7 +973,7 @@ func categoryLabelByID(l *Loop, cat vo.CategoryID) string {
 	if cat == 0 {
 		return "uncategorized"
 	}
-	if c, ok := l.registry.Category(cat); ok {
+	if c, ok := l.cache.Category(cat); ok {
 		if c.Label != "" {
 			return c.Label
 		}
@@ -1066,7 +1061,7 @@ func (l *Loop) allowed(cat vo.CategoryID) bool {
 	if cat == 0 {
 		return l.cfg.Filter.Allowed("", "")
 	}
-	if c, ok := l.registry.Category(cat); ok {
+	if c, ok := l.cache.Category(cat); ok {
 		return l.cfg.Filter.Allowed(c.Slug, c.Label)
 	}
 	return true
@@ -1074,7 +1069,7 @@ func (l *Loop) allowed(cat vo.CategoryID) bool {
 
 func (l *Loop) categoryRef(cat vo.CategoryID) anomaly.CategoryRef {
 	ref := anomaly.CategoryRef{ID: cat}
-	if c, ok := l.registry.Category(cat); ok {
+	if c, ok := l.cache.Category(cat); ok {
 		ref.Slug = c.Slug
 		ref.Label = c.Label
 	}
@@ -1164,33 +1159,23 @@ func singleSlashJoin(base string, segs ...string) string {
 	return out
 }
 
-// Run periodically refreshes supporting Grafana gauges from the aggregate
-// engine. It does NOT fire any alerts — alerts are emitted synchronously from
-// Observe. Run blocks until ctx is cancelled.
+// Run blocks until ctx is cancelled. Detection is synchronous in Observe;
+// the only periodic work is the baseline-buckets gauge (operator-visible
+// counter used by Grafana). Removed in v4 cleanup: the per-market
+// supporting gauges (WindowTradeRate/NotionalRate/AvgSize) that fed off
+// the in-memory aggregate engine — they were bucket-only diagnostics and
+// are now replaced by Postgres-derived Grafana queries.
 func (l *Loop) Run(ctx context.Context) error {
-	t := time.NewTicker(l.cfg.GaugeInterval)
+	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			l.refreshGauges()
+			l.metrics.BaselineBuckets.Set(float64(l.baseline.Buckets()))
 		}
 	}
-}
-
-func (l *Loop) refreshGauges() {
-	for _, m := range l.registry.Snapshot() {
-		for _, w := range l.cfg.RecentWindows {
-			win := l.engine.Window(m.ID, w)
-			label := windowLabel(w)
-			l.metrics.WindowTradeRate.WithLabelValues(string(m.ID), label).Set(win.TradesPerMinute())
-			l.metrics.WindowNotionalRate.WithLabelValues(string(m.ID), label).Set(win.NotionalPerMinute())
-			l.metrics.WindowAvgSize.WithLabelValues(string(m.ID), label).Set(win.AvgSize())
-		}
-	}
-	l.metrics.BaselineBuckets.Set(float64(l.baseline.Buckets()))
 }
 
 func windowLabel(d time.Duration) string {

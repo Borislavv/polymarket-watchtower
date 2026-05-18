@@ -319,7 +319,6 @@ crosses the lifecycle threshold.
   inside Politics) is still analysed normally. Default: `Politics`.
 - **Lifecycle gate** — `LIFECYCLE_ALERT_FROM_PCT` (alerts fire) and
   `LIFECYCLE_HOT_FROM_PCT` (alerts marked HOT). Markets without start/end
-  dates are silenced when `ALLOW_UNKNOWN_MARKET_LIFECYCLE=false` (default).
 - **Market age** — `MARKET_MIN_AGE` blocks alerts on markets younger than
   this in wall-clock terms, regardless of lifecycle percentage.
 - **Baseline readiness** — `BASELINE_MIN_READY_WINDOW` requires the observed

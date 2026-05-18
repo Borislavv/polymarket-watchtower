@@ -16,16 +16,6 @@ const (
 	EnvProd  Environment = "prod"
 )
 
-// AnomalyMode selects which detector wires alerts. single_cluster is the
-// default; volume keeps the legacy aggregate-rate behaviour for operators
-// who explicitly want it.
-type AnomalyMode string
-
-const (
-	ModeSingleCluster AnomalyMode = "single_cluster"
-	ModeVolume        AnomalyMode = "volume"
-)
-
 // Production persistence model (Strategy v4):
 //
 //   - When POSTGRES_DSN is set, the baseline is sourced from Postgres
@@ -77,20 +67,38 @@ type PostgresConfig struct {
 // BackfillConfig tunes the BackfillWorker. The worker is enabled whenever
 // Postgres is configured — backfill is the only way to populate the DB
 // with the historical trades the detector relies on.
+//
+// Backfill exhausts every market's available upstream history: pagination
+// walks offset 0..N until the Data API returns an empty page (status
+// `completed`) or the documented 3000-row offset cap (`partial_api_limit`).
+// There is no shallow-lookback short-circuit; the goal is the deepest DB
+// history Polymarket allows.
 type BackfillConfig struct {
-	// Interval is the tick cadence; each tick claims up to BatchSize
+	// Interval is the tick cadence; each tick claims up to Workers
 	// markets and runs a full backfill pass per market.
 	Interval time.Duration `env:"BACKFILL_INTERVAL" envDefault:"1m" validate:"required"`
-	// BatchSize is the max number of markets claimed per tick. Lower it
-	// to reduce upstream pressure; higher to speed bootstrap.
-	BatchSize int `env:"BACKFILL_WORKERS" envDefault:"4" validate:"gte=1"`
-	// Concurrency caps in-flight backfills inside one tick.
-	Concurrency int `env:"BACKFILL_CONCURRENCY" envDefault:"2" validate:"gte=1"`
+	// Workers is the number of parallel backfills (also the per-tick
+	// claim count — markets and goroutines are 1:1). Default 48; tune
+	// down only to reduce upstream pressure during incidents.
+	Workers int `env:"BACKFILL_WORKERS" envDefault:"48" validate:"gte=1"`
 	// PageLimit is the Data API page size (max 500).
 	PageLimit int `env:"BACKFILL_PAGE_LIMIT" envDefault:"500" validate:"gte=1,lte=500"`
 	// StaleAfter requeues 'running' markets older than this — used to
 	// recover from a crashed previous process.
 	StaleAfter time.Duration `env:"BACKFILL_STALE_AFTER" envDefault:"15m" validate:"required"`
+}
+
+// MarketSanityConfig tunes the soft-delete reaper (sanity worker). The
+// worker runs hourly, finds markets that have been soft-deleted longer
+// than Retention, re-checks the current upstream state, and either
+// resumes (clears deleted_at, re-queues backfill) or purges (stamps
+// purged_at, retains trades).
+type MarketSanityConfig struct {
+	Interval  time.Duration `env:"MARKET_SANITY_INTERVAL" envDefault:"1h" validate:"required"`
+	Retention time.Duration `env:"MARKET_SOFT_DELETE_RETENTION" envDefault:"720h" validate:"required"`
+	// ClaimLimit caps the per-tick batch. Defaults to 256 inside the
+	// worker; surfaced here for operational tuning.
+	ClaimLimit int `env:"MARKET_SANITY_CLAIM_LIMIT" envDefault:"256" validate:"gte=1"`
 }
 
 // AlertSenderConfig tunes the alert sender worker that drains
@@ -106,6 +114,22 @@ type AlertSenderConfig struct {
 	// status. A row stuck in `sending` longer than this is reset back to
 	// `pending` so the next tick re-issues it.
 	StaleSendingAfter time.Duration `env:"ALERT_SENDER_STALE_AFTER" envDefault:"5m" validate:"required"`
+
+	// Retry policy for failed delivery attempts. When enabled, the claim
+	// query also picks up `status='failed' AND next_retry_at <= now()`
+	// rows and re-attempts delivery; the backoff grows exponentially from
+	// RetryInitialBackoff up to RetryMaxBackoff with ±RetryJitterFraction
+	// jitter; after RetryMaxAttempts (counting the initial attempt) the
+	// row stays in 'failed' forever (operator must intervene).
+	//
+	// Permanent failures (Telegram HTML parse error, "chat not found",
+	// payload render error) are NEVER retried regardless of policy —
+	// retrying would just burn quota.
+	RetryEnabled        bool          `env:"ALERT_RETRY_ENABLED" envDefault:"true"`
+	RetryMaxAttempts    int           `env:"ALERT_RETRY_MAX_ATTEMPTS" envDefault:"5" validate:"gte=1"`
+	RetryInitialBackoff time.Duration `env:"ALERT_RETRY_INITIAL_BACKOFF" envDefault:"30s" validate:"required"`
+	RetryMaxBackoff     time.Duration `env:"ALERT_RETRY_MAX_BACKOFF" envDefault:"30m" validate:"required"`
+	RetryJitterFraction float64       `env:"ALERT_RETRY_JITTER_FRACTION" envDefault:"0.2" validate:"gte=0,lte=1"`
 }
 
 // Enabled reports whether the Postgres layer is configured. The rest of
@@ -131,13 +155,26 @@ type RateLimitConfig struct {
 }
 
 // PipelineConfig drives discovery and collection cadence and scope.
+//
+// DiscoverySafetyMaxMarkets is an OPERATIONAL EMERGENCY CAP only. With
+// Postgres as the source of truth, the production system processes every
+// market that survives the category whitelist; backpressure comes from
+// rate limits and DB state, not from arbitrary row truncation. The cap
+// exists so an operator can quickly bound upstream load if a Polymarket
+// listing spike (or a bug) tries to enroll an unreasonable number of
+// markets. Default 0 means "unlimited" and is the only correct setting
+// for normal production.
 type PipelineConfig struct {
-	DiscoverInterval   time.Duration `env:"DISCOVER_INTERVAL" envDefault:"10m" validate:"required"`
-	CollectInterval    time.Duration `env:"COLLECT_INTERVAL" envDefault:"60s" validate:"required"`
-	MaxMarkets         int           `env:"MAX_MARKETS" envDefault:"500" validate:"gte=0"`
-	ActiveOnly         bool          `env:"ACTIVE_ONLY" envDefault:"true"`
-	OrderBy            string        `env:"DISCOVER_ORDER" envDefault:"volume_24hr"`
-	CollectConcurrency int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
+	DiscoverInterval          time.Duration `env:"DISCOVER_INTERVAL" envDefault:"10m" validate:"required"`
+	CollectInterval           time.Duration `env:"COLLECT_INTERVAL" envDefault:"60s" validate:"required"`
+	DiscoverySafetyMaxMarkets int           `env:"DISCOVERY_SAFETY_MAX_MARKETS" envDefault:"0" validate:"gte=0"`
+	ActiveOnly                bool          `env:"ACTIVE_ONLY" envDefault:"true"`
+	OrderBy                   string        `env:"DISCOVER_ORDER" envDefault:"volume_24hr"`
+	CollectConcurrency        int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
+	// CollectBootstrapLookback is the per-market initial trade lookback
+	// on first sight. Used when no persisted cursor exists yet (e.g. a
+	// freshly-discovered market on a fresh database).
+	CollectBootstrapLookback time.Duration `env:"COLLECT_BOOTSTRAP_LOOKBACK" envDefault:"24h" validate:"required"`
 }
 
 // CategoryFilterConfig selects which Polymarket categories the watchtower
@@ -159,14 +196,6 @@ type CategoryFilterConfig struct {
 	Whitelist []string `env:"CATEGORY_WHITELIST" envSeparator:"," envDefault:"Politics"`
 }
 
-// AggregateConfig sizes the rolling-bucket engine used by both modes
-// (supporting gauges in single_cluster; alert source in volume).
-type AggregateConfig struct {
-	BucketSize     time.Duration   `env:"AGG_BUCKET" envDefault:"1m" validate:"required"`
-	BaselineWindow time.Duration   `env:"AGG_BASELINE_WINDOW" envDefault:"168h" validate:"required"`
-	RecentWindows  []time.Duration `env:"AGG_RECENT_WINDOWS" envDefault:"12h,24h" envSeparator:","`
-}
-
 // AnomalyConfig encodes the per-trade `single_cluster` detector and the
 // category-cluster (HARD) alert. Single-trade scoring is conservative-MIN
 // of two 3-rung ladders; the cluster fires HARD when several already-firing
@@ -180,17 +209,15 @@ type AggregateConfig struct {
 // Final severity is the lower of the two tiers. Either side below Info ⇒ no
 // alert. Single-trade severity caps at Critical; HARD is reserved for
 // cluster alerts (multiple sharks converging).
+//
+// v4 cleanup removed the legacy `volume` mode and the in-memory aggregate
+// engine. `single_cluster` is now the only production strategy and is
+// wired unconditionally — the ANOMALY_MODE env var is gone, the
+// `AggregateConfig` block (`AGG_BUCKET`, `AGG_BASELINE_WINDOW`,
+// `AGG_RECENT_WINDOWS`) is gone, and `BASELINE_MAX_SAMPLES` is no longer
+// an operator-facing env (it has a hardcoded default inside the
+// in-memory dev-only fallback).
 type AnomalyConfig struct {
-	Mode AnomalyMode `env:"ANOMALY_MODE" envDefault:"single_cluster" validate:"required,oneof=single_cluster volume"`
-
-	// StrategyVersion is stamped on every persisted alert row and woven
-	// into the dedup_key so a config retune cannot resurrect alerts
-	// dropped under the previous strategy. v4 adds same-trader
-	// accumulation-line detection on top of v2's trader-history
-	// multiplier + MM/arbitrage suppression. Bump this when changing
-	// tier thresholds, baseline gates, or any other decision input.
-	StrategyVersion string `env:"STRATEGY_VERSION" envDefault:"v4" validate:"required"`
-
 	// Single-trade severity ladders. Both ladders must qualify at the same
 	// rung or higher; final severity is the lower of the two.
 	InfoMinNotionalUSD     float64 `env:"ALERT_INFO_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
@@ -212,8 +239,7 @@ type AnomalyConfig struct {
 	// "no upper bound" (only the per-bucket MaxSamples ring caps memory).
 	// It is NOT a minimum-age requirement on the market — a 1-month-old
 	// market with BASELINE_WINDOW=1y uses the 1 month of available history.
-	BaselineWindow     time.Duration `env:"BASELINE_WINDOW" envDefault:"8760h" validate:"gte=0"`
-	BaselineMaxSamples int           `env:"BASELINE_MAX_SAMPLES" envDefault:"1024" validate:"gte=16"`
+	BaselineWindow time.Duration `env:"BASELINE_WINDOW" envDefault:"8760h" validate:"gte=0"`
 	// BaselineMinReadySpan requires the observed baseline span (newest minus
 	// oldest sample) to clear this floor before alerts can fire. Distinct
 	// from BaselineWindow which is a *cap*. 0 disables.
@@ -221,12 +247,13 @@ type AnomalyConfig struct {
 
 	// Lifecycle gating: only alert when the market is in the last
 	// (100 - LifecycleAlertFromPct)% of its lifetime. Markets with missing
-	// start/end dates are silenced by default (fail-closed); set
-	// ALLOW_UNKNOWN_MARKET_LIFECYCLE=true to opt in.
-	LifecycleAlertFromPct       float64       `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
-	LifecycleHotFromPct         float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
-	MarketMinAge                time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
-	AllowUnknownMarketLifecycle bool          `env:"ALLOW_UNKNOWN_MARKET_LIFECYCLE" envDefault:"false"`
+	// start/end dates are ALWAYS silenced — there is no env override (the
+	// previous `ALLOW_UNKNOWN_MARKET_LIFECYCLE` was removed in the v4
+	// hardening pass; an alert without lifecycle context is structurally
+	// unsafe and we never want a config knob to flip that off).
+	LifecycleAlertFromPct float64       `env:"LIFECYCLE_ALERT_FROM_PCT" envDefault:"75" validate:"gte=0,lte=100"`
+	LifecycleHotFromPct   float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
+	MarketMinAge          time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
 
 	// Trader-history multiplier (v2). Scoring adds a second multiplier:
 	// notional / wallet's median historical trade. A trade fires when it
@@ -311,12 +338,6 @@ type AnomalyConfig struct {
 	ClusterMinWallets  int           `env:"CLUSTER_MIN_UNIQUE_TRADERS" envDefault:"2" validate:"gte=1"`
 	ClusterMinTotalUSD float64       `env:"CLUSTER_MIN_TOTAL_NOTIONAL_USD" envDefault:"50000" validate:"gte=0"`
 	ClusterCooldown    time.Duration `env:"CLUSTER_COOLDOWN" envDefault:"30m" validate:"required"`
-
-	// Volume mode (legacy aggregate-rate detector).
-	VolumeMultipliers []float64     `env:"VOLUME_MULTIPLIERS" envDefault:"30,100,1000" envSeparator:","`
-	VolumeMinNotional float64       `env:"VOLUME_MIN_NOTIONAL_USD" envDefault:"5000" validate:"gte=0"`
-	VolumeMinTrades   int           `env:"VOLUME_MIN_TRADES" envDefault:"5" validate:"gte=0"`
-	VolumeCooldown    time.Duration `env:"VOLUME_COOLDOWN" envDefault:"30m" validate:"required"`
 }
 
 // AlertingConfig wires sinks. The Telegram sink sends to a single configured
@@ -340,11 +361,11 @@ type Config struct {
 	Application    ApplicationConfig
 	Postgres       PostgresConfig
 	Backfill       BackfillConfig
+	MarketSanity   MarketSanityConfig
 	AlertSender    AlertSenderConfig
 	Polymarket     PolymarketConfig
 	RateLimit      RateLimitConfig
 	Pipeline       PipelineConfig
-	Aggregate      AggregateConfig
 	Anomaly        AnomalyConfig
 	CategoryFilter CategoryFilterConfig
 	Alerting       AlertingConfig

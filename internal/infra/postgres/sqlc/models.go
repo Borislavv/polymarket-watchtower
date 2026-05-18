@@ -9,23 +9,36 @@ import (
 )
 
 type PolymarketAlerts struct {
-	ID                int64
-	DedupKey          string
-	StrategyVersion   string
-	Kind              string
-	Reason            string
-	Severity          string
-	MarketID          *int64
-	TraderID          *int64
-	TradeID           *int64
-	Payload           []byte
-	Status            string
-	TelegramMessageID *int64
-	SendAttempts      int32
-	LastSendError     *string
-	SentAt            pgtype.Timestamptz
-	CreatedAt         pgtype.Timestamptz
-	UpdatedAt         pgtype.Timestamptz
+	ID                  int64
+	DedupKey            string
+	StrategyVersion     string
+	Kind                string
+	Reason              string
+	Severity            string
+	MarketID            *int64
+	TraderID            *int64
+	TradeID             *int64
+	Payload             []byte
+	Status              string
+	TelegramMessageID   *int64
+	SendAttempts        int32
+	LastSendError       *string
+	SentAt              pgtype.Timestamptz
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
+	NextRetryAt         pgtype.Timestamptz
+	LastAttemptAt       pgtype.Timestamptz
+	OutcomeStatus       string
+	OutcomeCheckedAt    pgtype.Timestamptz
+	ResolvedAt          pgtype.Timestamptz
+	WinningOutcomeToken *string
+	WinningOutcomeLabel *string
+	DriftStatus         string
+	DriftCheckedAt      pgtype.Timestamptz
+	Clv15m              *float64
+	Clv1h               *float64
+	Clv6h               *float64
+	Clv24h              *float64
 }
 
 type PolymarketCategories struct {
@@ -72,6 +85,8 @@ type PolymarketMarkets struct {
 	BackfillCompletedAt     pgtype.Timestamptz
 	CreatedAt               pgtype.Timestamptz
 	UpdatedAt               pgtype.Timestamptz
+	DeletedAt               pgtype.Timestamptz
+	PurgedAt                pgtype.Timestamptz
 }
 
 type PolymarketTraders struct {

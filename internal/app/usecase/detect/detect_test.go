@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -58,15 +58,15 @@ func defaultThresholds() anomaly.Thresholds {
 	}
 }
 
-func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Config) (*Loop, *aggregate.MarketRegistry, *capturingEmitter) {
+func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Config) (*Loop, *marketcache.Cache, *capturingEmitter) {
 	t.Helper()
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
 			EventSlug: "us-pres-2028", EventTitle: "US Presidential Election 2028",
 			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -81,8 +81,7 @@ func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Conf
 		GrafanaBase:                 "http://grafana.local",
 		GrafanaDashUID:              "uid123",
 		GrafanaContext:              time.Hour,
-		AllowUnknownMarketLifecycle: true, // fixture market has no Start/End dates
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	return loop, reg, emit
 }
 
@@ -242,12 +241,12 @@ func TestClusterHardAlert(t *testing.T) {
 // the whitelist must produce zero findings, even on an obvious whale trade.
 func TestNonWhitelistedCategoryProducesNoAlert(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xb", Slug: "nba-finals", Question: "Who wins?",
 			EventSlug: "2026-nba-finals", TokenIDs: []vo.TokenID{"tok"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{77}, Active: true,
+			Categories: []vo.CategoryID{77}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 77, Slug: "nba", Label: "NBA"}},
 	)
@@ -260,7 +259,7 @@ func TestNonWhitelistedCategoryProducesNoAlert(t *testing.T) {
 		// Whitelist contains only Politics; the NBA market is not admitted.
 		Filter: category.NewFilter([]string{"politics"}),
 		Clock:  func() time.Time { return now },
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xb")
 	loop.Observe(context.Background(), m, bet(100_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
@@ -296,7 +295,7 @@ func TestMarketURLUsesEventSlug(t *testing.T) {
 
 func TestLifecycleGateSkipsEarlyMarkets(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	// Market spans 100 days; trade at day 50 = 50% elapsed; below 75% floor.
 	start := now.Add(-50 * 24 * time.Hour)
 	end := now.Add(50 * 24 * time.Hour)
@@ -322,7 +321,7 @@ func TestLifecycleGateSkipsEarlyMarkets(t *testing.T) {
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75,
 		LifecycleHotFromPct:   90,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 
 	m, _ := reg.Get("0xa")
 	warm(loop, m, 30, 60, 0.5, now)
@@ -334,7 +333,7 @@ func TestLifecycleGateSkipsEarlyMarkets(t *testing.T) {
 
 func TestLifecycleMarksHotInFinalStretch(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	// 100-day span; trade at day 95 = 95% elapsed → above HOT threshold.
 	start := now.Add(-95 * 24 * time.Hour)
 	end := now.Add(5 * 24 * time.Hour)
@@ -361,7 +360,7 @@ func TestLifecycleMarksHotInFinalStretch(t *testing.T) {
 		LifecycleAlertFromPct: 75,
 		LifecycleHotFromPct:   90,
 		PolymarketBase:        "https://polymarket.com",
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 
 	m, _ := reg.Get("0xa")
 	warm(loop, m, 30, 60, 0.5, now)
@@ -440,7 +439,7 @@ func TestBaselineWindowDoesNotBlockShortMarkets(t *testing.T) {
 	// 30-day market, currently at 80% of lifetime → past the 75% gate.
 	start := now.Add(-24 * 24 * time.Hour)
 	end := now.Add(6 * 24 * time.Hour)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "s", Question: "q",
@@ -462,7 +461,7 @@ func TestBaselineWindowDoesNotBlockShortMarkets(t *testing.T) {
 		MarketMinAge:          24 * time.Hour,
 		BaselineMinReadySpan:  24 * time.Hour,
 		PolymarketBase:        "https://polymarket.com",
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	// Seed baseline across the market's 30-day lifetime.
 	for i := 0; i < 30; i++ {
@@ -485,7 +484,7 @@ func TestEarlyLifecycleBlocksShortMarkets(t *testing.T) {
 	// 30-day market at 50% of lifetime — below 75% gate.
 	start := now.Add(-15 * 24 * time.Hour)
 	end := now.Add(15 * 24 * time.Hour)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{ID: "0xa", Slug: "s", EventSlug: "e", TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"}, Categories: []vo.CategoryID{42}, Active: true, StartDate: start, EndDate: end}},
 		[]market.Category{{ID: 42, Slug: "x", Label: "X"}},
@@ -497,7 +496,7 @@ func TestEarlyLifecycleBlocksShortMarkets(t *testing.T) {
 		Cluster:               cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75, LifecycleHotFromPct: 90,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", start.Add(time.Duration(i)*24*time.Hour/30*15)))
@@ -513,7 +512,7 @@ func TestMarketMinAgeBlocksTooYoung(t *testing.T) {
 	// 12h-old market, very late in lifetime but too young in absolute terms.
 	start := now.Add(-12 * time.Hour)
 	end := now.Add(time.Hour)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{ID: "0xa", Slug: "s", EventSlug: "e", TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"}, Categories: []vo.CategoryID{42}, Active: true, StartDate: start, EndDate: end}},
 		[]market.Category{{ID: 42, Slug: "x", Label: "X"}},
@@ -526,7 +525,7 @@ func TestMarketMinAgeBlocksTooYoung(t *testing.T) {
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75, LifecycleHotFromPct: 90,
 		MarketMinAge: 24 * time.Hour, // 12h < 24h → block
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", start))
@@ -541,7 +540,7 @@ func TestBaselineMinReadySpanBlocksThinSpan(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	start := now.Add(-30 * 24 * time.Hour)
 	end := now.Add(time.Hour)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{ID: "0xa", Slug: "s", EventSlug: "e", TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"}, Categories: []vo.CategoryID{42}, Active: true, StartDate: start, EndDate: end}},
 		[]market.Category{{ID: 42, Slug: "x", Label: "X"}},
@@ -555,7 +554,7 @@ func TestBaselineMinReadySpanBlocksThinSpan(t *testing.T) {
 		LifecycleAlertFromPct: 0, LifecycleHotFromPct: 100,
 		MarketMinAge:         0,
 		BaselineMinReadySpan: 24 * time.Hour,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	// Seed 30 baseline trades all in the last 10 minutes — span < 24h.
 	for i := 0; i < 30; i++ {
@@ -633,7 +632,7 @@ func TestSeverityTableFromStrategy(t *testing.T) {
 
 func TestUnknownLifecycleFailsClosedByDefault(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		// Market with no Start/End dates.
 		[]market.Market{{ID: "0xa", Slug: "s", EventSlug: "e", TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"}, Categories: []vo.CategoryID{42}, Active: true}},
@@ -646,9 +645,10 @@ func TestUnknownLifecycleFailsClosedByDefault(t *testing.T) {
 		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:      func() time.Time { return now },
-		// AllowUnknownMarketLifecycle deliberately omitted → false → fail-closed.
+		// v4 hardening: there is no AllowUnknownMarketLifecycle config knob.
+		// Unknown lifecycle is ALWAYS silenced. This test pins that contract.
 		PolymarketBase: "https://polymarket.com",
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))
@@ -686,7 +686,7 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 	// 2026-07-20. At 2026-05-17 that's ~83% of the lifetime → past the gate.
 	start := time.Date(2025, 7, 2, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID:   "0xfifa-france",
@@ -724,7 +724,7 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 		MarketMinAge:          24 * time.Hour,
 		BaselineMinReadySpan:  24 * time.Hour,
 		PolymarketBase:        "https://polymarket.com",
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xfifa-france")
 	// Warm baseline with 29 samples of $100 across the last week so SpanActual
 	// clears BaselineMinReadySpan and MedianUSD == 100.
@@ -766,12 +766,12 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 // whitelist is "Politics".
 func TestNonWhitelistedCategorySkipped(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "anything", Question: "Anything?", EventSlug: "anything",
 			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{99}, Active: true,
+			Categories: []vo.CategoryID{99}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 99, Slug: "sports", Label: "Sports"}},
 	)
@@ -786,8 +786,7 @@ func TestNonWhitelistedCategorySkipped(t *testing.T) {
 		Filter: category.NewFilter([]string{"politics"}),
 		Clock:  func() time.Time { return now },
 		// Lifecycle gate is disabled for the test; category filter must still bite.
-		AllowUnknownMarketLifecycle: true,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))
@@ -805,13 +804,13 @@ func TestNonWhitelistedCategorySkipped(t *testing.T) {
 // scan of market title, event slug, or any other text.
 func TestSportsLikeMarketUnderWhitelistedCategoryAllowed(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "will-france-win-fifa", Question: "Will France win the 2026 FIFA World Cup?",
 			EventSlug: "2026-fifa-world-cup-winner-595", EventTitle: "FIFA World Cup 2026",
 			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{1}, Active: true,
+			Categories: []vo.CategoryID{1}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 1, Slug: "hide-from-new", Label: "Hide From New"}},
 	)
@@ -825,8 +824,7 @@ func TestSportsLikeMarketUnderWhitelistedCategoryAllowed(t *testing.T) {
 		// event slug are NOT consulted, so the trade alerts.
 		Filter:                      category.NewFilter([]string{"hide-from-new"}),
 		Clock:                       func() time.Time { return now },
-		AllowUnknownMarketLifecycle: true,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))
@@ -843,13 +841,13 @@ func TestSportsLikeMarketUnderWhitelistedCategoryAllowed(t *testing.T) {
 // slug+label, never at market wording.
 func TestWhitelistStaysCategoryOnly(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "will-the-sports-bill-pass", Question: "Will the new sports betting bill pass?",
 			EventSlug: "us-sports-betting-bill-2026", EventTitle: "Sports Betting Bill",
 			TokenIDs: []vo.TokenID{"t"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{2}, Active: true,
+			Categories: []vo.CategoryID{2}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 2, Slug: "politics", Label: "Politics"}},
 	)
@@ -861,8 +859,7 @@ func TestWhitelistStaysCategoryOnly(t *testing.T) {
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Filter:                      category.NewFilter([]string{"politics"}),
 		Clock:                       func() time.Time { return now },
-		AllowUnknownMarketLifecycle: true,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now))

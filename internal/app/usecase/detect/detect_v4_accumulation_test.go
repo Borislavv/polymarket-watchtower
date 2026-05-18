@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -99,13 +99,13 @@ func newAccumulationLoop(
 	alerts AlertCreator,
 ) (*Loop, market.Market, *capturingEmitter) {
 	t.Helper()
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
 			EventSlug: "us-pres-2028", EventTitle: "US Presidential Election 2028",
 			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -120,7 +120,6 @@ func newAccumulationLoop(
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                       func() time.Time { return now },
 		PolymarketBase:              "https://polymarket.com",
-		AllowUnknownMarketLifecycle: true,
 		Accumulator:                 det,
 		AccumulationLines:           lines,
 		MMFilter:                    mm,
@@ -131,7 +130,7 @@ func newAccumulationLoop(
 		// from the trades we fed in. We keep BaselineMinReadySpan=0 so the
 		// single-trade scorer doesn't block in tests; accumulation has its
 		// own readiness via the line tradeCount floor.
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit
 }
@@ -355,7 +354,7 @@ func TestAccumulation_DedupKeyShape(t *testing.T) {
 	// Shape: accumulation:<sv>:<wallet>:<mid>:<token>:<side>:<bucket>
 	// We don't pin the bucket value (it depends on Truncate(now,Cooldown))
 	// but we pin the prefix and the trailing positional parts.
-	wantPrefix := "accumulation:v4:0xwhale:7:tok-yes:BUY:"
+	wantPrefix := "accumulation:" + anomaly.StrategyIdentity + ":0xwhale:7:tok-yes:BUY:"
 	if len(dk) < len(wantPrefix) || dk[:len(wantPrefix)] != wantPrefix {
 		t.Fatalf("dedup key shape: got %q want prefix %q", dk, wantPrefix)
 	}

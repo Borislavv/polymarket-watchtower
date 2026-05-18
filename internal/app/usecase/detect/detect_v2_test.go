@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -72,13 +72,13 @@ func newLoopV2WithMetrics(
 	met *metrics.Metrics,
 ) (*Loop, market.Market, *capturingEmitter) {
 	t.Helper()
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
 			EventSlug: "us-pres-2028", EventTitle: "US Presidential Election 2028",
 			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -90,11 +90,10 @@ func newLoopV2WithMetrics(
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                       func() time.Time { return now },
 		PolymarketBase:              "https://polymarket.com",
-		AllowUnknownMarketLifecycle: true,
 		TraderBaseliner:             tb,
 		MinTraderHistoryTrades:      minTraderHistory,
 		MMFilter:                    mm,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, met, &log)
+	}, reg, emit, met, &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit
 }

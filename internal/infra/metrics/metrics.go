@@ -6,9 +6,11 @@
 //   - High-cardinality dimensions (market id, wallet, tx hash) live in LOGS
 //     and ALERT PAYLOADS, never in counter labels — Polymarket has 5k+ active
 //     markets and emitting them as labels would blow up Prometheus memory.
-//   - Per-market gauges (WindowTradeRate etc.) are kept for the supporting
-//     dashboard only; their cardinality is bounded by MAX_MARKETS (default
-//     500) and they are not used to fire alerts.
+//   - Per-market counters (TradesIngested, NotionalIngested) are bounded by
+//     the active universe and are cheap. The v4 cleanup removed the bucket-
+//     only gauges (WindowTradeRate/NotionalRate/AvgSize) that fed off the
+//     in-memory aggregate engine; replace with Postgres-derived Grafana
+//     queries.
 package metrics
 
 import (
@@ -32,12 +34,8 @@ type Metrics struct {
 	MarketsTracked prometheus.Gauge
 
 	// --- Collect (supporting per-market series — bounded by MAX_MARKETS) ---
-	TradesIngested     *prometheus.CounterVec // market
-	NotionalIngested   *prometheus.CounterVec // market
-	WindowTradeRate    *prometheus.GaugeVec   // market, window
-	WindowNotionalRate *prometheus.GaugeVec   // market, window
-	WindowAvgSize      *prometheus.GaugeVec   // market, window
-
+	TradesIngested   *prometheus.CounterVec // market
+	NotionalIngested *prometheus.CounterVec // market
 	// --- Per-trade anomaly model (primary signal) ---
 	TradeSizeUSD            prometheus.Histogram   // every trade's USD notional
 	TradeOdds               prometheus.Histogram   // every trade's 1/price odds
@@ -54,8 +52,9 @@ type Metrics struct {
 	BaselineBuckets         prometheus.Gauge       // total live (category,market,outcome) buckets
 
 	// --- Filtering ---
-	CategoryFilterSkipped *prometheus.CounterVec // stage = discover|detect
-	AlertMMSuppressed     *prometheus.CounterVec // category, reason — alerts suppressed by MM/arb filter (reason=POSSIBLE_MARKET_MAKER)
+	CategoryFilterSkipped   *prometheus.CounterVec // stage = discover|detect
+	AlertMMSuppressed       *prometheus.CounterVec // category, reason — alerts suppressed by MM/arb filter (reason=POSSIBLE_MARKET_MAKER)
+	LifecycleUnknownSkipped prometheus.Counter     // trades silenced because the market had no StartDate/EndDate
 
 	// --- Alerting outcomes ---
 	TelegramAlertsSent  *prometheus.CounterVec // severity
@@ -91,21 +90,6 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "collect", Name: "notional_usd_total",
 		Help: "Notional USD ingested per market.",
 	}, []string{"market"})
-
-	m.WindowTradeRate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "watchtower", Subsystem: "window", Name: "trade_rate_per_min",
-		Help: "Supporting: rolling trade rate by market and window label.",
-	}, []string{"market", "window"})
-
-	m.WindowNotionalRate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "watchtower", Subsystem: "window", Name: "notional_rate_usd_per_min",
-		Help: "Supporting: rolling notional rate by market and window label.",
-	}, []string{"market", "window"})
-
-	m.WindowAvgSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "watchtower", Subsystem: "window", Name: "avg_size",
-		Help: "Supporting: rolling average trade size by market and window label.",
-	}, []string{"market", "window"})
 
 	m.TradeSizeUSD = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "size_usd",
@@ -187,6 +171,11 @@ func New() *Metrics {
 		Help: "Alerts suppressed because the wallet showed balanced two-sided activity (market-making/arbitrage signature). Labelled by category and the structured reason code (POSSIBLE_MARKET_MAKER).",
 	}, []string{"category", "reason"})
 
+	m.LifecycleUnknownSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "filter", Name: "lifecycle_unknown_skipped_total",
+		Help: "Trades silenced because the market lacked StartDate/EndDate (lifecycle gate is fail-closed without exception in v4).",
+	})
+
 	m.TelegramAlertsSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "telegram", Name: "alerts_sent_total",
 		Help: "Telegram alerts successfully delivered, by severity.",
@@ -201,14 +190,13 @@ func New() *Metrics {
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
 		m.TradesIngested, m.NotionalIngested,
-		m.WindowTradeRate, m.WindowNotionalRate, m.WindowAvgSize,
 		m.TradeSizeUSD, m.TradeOdds, m.TradeAnomalyMultiplier, m.TraderMultiplier,
 		m.TradeAnomalies, m.TradeAnomalyAxis, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
 		m.AccumulationAlerts,
 		m.QuietMarketAlerts,
 		m.BaselineBuckets,
-		m.CategoryFilterSkipped, m.AlertMMSuppressed,
+		m.CategoryFilterSkipped, m.AlertMMSuppressed, m.LifecycleUnknownSkipped,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
 	)
 	return m

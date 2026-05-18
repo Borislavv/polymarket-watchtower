@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -52,13 +52,13 @@ func newSingleTradeQuietLoop(
 	last *fakeLastTradeFetcher,
 ) (*Loop, market.Market, *capturingEmitter) {
 	t.Helper()
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
 			EventSlug: "us-pres-2028", EventTitle: "US Presidential Election 2028",
 			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -70,11 +70,10 @@ func newSingleTradeQuietLoop(
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                       func() time.Time { return now },
 		PolymarketBase:              "https://polymarket.com",
-		AllowUnknownMarketLifecycle: true,
 		QuietMarket:                 quietmarket.New(qmCfg),
 		LastTradeFetcher:            last,
 		Markets:                     &fakeMarketResolver{id: 7},
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 90 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit
 }
@@ -227,13 +226,13 @@ func TestQuietMarket_Accumulation_AppliesToLineFinding(t *testing.T) {
 	}}
 	last := &fakeLastTradeFetcher{last: now.Add(-12 * time.Hour)}
 
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
 			EventSlug: "us-pres-2028", EventTitle: "US Presidential Election 2028",
 			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -245,7 +244,6 @@ func TestQuietMarket_Accumulation_AppliesToLineFinding(t *testing.T) {
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                       func() time.Time { return now },
 		PolymarketBase:              "https://polymarket.com",
-		AllowUnknownMarketLifecycle: true,
 		Accumulator:                 accumulation.New(accumulationCfg(), defaultThresholds()),
 		AccumulationLines:           lines,
 		QuietMarket:                 quietmarket.New(quietMarketCfg()),
@@ -253,7 +251,7 @@ func TestQuietMarket_Accumulation_AppliesToLineFinding(t *testing.T) {
 		Markets:                     &fakeMarketResolver{id: 7},
 		Traders:                     &fakeTraderResolver{id: 42},
 		Alerts:                      newFakeAlerts(),
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 90 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	// Seed a quiet baseline so both the accumulation multiplier and the
 	// quiet-market detector have something to read.
@@ -279,12 +277,12 @@ func TestQuietMarket_DisabledNeverStamps(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	last := &fakeLastTradeFetcher{last: now.Add(-12 * time.Hour)}
 	// Disabled detector path: omit cfg.QuietMarket on the Loop entirely.
-	reg := aggregate.NewRegistry()
+	reg := marketcache.New()
 	reg.Replace(
 		[]market.Market{{
 			ID: "0xa", Slug: "x", Question: "?",
 			TokenIDs: []vo.TokenID{"tok-yes"}, Outcomes: []string{"Yes"},
-			Categories: []vo.CategoryID{42}, Active: true,
+			Categories: []vo.CategoryID{42}, Active: true, StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
 		}},
 		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
 	)
@@ -295,10 +293,9 @@ func TestQuietMarket_DisabledNeverStamps(t *testing.T) {
 		Baseline:                    baseline.Config{Window: 90 * 24 * time.Hour},
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		Clock:                       func() time.Time { return now },
-		AllowUnknownMarketLifecycle: true,
 		Markets:                     &fakeMarketResolver{id: 7},
 		LastTradeFetcher:            last,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 90 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
+	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	warmBaselineDirect(loop, 30, 100, now.Add(-30*24*time.Hour))
 

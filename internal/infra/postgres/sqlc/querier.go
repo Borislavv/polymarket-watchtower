@@ -40,12 +40,16 @@ type Querier interface {
 	// second caller picking up the same id will not flip status (status check
 	// in the WHERE clause guarantees one writer wins).
 	BeginMarketBackfill(ctx context.Context, id int64) error
-	// Atomically transition up to $1 pending alerts to 'sending' and return
-	// them. The inner SELECT … FOR UPDATE SKIP LOCKED guarantees concurrent
-	// senders see disjoint batches even though the outer UPDATE runs in its
-	// own short-lived transaction. A row in `sending` is invisible to the
-	// next claimer until MarkAlertSent / MarkAlertSendFailed advances it, or
+	// Atomically transition up to $1 alerts to 'sending' and return them. The
+	// inner SELECT … FOR UPDATE SKIP LOCKED guarantees concurrent senders see
+	// disjoint batches even though the outer UPDATE runs in its own short-
+	// lived transaction. A row in `sending` is invisible to the next claimer
+	// until MarkAlertSent / MarkAlertSendFailed advances it, or
 	// ResetStaleSendingAlerts recovers it after a crashed sender.
+	//
+	// v4 hardening: the claim picks up BOTH pending rows AND retry-eligible
+	// failed rows (status='failed' AND next_retry_at <= now()). The retry
+	// worker is the same alertsender; there is no separate retry path.
 	ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([]PolymarketAlerts, error)
 	CompleteMarketBackfill(ctx context.Context, arg CompleteMarketBackfillParams) error
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
@@ -73,10 +77,12 @@ type Querier interface {
 	LinkMarketCategory(ctx context.Context, arg LinkMarketCategoryParams) error
 	// Pick the next batch of markets to backfill, prioritised by upcoming
 	// end_date (markets nearer resolution have the most actionable history).
-	// Limit is the per-tick claim count.
+	// Excludes soft-deleted and purged markets — backfill never wastes API
+	// pages on a market we have no intent to monitor.
 	ListActiveMarketsForBackfill(ctx context.Context, limit int32) ([]PolymarketMarkets, error)
 	// Active markets that have at least started backfill — collection of
 	// recent trades only makes sense once we know how far back history goes.
+	// Excludes soft-deleted and purged markets.
 	ListActiveMarketsForCollection(ctx context.Context) ([]PolymarketMarkets, error)
 	ListAllCategories(ctx context.Context) ([]PolymarketCategories, error)
 	// Per-(market, outcome) baseline samples within the lookback window.
@@ -89,15 +95,52 @@ type Querier interface {
 	ListClusterWindowTrades(ctx context.Context, arg ListClusterWindowTradesParams) ([]ListClusterWindowTradesRow, error)
 	ListEnabledCategories(ctx context.Context) ([]PolymarketCategories, error)
 	ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]int64, error)
+	// Used by the drift worker. Returns sent alerts whose drift is still
+	// pending AND whose oldest reference window (15m by convention) has
+	// already elapsed. Bounded by claim_limit per tick.
+	ListSentAlertsForDrift(ctx context.Context, arg ListSentAlertsForDriftParams) ([]PolymarketAlerts, error)
+	// Used by the outcomes worker. Returns sent alerts whose outcome is
+	// still pending, prioritised by oldest-unchecked-first so a single
+	// alert that keeps failing the upstream lookup doesn't starve fresher
+	// candidates. The query joins polymarket_markets to filter for markets
+	// whose end_date has passed (or which are flagged closed) — we only
+	// check markets that could plausibly be resolved.
+	ListSentAlertsForOutcomeCheck(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
+	// Used by the sanity worker (internal/app/usecase/sanity) to find markets
+	// whose soft-delete retention window has elapsed. Returns markets that:
+	//   - have been soft-deleted (deleted_at IS NOT NULL)
+	//   - are not already purged (purged_at IS NULL)
+	//   - crossed the retention cutoff
+	// The worker then re-checks the market against the latest discover sweep;
+	// a market that has resumed flips back via UpsertMarket; one that is
+	// still gone gets stamped purged_at.
+	ListSoftDeletedForPurge(ctx context.Context, arg ListSoftDeletedForPurgeParams) ([]PolymarketMarkets, error)
 	// Used by the BackfillWorker to verify which fetched trade dedup_keys are
 	// already persisted (defence in depth on top of ON CONFLICT DO NOTHING).
 	ListTradesForBackfillPage(ctx context.Context, arg ListTradesForBackfillPageParams) ([]string, error)
-	// Releases the claim back to 'pending' so the next ClaimPending tick can
-	// retry. The send_attempts column is bumped + the error message stored so
-	// operators can spot poison rows.
+	// Persists the four CLV-lite windows. A NULL CLV column means the
+	// reference price for that window was unavailable (e.g. no later trade
+	// on the same (market, outcome)). drift_status flips to 'available'
+	// when at least one window produced a number; 'unavailable' otherwise.
+	MarkAlertDrift(ctx context.Context, arg MarkAlertDriftParams) error
+	// Stamps the outcome verdict on a sent alert. Called by the outcomes
+	// worker after it has consulted Polymarket's market state. status must
+	// be one of: resolved_correct, resolved_wrong, unknown, unavailable.
+	MarkAlertOutcome(ctx context.Context, arg MarkAlertOutcomeParams) error
+	// Bumps outcome_checked_at on alerts where the upstream check failed
+	// transiently (e.g. Polymarket /markets/{id} returned an error or a
+	// not-yet-resolved market). Keeps the row scheduled for re-check at the
+	// next tick without changing the verdict.
+	MarkAlertOutcomeUnavailableTouch(ctx context.Context, id int64) error
+	// Records a failed delivery attempt. The caller has already computed
+	// next_retry_at (NULL = exhausted / permanent; non-NULL = retryable
+	// at the supplied wall-clock time). Status flips to 'failed' regardless
+	// — the claim query picks up retryable-failed rows on the next tick.
 	MarkAlertSendFailed(ctx context.Context, arg MarkAlertSendFailedParams) error
 	// Completes a claim. Guarded by status='sending' so a duplicate sender
-	// racing on a row that was already MarkFailed cannot resurrect it.
+	// racing on a row that was already MarkFailed cannot resurrect it. Clears
+	// retry state so a row that succeeded after a failure does not keep its
+	// schedule.
 	MarkAlertSent(ctx context.Context, arg MarkAlertSentParams) error
 	// Mark categories as inactive when they did not appear in the latest
 	// Polymarket /tags response. `enabled` is left alone — operator intent is
@@ -106,11 +149,26 @@ type Querier interface {
 	// Set the local `enabled` flag for one category. Called once per
 	// CATEGORY_WHITELIST entry on app boot.
 	MarkCategoryEnabled(ctx context.Context, arg MarkCategoryEnabledParams) error
-	// Mark active markets inactive when they did not appear in the latest
-	// whitelisted-categories discovery sweep. Scoped by category to avoid
-	// penalising markets in categories we don't currently sync.
+	// Stamps purged_at and leaves the row intact. Trades retained for
+	// analytics — the FK from polymarket_trades.market_id does not CASCADE
+	// on the trade side, so a row delete would orphan trades.
+	MarkMarketPurged(ctx context.Context, id int64) error
+	// Mark active markets inactive AND stamp deleted_at when they did not
+	// appear in the latest whitelisted-categories discovery sweep. Scoped by
+	// category so markets in non-whitelisted categories are untouched.
+	// The soft-delete marker (deleted_at) is set only on the active→inactive
+	// transition — if a market was already inactive we leave its marker alone
+	// so the sanity worker's retention window starts at the original
+	// disappearance, not at every subsequent tick.
 	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) error
 	OldestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
+	// Called by the sanity worker (or future supervised paths) when a market
+	// is resumed: clears deleted_at, flips active, resets backfill to pending
+	// so the BackfillWorker picks up missing history on the next tick.
+	// Discovery's UpsertMarket already handles the live-sweep case; this
+	// query covers the path where the sanity worker confirms resumption via
+	// a fresh DB read.
+	RequeueResumedMarket(ctx context.Context, id int64) error
 	// Recovery: a process that crashed mid-backfill leaves rows in 'running'.
 	// This resets any 'running' row whose backfill_started_at is older than
 	// the supplied threshold, so the next scheduler tick re-claims them.
@@ -119,6 +177,10 @@ type Querier interface {
 	// supplied cutoff is moved back to 'pending'. Called by the sender worker
 	// on each tick (cheap when zero rows match).
 	ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.Timestamptz) error
+	// Returns the price of the FIRST trade on (market, outcome_token) at or
+	// after the supplied timestamp. NULL when no later trade exists yet.
+	// Powers the CLV-lite drift worker's per-window reference price lookup.
+	TradePriceAtOrAfter(ctx context.Context, arg TradePriceAtOrAfterParams) (float64, error)
 	// Per-(trader, market, outcome) two-sided activity over the supplied
 	// lookback. Powers the MM/arbitrage suppression filter: a wallet that
 	// has been hitting BUY and SELL on the same outcome in roughly balanced
@@ -150,8 +212,14 @@ type Querier interface {
 	UpsertCategory(ctx context.Context, arg UpsertCategoryParams) (PolymarketCategories, error)
 	// Insert or update a market by condition_id. Backfill state fields are
 	// preserved on update — only discovery-sourced fields are touched. A
-	// previously-inactive market that reappears flips `active=TRUE` and the
-	// next BackfillWorker tick will pick up missing history.
+	// market resurfacing after a soft-delete:
+	//   - active flips to TRUE
+	//   - deleted_at is cleared (the sanity worker would otherwise hard-purge
+	//     the row at retention; clearing the marker reactivates processing)
+	//   - purged_at is left as-is (purged markets stay purged forever; trades
+	//     remain queryable but the market is excluded from collect/backfill)
+	// The next BackfillWorker tick picks up missing history because
+	// ApplyWhitelist callers re-stamp backfill_status='pending' on resume.
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error)
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
 	// Insert a trader by wallet address; on conflict bump last_seen_at.

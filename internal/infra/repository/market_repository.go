@@ -43,8 +43,16 @@ type Market struct {
 	BackfillLastError       string
 	BackfillStartedAt       time.Time
 	BackfillCompletedAt     time.Time
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
+	// DeletedAt is the soft-delete marker. Stamped when the market
+	// disappears from a discovery sweep; cleared on resume.
+	DeletedAt time.Time
+	// PurgedAt is the hard-purge marker. Stamped by the sanity worker
+	// when the retention window elapses while the market is still gone.
+	// A purged market is excluded from all active processing; its trades
+	// remain queryable for historical analytics.
+	PurgedAt  time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // UpsertMarketInput is what the discovery worker hands to UpsertSeen. It
@@ -207,6 +215,16 @@ func (r *MarketRepository) GetByConditionID(ctx context.Context, conditionID str
 	return marketFromSQLC(row), nil
 }
 
+// GetByID resolves a market by its local DB id. Used by the outcomes
+// worker to look up the upstream conditionID from an alert.market_id.
+func (r *MarketRepository) GetByID(ctx context.Context, marketID int64) (Market, error) {
+	row, err := r.q.GetMarketByID(ctx, marketID)
+	if err != nil {
+		return Market{}, fmt.Errorf("get market id %d: %w", marketID, err)
+	}
+	return marketFromSQLC(row), nil
+}
+
 // UpsertOutcome links a market outcome (Yes/No/etc.) to its CLOB token id.
 func (r *MarketRepository) UpsertOutcome(ctx context.Context, marketID int64, tokenID, label string) error {
 	return r.q.UpsertMarketOutcome(ctx, sqlc.UpsertMarketOutcomeParams{
@@ -214,6 +232,35 @@ func (r *MarketRepository) UpsertOutcome(ctx context.Context, marketID int64, to
 		TokenID:  tokenID,
 		Label:    label,
 	})
+}
+
+// ListSoftDeletedForPurge returns up to claimLimit soft-deleted markets
+// whose deleted_at <= cutoff and which have not already been purged.
+// Used by the sanity worker.
+func (r *MarketRepository) ListSoftDeletedForPurge(ctx context.Context, cutoff time.Time, claimLimit int32) ([]Market, error) {
+	rows, err := r.q.ListSoftDeletedForPurge(ctx, sqlc.ListSoftDeletedForPurgeParams{
+		Cutoff:     tsFromTime(cutoff),
+		ClaimLimit: claimLimit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list soft-deleted: %w", err)
+	}
+	return marketsFromSQLC(rows), nil
+}
+
+// MarkPurged stamps purged_at and active=false. The row is retained so
+// the FK from polymarket_trades.market_id stays valid — trades remain
+// queryable for historical analytics.
+func (r *MarketRepository) MarkPurged(ctx context.Context, marketID int64) error {
+	return r.q.MarkMarketPurged(ctx, marketID)
+}
+
+// RequeueResumed clears deleted_at, sets active=true, and resets
+// backfill_status='pending' so the BackfillWorker re-fetches missing
+// history. Called by the sanity worker when a re-check confirms the
+// market has resumed upstream.
+func (r *MarketRepository) RequeueResumed(ctx context.Context, marketID int64) error {
+	return r.q.RequeueResumedMarket(ctx, marketID)
 }
 
 func marketsFromSQLC(rows []sqlc.PolymarketMarkets) []Market {
@@ -244,6 +291,8 @@ func marketFromSQLC(row sqlc.PolymarketMarkets) Market {
 		BackfillLastError:       derefStr(row.BackfillLastError),
 		BackfillStartedAt:       tsTime(row.BackfillStartedAt),
 		BackfillCompletedAt:     tsTime(row.BackfillCompletedAt),
+		DeletedAt:               tsTime(row.DeletedAt),
+		PurgedAt:                tsTime(row.PurgedAt),
 		CreatedAt:               row.CreatedAt.Time,
 		UpdatedAt:               row.UpdatedAt.Time,
 	}

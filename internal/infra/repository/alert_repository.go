@@ -31,25 +31,58 @@ const (
 	AlertKindAccumulation AlertKind = "accumulation"
 )
 
+// OutcomeStatus is the typed string used by polymarket_alerts.outcome_status.
+type OutcomeStatus string
+
+const (
+	OutcomePending     OutcomeStatus = "pending"
+	OutcomeCorrect     OutcomeStatus = "resolved_correct"
+	OutcomeWrong       OutcomeStatus = "resolved_wrong"
+	OutcomeUnknown     OutcomeStatus = "unknown"
+	OutcomeUnavailable OutcomeStatus = "unavailable"
+)
+
+// DriftStatus is the typed string used by polymarket_alerts.drift_status.
+type DriftStatus string
+
+const (
+	DriftPending     DriftStatus = "pending"
+	DriftAvailable   DriftStatus = "available"
+	DriftUnavailable DriftStatus = "unavailable"
+)
+
 // Alert is the repository view of a polymarket_alerts row.
 type Alert struct {
-	ID                int64
-	DedupKey          string
-	StrategyVersion   string
-	Kind              AlertKind
-	Reason            string
-	Severity          string
-	MarketID          *int64
-	TraderID          *int64
-	TradeID           *int64
-	Payload           []byte
-	Status            AlertStatus
-	TelegramMessageID *int64
-	SendAttempts      int32
-	LastSendError     string
-	SentAt            time.Time
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                  int64
+	DedupKey            string
+	StrategyVersion     string
+	Kind                AlertKind
+	Reason              string
+	Severity            string
+	MarketID            *int64
+	TraderID            *int64
+	TradeID             *int64
+	Payload             []byte
+	Status              AlertStatus
+	TelegramMessageID   *int64
+	SendAttempts        int32
+	LastSendError       string
+	NextRetryAt         time.Time
+	LastAttemptAt       time.Time
+	SentAt              time.Time
+	OutcomeStatus       OutcomeStatus
+	OutcomeCheckedAt    time.Time
+	ResolvedAt          time.Time
+	WinningOutcomeToken string
+	WinningOutcomeLabel string
+	DriftStatus         DriftStatus
+	DriftCheckedAt      time.Time
+	CLV15m              *float64
+	CLV1h               *float64
+	CLV6h               *float64
+	CLV24h              *float64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // NewAlert is the per-insert input for TryCreatePending. The repo derives
@@ -131,13 +164,16 @@ func (r *AlertRepository) MarkSent(ctx context.Context, id int64, telegramMessag
 	})
 }
 
-// MarkFailed records a failed delivery without flipping status; the row
-// stays pending so the next sender tick can retry. The attempt counter
-// bumps so callers can implement bounded-retry policies above the repo.
-func (r *AlertRepository) MarkFailed(ctx context.Context, id int64, errMsg string) error {
+// MarkFailed records a failed delivery and schedules (or exhausts) the
+// retry. The caller computes nextRetryAt via the retry policy (exponential
+// backoff + jitter); pass time.Time{} to signal "exhausted / no retry".
+// Status flips to 'failed' regardless — the claim query picks up
+// retryable failures on subsequent ticks.
+func (r *AlertRepository) MarkFailed(ctx context.Context, id int64, errMsg string, nextRetryAt time.Time) error {
 	return r.q.MarkAlertSendFailed(ctx, sqlc.MarkAlertSendFailedParams{
 		ID:            id,
 		LastSendError: strPtr(errMsg),
+		NextRetryAt:   tsFromTime(nextRetryAt),
 	})
 }
 
@@ -177,24 +213,138 @@ func (r *AlertRepository) LatestClusterForMarket(ctx context.Context, marketID i
 	return alertFromSQLC(row), true, nil
 }
 
+// OutcomeUpdate carries the outcome verdict supplied by the outcomes worker.
+type OutcomeUpdate struct {
+	AlertID             int64
+	Status              OutcomeStatus
+	ResolvedAt          time.Time
+	WinningOutcomeToken string
+	WinningOutcomeLabel string
+}
+
+// DriftUpdate carries the CLV-lite values supplied by the drift worker.
+// Each *float64 is nil when the reference price for that window was
+// unavailable (no later trade on the same market+outcome).
+type DriftUpdate struct {
+	AlertID int64
+	Status  DriftStatus
+	CLV15m  *float64
+	CLV1h   *float64
+	CLV6h   *float64
+	CLV24h  *float64
+}
+
+// ListSentForOutcomeCheck returns sent alerts whose markets are
+// resolved-or-close-enough and whose outcome verdict is still pending.
+func (r *AlertRepository) ListSentForOutcomeCheck(ctx context.Context, claimLimit int32) ([]Alert, error) {
+	rows, err := r.q.ListSentAlertsForOutcomeCheck(ctx, claimLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list sent alerts for outcome: %w", err)
+	}
+	out := make([]Alert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, alertFromSQLC(row))
+	}
+	return out, nil
+}
+
+// MarkOutcome persists the verdict computed by the outcomes worker.
+func (r *AlertRepository) MarkOutcome(ctx context.Context, u OutcomeUpdate) error {
+	return r.q.MarkAlertOutcome(ctx, sqlc.MarkAlertOutcomeParams{
+		ID:                  u.AlertID,
+		OutcomeStatus:       string(u.Status),
+		ResolvedAt:          tsFromTime(u.ResolvedAt),
+		WinningOutcomeToken: strPtr(u.WinningOutcomeToken),
+		WinningOutcomeLabel: strPtr(u.WinningOutcomeLabel),
+	})
+}
+
+// TouchOutcomeUnavailable bumps outcome_checked_at without changing the
+// verdict — used when the upstream check failed transiently and we want
+// the row to come up again on the next tick.
+func (r *AlertRepository) TouchOutcomeUnavailable(ctx context.Context, alertID int64) error {
+	return r.q.MarkAlertOutcomeUnavailableTouch(ctx, alertID)
+}
+
+// ListSentForDrift returns sent alerts whose drift is still pending and
+// whose oldest reference window (`minWindow`, typically 15m) has elapsed.
+func (r *AlertRepository) ListSentForDrift(ctx context.Context, minWindow time.Duration, claimLimit int32) ([]Alert, error) {
+	rows, err := r.q.ListSentAlertsForDrift(ctx, sqlc.ListSentAlertsForDriftParams{
+		MinWindow:  intervalFromDuration(minWindow),
+		ClaimLimit: claimLimit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list sent alerts for drift: %w", err)
+	}
+	out := make([]Alert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, alertFromSQLC(row))
+	}
+	return out, nil
+}
+
+// MarkDrift persists the CLV-lite values computed by the drift worker.
+func (r *AlertRepository) MarkDrift(ctx context.Context, u DriftUpdate) error {
+	return r.q.MarkAlertDrift(ctx, sqlc.MarkAlertDriftParams{
+		ID:          u.AlertID,
+		DriftStatus: string(u.Status),
+		Clv15m:      u.CLV15m,
+		Clv1h:       u.CLV1h,
+		Clv6h:       u.CLV6h,
+		Clv24h:      u.CLV24h,
+	})
+}
+
+// TradePriceAtOrAfter returns the price of the first trade on the
+// supplied (market, outcome) bucket at or after `at`. Returns
+// (0, false, nil) when no later trade exists yet — the drift worker
+// treats that as "reference price unavailable".
+func (r *TradeRepository) TradePriceAtOrAfter(ctx context.Context, marketID int64, outcomeToken string, at time.Time) (float64, bool, error) {
+	price, err := r.q.TradePriceAtOrAfter(ctx, sqlc.TradePriceAtOrAfterParams{
+		MarketID:     marketID,
+		OutcomeToken: outcomeToken,
+		AtOrAfter:    tsFromTime(at),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("trade price at-or-after: %w", err)
+	}
+	return price, true, nil
+}
+
 func alertFromSQLC(row sqlc.PolymarketAlerts) Alert {
 	return Alert{
-		ID:                row.ID,
-		DedupKey:          row.DedupKey,
-		StrategyVersion:   row.StrategyVersion,
-		Kind:              AlertKind(row.Kind),
-		Reason:            row.Reason,
-		Severity:          row.Severity,
-		MarketID:          row.MarketID,
-		TraderID:          row.TraderID,
-		TradeID:           row.TradeID,
-		Payload:           row.Payload,
-		Status:            AlertStatus(row.Status),
-		TelegramMessageID: row.TelegramMessageID,
-		SendAttempts:      row.SendAttempts,
-		LastSendError:     derefStr(row.LastSendError),
-		SentAt:            tsTime(row.SentAt),
-		CreatedAt:         row.CreatedAt.Time,
-		UpdatedAt:         row.UpdatedAt.Time,
+		ID:                  row.ID,
+		DedupKey:            row.DedupKey,
+		StrategyVersion:     row.StrategyVersion,
+		Kind:                AlertKind(row.Kind),
+		Reason:              row.Reason,
+		Severity:            row.Severity,
+		MarketID:            row.MarketID,
+		TraderID:            row.TraderID,
+		TradeID:             row.TradeID,
+		Payload:             row.Payload,
+		Status:              AlertStatus(row.Status),
+		TelegramMessageID:   row.TelegramMessageID,
+		SendAttempts:        row.SendAttempts,
+		LastSendError:       derefStr(row.LastSendError),
+		NextRetryAt:         tsTime(row.NextRetryAt),
+		LastAttemptAt:       tsTime(row.LastAttemptAt),
+		SentAt:              tsTime(row.SentAt),
+		OutcomeStatus:       OutcomeStatus(row.OutcomeStatus),
+		OutcomeCheckedAt:    tsTime(row.OutcomeCheckedAt),
+		ResolvedAt:          tsTime(row.ResolvedAt),
+		WinningOutcomeToken: derefStr(row.WinningOutcomeToken),
+		WinningOutcomeLabel: derefStr(row.WinningOutcomeLabel),
+		DriftStatus:         DriftStatus(row.DriftStatus),
+		DriftCheckedAt:      tsTime(row.DriftCheckedAt),
+		CLV15m:              row.Clv15m,
+		CLV1h:               row.Clv1h,
+		CLV6h:               row.Clv6h,
+		CLV24h:              row.Clv24h,
+		CreatedAt:           row.CreatedAt.Time,
+		UpdatedAt:           row.UpdatedAt.Time,
 	}
 }

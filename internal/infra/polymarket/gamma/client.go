@@ -141,6 +141,77 @@ func (c *Client) ListEvents(ctx context.Context, opts ListMarketsOpts) ([]gammaE
 	return out, nil
 }
 
+// MarketResolution is the resolution snapshot of a single market —
+// enough for the outcomes worker to decide if an alert was correct.
+// Returned by GetMarketResolution; never leaked outside the gamma
+// adapter when this method is used elsewhere.
+type MarketResolution struct {
+	ConditionID    string
+	Closed         bool
+	Archived       bool
+	EndDate        time.Time
+	TokenIDs       []string
+	OutcomeLabels  []string
+	OutcomePrices  []float64 // index-aligned with TokenIDs / OutcomeLabels
+}
+
+// GetMarketResolution returns the resolution snapshot for one market.
+// Found=false when Gamma doesn't return the market (typically: archived
+// > 90d, or unknown conditionID). The caller distinguishes "not yet
+// resolved" (Closed=false) from "resolved" (Closed=true) by inspecting
+// the returned MarketResolution.
+func (c *Client) GetMarketResolution(ctx context.Context, conditionID string) (MarketResolution, bool, error) {
+	if conditionID == "" {
+		return MarketResolution{}, false, errors.New("gamma: conditionId required")
+	}
+	q := url.Values{}
+	q.Set("condition_ids", conditionID)
+	q.Set("limit", "1")
+	var page []gammaMarket
+	if err := c.h.GetJSON(ctx, "/markets", q, &page); err != nil {
+		return MarketResolution{}, false, fmt.Errorf("gamma markets resolution %s: %w", conditionID, err)
+	}
+	if len(page) == 0 {
+		return MarketResolution{}, false, nil
+	}
+	raw := page[0]
+	tokens, _ := parseStringArray(raw.ClobTokenIDsRaw)
+	labels, _ := parseStringArray(raw.OutcomesJSON)
+	prices, _ := parseFloatArray(raw.OutcomePricesRaw)
+	endDate, _ := parseTime(raw.EndDate)
+	return MarketResolution{
+		ConditionID:   raw.ConditionID,
+		Closed:        raw.Closed,
+		Archived:      raw.Archived,
+		EndDate:       endDate,
+		TokenIDs:      tokens,
+		OutcomeLabels: labels,
+		OutcomePrices: prices,
+	}, true, nil
+}
+
+// parseFloatArray decodes Gamma's JSON-encoded numeric arrays. They land
+// as quoted strings like `["1","0"]` or `["0.5","0.5"]` so we strip
+// quotes and parse each element.
+func parseFloatArray(raw string) ([]float64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var s []string
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return nil, err
+	}
+	out := make([]float64, 0, len(s))
+	for _, v := range s {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 // MapEventsToMarketCategories indexes event tags by market condition id, so a
 // caller that holds a []market.Market can backfill Categories without another
 // round-trip.

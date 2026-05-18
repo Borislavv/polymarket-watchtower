@@ -14,7 +14,6 @@ A single-trade alert fires only when **all** are true:
    `slug + " " + label` ONLY; market titles, event slugs, market slugs,
    and tags are not scanned. Default whitelist: `Politics`.
 2. Market lifecycle progress ≥ `LIFECYCLE_ALERT_FROM_PCT` (default 75%).
-   Unknown lifecycle → **silent by default** (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`).
 3. Market absolute age ≥ `MARKET_MIN_AGE` (default 24h).
 4. Per-(category, market, outcome) baseline has `Count ≥ SINGLE_MIN_BASELINE_TRADES`,
    `TotalUSD ≥ SINGLE_MIN_BASELINE_NOTIONAL_USD`, `MedianUSD > 0`, and
@@ -27,11 +26,59 @@ A single-trade alert fires only when **all** are true:
 Baseline updates run **before** the alert gates so the reservoir warms
 continuously even when alerts are suppressed.
 
-## Detection modes
+## Detection mode
 
-`ANOMALY_MODE` is validated `oneof=single_cluster volume`. Default
-`single_cluster`. The `volume` mode is the legacy aggregate-rate detector;
-do not extend it.
+v4 cleanup made `single_cluster` the only strategy. The legacy `volume`
+mode and the in-memory aggregate engine (rolling-bucket ring, gauges,
+recent-window ratios) were removed; the `ANOMALY_MODE` env var is gone.
+
+## Market lifecycle in the DB
+
+Ended markets are **soft-deleted**, never immediately removed. The
+discovery upsert query stamps `deleted_at = NOW()` when a market that
+was previously active disappears from a sweep. The sanity worker
+(`internal/app/usecase/sanity`) runs hourly, finds markets whose
+`deleted_at` is older than `MARKET_SOFT_DELETE_RETENTION` (default 720h
+= 30d), re-checks the current upstream state via the discover cache,
+and either:
+
+- **Resumes** the market (`clear deleted_at; active=true; backfill_status='pending'`)
+  so the backfill worker re-fetches missing history; or
+- **Purges** the market (`purged_at=NOW(); active=false`). The row is
+  retained — `polymarket_trades.market_id` has no CASCADE on the trades
+  side, so deleting a market would either fail FK or destroy historical
+  analytics. `purged_at IS NOT NULL` excludes the market from all active
+  processing (`ListActiveMarketsForBackfill`, `ListActiveMarketsForCollection`).
+
+Hard delete is **never** performed by the worker.
+
+## Discovery: no silent truncation
+
+v4 cleanup removed `MAX_MARKETS`. The discovery loop processes every
+market that passes the category whitelist. `DISCOVERY_SAFETY_MAX_MARKETS`
+(default 0 = unlimited) is an operational emergency cap, **not** the
+normal bound on coverage. Backpressure comes from rate limits, DB state,
+and the per-tick concurrency knobs — not row count.
+
+## Backfill: full history, 48 workers
+
+`BACKFILL_WORKERS` is the single concurrency knob (default 48 — also the
+per-tick claim count, since markets and goroutines are 1:1). Each market
+is walked offset 0..N until the Data API returns an empty page
+(`status=completed`) or the documented 3000-row offset cap is hit
+(`status=partial_api_limit`). No shallow-lookback short-circuit; the goal
+is the deepest DB history Polymarket allows. The 3000-row cap is
+surfaced as an explicit market state so operators can spot it in
+`watchtower_backfill_status_total{status=partial_api_limit}` (and act on
+it if Polymarket changes the cap upstream).
+
+## In-memory caches (v4 contract)
+
+The only in-memory cache that survived the cleanup is
+`internal/app/usecase/marketcache.Cache`: a discover-fed snapshot of the
+active universe used by `detect.Loop` for hot-path category-label
+lookups. Contract: cache miss returns `(zero, false)`; correctness does
+not depend on the cache. The DB is the source of truth.
 
 ## Baseline semantics
 
@@ -60,7 +107,6 @@ do not extend it.
 - At or above `LIFECYCLE_HOT_FROM_PCT` (default 90) → `Finding.Hot = true`,
   Telegram header carries `· HOT`.
 - Markets with missing `StartDate`/`EndDate` are **silenced by default**.
-  Set `ALLOW_UNKNOWN_MARKET_LIFECYCLE=true` to opt in (legacy/debugging).
 
 ## Severity rule
 
@@ -145,11 +191,24 @@ DSN set; CI integration tests opt in via `POSTGRES_TEST_DSN`.
 - Log line at info level with the buy/sell breakdown for every
   suppression so a reviewer can audit.
 
-### Strategy version
+### Strategy versioning decision (v4 cleanup)
 
-`STRATEGY_VERSION` default is now `v4`. Woven into every alert dedup key —
-older alerts cannot block newer ones on the same trade. Bump again when
-changing decision inputs.
+Strategy identity is **code-owned**. It lives at
+`anomaly.StrategyIdentity = "informed-flow-v4"` and is woven into every
+alert dedup key. The previous `STRATEGY_VERSION` env var was removed —
+an operator must not be able to flip the dedup namespace at runtime; a
+stray value would silently re-alert on trades already deduped.
+
+When to bump the constant:
+
+- new detector wired in / removed → BUMP
+- dedup-key format change → BUMP
+- scorer formula change → BUMP
+- tier threshold tuning → NO bump (operator knob; per-trade keys carry
+  the trade's own identity, so dedup stays sound)
+
+A bump is a code-reviewed commit; the field stays an env var inside the
+detector Config (`StrategyVersion string`) so tests can override.
 
 ## Strategy v4 additions
 
@@ -350,7 +409,6 @@ Required coverage for any alerting/baseline/lifecycle change:
   window=0).
 - Lifecycle pct at 50% / 75% / 90% boundaries.
 - `MARKET_MIN_AGE` and `BASELINE_MIN_READY_WINDOW` gates.
-- `ALLOW_UNKNOWN_MARKET_LIFECYCLE` — fail-closed default.
 - Tier composition (`ConservativeMin` of absolute and multiplier ladders).
 - Cluster floors (trades / wallets / total / cooldown).
 - Telegram link rendering with each URL present and missing.
@@ -369,7 +427,6 @@ Three opinionated overlays under `presets/` (see `presets/README.md`):
 - `balanced.env` — defaults; lifecycle ≥75%, Info multiplier ≥100×, Info
   notional ≥$10k.
 - `aggressive.env` — local exploration only; lifecycle ≥60%, Info
-  multiplier ≥30×, Info notional ≥$2.5k. `ALLOW_UNKNOWN_MARKET_LIFECYCLE=true`.
 
 Apply via `set -a && source presets/<name>.env` or `env_file:` in compose.
 Preset behaviour pinned by tests in `internal/app/preset_test.go`.

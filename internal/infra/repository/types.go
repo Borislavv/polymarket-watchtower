@@ -44,3 +44,14 @@ func derefStr(p *string) string {
 	}
 	return *p
 }
+
+// intervalFromDuration converts a time.Duration to a pgtype.Interval.
+// Postgres INTERVAL has microsecond resolution; Go's time.Duration is
+// nanoseconds. We round down to microseconds (sub-microsecond precision
+// has no practical meaning for our windows).
+func intervalFromDuration(d time.Duration) pgtype.Interval {
+	return pgtype.Interval{
+		Microseconds: int64(d / time.Microsecond),
+		Valid:        true,
+	}
+}

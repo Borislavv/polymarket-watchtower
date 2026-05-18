@@ -21,14 +21,20 @@ import (
 // --- fakes ---------------------------------------------------------------
 
 type fakeStore struct {
-	mu      sync.Mutex
-	pending []repository.Alert
-	sent    map[int64]int64 // alert id -> telegram message id
-	failed  map[int64]string
+	mu              sync.Mutex
+	pending         []repository.Alert
+	sent            map[int64]int64 // alert id -> telegram message id
+	failed          map[int64]string
+	failedNextRetry map[int64]time.Time
 }
 
 func newFakeStore(rows ...repository.Alert) *fakeStore {
-	return &fakeStore{pending: rows, sent: map[int64]int64{}, failed: map[int64]string{}}
+	return &fakeStore{
+		pending:         rows,
+		sent:            map[int64]int64{},
+		failed:          map[int64]string{},
+		failedNextRetry: map[int64]time.Time{},
+	}
 }
 
 func (f *fakeStore) ClaimPending(_ context.Context, limit int32) ([]repository.Alert, error) {
@@ -50,10 +56,11 @@ func (f *fakeStore) MarkSent(_ context.Context, id int64, msgID int64) error {
 	return nil
 }
 
-func (f *fakeStore) MarkFailed(_ context.Context, id int64, msg string) error {
+func (f *fakeStore) MarkFailed(_ context.Context, id int64, msg string, nextRetryAt time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failed[id] = msg
+	f.failedNextRetry[id] = nextRetryAt
 	return nil
 }
 

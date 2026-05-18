@@ -10,11 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/dbbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -121,14 +121,12 @@ func newDBLoop(t *testing.T, pool *pgxpool.Pool, now time.Time, emit Emitter) *L
 		LifecycleHotFromPct:         90,
 		MarketMinAge:                24 * time.Hour,
 		BaselineMinReadySpan:        24 * time.Hour,
-		AllowUnknownMarketLifecycle: false,
 		StrategyVersion:             "v1",
 		Baseliner:                   provider,
 		Alerts:                      ar,
 		Markets:                     mr,
 		Traders:                     dr,
-	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 365 * 24 * time.Hour}),
-		aggregate.NewRegistry(), emit, metrics.New(), &log)
+	}, marketcache.New(), emit, metrics.New(), &log)
 }
 
 // TestDetect_DBBaselineFiresAndPersistsAlert is the end-to-end happy path:

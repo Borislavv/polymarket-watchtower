@@ -31,19 +31,24 @@ SET status     = 'sending',
 WHERE id IN (
     SELECT id FROM polymarket_alerts
     WHERE status = 'pending'
+       OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= NOW())
     ORDER BY created_at
     LIMIT $1
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at
+RETURNING id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at, next_retry_at, last_attempt_at, outcome_status, outcome_checked_at, resolved_at, winning_outcome_token, winning_outcome_label, drift_status, drift_checked_at, clv_15m, clv_1h, clv_6h, clv_24h
 `
 
-// Atomically transition up to $1 pending alerts to 'sending' and return
-// them. The inner SELECT … FOR UPDATE SKIP LOCKED guarantees concurrent
-// senders see disjoint batches even though the outer UPDATE runs in its
-// own short-lived transaction. A row in `sending` is invisible to the
-// next claimer until MarkAlertSent / MarkAlertSendFailed advances it, or
+// Atomically transition up to $1 alerts to 'sending' and return them. The
+// inner SELECT … FOR UPDATE SKIP LOCKED guarantees concurrent senders see
+// disjoint batches even though the outer UPDATE runs in its own short-
+// lived transaction. A row in `sending` is invisible to the next claimer
+// until MarkAlertSent / MarkAlertSendFailed advances it, or
 // ResetStaleSendingAlerts recovers it after a crashed sender.
+//
+// v4 hardening: the claim picks up BOTH pending rows AND retry-eligible
+// failed rows (status='failed' AND next_retry_at <= now()). The retry
+// worker is the same alertsender; there is no separate retry path.
 func (q *Queries) ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([]PolymarketAlerts, error) {
 	rows, err := q.db.Query(ctx, claimPendingAlertsForSend, limit)
 	if err != nil {
@@ -71,6 +76,19 @@ func (q *Queries) ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([
 			&i.SentAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.NextRetryAt,
+			&i.LastAttemptAt,
+			&i.OutcomeStatus,
+			&i.OutcomeCheckedAt,
+			&i.ResolvedAt,
+			&i.WinningOutcomeToken,
+			&i.WinningOutcomeLabel,
+			&i.DriftStatus,
+			&i.DriftCheckedAt,
+			&i.Clv15m,
+			&i.Clv1h,
+			&i.Clv6h,
+			&i.Clv24h,
 		); err != nil {
 			return nil, err
 		}
@@ -83,7 +101,7 @@ func (q *Queries) ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([
 }
 
 const latestClusterAlertForCategory = `-- name: LatestClusterAlertForCategory :one
-SELECT id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at FROM polymarket_alerts
+SELECT id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at, next_retry_at, last_attempt_at, outcome_status, outcome_checked_at, resolved_at, winning_outcome_token, winning_outcome_label, drift_status, drift_checked_at, clv_15m, clv_1h, clv_6h, clv_24h FROM polymarket_alerts
 WHERE kind             = 'category_watch'
   AND market_id        = $1
   AND strategy_version = $2
@@ -119,15 +137,254 @@ func (q *Queries) LatestClusterAlertForCategory(ctx context.Context, arg LatestC
 		&i.SentAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.NextRetryAt,
+		&i.LastAttemptAt,
+		&i.OutcomeStatus,
+		&i.OutcomeCheckedAt,
+		&i.ResolvedAt,
+		&i.WinningOutcomeToken,
+		&i.WinningOutcomeLabel,
+		&i.DriftStatus,
+		&i.DriftCheckedAt,
+		&i.Clv15m,
+		&i.Clv1h,
+		&i.Clv6h,
+		&i.Clv24h,
 	)
 	return i, err
 }
 
+const listSentAlertsForDrift = `-- name: ListSentAlertsForDrift :many
+SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity, a.market_id, a.trader_id, a.trade_id, a.payload, a.status, a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at, a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at, a.outcome_status, a.outcome_checked_at, a.resolved_at, a.winning_outcome_token, a.winning_outcome_label, a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h
+FROM polymarket_alerts a
+WHERE a.status       = 'sent'
+  AND a.drift_status = 'pending'
+  AND a.sent_at IS NOT NULL
+  AND a.sent_at + $1::interval <= NOW()
+ORDER BY a.sent_at NULLS LAST, a.id
+LIMIT $2::integer
+`
+
+type ListSentAlertsForDriftParams struct {
+	MinWindow  pgtype.Interval
+	ClaimLimit int32
+}
+
+// Used by the drift worker. Returns sent alerts whose drift is still
+// pending AND whose oldest reference window (15m by convention) has
+// already elapsed. Bounded by claim_limit per tick.
+func (q *Queries) ListSentAlertsForDrift(ctx context.Context, arg ListSentAlertsForDriftParams) ([]PolymarketAlerts, error) {
+	rows, err := q.db.Query(ctx, listSentAlertsForDrift, arg.MinWindow, arg.ClaimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PolymarketAlerts
+	for rows.Next() {
+		var i PolymarketAlerts
+		if err := rows.Scan(
+			&i.ID,
+			&i.DedupKey,
+			&i.StrategyVersion,
+			&i.Kind,
+			&i.Reason,
+			&i.Severity,
+			&i.MarketID,
+			&i.TraderID,
+			&i.TradeID,
+			&i.Payload,
+			&i.Status,
+			&i.TelegramMessageID,
+			&i.SendAttempts,
+			&i.LastSendError,
+			&i.SentAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.NextRetryAt,
+			&i.LastAttemptAt,
+			&i.OutcomeStatus,
+			&i.OutcomeCheckedAt,
+			&i.ResolvedAt,
+			&i.WinningOutcomeToken,
+			&i.WinningOutcomeLabel,
+			&i.DriftStatus,
+			&i.DriftCheckedAt,
+			&i.Clv15m,
+			&i.Clv1h,
+			&i.Clv6h,
+			&i.Clv24h,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSentAlertsForOutcomeCheck = `-- name: ListSentAlertsForOutcomeCheck :many
+SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity, a.market_id, a.trader_id, a.trade_id, a.payload, a.status, a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at, a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at, a.outcome_status, a.outcome_checked_at, a.resolved_at, a.winning_outcome_token, a.winning_outcome_label, a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h
+FROM polymarket_alerts a
+JOIN polymarket_markets m ON m.id = a.market_id
+WHERE a.status         = 'sent'
+  AND a.outcome_status = 'pending'
+  AND (m.closed = TRUE OR (m.end_date IS NOT NULL AND m.end_date <= NOW()))
+ORDER BY a.outcome_checked_at NULLS FIRST, a.id
+LIMIT $1::integer
+`
+
+// Used by the outcomes worker. Returns sent alerts whose outcome is
+// still pending, prioritised by oldest-unchecked-first so a single
+// alert that keeps failing the upstream lookup doesn't starve fresher
+// candidates. The query joins polymarket_markets to filter for markets
+// whose end_date has passed (or which are flagged closed) — we only
+// check markets that could plausibly be resolved.
+func (q *Queries) ListSentAlertsForOutcomeCheck(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error) {
+	rows, err := q.db.Query(ctx, listSentAlertsForOutcomeCheck, claimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PolymarketAlerts
+	for rows.Next() {
+		var i PolymarketAlerts
+		if err := rows.Scan(
+			&i.ID,
+			&i.DedupKey,
+			&i.StrategyVersion,
+			&i.Kind,
+			&i.Reason,
+			&i.Severity,
+			&i.MarketID,
+			&i.TraderID,
+			&i.TradeID,
+			&i.Payload,
+			&i.Status,
+			&i.TelegramMessageID,
+			&i.SendAttempts,
+			&i.LastSendError,
+			&i.SentAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.NextRetryAt,
+			&i.LastAttemptAt,
+			&i.OutcomeStatus,
+			&i.OutcomeCheckedAt,
+			&i.ResolvedAt,
+			&i.WinningOutcomeToken,
+			&i.WinningOutcomeLabel,
+			&i.DriftStatus,
+			&i.DriftCheckedAt,
+			&i.Clv15m,
+			&i.Clv1h,
+			&i.Clv6h,
+			&i.Clv24h,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markAlertDrift = `-- name: MarkAlertDrift :exec
+UPDATE polymarket_alerts
+SET drift_status      = $2::text,
+    drift_checked_at  = NOW(),
+    clv_15m           = $3::double precision,
+    clv_1h            = $4::double precision,
+    clv_6h            = $5::double precision,
+    clv_24h           = $6::double precision,
+    updated_at        = NOW()
+WHERE id = $1
+`
+
+type MarkAlertDriftParams struct {
+	ID          int64
+	DriftStatus string
+	Clv15m      *float64
+	Clv1h       *float64
+	Clv6h       *float64
+	Clv24h      *float64
+}
+
+// Persists the four CLV-lite windows. A NULL CLV column means the
+// reference price for that window was unavailable (e.g. no later trade
+// on the same (market, outcome)). drift_status flips to 'available'
+// when at least one window produced a number; 'unavailable' otherwise.
+func (q *Queries) MarkAlertDrift(ctx context.Context, arg MarkAlertDriftParams) error {
+	_, err := q.db.Exec(ctx, markAlertDrift,
+		arg.ID,
+		arg.DriftStatus,
+		arg.Clv15m,
+		arg.Clv1h,
+		arg.Clv6h,
+		arg.Clv24h,
+	)
+	return err
+}
+
+const markAlertOutcome = `-- name: MarkAlertOutcome :exec
+UPDATE polymarket_alerts
+SET outcome_status        = $2::text,
+    outcome_checked_at    = NOW(),
+    resolved_at           = $3::timestamptz,
+    winning_outcome_token = $4::text,
+    winning_outcome_label = $5::text,
+    updated_at            = NOW()
+WHERE id = $1
+`
+
+type MarkAlertOutcomeParams struct {
+	ID                  int64
+	OutcomeStatus       string
+	ResolvedAt          pgtype.Timestamptz
+	WinningOutcomeToken *string
+	WinningOutcomeLabel *string
+}
+
+// Stamps the outcome verdict on a sent alert. Called by the outcomes
+// worker after it has consulted Polymarket's market state. status must
+// be one of: resolved_correct, resolved_wrong, unknown, unavailable.
+func (q *Queries) MarkAlertOutcome(ctx context.Context, arg MarkAlertOutcomeParams) error {
+	_, err := q.db.Exec(ctx, markAlertOutcome,
+		arg.ID,
+		arg.OutcomeStatus,
+		arg.ResolvedAt,
+		arg.WinningOutcomeToken,
+		arg.WinningOutcomeLabel,
+	)
+	return err
+}
+
+const markAlertOutcomeUnavailableTouch = `-- name: MarkAlertOutcomeUnavailableTouch :exec
+UPDATE polymarket_alerts
+SET outcome_checked_at = NOW(),
+    updated_at         = NOW()
+WHERE id = $1
+`
+
+// Bumps outcome_checked_at on alerts where the upstream check failed
+// transiently (e.g. Polymarket /markets/{id} returned an error or a
+// not-yet-resolved market). Keeps the row scheduled for re-check at the
+// next tick without changing the verdict.
+func (q *Queries) MarkAlertOutcomeUnavailableTouch(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, markAlertOutcomeUnavailableTouch, id)
+	return err
+}
+
 const markAlertSendFailed = `-- name: MarkAlertSendFailed :exec
 UPDATE polymarket_alerts
-SET status          = 'pending',
+SET status          = 'failed',
     send_attempts   = send_attempts + 1,
+    last_attempt_at = NOW(),
     last_send_error = $2,
+    next_retry_at   = $3,
     updated_at      = NOW()
 WHERE id     = $1
   AND status = 'sending'
@@ -136,13 +393,15 @@ WHERE id     = $1
 type MarkAlertSendFailedParams struct {
 	ID            int64
 	LastSendError *string
+	NextRetryAt   pgtype.Timestamptz
 }
 
-// Releases the claim back to 'pending' so the next ClaimPending tick can
-// retry. The send_attempts column is bumped + the error message stored so
-// operators can spot poison rows.
+// Records a failed delivery attempt. The caller has already computed
+// next_retry_at (NULL = exhausted / permanent; non-NULL = retryable
+// at the supplied wall-clock time). Status flips to 'failed' regardless
+// — the claim query picks up retryable-failed rows on the next tick.
 func (q *Queries) MarkAlertSendFailed(ctx context.Context, arg MarkAlertSendFailedParams) error {
-	_, err := q.db.Exec(ctx, markAlertSendFailed, arg.ID, arg.LastSendError)
+	_, err := q.db.Exec(ctx, markAlertSendFailed, arg.ID, arg.LastSendError, arg.NextRetryAt)
 	return err
 }
 
@@ -150,8 +409,10 @@ const markAlertSent = `-- name: MarkAlertSent :exec
 UPDATE polymarket_alerts
 SET status              = 'sent',
     sent_at             = NOW(),
+    last_attempt_at     = NOW(),
     telegram_message_id = $2,
     last_send_error     = NULL,
+    next_retry_at       = NULL,
     updated_at          = NOW()
 WHERE id     = $1
   AND status = 'sending'
@@ -163,7 +424,9 @@ type MarkAlertSentParams struct {
 }
 
 // Completes a claim. Guarded by status='sending' so a duplicate sender
-// racing on a row that was already MarkFailed cannot resurrect it.
+// racing on a row that was already MarkFailed cannot resurrect it. Clears
+// retry state so a row that succeeded after a failure does not keep its
+// schedule.
 func (q *Queries) MarkAlertSent(ctx context.Context, arg MarkAlertSentParams) error {
 	_, err := q.db.Exec(ctx, markAlertSent, arg.ID, arg.TelegramMessageID)
 	return err
@@ -185,6 +448,32 @@ func (q *Queries) ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.
 	return err
 }
 
+const tradePriceAtOrAfter = `-- name: TradePriceAtOrAfter :one
+SELECT price::double precision AS price
+FROM polymarket_trades
+WHERE market_id     = $1::bigint
+  AND outcome_token = $2::text
+  AND traded_at     >= $3::timestamptz
+ORDER BY traded_at ASC
+LIMIT 1
+`
+
+type TradePriceAtOrAfterParams struct {
+	MarketID     int64
+	OutcomeToken string
+	AtOrAfter    pgtype.Timestamptz
+}
+
+// Returns the price of the FIRST trade on (market, outcome_token) at or
+// after the supplied timestamp. NULL when no later trade exists yet.
+// Powers the CLV-lite drift worker's per-window reference price lookup.
+func (q *Queries) TradePriceAtOrAfter(ctx context.Context, arg TradePriceAtOrAfterParams) (float64, error) {
+	row := q.db.QueryRow(ctx, tradePriceAtOrAfter, arg.MarketID, arg.OutcomeToken, arg.AtOrAfter)
+	var price float64
+	err := row.Scan(&price)
+	return price, err
+}
+
 const tryCreatePendingAlert = `-- name: TryCreatePendingAlert :one
 INSERT INTO polymarket_alerts (
     dedup_key, strategy_version,
@@ -194,7 +483,7 @@ INSERT INTO polymarket_alerts (
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
 ON CONFLICT (dedup_key) DO NOTHING
-RETURNING id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at
+RETURNING id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at, next_retry_at, last_attempt_at, outcome_status, outcome_checked_at, resolved_at, winning_outcome_token, winning_outcome_label, drift_status, drift_checked_at, clv_15m, clv_1h, clv_6h, clv_24h
 `
 
 type TryCreatePendingAlertParams struct {
@@ -244,6 +533,19 @@ func (q *Queries) TryCreatePendingAlert(ctx context.Context, arg TryCreatePendin
 		&i.SentAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.NextRetryAt,
+		&i.LastAttemptAt,
+		&i.OutcomeStatus,
+		&i.OutcomeCheckedAt,
+		&i.ResolvedAt,
+		&i.WinningOutcomeToken,
+		&i.WinningOutcomeLabel,
+		&i.DriftStatus,
+		&i.DriftCheckedAt,
+		&i.Clv15m,
+		&i.Clv1h,
+		&i.Clv6h,
+		&i.Clv24h,
 	)
 	return i, err
 }

@@ -64,7 +64,6 @@ For `single_cluster` (the product path):
 - **Lifecycle gating:** alerts only fire when the market has cleared
   `MARKET_MIN_AGE` AND is past `LIFECYCLE_ALERT_FROM_PCT` of its lifetime.
   Markets with missing start/end dates are silenced by default
-  (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`, fail-closed).
 - **Category whitelist:** `CATEGORY_WHITELIST` matches the category
   `slug + " " + label` and nothing else. ONLY whitelisted categories are
   monitored; everything else is ignored. Market titles, event slugs,

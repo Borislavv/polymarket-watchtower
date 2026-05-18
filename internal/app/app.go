@@ -6,12 +6,10 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/alertsender"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
@@ -25,8 +23,11 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	httpsrv "github.com/Borislavv/polymarket-watchtower/internal/infra/http"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/log"
@@ -48,18 +49,18 @@ type App struct {
 	cfg    *Config
 	logger *zerolog.Logger
 
-	metrics  *metrics.Metrics
-	registry *aggregate.MarketRegistry
-	engine   *aggregate.Engine
+	metrics *metrics.Metrics
+	cache   *marketcache.Cache
 
 	discover  *discover.Loop
 	collect   *collect.Loop
-	detectRun func(context.Context) error // active mode's Run
+	detectRun func(context.Context) error
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
 	backfill *backfill.Worker
 	sender   *alertsender.Worker
+	sanity   *sanity.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -85,11 +86,7 @@ func New() (*App, error) {
 		Msg("starting watchtower")
 
 	met := metrics.New()
-	registry := aggregate.NewRegistry()
-	engine := aggregate.New(aggregate.Config{
-		Bucket:   cfg.Aggregate.BucketSize,
-		Baseline: cfg.Aggregate.BaselineWindow,
-	})
+	cache := marketcache.New()
 
 	gammaHTTP, err := httpx.New(httpx.Config{
 		BaseURL:   cfg.Polymarket.GammaURL,
@@ -145,6 +142,7 @@ func New() (*App, error) {
 		mmFilter       *mmfilter.Filter
 		backfillWorker *backfill.Worker
 		senderWorker   *alertsender.Worker
+		sanityWorker   *sanity.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -188,7 +186,7 @@ func New() (*App, error) {
 			Int("max_open_conns", cfg.Postgres.MaxOpenConns).
 			Bool("auto_migrate", cfg.Postgres.AutoMigrate).
 			Str("baseline_source", "postgres").
-			Str("strategy_version", cfg.Anomaly.StrategyVersion).
+			Str("strategy_identity", anomaly.StrategyIdentity).
 			Bool("trader_axis_enabled", cfg.Anomaly.MinTraderHistoryTrades > 0).
 			Bool("mm_filter_enabled", cfg.Anomaly.MMFilterEnabled).
 			Dur("mm_lookback", cfg.Anomaly.MMLookback).
@@ -200,15 +198,15 @@ func New() (*App, error) {
 	}
 
 	discoverCfg := discover.Config{
-		Interval:   cfg.Pipeline.DiscoverInterval,
-		MaxMarkets: cfg.Pipeline.MaxMarkets,
-		ActiveOnly: cfg.Pipeline.ActiveOnly,
-		OrderBy:    cfg.Pipeline.OrderBy,
+		Interval:         cfg.Pipeline.DiscoverInterval,
+		SafetyMaxMarkets: cfg.Pipeline.DiscoverySafetyMaxMarkets,
+		ActiveOnly:       cfg.Pipeline.ActiveOnly,
+		OrderBy:          cfg.Pipeline.OrderBy,
 	}
 	if persistSink != nil {
 		discoverCfg.Persist = persistSink.PersistDiscovery
 	}
-	discoverLoop := discover.New(discoverCfg, gammaClient, registry, engine, categoryFilter, met, logger)
+	discoverLoop := discover.New(discoverCfg, gammaClient, cache, categoryFilter, met, logger)
 
 	// Realtime fanout owns log + optional webhook only. Telegram delivery
 	// flows through the DB queue and the alertsender worker — keeping it
@@ -257,6 +255,13 @@ func New() (*App, error) {
 			Workers:           cfg.AlertSender.Workers,
 			ChatID:            cfg.Alerting.TelegramChatID,
 			StaleSendingAfter: cfg.AlertSender.StaleSendingAfter,
+			Retry: alertsender.RetryPolicy{
+				Enabled:        cfg.AlertSender.RetryEnabled,
+				MaxAttempts:    cfg.AlertSender.RetryMaxAttempts,
+				InitialBackoff: cfg.AlertSender.RetryInitialBackoff,
+				MaxBackoff:     cfg.AlertSender.RetryMaxBackoff,
+				JitterFraction: cfg.AlertSender.RetryJitterFraction,
+			},
 		}, alertsRepo, bot, met, logger)
 		logger.Info().
 			Str("chat_id", cfg.Alerting.TelegramChatID).
@@ -266,175 +271,153 @@ func New() (*App, error) {
 	if cfg.Postgres.Enabled() {
 		backfillWorker = backfill.New(backfill.Config{
 			Interval:    cfg.Backfill.Interval,
-			BatchSize:   cfg.Backfill.BatchSize,
-			Concurrency: cfg.Backfill.Concurrency,
+			BatchSize:   cfg.Backfill.Workers,
+			Concurrency: cfg.Backfill.Workers,
 			PageSize:    cfg.Backfill.PageLimit,
 			StaleAfter:  cfg.Backfill.StaleAfter,
 		}, marketsRepo, tradesRepo, tradersRepo, dataClient, logger)
 		logger.Info().
-			Int("batch_size", cfg.Backfill.BatchSize).
+			Int("workers", cfg.Backfill.Workers).
 			Dur("interval", cfg.Backfill.Interval).
 			Msg("backfill: enabled")
+
+		sanityWorker = sanity.New(sanity.Config{
+			Interval:   cfg.MarketSanity.Interval,
+			Retention:  cfg.MarketSanity.Retention,
+			ClaimLimit: int32(cfg.MarketSanity.ClaimLimit),
+		}, marketsRepo, marketcacheUpstream{cache: cache}, logger)
+		logger.Info().
+			Dur("interval", cfg.MarketSanity.Interval).
+			Dur("retention", cfg.MarketSanity.Retention).
+			Msg("sanity: enabled (soft-delete reaper)")
 	}
 
-	// Detector wiring depends on ANOMALY_MODE. single_cluster is the primary
-	// product path (per-trade scoring + cluster HARD alert); volume keeps the
-	// legacy aggregate-rate detector for operators who explicitly opt in.
-	var (
-		detectLoop *detect.Loop
-		volumeLoop *detect.VolumeLoop
-		observer   collect.TradeObserver
-		detectRun  func(context.Context) error
-	)
-	switch cfg.Anomaly.Mode {
-	case ModeSingleCluster:
-		detectCfg := detect.Config{
-			Thresholds: anomaly.Thresholds{
-				Info: anomaly.Tier{
-					MinNotionalUSD: cfg.Anomaly.InfoMinNotionalUSD,
-					MinOdds:        cfg.Anomaly.InfoMinOdds,
-					MinMultiplier:  cfg.Anomaly.InfoMinMultiplier,
-				},
-				Warning: anomaly.Tier{
-					MinNotionalUSD: cfg.Anomaly.WarningMinNotionalUSD,
-					MinOdds:        cfg.Anomaly.WarningMinOdds,
-					MinMultiplier:  cfg.Anomaly.WarningMinMultiplier,
-				},
-				Critical: anomaly.Tier{
-					MinNotionalUSD: cfg.Anomaly.CriticalMinNotionalUSD,
-					MinOdds:        cfg.Anomaly.CriticalMinOdds,
-					MinMultiplier:  cfg.Anomaly.CriticalMinMultiplier,
-				},
-				MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
-				MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
+	// Detection is the single_cluster pipeline: per-trade scoring +
+	// cluster + accumulation + quiet-market wake-up. Volume mode and
+	// the supporting in-memory aggregate engine were removed in the v4
+	// cleanup — the production decision source is dbbaseline.Provider.
+	detectCfg := detect.Config{
+		Thresholds: anomaly.Thresholds{
+			Info: anomaly.Tier{
+				MinNotionalUSD: cfg.Anomaly.InfoMinNotionalUSD,
+				MinOdds:        cfg.Anomaly.InfoMinOdds,
+				MinMultiplier:  cfg.Anomaly.InfoMinMultiplier,
 			},
-			Baseline: baseline.Config{
-				Window:     cfg.Anomaly.BaselineWindow,
-				MaxSamples: cfg.Anomaly.BaselineMaxSamples,
+			Warning: anomaly.Tier{
+				MinNotionalUSD: cfg.Anomaly.WarningMinNotionalUSD,
+				MinOdds:        cfg.Anomaly.WarningMinOdds,
+				MinMultiplier:  cfg.Anomaly.WarningMinMultiplier,
 			},
-			Cluster: cluster.Config{
-				Window:           cfg.Anomaly.ClusterWindow,
-				MinTrades:        cfg.Anomaly.ClusterMinTrades,
-				MinUniqueWallets: cfg.Anomaly.ClusterMinWallets,
-				MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
-				Cooldown:         cfg.Anomaly.ClusterCooldown,
+			Critical: anomaly.Tier{
+				MinNotionalUSD: cfg.Anomaly.CriticalMinNotionalUSD,
+				MinOdds:        cfg.Anomaly.CriticalMinOdds,
+				MinMultiplier:  cfg.Anomaly.CriticalMinMultiplier,
 			},
-			Filter:                      categoryFilter,
-			RecentWindows:               cfg.Aggregate.RecentWindows,
-			GaugeInterval:               cfg.Pipeline.CollectInterval,
-			PolymarketBase:              cfg.Polymarket.PublicBaseURL,
-			GrafanaBase:                 cfg.Alerting.GrafanaBaseURL,
-			GrafanaDashUID:              cfg.Alerting.GrafanaDashUID,
-			GrafanaContext:              cfg.Alerting.GrafanaContext,
-			LifecycleAlertFromPct:       cfg.Anomaly.LifecycleAlertFromPct,
-			LifecycleHotFromPct:         cfg.Anomaly.LifecycleHotFromPct,
-			MarketMinAge:                cfg.Anomaly.MarketMinAge,
-			BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
-			AllowUnknownMarketLifecycle: cfg.Anomaly.AllowUnknownMarketLifecycle,
-			StrategyVersion:             cfg.Anomaly.StrategyVersion,
-		}
-		// Production: DB baseline + DB-backed alert dedup. The detector
-		// only uses the in-memory reservoir embedded in baseline.Baseline
-		// when Postgres is unwired (dev/debug only — there is no longer a
-		// runtime knob that selects "memory" while Postgres is available).
-		if cfg.Postgres.Enabled() {
-			detectCfg.Baseliner = dbBaseline
-		}
-		if cfg.Postgres.Enabled() {
-			detectCfg.Alerts = alertsRepo
-			detectCfg.Markets = marketsRepo
-			detectCfg.Traders = tradersRepo
-			// v2 additions: trader-axis multiplier + MM/arb suppression.
-			// Both are Postgres-only — the trader-history multiplier needs
-			// persisted trader_id↔trades and the MM filter needs the
-			// two-sided activity query. Memory mode degrades gracefully to
-			// v1 (market-only scoring, no suppression).
-			detectCfg.TraderBaseliner = traderBaseline
-			detectCfg.MinTraderHistoryTrades = cfg.Anomaly.MinTraderHistoryTrades
-			if mmFilter != nil {
-				detectCfg.MMFilter = mmFilter
-			}
-			// v4 quiet-market wake-up. Postgres-only — needs LastTradedAtBefore
-			// and the dbbaseline.Provider. Context detector: stamps Findings,
-			// never fires alerts on its own.
-			if cfg.Anomaly.QuietMarketEnabled {
-				detectCfg.QuietMarket = quietmarket.New(quietmarket.Config{
-					Enabled:               true,
-					MaxTradesPerDay:       cfg.Anomaly.QuietMarketMaxTradesPerDay,
-					MaxNotionalPerDayUSD:  cfg.Anomaly.QuietMarketMaxNotionalPerDay,
-					MinIdleDuration:       cfg.Anomaly.QuietMarketMinIdleDuration,
-					MinCurrentNotionalUSD: cfg.Anomaly.QuietMarketMinCurrentNotional,
-					MinMultiplier:         cfg.Anomaly.QuietMarketMinMultiplier,
-				})
-				detectCfg.LastTradeFetcher = tradesRepo
-			}
-			// v4: same-trader accumulation-line detector. Postgres-only —
-			// the entire signal is computed over the persisted
-			// per-(wallet, market, outcome, side) bucket.
-			if cfg.Anomaly.AccumulationEnabled {
-				detectCfg.Accumulator = accumulation.New(accumulation.Config{
-					Enabled:              true,
-					Window:               cfg.Anomaly.AccumulationWindow,
-					MinTrades:            cfg.Anomaly.AccumulationMinTrades,
-					TradeFractionOfInfo:  cfg.Anomaly.AccumulationMinTradeFraction,
-					TotalMultiplier:      cfg.Anomaly.AccumulationTotalMultiplier,
-					ManySmallsMultiplier: cfg.Anomaly.AccumulationManySmallsMultiplier,
-					HardMultiplier:       cfg.Anomaly.AccumulationHardMultiplier,
-					Cooldown:             cfg.Anomaly.AccumulationCooldown,
-				}, detectCfg.Thresholds)
-				detectCfg.AccumulationLines = tradesRepo
-			}
-		}
-		detectLoop = detect.New(detectCfg, engine, registry, emitter, met, logger)
-		observer = detectLoop
-		detectRun = detectLoop.Run
-	case ModeVolume:
-		volumeLoop = detect.NewVolume(detect.VolumeConfig{
-			Interval:      cfg.Pipeline.CollectInterval,
-			RecentWindows: cfg.Aggregate.RecentWindows,
-			Multipliers:   cfg.Anomaly.VolumeMultipliers,
-			MinNotional:   cfg.Anomaly.VolumeMinNotional,
-			MinTrades:     cfg.Anomaly.VolumeMinTrades,
-			Cooldown:      cfg.Anomaly.VolumeCooldown,
-			Filter:        categoryFilter,
-		}, engine, registry, emitter, met, logger)
-		observer = volumeLoop
-		detectRun = volumeLoop.Run
-	default:
-		return nil, fmt.Errorf("unknown ANOMALY_MODE %q", cfg.Anomaly.Mode)
+			MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
+			MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
+		},
+		Baseline: baseline.Config{
+			Window: cfg.Anomaly.BaselineWindow,
+		},
+		Cluster: cluster.Config{
+			Window:           cfg.Anomaly.ClusterWindow,
+			MinTrades:        cfg.Anomaly.ClusterMinTrades,
+			MinUniqueWallets: cfg.Anomaly.ClusterMinWallets,
+			MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
+			Cooldown:         cfg.Anomaly.ClusterCooldown,
+		},
+		Filter:                      categoryFilter,
+		PolymarketBase:              cfg.Polymarket.PublicBaseURL,
+		GrafanaBase:                 cfg.Alerting.GrafanaBaseURL,
+		GrafanaDashUID:              cfg.Alerting.GrafanaDashUID,
+		GrafanaContext:              cfg.Alerting.GrafanaContext,
+		LifecycleAlertFromPct:       cfg.Anomaly.LifecycleAlertFromPct,
+		LifecycleHotFromPct:         cfg.Anomaly.LifecycleHotFromPct,
+		MarketMinAge:                cfg.Anomaly.MarketMinAge,
+		BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
+		StrategyVersion: anomaly.StrategyIdentity,
 	}
+	// Production: DB baseline + DB-backed alert dedup. The detector only
+	// uses the in-memory reservoir embedded in baseline.Baseline when
+	// Postgres is unwired (dev/debug only).
+	if cfg.Postgres.Enabled() {
+		detectCfg.Baseliner = dbBaseline
+		detectCfg.Alerts = alertsRepo
+		detectCfg.Markets = marketsRepo
+		detectCfg.Traders = tradersRepo
+		detectCfg.TraderBaseliner = traderBaseline
+		detectCfg.MinTraderHistoryTrades = cfg.Anomaly.MinTraderHistoryTrades
+		if mmFilter != nil {
+			detectCfg.MMFilter = mmFilter
+		}
+		if cfg.Anomaly.QuietMarketEnabled {
+			detectCfg.QuietMarket = quietmarket.New(quietmarket.Config{
+				Enabled:               true,
+				MaxTradesPerDay:       cfg.Anomaly.QuietMarketMaxTradesPerDay,
+				MaxNotionalPerDayUSD:  cfg.Anomaly.QuietMarketMaxNotionalPerDay,
+				MinIdleDuration:       cfg.Anomaly.QuietMarketMinIdleDuration,
+				MinCurrentNotionalUSD: cfg.Anomaly.QuietMarketMinCurrentNotional,
+				MinMultiplier:         cfg.Anomaly.QuietMarketMinMultiplier,
+			})
+			detectCfg.LastTradeFetcher = tradesRepo
+		}
+		if cfg.Anomaly.AccumulationEnabled {
+			detectCfg.Accumulator = accumulation.New(accumulation.Config{
+				Enabled:              true,
+				Window:               cfg.Anomaly.AccumulationWindow,
+				MinTrades:            cfg.Anomaly.AccumulationMinTrades,
+				TradeFractionOfInfo:  cfg.Anomaly.AccumulationMinTradeFraction,
+				TotalMultiplier:      cfg.Anomaly.AccumulationTotalMultiplier,
+				ManySmallsMultiplier: cfg.Anomaly.AccumulationManySmallsMultiplier,
+				HardMultiplier:       cfg.Anomaly.AccumulationHardMultiplier,
+				Cooldown:             cfg.Anomaly.AccumulationCooldown,
+			}, detectCfg.Thresholds)
+			detectCfg.AccumulationLines = tradesRepo
+		}
+	}
+	detectLoop := detect.New(detectCfg, cache, emitter, met, logger)
 
 	collectCfg := collect.Config{
-		Interval:     cfg.Pipeline.CollectInterval,
-		Concurrency:  cfg.Pipeline.CollectConcurrency,
-		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
+		Interval:          cfg.Pipeline.CollectInterval,
+		Concurrency:       cfg.Pipeline.CollectConcurrency,
+		BootstrapLookback: cfg.Pipeline.CollectBootstrapLookback,
 	}
 	if persistSink != nil {
 		collectCfg.Persist = persistSink.PersistTrades
 		collectCfg.Cursor = persistSink.LatestTradedAt
 	}
-	collectLoop := collect.New(collectCfg, dataClient, engine, registry, observer, met, logger)
+	collectLoop := collect.New(collectCfg, dataClient, cache, detectLoop, met, logger)
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
-
-	logger.Info().Str("mode", string(cfg.Anomaly.Mode)).Msg("anomaly detector mode")
-	_ = volumeLoop // referenced via detectRun
-	_ = detectLoop // referenced via observer / detectRun
 
 	return &App{
 		cfg:       cfg,
 		logger:    logger,
 		metrics:   met,
-		registry:  registry,
-		engine:    engine,
+		cache:     cache,
 		discover:  discoverLoop,
 		collect:   collectLoop,
-		detectRun: detectRun,
+		detectRun: detectLoop.Run,
 		httpSrv:   httpSrv,
 		backfill:  backfillWorker,
 		sender:    senderWorker,
+		sanity:    sanityWorker,
 		pgPool:    pgPool,
 	}, nil
+}
+
+// marketcacheUpstream adapts *marketcache.Cache to sanity.UpstreamChecker.
+// "Active upstream" is exactly "present in the most recent discover
+// sweep" — which is what the cache contains. Cache miss → market is no
+// longer upstream → returns false → sanity proceeds with purge.
+type marketcacheUpstream struct{ cache *marketcache.Cache }
+
+func (u marketcacheUpstream) IsActiveUpstream(conditionID string) bool {
+	if u.cache == nil {
+		return false
+	}
+	_, ok := u.cache.Get(vo.MarketID(conditionID))
+	return ok
 }
 
 func (a *App) Run() error {
@@ -460,6 +443,9 @@ func (a *App) Run() error {
 	if a.sender != nil {
 		execs = append(execs, shutdown2.Exec{Name: "alertsender", Fn: a.sender.Run})
 	}
+	if a.sanity != nil {
+		execs = append(execs, shutdown2.Exec{Name: "sanity", Fn: a.sanity.Run})
+	}
 
 	return shutdown2.Graceful(
 		ctx,
@@ -467,19 +453,4 @@ func (a *App) Run() error {
 		shutdown2.WithLogger(a.logger),
 		shutdown2.WithFadeOutDuration(a.cfg.Application.ShutdownGracePeriod),
 	)
-}
-
-// longestRecent returns the longest recent window, which doubles as the
-// per-market initial trade lookback so the engine warms up on first tick.
-func longestRecent(ws []time.Duration) time.Duration {
-	var m time.Duration
-	for _, w := range ws {
-		if w > m {
-			m = w
-		}
-	}
-	if m == 0 {
-		m = time.Hour
-	}
-	return m
 }

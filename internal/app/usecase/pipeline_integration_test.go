@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aggregate"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	anomaly2 "github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
@@ -89,6 +89,11 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 					"active":       true,
 					"outcomes":     `["Yes","No"]`,
 					"clobTokenIds": `["tok-yes","tok-no"]`,
+					// Lifecycle: market started 95d ago and ends in 5d. Without
+					// dates the detector silences everything by design (v4
+					// fail-closed contract; no env override).
+					"startDate": now.Add(-95 * 24 * time.Hour).Format(time.RFC3339),
+					"endDate":   now.Add(5 * 24 * time.Hour).Format(time.RFC3339),
 					// Parent event — the user-facing URL is /event/<event.slug>,
 					// NOT /event/<market.slug>. Verified live: market slugs 404.
 					"events": []map[string]any{{
@@ -189,13 +194,12 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	dataClient := dataapi.New(dh)
 
 	met := metrics.New()
-	reg := aggregate.NewRegistry()
-	eng := aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour, Clock: clock})
+	reg := marketcache.New()
 	log := zerolog.Nop()
 
 	disc := discover.New(discover.Config{
-		Interval: time.Hour, ActiveOnly: true, MaxMarkets: 100,
-	}, gammaClient, reg, eng, nil, met, &log)
+		Interval: time.Hour, ActiveOnly: true, SafetyMaxMarkets: 100,
+	}, gammaClient, reg, nil, met, &log)
 
 	tg, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled: true, BotToken: "test", ChatID: "1", BaseURL: telegramSrv.URL,
@@ -218,18 +222,16 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 		Cluster: cluster.Config{
 			Window: time.Hour, MinTrades: 3, MinUniqueWallets: 3, MinTotalUSD: 50_000, Cooldown: time.Hour,
 		},
-		RecentWindows:               []time.Duration{time.Hour},
 		PolymarketBase:              "https://polymarket.com",
 		GrafanaBase:                 "http://grafana.local",
 		GrafanaDashUID:              "uid1",
 		GrafanaContext:              time.Hour,
-		AllowUnknownMarketLifecycle: true, // fake markets have no start/end dates
 		Clock:                       clock,
-	}, eng, reg, fanout, met, &log)
+	}, reg, fanout, met, &log)
 
 	collectLoop := collect.New(collect.Config{
-		Interval: time.Hour, Concurrency: 1, LookbackBoot: 25 * time.Hour, Clock: clock,
-	}, dataClient, eng, reg, det, met, &log)
+		Interval: time.Hour, Concurrency: 1, BootstrapLookback: 25 * time.Hour, Clock: clock,
+	}, dataClient, reg, det, met, &log)
 
 	ctx := context.Background()
 	if err := disc.RunOnce(ctx); err != nil {
