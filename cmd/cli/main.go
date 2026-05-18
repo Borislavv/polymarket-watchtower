@@ -1,7 +1,10 @@
 // Package main is the watchtower cli. Sub-commands are exposed via the
-// first positional argument; today the only command is `migrate`, used to
-// apply embedded SQL migrations against a target Postgres DSN without
-// booting the full watchtower binary.
+// first positional argument:
+//
+//   - migrate          — apply embedded SQL migrations against a DSN.
+//   - diagnose-alerts  — connect to a live DB and print a gate-by-gate
+//     breakdown that explains, with real counts, why a given config
+//     either produces or suppresses alerts. Hits the database read-only.
 package main
 
 import (
@@ -20,6 +23,8 @@ func main() {
 	switch os.Args[1] {
 	case "migrate":
 		runMigrate(os.Args[2:])
+	case "diagnose-alerts":
+		runDiagnoseAlerts(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -27,7 +32,9 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cli migrate -dsn postgres://…")
+	fmt.Fprintln(os.Stderr, "usage: cli <migrate|diagnose-alerts> [flags]")
+	fmt.Fprintln(os.Stderr, "  migrate          -dsn postgres://…")
+	fmt.Fprintln(os.Stderr, "  diagnose-alerts  -dsn postgres://… [--lookback 24h]")
 }
 
 func runMigrate(args []string) {
