@@ -85,14 +85,14 @@ func newLoopV2WithMetrics(
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  th,
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
-		PolymarketBase:              "https://polymarket.com",
-		TraderBaseliner:             tb,
-		MinTraderHistoryTrades:      minTraderHistory,
-		MMFilter:                    mm,
+		Thresholds:             th,
+		Baseline:               baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:                cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:                  func() time.Time { return now },
+		PolymarketBase:         "https://polymarket.com",
+		TraderBaseliner:        tb,
+		MinTraderHistoryTrades: minTraderHistory,
+		MMFilter:               mm,
 	}, reg, emit, met, &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit

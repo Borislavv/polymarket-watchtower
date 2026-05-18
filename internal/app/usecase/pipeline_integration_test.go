@@ -222,11 +222,11 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 		Cluster: cluster.Config{
 			Window: time.Hour, MinTrades: 3, MinUniqueWallets: 3, MinTotalUSD: 50_000, Cooldown: time.Hour,
 		},
-		PolymarketBase:              "https://polymarket.com",
-		GrafanaBase:                 "http://grafana.local",
-		GrafanaDashUID:              "uid1",
-		GrafanaContext:              time.Hour,
-		Clock:                       clock,
+		PolymarketBase: "https://polymarket.com",
+		GrafanaBase:    "http://grafana.local",
+		GrafanaDashUID: "uid1",
+		GrafanaContext: time.Hour,
+		Clock:          clock,
 	}, reg, fanout, met, &log)
 
 	collectLoop := collect.New(collect.Config{

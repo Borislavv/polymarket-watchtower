@@ -115,17 +115,17 @@ func newAccumulationLoop(
 	det := accumulation.New(cfg, th)
 
 	loop := New(Config{
-		Thresholds:                  th,
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
-		PolymarketBase:              "https://polymarket.com",
-		Accumulator:                 det,
-		AccumulationLines:           lines,
-		MMFilter:                    mm,
-		Markets:                     &fakeMarketResolver{id: 7},
-		Traders:                     &fakeTraderResolver{id: 42},
-		Alerts:                      alerts,
+		Thresholds:        th,
+		Baseline:          baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:           cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:             func() time.Time { return now },
+		PolymarketBase:    "https://polymarket.com",
+		Accumulator:       det,
+		AccumulationLines: lines,
+		MMFilter:          mm,
+		Markets:           &fakeMarketResolver{id: 7},
+		Traders:           &fakeTraderResolver{id: 42},
+		Alerts:            alerts,
 		// In-memory baseline path so per-trade market multiplier is computed
 		// from the trades we fed in. We keep BaselineMinReadySpan=0 so the
 		// single-trade scorer doesn't block in tests; accumulation has its

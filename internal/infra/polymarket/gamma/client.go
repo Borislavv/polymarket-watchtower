@@ -146,13 +146,13 @@ func (c *Client) ListEvents(ctx context.Context, opts ListMarketsOpts) ([]gammaE
 // Returned by GetMarketResolution; never leaked outside the gamma
 // adapter when this method is used elsewhere.
 type MarketResolution struct {
-	ConditionID    string
-	Closed         bool
-	Archived       bool
-	EndDate        time.Time
-	TokenIDs       []string
-	OutcomeLabels  []string
-	OutcomePrices  []float64 // index-aligned with TokenIDs / OutcomeLabels
+	ConditionID   string
+	Closed        bool
+	Archived      bool
+	EndDate       time.Time
+	TokenIDs      []string
+	OutcomeLabels []string
+	OutcomePrices []float64 // index-aligned with TokenIDs / OutcomeLabels
 }
 
 // GetMarketResolution returns the resolution snapshot for one market.

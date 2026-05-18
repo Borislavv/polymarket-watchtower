@@ -65,14 +65,14 @@ func newSingleTradeQuietLoop(
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 90 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
-		PolymarketBase:              "https://polymarket.com",
-		QuietMarket:                 quietmarket.New(qmCfg),
-		LastTradeFetcher:            last,
-		Markets:                     &fakeMarketResolver{id: 7},
+		Thresholds:       defaultThresholds(),
+		Baseline:         baseline.Config{Window: 90 * 24 * time.Hour},
+		Cluster:          cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:            func() time.Time { return now },
+		PolymarketBase:   "https://polymarket.com",
+		QuietMarket:      quietmarket.New(qmCfg),
+		LastTradeFetcher: last,
+		Markets:          &fakeMarketResolver{id: 7},
 	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	return loop, m, emit
@@ -239,18 +239,18 @@ func TestQuietMarket_Accumulation_AppliesToLineFinding(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 90 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
-		PolymarketBase:              "https://polymarket.com",
-		Accumulator:                 accumulation.New(accumulationCfg(), defaultThresholds()),
-		AccumulationLines:           lines,
-		QuietMarket:                 quietmarket.New(quietMarketCfg()),
-		LastTradeFetcher:            last,
-		Markets:                     &fakeMarketResolver{id: 7},
-		Traders:                     &fakeTraderResolver{id: 42},
-		Alerts:                      newFakeAlerts(),
+		Thresholds:        defaultThresholds(),
+		Baseline:          baseline.Config{Window: 90 * 24 * time.Hour},
+		Cluster:           cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:             func() time.Time { return now },
+		PolymarketBase:    "https://polymarket.com",
+		Accumulator:       accumulation.New(accumulationCfg(), defaultThresholds()),
+		AccumulationLines: lines,
+		QuietMarket:       quietmarket.New(quietMarketCfg()),
+		LastTradeFetcher:  last,
+		Markets:           &fakeMarketResolver{id: 7},
+		Traders:           &fakeTraderResolver{id: 42},
+		Alerts:            newFakeAlerts(),
 	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	// Seed a quiet baseline so both the accumulation multiplier and the
@@ -289,12 +289,12 @@ func TestQuietMarket_DisabledNeverStamps(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 90 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Clock:                       func() time.Time { return now },
-		Markets:                     &fakeMarketResolver{id: 7},
-		LastTradeFetcher:            last,
+		Thresholds:       defaultThresholds(),
+		Baseline:         baseline.Config{Window: 90 * 24 * time.Hour},
+		Cluster:          cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:            func() time.Time { return now },
+		Markets:          &fakeMarketResolver{id: 7},
+		LastTradeFetcher: last,
 	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	warmBaselineDirect(loop, 30, 100, now.Add(-30*24*time.Hour))

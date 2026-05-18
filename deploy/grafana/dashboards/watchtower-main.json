@@ -1,0 +1,276 @@
+{
+  "uid": "watchtower-main",
+  "title": "Polymarket Watchtower",
+  "tags": ["polymarket", "watchtower"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "editable": true,
+  "annotations": {"list": []},
+  "templating": {
+    "list": [
+      {
+        "name": "category",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+        "query": "label_values(watchtower_category_anomalous_trades_total, category)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "severity",
+        "type": "custom",
+        "query": "info,warning,critical,hard",
+        "current": {"text": "All", "value": "$__all"},
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Markets tracked",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "watchtower_discover_markets_tracked", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Baseline buckets",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "watchtower_baseline_buckets", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Single-trade anomalies (1h)",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "sum(increase(watchtower_trade_anomalies_total[1h]))", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "HARD alerts (1h)",
+      "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}},
+      "targets": [{"expr": "sum(increase(watchtower_category_hard_alerts_total[1h]))", "refId": "A"}]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Anomalous USD / 1h",
+      "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{"expr": "sum(increase(watchtower_category_anomalous_notional_usd_total[1h]))", "refId": "A"}]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Telegram sent / errors (1h)",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum(increase(watchtower_telegram_alerts_sent_total[1h]))", "legendFormat": "sent", "refId": "A"},
+        {"expr": "sum(increase(watchtower_telegram_alert_errors_total[1h]))", "legendFormat": "errors", "refId": "B"}
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "MM-suppressed (24h)",
+      "gridPos": {"x": 0, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "sum(increase(watchtower_filter_alert_mm_suppressed_total[24h]))", "refId": "A"}]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Unknown-lifecycle skipped (24h)",
+      "gridPos": {"x": 4, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "increase(watchtower_filter_lifecycle_unknown_skipped_total[24h])", "refId": "A"}]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Pending alerts (approx)",
+      "gridPos": {"x": 8, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Approximation: emitted − sent. Exact: SELECT count(*) FROM polymarket_alerts WHERE status='pending'.",
+      "targets": [{"expr": "sum(watchtower_trade_anomalies_total) + sum(watchtower_accumulation_alerts_total) + sum(watchtower_category_hard_alerts_total) - sum(watchtower_telegram_alerts_sent_total)", "refId": "A"}]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Failed alerts (24h)",
+      "gridPos": {"x": 12, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}}},
+      "targets": [{"expr": "sum(increase(watchtower_telegram_alert_errors_total[24h]))", "refId": "A"}]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Postgres trades (total)",
+      "gridPos": {"x": 16, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Proxy: cumulative ingest counters across all markets.",
+      "targets": [{"expr": "sum(watchtower_collect_trades_total)", "refId": "A"}]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Backfill USD/min (5m)",
+      "gridPos": {"x": 20, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{"expr": "sum(rate(watchtower_collect_notional_usd_total[5m])) * 60", "refId": "A"}]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Single-trade anomalies by severity (rate / min)",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum by (severity) (rate(watchtower_trade_anomalies_total{category=~\"$category\", severity=~\"$severity\"}[5m])) * 60", "legendFormat": "single:{{severity}}", "refId": "A"},
+        {"expr": "sum by (severity) (rate(watchtower_accumulation_alerts_total{category=~\"$category\", severity=~\"$severity\"}[5m])) * 60", "legendFormat": "accumulation:{{severity}}", "refId": "B"},
+        {"expr": "sum(rate(watchtower_category_hard_alerts_total{category=~\"$category\"}[5m])) * 60", "legendFormat": "cluster (hard)", "refId": "C"},
+        {"expr": "sum by (kind) (rate(watchtower_quietmarket_alerts_total[5m])) * 60", "legendFormat": "quietmarket:{{kind}}", "refId": "D"}
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Single-trade anomaly axis (rate / 5m)",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum by (axis) (rate(watchtower_trade_anomaly_axis_total[5m]))", "legendFormat": "{{axis}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Top categories — anomalous trade count (5m)",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "topk(10, sum by (category) (increase(watchtower_category_anomalous_trades_total{severity=~\"$severity\"}[5m])))",
+        "legendFormat": "{{category}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Top categories — anomalous USD (5m)",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{
+        "expr": "topk(10, sum by (category) (increase(watchtower_category_anomalous_notional_usd_total{severity=~\"$severity\"}[5m])))",
+        "legendFormat": "{{category}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "CategoryWatchRequired HARD alerts (per category, 5m)",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (category) (increase(watchtower_category_hard_alerts_total{category=~\"$category\"}[5m]))",
+        "legendFormat": "{{category}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Telegram sent vs errors (rate / 5m)",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum by (severity) (rate(watchtower_telegram_alerts_sent_total[5m]))", "legendFormat": "sent:{{severity}}", "refId": "A"},
+        {"expr": "sum by (severity) (rate(watchtower_telegram_alert_errors_total[5m]))", "legendFormat": "err:{{severity}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 30,
+      "type": "heatmap",
+      "title": "Trade-size USD distribution (every trade)",
+      "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (le) (rate(watchtower_trade_size_usd_bucket[5m]))",
+        "format": "heatmap",
+        "legendFormat": "{{le}}",
+        "refId": "A"
+      }],
+      "options": {"yAxis": {"unit": "currencyUSD"}}
+    },
+    {
+      "id": 31,
+      "type": "heatmap",
+      "title": "Anomaly multiplier distribution (effective)",
+      "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (le) (rate(watchtower_trade_anomaly_multiplier_bucket[5m]))",
+        "format": "heatmap",
+        "legendFormat": "{{le}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Upstream API latency (p50 / p95 / p99)",
+      "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (api, le) (rate(watchtower_upstream_request_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{api}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (api, le) (rate(watchtower_upstream_request_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{api}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (api, le) (rate(watchtower_upstream_request_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{api}}", "refId": "C"}
+      ]
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Upstream errors (rate / 5m by status)",
+      "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (api, status) (rate(watchtower_upstream_requests_total{status!~\"2..\"}[5m]))",
+        "legendFormat": "{{api}}:{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Trade ingest rate (per market, top 10)",
+      "gridPos": {"x": 0, "y": 48, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "topk(10, sum by (market) (rate(watchtower_collect_trades_total[5m])))",
+        "legendFormat": "{{market}}",
+        "refId": "A"
+      }]
+    }
+  ]
+}

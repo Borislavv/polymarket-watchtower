@@ -101,6 +101,33 @@ type MarketSanityConfig struct {
 	ClaimLimit int `env:"MARKET_SANITY_CLAIM_LIMIT" envDefault:"256" validate:"gte=1"`
 }
 
+// OutcomesConfig tunes the post-alert resolution tracker. The worker
+// runs periodically, picks sent alerts whose markets may be resolved
+// upstream, and stamps a verdict (resolved_correct / resolved_wrong /
+// unknown / unavailable) on each row. Signal-quality measurement only —
+// never re-emits alerts, never reverses dedup.
+type OutcomesConfig struct {
+	Enabled    bool          `env:"OUTCOMES_ENABLED" envDefault:"true"`
+	Interval   time.Duration `env:"OUTCOMES_INTERVAL" envDefault:"15m" validate:"required"`
+	ClaimLimit int           `env:"OUTCOMES_CLAIM_LIMIT" envDefault:"64" validate:"gte=1"`
+	// WinningPriceThreshold is the price above which an outcome token is
+	// treated as the winner. Polymarket resolutions are typically
+	// {1.0, 0.0}; 0.99 catches the canonical case while ignoring late-
+	// trading noise around the resolution moment.
+	WinningPriceThreshold float64 `env:"OUTCOMES_WINNING_PRICE_THRESHOLD" envDefault:"0.99" validate:"gt=0,lt=1"`
+}
+
+// DriftConfig tunes the CLV-lite post-trade drift enrichment worker.
+// For each sent alert it computes the favourable price drift at four
+// reference windows (15m / 1h / 6h / 24h) using public trade data as
+// the reference price source. Sign convention: positive = favourable
+// for the alert direction.
+type DriftConfig struct {
+	Enabled    bool          `env:"DRIFT_ENABLED" envDefault:"true"`
+	Interval   time.Duration `env:"DRIFT_INTERVAL" envDefault:"5m" validate:"required"`
+	ClaimLimit int           `env:"DRIFT_CLAIM_LIMIT" envDefault:"64" validate:"gte=1"`
+}
+
 // AlertSenderConfig tunes the alert sender worker that drains
 // polymarket_alerts and delivers each row to Telegram.
 type AlertSenderConfig struct {
@@ -362,6 +389,8 @@ type Config struct {
 	Postgres       PostgresConfig
 	Backfill       BackfillConfig
 	MarketSanity   MarketSanityConfig
+	Outcomes       OutcomesConfig
+	Drift          DriftConfig
 	AlertSender    AlertSenderConfig
 	Polymarket     PolymarketConfig
 	RateLimit      RateLimitConfig

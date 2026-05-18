@@ -73,14 +73,14 @@ func newLoop(t *testing.T, now time.Time, th anomaly.Thresholds, cl cluster.Conf
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  th,
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
-		Cluster:                     cl,
-		Clock:                       func() time.Time { return now },
-		PolymarketBase:              "https://polymarket.com",
-		GrafanaBase:                 "http://grafana.local",
-		GrafanaDashUID:              "uid123",
-		GrafanaContext:              time.Hour,
+		Thresholds:     th,
+		Baseline:       baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:        cl,
+		Clock:          func() time.Time { return now },
+		PolymarketBase: "https://polymarket.com",
+		GrafanaBase:    "http://grafana.local",
+		GrafanaDashUID: "uid123",
+		GrafanaContext: time.Hour,
 	}, reg, emit, metrics.New(), &log)
 	return loop, reg, emit
 }
@@ -822,8 +822,8 @@ func TestSportsLikeMarketUnderWhitelistedCategoryAllowed(t *testing.T) {
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
 		// Whitelist admits "hide-from-new". Sports words in market title /
 		// event slug are NOT consulted, so the trade alerts.
-		Filter:                      category.NewFilter([]string{"hide-from-new"}),
-		Clock:                       func() time.Time { return now },
+		Filter: category.NewFilter([]string{"hide-from-new"}),
+		Clock:  func() time.Time { return now },
 	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {
@@ -854,11 +854,11 @@ func TestWhitelistStaysCategoryOnly(t *testing.T) {
 	emit := &capturingEmitter{}
 	log := zerolog.Nop()
 	loop := New(Config{
-		Thresholds:                  defaultThresholds(),
-		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
-		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Filter:                      category.NewFilter([]string{"politics"}),
-		Clock:                       func() time.Time { return now },
+		Thresholds: defaultThresholds(),
+		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Filter:     category.NewFilter([]string{"politics"}),
+		Clock:      func() time.Time { return now },
 	}, reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xa")
 	for i := 0; i < 30; i++ {

@@ -135,7 +135,7 @@ type Config struct {
 	// oldest sample) to clear this floor before alerts can fire. 0 disables.
 	// Distinct from BaselineWindow, which is the *maximum* lookback.
 	BaselineMinReadySpan time.Duration
-	Clock func() time.Time
+	Clock                func() time.Time
 
 	// Baseliner is the Postgres-backed baseline fetcher. Wired in
 	// production whenever POSTGRES_DSN is set. Leave nil only in the

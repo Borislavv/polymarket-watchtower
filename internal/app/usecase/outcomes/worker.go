@@ -194,21 +194,23 @@ func (w *Worker) classify(a repository.Alert, res gamma.MarketResolution) reposi
 	}
 
 	// Decode the persisted Finding to recover the alert's trade direction.
+	// TradeRef carries the outcome LABEL ("Yes"/"No"/...), not the CLOB
+	// token id, so we match by label against res.OutcomeLabels.
 	var f anomaly.Finding
 	if err := json.Unmarshal(a.Payload, &f); err != nil || f.Trade == nil {
 		update.Status = repository.OutcomeUnknown
 		return update
 	}
-	alertedToken := string(f.Trade.Token)
+	alertedLabel := f.Trade.Outcome
 	alertedSide := f.Trade.Side
-	winningToken := update.WinningOutcomeToken
+	winningLabel := update.WinningOutcomeLabel
 
 	switch {
-	case alertedToken == "" || winningToken == "":
+	case alertedLabel == "" || winningLabel == "":
 		update.Status = repository.OutcomeUnknown
-	case alertedSide == trade.SideBuy && alertedToken == winningToken:
+	case alertedSide == trade.SideBuy && alertedLabel == winningLabel:
 		update.Status = repository.OutcomeCorrect
-	case alertedSide == trade.SideSell && alertedToken != winningToken:
+	case alertedSide == trade.SideSell && alertedLabel != winningLabel:
 		// Selling a losing outcome is correct (the seller predicted the
 		// loss).
 		update.Status = repository.OutcomeCorrect

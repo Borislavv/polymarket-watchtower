@@ -106,7 +106,11 @@ not depend on the cache. The DB is the source of truth.
 - Below `LIFECYCLE_ALERT_FROM_PCT` (default 75) → no alert.
 - At or above `LIFECYCLE_HOT_FROM_PCT` (default 90) → `Finding.Hot = true`,
   Telegram header carries `· HOT`.
-- Markets with missing `StartDate`/`EndDate` are **silenced by default**.
+- Markets with missing `StartDate`/`EndDate` are **always silenced** — no
+  env override. The previous `ALLOW_UNKNOWN_MARKET_LIFECYCLE` was removed
+  in the post-v4 hardening pass; an alert without lifecycle context is
+  structurally unsafe and operators must not be able to flip that off.
+  Counter: `watchtower_filter_lifecycle_unknown_skipped_total`.
 
 ## Severity rule
 
@@ -257,6 +261,84 @@ detect.Loop fetches `LastTradedAtBefore` from `repository.TradeRepository`
 
 Cluster alerts are not tagged — a multi-wallet cluster is intrinsically
 not quiet.
+
+## Failed-alert retry policy
+
+The `alertsender` worker claims both `status='pending'` rows AND
+retryable `status='failed'` rows whose `next_retry_at <= now()`.
+Behavior:
+
+- Transient errors (network blips, Telegram 5xx, timeout) bump
+  `send_attempts` and schedule `next_retry_at = now + backoff` where
+  `backoff = min(initial * 2^attempts, max) ± jitter`.
+- Permanent errors (`render:`-prefixed payload bugs, Telegram HTML
+  parse rejection, "chat not found", "bot was kicked",
+  "message is too long") are stamped `next_retry_at=NULL` — the row
+  stays `failed` forever and an operator must intervene. Retrying them
+  would just burn quota.
+- After `ALERT_RETRY_MAX_ATTEMPTS` attempts the row is exhausted (same
+  permanent-failed outcome).
+
+Config: `ALERT_RETRY_ENABLED`, `ALERT_RETRY_MAX_ATTEMPTS=5`,
+`ALERT_RETRY_INITIAL_BACKOFF=30s`, `ALERT_RETRY_MAX_BACKOFF=30m`,
+`ALERT_RETRY_JITTER_FRACTION=0.2`.
+
+## Post-alert outcome tracking
+
+The `outcomes` worker periodically scans sent alerts whose markets may
+be resolved (`closed=true` OR `end_date <= now()`), queries Gamma for
+the market's `outcomePrices`, and stamps a verdict on each alert:
+
+- `pending` — alert was sent but market hasn't resolved yet.
+- `resolved_correct` — alert direction matches the winning outcome
+  (BUY winning-side, or SELL losing-side).
+- `resolved_wrong` — alert direction is opposite the winning outcome.
+- `unknown` — market closed but `outcomePrices` are inconclusive (no
+  token cleared `OUTCOMES_WINNING_PRICE_THRESHOLD`).
+- `unavailable` — market not in Gamma (archived, expired) or the
+  Finding payload lacks the outcome label.
+
+Signal-quality measurement only — never re-emits alerts, never reverses
+the dedup namespace. Verdicts live on the alert row
+(`outcome_status`, `winning_outcome_token`, `winning_outcome_label`,
+`resolved_at`).
+
+Config: `OUTCOMES_ENABLED`, `OUTCOMES_INTERVAL=15m`,
+`OUTCOMES_CLAIM_LIMIT=64`, `OUTCOMES_WINNING_PRICE_THRESHOLD=0.99`.
+
+## CLV-lite post-trade drift enrichment
+
+The `drift` worker periodically scans sent alerts whose reference
+windows have elapsed and persists the *signed favourable* fractional
+price drift for each window:
+
+- `clv_15m`, `clv_1h`, `clv_6h`, `clv_24h` — `DOUBLE PRECISION NULL`
+- Positive = favourable for the alert direction (BUY: laterPrice >
+  tradePrice; SELL: laterPrice < tradePrice).
+- Each value is the fractional move relative to the trade price.
+
+Reference prices come from `polymarket_trades` (the first trade on the
+same `(market, outcome)` at or after `T+window`). The worker NEVER
+uses future data for the firing decision — it only operates on alerts
+whose `sent_at + window` has elapsed. `drift_status` flips to
+`available` once any window produced a number; `unavailable` once the
+24h window has elapsed without a reference price.
+
+Outcome token: the drift worker reads `Finding.Accumulation.OutcomeToken`
+when present. Single-trade Findings without accumulation context are
+stamped `unavailable` (the `TradeRef` carries the outcome LABEL only,
+not the CLOB token id).
+
+Config: `DRIFT_ENABLED`, `DRIFT_INTERVAL=5m`, `DRIFT_CLAIM_LIMIT=64`.
+
+## Grafana dashboard
+
+`deploy/grafana/dashboards/watchtower-main.json` is provisioned at
+container startup (UID `watchtower-main`). Panels cover: alerts by
+severity, single-trade anomaly axis, Telegram delivery, upstream API
+latency / errors, trade ingest rate, queue depth, Postgres growth, MM
+suppression, lifecycle-unknown skipped. Alert deep-links from Telegram
+reach this UID via `GRAFANA_DASH_UID`.
 
 ### POSSIBLE_MARKET_MAKER reason code
 

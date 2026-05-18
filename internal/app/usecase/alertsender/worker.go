@@ -313,12 +313,12 @@ func isPermanentError(err error) bool {
 		return true
 	}
 	for _, marker := range []string{
-		"can't parse entities",       // Telegram HTML parse rejection
-		"chat not found",             // bad chat id
-		"bot was kicked",             // chat removed bot
-		"bot is not a member",        // bot lacks permission
-		"have no rights to send",     // bot lacks permission
-		"message is too long",        // payload exceeds Telegram limit
+		"can't parse entities",   // Telegram HTML parse rejection
+		"chat not found",         // bad chat id
+		"bot was kicked",         // chat removed bot
+		"bot is not a member",    // bot lacks permission
+		"have no rights to send", // bot lacks permission
+		"message is too long",    // payload exceeds Telegram limit
 	} {
 		if strings.Contains(msg, marker) {
 			return true

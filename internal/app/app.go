@@ -23,7 +23,9 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
@@ -61,6 +63,8 @@ type App struct {
 	backfill *backfill.Worker
 	sender   *alertsender.Worker
 	sanity   *sanity.Worker
+	outcomes *outcomes.Worker
+	drift    *drift.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -143,6 +147,8 @@ func New() (*App, error) {
 		backfillWorker *backfill.Worker
 		senderWorker   *alertsender.Worker
 		sanityWorker   *sanity.Worker
+		outcomesWorker *outcomes.Worker
+		driftWorker    *drift.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -290,6 +296,27 @@ func New() (*App, error) {
 			Dur("interval", cfg.MarketSanity.Interval).
 			Dur("retention", cfg.MarketSanity.Retention).
 			Msg("sanity: enabled (soft-delete reaper)")
+
+		if cfg.Outcomes.Enabled {
+			outcomesWorker = outcomes.New(outcomes.Config{
+				Interval:              cfg.Outcomes.Interval,
+				ClaimLimit:            int32(cfg.Outcomes.ClaimLimit),
+				WinningPriceThreshold: cfg.Outcomes.WinningPriceThreshold,
+			}, alertsRepo, marketsRepo, gammaClient, logger)
+			logger.Info().
+				Dur("interval", cfg.Outcomes.Interval).
+				Msg("outcomes: enabled (post-alert resolution tracking)")
+		}
+		if cfg.Drift.Enabled {
+			driftWorker = drift.New(drift.Config{
+				Interval:      cfg.Drift.Interval,
+				ClaimLimit:    int32(cfg.Drift.ClaimLimit),
+				LongestWindow: 24 * 60 * 60 * 1_000_000_000, // 24h hardcoded to match column set
+			}, alertsRepo, tradesRepo, logger)
+			logger.Info().
+				Dur("interval", cfg.Drift.Interval).
+				Msg("drift: enabled (CLV-lite post-trade enrichment)")
+		}
 	}
 
 	// Detection is the single_cluster pipeline: per-trade scoring +
@@ -326,16 +353,16 @@ func New() (*App, error) {
 			MinTotalUSD:      cfg.Anomaly.ClusterMinTotalUSD,
 			Cooldown:         cfg.Anomaly.ClusterCooldown,
 		},
-		Filter:                      categoryFilter,
-		PolymarketBase:              cfg.Polymarket.PublicBaseURL,
-		GrafanaBase:                 cfg.Alerting.GrafanaBaseURL,
-		GrafanaDashUID:              cfg.Alerting.GrafanaDashUID,
-		GrafanaContext:              cfg.Alerting.GrafanaContext,
-		LifecycleAlertFromPct:       cfg.Anomaly.LifecycleAlertFromPct,
-		LifecycleHotFromPct:         cfg.Anomaly.LifecycleHotFromPct,
-		MarketMinAge:                cfg.Anomaly.MarketMinAge,
-		BaselineMinReadySpan:        cfg.Anomaly.BaselineMinReadySpan,
-		StrategyVersion: anomaly.StrategyIdentity,
+		Filter:                categoryFilter,
+		PolymarketBase:        cfg.Polymarket.PublicBaseURL,
+		GrafanaBase:           cfg.Alerting.GrafanaBaseURL,
+		GrafanaDashUID:        cfg.Alerting.GrafanaDashUID,
+		GrafanaContext:        cfg.Alerting.GrafanaContext,
+		LifecycleAlertFromPct: cfg.Anomaly.LifecycleAlertFromPct,
+		LifecycleHotFromPct:   cfg.Anomaly.LifecycleHotFromPct,
+		MarketMinAge:          cfg.Anomaly.MarketMinAge,
+		BaselineMinReadySpan:  cfg.Anomaly.BaselineMinReadySpan,
+		StrategyVersion:       anomaly.StrategyIdentity,
 	}
 	// Production: DB baseline + DB-backed alert dedup. The detector only
 	// uses the in-memory reservoir embedded in baseline.Baseline when
@@ -402,6 +429,8 @@ func New() (*App, error) {
 		backfill:  backfillWorker,
 		sender:    senderWorker,
 		sanity:    sanityWorker,
+		outcomes:  outcomesWorker,
+		drift:     driftWorker,
 		pgPool:    pgPool,
 	}, nil
 }
@@ -445,6 +474,12 @@ func (a *App) Run() error {
 	}
 	if a.sanity != nil {
 		execs = append(execs, shutdown2.Exec{Name: "sanity", Fn: a.sanity.Run})
+	}
+	if a.outcomes != nil {
+		execs = append(execs, shutdown2.Exec{Name: "outcomes", Fn: a.outcomes.Run})
+	}
+	if a.drift != nil {
+		execs = append(execs, shutdown2.Exec{Name: "drift", Fn: a.drift.Run})
 	}
 
 	return shutdown2.Graceful(
