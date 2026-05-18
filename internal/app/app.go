@@ -15,6 +15,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	httpsrv "github.com/Borislavv/polymarket-watchtower/internal/infra/http"
@@ -23,8 +24,11 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
+	pg "github.com/Borislavv/polymarket-watchtower/internal/infra/postgres"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	shutdown2 "github.com/Borislavv/polymarket-watchtower/internal/infra/shutdown"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
 
@@ -44,7 +48,9 @@ type App struct {
 	detectRun func(context.Context) error // active mode's Run
 	httpSrv   *httpsrv.Server
 
-	telegramPoller *alerting2.Poller // nil when TELEGRAM_UPDATES_ENABLED=false
+	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
+	// can drain it cleanly.
+	pgPool *pgxpool.Pool
 }
 
 func New() (*App, error) {
@@ -98,47 +104,76 @@ func New() (*App, error) {
 	gammaClient := gamma.New(gammaHTTP)
 	dataClient := dataapi.New(dataHTTP)
 
-	categoryFilter := category.NewFilter(cfg.CategoryFilter.Blacklist)
-	logger.Info().Str("category_blacklist", categoryFilter.Summary()).Msg("category filter")
+	categoryFilter := category.NewFilter(cfg.CategoryFilter.Whitelist)
+	logger.Info().Str("category_whitelist", categoryFilter.Summary()).Msg("category filter")
 
-	discoverLoop := discover.New(discover.Config{
+	// Postgres is optional. When DSN is set we open the pool, run
+	// migrations, and build a persist.Sink that writes every discovery
+	// sweep and trade batch to the DB. When DSN is empty the app stays in
+	// Phase-1 mode (in-memory only) — the loops see a nil Persist.
+	var (
+		pgPool      *pgxpool.Pool
+		persistSink *persist.Sink
+	)
+	if cfg.Postgres.Enabled() {
+		if cfg.Postgres.AutoMigrate {
+			if err := pg.Migrate(cfg.Postgres.DSN); err != nil {
+				return nil, fmt.Errorf("postgres migrate: %w", err)
+			}
+		}
+		var err error
+		pgPool, err = pg.Open(context.Background(), pg.Config{
+			DSN:             cfg.Postgres.DSN,
+			MaxOpenConns:    cfg.Postgres.MaxOpenConns,
+			MaxIdleConns:    cfg.Postgres.MaxIdleConns,
+			ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("postgres open: %w", err)
+		}
+		persistSink = persist.NewSink(
+			repository.NewCategoryRepository(pgPool),
+			repository.NewMarketRepository(pgPool),
+			repository.NewTradeRepository(pgPool),
+			repository.NewTraderRepository(pgPool),
+			cfg.CategoryFilter.Whitelist,
+		)
+		logger.Info().
+			Int("max_open_conns", cfg.Postgres.MaxOpenConns).
+			Bool("auto_migrate", cfg.Postgres.AutoMigrate).
+			Msg("postgres: persistence enabled")
+	} else {
+		logger.Info().Msg("postgres: not configured, running in-memory only (Phase-1 mode)")
+	}
+
+	discoverCfg := discover.Config{
 		Interval:   cfg.Pipeline.DiscoverInterval,
 		MaxMarkets: cfg.Pipeline.MaxMarkets,
 		ActiveOnly: cfg.Pipeline.ActiveOnly,
 		OrderBy:    cfg.Pipeline.OrderBy,
-	}, gammaClient, registry, engine, categoryFilter, met, logger)
+	}
+	if persistSink != nil {
+		discoverCfg.Persist = persistSink.PersistDiscovery
+	}
+	discoverLoop := discover.New(discoverCfg, gammaClient, registry, engine, categoryFilter, met, logger)
 
 	sinks := []alerting2.Channel{&alerting2.LogSink{Logger: logger}}
 	if cfg.Alerting.WebhookURL != "" {
 		sinks = append(sinks, alerting2.NewWebhookSink(cfg.Alerting.WebhookURL))
 	}
-	telegramSubs := alerting2.NewSubscribers(cfg.Alerting.TelegramChatID)
 	telegram, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled:  cfg.Alerting.TelegramEnabled,
 		BotToken: cfg.Alerting.TelegramBotToken,
 		ChatID:   cfg.Alerting.TelegramChatID,
 		BaseURL:  cfg.Alerting.TelegramBaseURL,
 		Timeout:  cfg.Alerting.TelegramTimeout,
-	}, telegramSubs)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("telegram sink: %w", err)
 	}
 	telegram.WithMetrics(met)
 	sinks = append(sinks, telegram)
 	emitter := &alerting2.Fanout{Sinks: sinks, Logger: logger}
-
-	var telegramPoller *alerting2.Poller
-	if cfg.Alerting.TelegramEnabled && cfg.Alerting.TelegramUpdatesEnabled {
-		telegramPoller, err = alerting2.NewPoller(alerting2.PollerConfig{
-			BotToken: cfg.Alerting.TelegramBotToken,
-			BaseURL:  cfg.Alerting.TelegramBaseURL,
-			Interval: cfg.Alerting.TelegramUpdatesInterval,
-			Timeout:  cfg.Alerting.TelegramTimeout,
-		}, telegramSubs, logger)
-		if err != nil {
-			return nil, fmt.Errorf("telegram poller: %w", err)
-		}
-	}
 
 	// Detector wiring depends on ANOMALY_MODE. single_cluster is the primary
 	// product path (per-trade scoring + cluster HARD alert); volume keeps the
@@ -213,11 +248,15 @@ func New() (*App, error) {
 		return nil, fmt.Errorf("unknown ANOMALY_MODE %q", cfg.Anomaly.Mode)
 	}
 
-	collectLoop := collect.New(collect.Config{
+	collectCfg := collect.Config{
 		Interval:     cfg.Pipeline.CollectInterval,
 		Concurrency:  cfg.Pipeline.CollectConcurrency,
 		LookbackBoot: longestRecent(cfg.Aggregate.RecentWindows),
-	}, dataClient, engine, registry, observer, met, logger)
+	}
+	if persistSink != nil {
+		collectCfg.Persist = persistSink.PersistTrades
+	}
+	collectLoop := collect.New(collectCfg, dataClient, engine, registry, observer, met, logger)
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
@@ -226,31 +265,35 @@ func New() (*App, error) {
 	_ = detectLoop // referenced via observer / detectRun
 
 	return &App{
-		cfg:            cfg,
-		logger:         logger,
-		metrics:        met,
-		registry:       registry,
-		engine:         engine,
-		discover:       discoverLoop,
-		collect:        collectLoop,
-		detectRun:      detectRun,
-		httpSrv:        httpSrv,
-		telegramPoller: telegramPoller,
+		cfg:       cfg,
+		logger:    logger,
+		metrics:   met,
+		registry:  registry,
+		engine:    engine,
+		discover:  discoverLoop,
+		collect:   collectLoop,
+		detectRun: detectRun,
+		httpSrv:   httpSrv,
+		pgPool:    pgPool,
 	}, nil
 }
 
 func (a *App) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Close the Postgres pool after all workers have drained, so the last
+	// queries-in-flight see a live connection.
+	defer func() {
+		if a.pgPool != nil {
+			a.pgPool.Close()
+		}
+	}()
 
 	execs := []shutdown2.Exec{
 		{Name: "metrics-server", Fn: a.httpSrv.Run},
 		{Name: "discover", Fn: a.discover.Run},
 		{Name: "collect", Fn: a.collect.Run},
 		{Name: "detect", Fn: a.detectRun},
-	}
-	if a.telegramPoller != nil {
-		execs = append(execs, shutdown2.Exec{Name: "telegram-poller", Fn: a.telegramPoller.Run})
 	}
 
 	return shutdown2.Graceful(

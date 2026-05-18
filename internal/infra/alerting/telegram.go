@@ -11,84 +11,57 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 )
 
-// TelegramConfig is the minimal config for a Telegram bot.
+// TelegramConfig wires the Telegram sink. The sink sends to a single
+// configured chat — there is no subscriber registry and no /getUpdates
+// polling. That keeps the bot's recipient set deterministic: alerts go to
+// TELEGRAM_CHAT_ID and nowhere else.
 type TelegramConfig struct {
-	Enabled  bool
+	// Enabled turns the sink on. When false, Notify is a no-op (the alert is
+	// still rendered to the log sink so debugging stays easy).
+	Enabled bool
+	// BotToken is the bot's API token. Required when Enabled.
 	BotToken string
-	ChatID   string
-	BaseURL  string
-	Timeout  time.Duration
+	// ChatID is the single recipient (numeric chat id or @channelusername).
+	// Required when Enabled. We keep this as a string so the channel/group
+	// "-100…" form and the @username form both work without quoting tricks.
+	ChatID string
+	// BaseURL defaults to https://api.telegram.org. Override for tests or a
+	// corporate proxy.
+	BaseURL string
+	// Timeout for each send. Defaults to 5s.
+	Timeout time.Duration
 }
 
-// Subscribers is a concurrency-safe set of Telegram chat ids.
-type Subscribers struct {
-	mu  sync.RWMutex
-	ids map[int64]struct{}
-}
-
-func NewSubscribers(seed ...string) *Subscribers {
-	s := &Subscribers{ids: make(map[int64]struct{})}
-	for _, raw := range seed {
-		if raw == "" {
-			continue
-		}
-		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			s.ids[id] = struct{}{}
-		}
-	}
-	return s
-}
-
-func (s *Subscribers) Add(id int64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.ids[id]; ok {
-		return false
-	}
-	s.ids[id] = struct{}{}
-	return true
-}
-
-func (s *Subscribers) Snapshot() []int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]int64, 0, len(s.ids))
-	for id := range s.ids {
-		out = append(out, id)
-	}
-	return out
-}
-
-func (s *Subscribers) Size() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.ids)
-}
-
-// TelegramSink broadcasts findings to every chat in the Subscribers registry.
+// TelegramSink delivers every Finding to a single Telegram chat as an HTML
+// message. Construction validates the config so a misconfigured Enabled
+// sink fails fast at startup rather than dropping alerts silently at run
+// time.
 type TelegramSink struct {
-	cfg         TelegramConfig
-	client      *http.Client
-	subscribers *Subscribers
-	metrics     *metrics.Metrics
+	cfg     TelegramConfig
+	client  *http.Client
+	metrics *metrics.Metrics
 }
 
-func NewTelegramSink(cfg TelegramConfig, subs *Subscribers) (*TelegramSink, error) {
+// NewTelegramSink validates the config and returns a ready sink.
+//
+//   - Enabled=false → returns a no-op sink (Notify always returns nil).
+//   - Enabled=true requires BotToken AND ChatID. Either missing is a startup
+//     error — operators get an immediate signal, not a silent no-op.
+func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if !cfg.Enabled {
-		return &TelegramSink{cfg: cfg, subscribers: subs}, nil
+		return &TelegramSink{cfg: cfg}, nil
 	}
 	if cfg.BotToken == "" {
 		return nil, errors.New("telegram: bot token required when enabled")
 	}
-	if subs == nil {
-		return nil, errors.New("telegram: subscribers registry required when enabled")
+	if cfg.ChatID == "" {
+		return nil, errors.New("telegram: chat id required when enabled (TELEGRAM_CHAT_ID)")
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.telegram.org"
@@ -96,45 +69,48 @@ func NewTelegramSink(cfg TelegramConfig, subs *Subscribers) (*TelegramSink, erro
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Second
 	}
-	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}, subscribers: subs}, nil
+	return &TelegramSink{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}}, nil
 }
 
+// WithMetrics attaches a Prometheus metrics handle and returns the sink for
+// chaining at construction time.
 func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 	s.metrics = m
 	return s
 }
 
+// Name is the sink identifier used by the fanout for logging.
 func (s *TelegramSink) Name() string { return "telegram" }
 
+// Notify renders the finding and delivers it to the configured chat. When
+// the sink is disabled this is a no-op (no error). Delivery errors are
+// surfaced to the fanout for logging; the sink never retries.
 func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
 	if !s.cfg.Enabled {
 		return nil
 	}
-	chatIDs := s.subscribers.Snapshot()
-	if len(chatIDs) == 0 {
-		return nil
-	}
 	text := FormatTelegramMessage(f)
-	var firstErr error
-	for _, id := range chatIDs {
-		if err := s.sendOne(ctx, id, text); err != nil {
-			s.observeErr(f.Severity)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		s.observeOK(f.Severity)
+	if err := s.send(ctx, s.cfg.ChatID, text); err != nil {
+		s.observeErr(f.Severity)
+		return err
 	}
-	return firstErr
+	s.observeOK(f.Severity)
+	return nil
 }
 
-func (s *TelegramSink) sendOne(ctx context.Context, chatID int64, text string) error {
+// send POSTs one sendMessage call. ChatID is sent as a number when it
+// parses as int64 (Telegram's preferred form for private/group chats) and
+// as a string otherwise (channel @usernames).
+func (s *TelegramSink) send(ctx context.Context, chatID, text string) error {
 	body := map[string]any{
-		"chat_id":                  chatID,
 		"text":                     text,
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
+	}
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil {
+		body["chat_id"] = id
+	} else {
+		body["chat_id"] = chatID
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -150,13 +126,13 @@ func (s *TelegramSink) sendOne(ctx context.Context, chatID int64, text string) e
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram: send to chat %d: %w", chatID, err)
+		return fmt.Errorf("telegram: send to chat %s: %w", chatID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("telegram: chat %d -> %d: %s", chatID, resp.StatusCode, string(b))
+		return fmt.Errorf("telegram: chat %s -> %d: %s", chatID, resp.StatusCode, string(b))
 	}
 	return nil
 }
@@ -324,25 +300,51 @@ func writeCluster(b *strings.Builder, f anomaly.Finding) {
 	}
 }
 
+// writeLinks renders the bulleted Links section. Every entry is a Telegram
+// HTML <a href> anchor produced by renderLink — entries whose href is empty
+// are omitted entirely (no plain-text label is ever emitted). The whole
+// section is skipped when nothing is renderable.
 func writeLinks(b *strings.Builder, f anomaly.Finding) {
-	if f.MarketURL == "" && f.CategoryURL == "" && f.TraderURL == "" && f.GrafanaURL == "" {
-		return
-	}
-	b.WriteString("\n<b>Links</b>\n")
-	type linkEntry struct {
-		label, href string
-	}
-	for _, e := range []linkEntry{
+	entries := []struct{ label, href string }{
 		{"Polymarket market", f.MarketURL},
 		{"Polymarket category", f.CategoryURL},
 		{"Trader", f.TraderURL},
 		{"Grafana", f.GrafanaURL},
-	} {
+	}
+	any := false
+	for _, e := range entries {
+		if e.href != "" {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+	b.WriteString("\n<b>Links</b>\n")
+	for _, e := range entries {
 		if e.href == "" {
 			continue
 		}
-		fmt.Fprintf(b, `• <a href="%s">%s</a>`+"\n", html.EscapeString(e.href), e.label)
+		b.WriteString("• ")
+		b.WriteString(renderLink(e.label, e.href))
+		b.WriteByte('\n')
 	}
+}
+
+// renderLink returns a Telegram HTML-parse-mode anchor: `<a href="...">label</a>`.
+//
+// Both inputs are HTML-escaped via html.EscapeString so Telegram parses the
+// tag instead of treating loose '&' or '<' as literal text. We deliberately
+// do NOT URL-encode the href — callers must hand in a fully-encoded URL
+// (i.e. one built via net/url). Empty href returns the literal label
+// unwrapped, but callers in this package skip empty hrefs upstream so this
+// path exists only as a safety net for future reuse.
+func renderLink(label, href string) string {
+	if href == "" {
+		return html.EscapeString(label)
+	}
+	return `<a href="` + html.EscapeString(href) + `">` + html.EscapeString(label) + `</a>`
 }
 
 // --- helpers ---------------------------------------------------------------

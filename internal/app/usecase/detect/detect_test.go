@@ -237,7 +237,10 @@ func TestClusterHardAlert(t *testing.T) {
 	}
 }
 
-func TestBlacklistedCategoryNoAlert(t *testing.T) {
+// TestNonWhitelistedCategoryProducesNoAlert is the base case for the
+// whitelist filter at the detect layer: a market whose category is not in
+// the whitelist must produce zero findings, even on an obvious whale trade.
+func TestNonWhitelistedCategoryProducesNoAlert(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	reg := aggregate.NewRegistry()
 	reg.Replace(
@@ -254,13 +257,14 @@ func TestBlacklistedCategoryNoAlert(t *testing.T) {
 		Thresholds: defaultThresholds(),
 		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 1, MinUniqueWallets: 1},
-		Filter:     category.NewFilter([]string{"nba"}),
-		Clock:      func() time.Time { return now },
+		// Whitelist contains only Politics; the NBA market is not admitted.
+		Filter: category.NewFilter([]string{"politics"}),
+		Clock:  func() time.Time { return now },
 	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
 	m, _ := reg.Get("0xb")
 	loop.Observe(context.Background(), m, bet(100_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("blacklisted category produced %d findings", len(got))
+		t.Fatalf("non-whitelisted category produced %d findings", len(got))
 	}
 }
 
@@ -710,8 +714,10 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 		// clears BaselineMinReadySpan (24h).
 		Baseline: baseline.Config{Window: 365 * 24 * time.Hour},
 		Cluster:  cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99}, // never fire cluster
-		// Default-shaped sports blacklist — must not catch this market.
-		Filter:                category.NewFilter([]string{"sports", "sport"}),
+		// Whitelist admits this market's category (Hide From New). The point
+		// of the test is that sports words in the market title/event slug
+		// do NOT block the trade — filtering is category-identity only.
+		Filter:                category.NewFilter([]string{"hide-from-new"}),
 		Clock:                 func() time.Time { return now },
 		LifecycleAlertFromPct: 75,
 		LifecycleHotFromPct:   90,
@@ -754,10 +760,11 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 	}
 }
 
-// TestPrimarySportsCategorySkipped confirms the category-level blacklist
-// silences a market whose category itself is sports — the only place sports
-// filtering applies.
-func TestPrimarySportsCategorySkipped(t *testing.T) {
+// TestNonWhitelistedCategorySkipped confirms that markets whose category is
+// not in the whitelist produce no alerts. Sports is the natural example
+// because it's the category we most commonly want to exclude when the
+// whitelist is "Politics".
+func TestNonWhitelistedCategorySkipped(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	reg := aggregate.NewRegistry()
 	reg.Replace(
@@ -774,8 +781,10 @@ func TestPrimarySportsCategorySkipped(t *testing.T) {
 		Thresholds: defaultThresholds(),
 		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Filter:     category.NewFilter([]string{"sports", "sport"}),
-		Clock:      func() time.Time { return now },
+		// Whitelist contains only Politics. The market's Sports category is
+		// not admitted, so even a huge late trade must produce no alert.
+		Filter: category.NewFilter([]string{"politics"}),
+		Clock:  func() time.Time { return now },
 		// Lifecycle gate is disabled for the test; category filter must still bite.
 		AllowUnknownMarketLifecycle: true,
 	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
@@ -785,15 +794,16 @@ func TestPrimarySportsCategorySkipped(t *testing.T) {
 	}
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("primary sports category must be silenced, got %d", len(got))
+		t.Fatalf("non-whitelisted category must be silenced, got %d", len(got))
 	}
 }
 
-// TestSportsLikeMarketUnderNonSportsCategoryAllowed pins the corrected
-// behaviour: a market whose title / event slug contain sports words ("FIFA",
-// "World Cup") but whose category is something else (Polymarket's
-// `Hide From New`) MUST still produce an alert. Filtering is category-only.
-func TestSportsLikeMarketUnderNonSportsCategoryAllowed(t *testing.T) {
+// TestSportsLikeMarketUnderWhitelistedCategoryAllowed pins the contract:
+// a market whose title / event slug contain sports words ("FIFA",
+// "World Cup") but whose category is whitelisted (here `Hide From New`)
+// MUST still produce an alert. Filtering is category-identity only — no
+// scan of market title, event slug, or any other text.
+func TestSportsLikeMarketUnderWhitelistedCategoryAllowed(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	reg := aggregate.NewRegistry()
 	reg.Replace(
@@ -811,8 +821,9 @@ func TestSportsLikeMarketUnderNonSportsCategoryAllowed(t *testing.T) {
 		Thresholds: defaultThresholds(),
 		Baseline:   baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:    cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		// Default-shaped sports blacklist — must not catch this market.
-		Filter:                      category.NewFilter([]string{"sports", "sport"}),
+		// Whitelist admits "hide-from-new". Sports words in market title /
+		// event slug are NOT consulted, so the trade alerts.
+		Filter:                      category.NewFilter([]string{"hide-from-new"}),
 		Clock:                       func() time.Time { return now },
 		AllowUnknownMarketLifecycle: true,
 	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
@@ -822,15 +833,15 @@ func TestSportsLikeMarketUnderNonSportsCategoryAllowed(t *testing.T) {
 	}
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
-		t.Fatalf("sports-themed market under non-sports category must alert, got %d findings", len(got))
+		t.Fatalf("sports-themed market under whitelisted category must alert, got %d findings", len(got))
 	}
 }
 
-// TestBlacklistStaysCategoryOnly is the explicit guard for the
-// `sports` keyword: even when the market slug / event slug literally contain
-// the word "sports", the category filter (which sees only category slug+label)
-// must let the trade through when the category is not sports.
-func TestBlacklistStaysCategoryOnly(t *testing.T) {
+// TestWhitelistStaysCategoryOnly is the symmetric guard: a market whose
+// metadata contains sports words but whose category is whitelisted
+// (Politics) must STILL alert. The whitelist looks only at the category
+// slug+label, never at market wording.
+func TestWhitelistStaysCategoryOnly(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	reg := aggregate.NewRegistry()
 	reg.Replace(
@@ -848,7 +859,7 @@ func TestBlacklistStaysCategoryOnly(t *testing.T) {
 		Thresholds:                  defaultThresholds(),
 		Baseline:                    baseline.Config{Window: 7 * 24 * time.Hour},
 		Cluster:                     cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
-		Filter:                      category.NewFilter([]string{"sports", "sport"}),
+		Filter:                      category.NewFilter([]string{"politics"}),
 		Clock:                       func() time.Time { return now },
 		AllowUnknownMarketLifecycle: true,
 	}, aggregate.New(aggregate.Config{Bucket: time.Minute, Baseline: 7 * 24 * time.Hour}), reg, emit, metrics.New(), &log)
@@ -858,7 +869,7 @@ func TestBlacklistStaysCategoryOnly(t *testing.T) {
 	}
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 1 {
-		t.Fatalf("non-sports category with sports word in metadata must alert, got %d", len(got))
+		t.Fatalf("whitelisted category with sports word in metadata must alert, got %d", len(got))
 	}
 }
 

@@ -34,6 +34,33 @@ type ApplicationConfig struct {
 	ShutdownGracePeriod time.Duration `env:"SHUTDOWN_GRACE_PERIOD" envDefault:"15s" validate:"required"`
 }
 
+// PostgresConfig wires the optional PostgreSQL persistence layer. When DSN
+// is empty the app stays purely in-memory (Phase-1 mode); otherwise the
+// app opens a pool at startup and runs the embedded migrations before any
+// worker starts.
+//
+// Tuning notes:
+//   - MaxOpenConns bounds the upstream pool size. Postgres connection
+//     overhead is non-trivial; over-provisioning hurts more than it helps.
+//   - MaxIdleConns ≤ MaxOpenConns; setting them equal keeps the pool warm
+//     for spiky workloads.
+//   - ConnMaxLifetime forces periodic rotation so a long-running pool
+//     doesn't hold a single TCP connection past upstream timeouts.
+type PostgresConfig struct {
+	DSN             string        `env:"POSTGRES_DSN"`
+	MaxOpenConns    int           `env:"POSTGRES_MAX_OPEN_CONNS" envDefault:"10" validate:"gte=1"`
+	MaxIdleConns    int           `env:"POSTGRES_MAX_IDLE_CONNS" envDefault:"5"  validate:"gte=0"`
+	ConnMaxLifetime time.Duration `env:"POSTGRES_CONN_MAX_LIFETIME" envDefault:"30m" validate:"gte=0"`
+	// AutoMigrate runs the embedded `db/migrations` set on startup. Leave
+	// true in dev/local; flip false in production if you manage migrations
+	// via a separate deploy step.
+	AutoMigrate bool `env:"POSTGRES_AUTO_MIGRATE" envDefault:"true"`
+}
+
+// Enabled reports whether the Postgres layer is configured. The rest of
+// the app treats "no DSN" as Phase-1 mode and skips DB-touching workers.
+func (c PostgresConfig) Enabled() bool { return c.DSN != "" }
+
 // PolymarketConfig points at upstream APIs.
 type PolymarketConfig struct {
 	GammaURL      string        `env:"GAMMA_API_URL" envDefault:"https://gamma-api.polymarket.com" validate:"required,url"`
@@ -62,16 +89,23 @@ type PipelineConfig struct {
 	CollectConcurrency int           `env:"COLLECT_CONCURRENCY" envDefault:"8" validate:"gte=1"`
 }
 
-// CategoryFilterConfig holds the category-identity blacklist.
+// CategoryFilterConfig selects which Polymarket categories the watchtower
+// monitors. The filter is a WHITELIST: only categories whose
+// `slug + " " + label` contains at least one whitelist token (case-
+// insensitive substring) are processed. Everything else is ignored —
+// discovery skips it, no backfill is scheduled, no trades are collected,
+// no alerts fire.
 //
-// Matching is case-insensitive substring against the Polymarket category
-// `slug + " " + label` only. Market titles, event slugs, and market slugs
-// are deliberately NOT consulted — a sports-shaped question Polymarket
-// happens to file under a non-sports category (e.g. `Hide From New`) is
-// still real prediction-market activity and should be analysed. The
-// operator's filtering tool is the category, not the market metadata.
+// Matching is against category identity only. Market titles, event slugs,
+// market slugs, and tags are NOT consulted. A sports-themed market filed
+// under a whitelisted non-sports category (e.g. a FIFA question inside
+// Politics) is still analysed normally.
+//
+// An empty whitelist disables the filter (every category passes). The
+// shipped default is "Politics" — narrow on purpose so initial DB volume
+// and Polymarket API load stay manageable.
 type CategoryFilterConfig struct {
-	Blacklist []string `env:"CATEGORY_BLACKLIST" envSeparator:"," envDefault:"sports,sport"`
+	Whitelist []string `env:"CATEGORY_WHITELIST" envSeparator:"," envDefault:"Politics"`
 }
 
 // AggregateConfig sizes the rolling-bucket engine used by both modes
@@ -150,16 +184,17 @@ type AnomalyConfig struct {
 	VolumeCooldown    time.Duration `env:"VOLUME_COOLDOWN" envDefault:"30m" validate:"required"`
 }
 
-// AlertingConfig selects sinks and provides the Grafana deep-link base.
+// AlertingConfig wires sinks. The Telegram sink sends to a single configured
+// chat — there is no subscriber discovery, no /getUpdates polling, no
+// dynamic broadcast. Set TELEGRAM_CHAT_ID once and that's the only chat
+// that will ever receive alerts.
 type AlertingConfig struct {
-	WebhookURL              string        `env:"ALERT_WEBHOOK_URL"`
-	TelegramEnabled         bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
-	TelegramBotToken        string        `env:"TELEGRAM_BOT_TOKEN"`
-	TelegramChatID          string        `env:"TELEGRAM_CHAT_ID"`
-	TelegramBaseURL         string        `env:"TELEGRAM_BASE_URL"`
-	TelegramTimeout         time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
-	TelegramUpdatesEnabled  bool          `env:"TELEGRAM_UPDATES_ENABLED" envDefault:"false"`
-	TelegramUpdatesInterval time.Duration `env:"TELEGRAM_UPDATES_INTERVAL" envDefault:"10s"`
+	WebhookURL       string        `env:"ALERT_WEBHOOK_URL"`
+	TelegramEnabled  bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
+	TelegramBotToken string        `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID   string        `env:"TELEGRAM_CHAT_ID"`
+	TelegramBaseURL  string        `env:"TELEGRAM_BASE_URL"`
+	TelegramTimeout  time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
 
 	GrafanaBaseURL string        `env:"GRAFANA_BASE_URL" envDefault:"http://localhost:3000"`
 	GrafanaDashUID string        `env:"GRAFANA_DASH_UID" envDefault:""`
@@ -168,6 +203,7 @@ type AlertingConfig struct {
 
 type Config struct {
 	Application    ApplicationConfig
+	Postgres       PostgresConfig
 	Polymarket     PolymarketConfig
 	RateLimit      RateLimitConfig
 	Pipeline       PipelineConfig

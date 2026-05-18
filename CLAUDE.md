@@ -9,9 +9,10 @@ Goal: surface large risky bets and suspicious wallet clusters near the end
 of a market's lifetime. Spam reduction is non-negotiable.
 
 A single-trade alert fires only when **all** are true:
-1. The market's category passes `CATEGORY_BLACKLIST`. Matching is case-
-   insensitive substring against the category `slug + " " + label` ONLY —
-   market titles, event slugs, market slugs, and tags are not scanned.
+1. The market's category passes `CATEGORY_WHITELIST` — i.e. is in the
+   whitelist. Matching is case-insensitive substring against the category
+   `slug + " " + label` ONLY; market titles, event slugs, market slugs,
+   and tags are not scanned. Default whitelist: `Politics`.
 2. Market lifecycle progress ≥ `LIFECYCLE_ALERT_FROM_PCT` (default 75%).
    Unknown lifecycle → **silent by default** (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`).
 3. Market absolute age ≥ `MARKET_MIN_AGE` (default 24h).
@@ -97,22 +98,35 @@ Severity always `SeverityHard`. Payload carries a `Sample []TradeRef`
 (capped 5) for per-trader contributor lines. `Cluster.Count(cat)` stamps
 `InCluster` + `ClusterPeerCount` on the per-trade alert.
 
-## Category blacklist rule
+## Category whitelist rule
 
-- One list, `CATEGORY_BLACKLIST`. No allowlist.
+- One list, `CATEGORY_WHITELIST`. ONLY whitelisted categories are processed
+  — discovered, monitored, scored, alerted. There is no blacklist; the
+  whitelist is the sole category-selection mechanism.
 - Case-insensitive substring match against the Polymarket category
   `slug + " " + label` and **nothing else**. Market titles, event slugs,
   market slugs, and tags are deliberately NOT scanned.
 - A sports-themed market (e.g. "Will France win the 2026 FIFA World Cup?")
-  filed under a non-sports category like Polymarket's `Hide From New` is
-  still real prediction-market activity and is analysed normally. Sports
-  exclusion is a category-identity decision, not a keyword-on-text decision.
-- Default value: `sports,sport`. Operators wanting to exclude additional
-  categories add their slug or label — never a keyword meant to catch
-  market wording.
+  filed under a whitelisted non-sports category like Polymarket's
+  `Hide From New` is still analysed normally. Category-identity is the
+  decision; market wording is not.
+- Default value: `Politics`. Add categories explicitly via
+  `CATEGORY_WHITELIST=Politics,Macro,Geopolitics`.
+- Empty whitelist disables the filter (every category passes). Useful for
+  local exploration; not appropriate for production.
 - Applied at discover (prune ids before they reach the registry) and at
   detect (defense in depth, increments
   `watchtower_filter_category_skipped_total{stage="detect"}`).
+
+## Telegram simplification
+
+- Single recipient: `TELEGRAM_CHAT_ID`. No `/getUpdates` polling, no
+  subscriber registry, no broadcast. `TELEGRAM_UPDATES_*` env vars are
+  removed.
+- `Enabled=true` without `BOT_TOKEN` or `CHAT_ID` is a startup error so
+  misconfiguration is visible immediately.
+- ChatID accepts numeric (private/group/channel) or `@channelusername`
+  forms. Numeric is sent as JSON number, `@username` as JSON string.
 
 ## Telegram alert content
 
@@ -127,9 +141,13 @@ Sections (in order):
 2. `Trade` — outcome+side, size+shares@price, trader wallet, category,
    ISO timestamp.
 3. `Cluster` (HARD only) — counts, total, window, contributor list.
-4. `Links` — bulleted list. Each `<a>` only when URL non-empty. Order:
-   Polymarket market → Polymarket category → Trader → Grafana. Never emit
-   plain-text "Grafana" — omit the row if the URL is missing.
+4. `Links` — bulleted list of real Telegram HTML anchors built by
+   `renderLink(label, href)` (one helper, one escape rule). Each `<a>` only
+   when URL non-empty. Order: Polymarket market → Polymarket category →
+   Trader → Grafana. Never emit a plain-text label — when a URL is empty,
+   the entry is omitted entirely (no bullet, no orphan section header).
+   Pinned by `telegram_test.go::TestLabelsNeverAppearAsPlainText` and
+   `TestGrafanaLinkClickableInWirePayload` (end-to-end JSON wire payload).
 
 Link URLs:
 - Market: `<polymarket-base>/event/<event-slug>`.
@@ -138,6 +156,25 @@ Link URLs:
 - Grafana: deep link with `from/to=±GRAFANA_CONTEXT_WINDOW`, `var-category`,
   `var-market`, `var-severity`. Set `GRAFANA_BASE_URL` to a publicly
   reachable host or recipients can't open it from a phone.
+
+## PostgreSQL persistence (Phase 2)
+
+- `POSTGRES_DSN` empty → app stays in Phase-1 mode (in-memory only).
+- DSN set → pool opens at startup, `db/migrations` apply (unless
+  `POSTGRES_AUTO_MIGRATE=false`), and every discovered category/market and
+  every collected trade is written through to `polymarket_categories`,
+  `polymarket_markets`, `polymarket_trades`, `polymarket_traders`.
+- Detection still reads from the in-memory baseline ring in this release
+  — the DB-backed detector lands in the next session.
+- Schema lives in `db/migrations/` and is the source for both the runtime
+  migrator (`internal/infra/postgres/migrate.go` via `db.Migrations` embed)
+  and sqlc generation (`sqlc.yaml`).
+- Repositories (`internal/infra/repository/`) wrap sqlc-generated code in
+  `internal/infra/postgres/sqlc/`. Nothing above the repo layer imports
+  sqlc directly — pgtype.* never leaks into domain code.
+- See `doc/persistence.md` for schema, dedup-key formats, and the stage
+  table tracking 5–8 (DB baseline, backfill worker, alert dedup, in-memory
+  state removal).
 
 ## Standard library for infrastructure primitives
 
@@ -162,9 +199,10 @@ Required coverage for any alerting/baseline/lifecycle change:
 - Cluster floors (trades / wallets / total / cooldown).
 - Telegram link rendering with each URL present and missing.
 - Grafana URL includes `var-severity`.
-- Category blacklist: primary sports category blocked, sports-themed market
-  under non-sports category allowed, sports keyword in market metadata only
-  is allowed.
+- Category whitelist: non-whitelisted category blocked (e.g. Sports when
+  whitelist is `Politics`); sports-themed market under a whitelisted
+  category (e.g. inside `Hide From New` when that's whitelisted) still
+  alerts; sports keyword in market metadata only is irrelevant.
 - Every preset loads and matches its documented strictness.
 
 ## Presets

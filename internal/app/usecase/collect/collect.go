@@ -27,11 +27,20 @@ type TradeObserver interface {
 	Observe(ctx context.Context, m market.Market, t trade.Trade)
 }
 
+// Persist is the optional Postgres side-channel for collected trades.
+// Called once per pull with the freshly-fetched batch and its market.
+// Errors are logged and the loop continues — the in-memory observer is
+// still the source of truth for live alerting in this stage.
+type Persist func(ctx context.Context, m market.Market, trades []trade.Trade) error
+
 type Config struct {
 	Interval     time.Duration
 	Concurrency  int
 	LookbackBoot time.Duration    // initial pull window per market on first sight
 	Clock        func() time.Time // optional; defaults to time.Now
+	// Persist optionally receives each fetched batch for write-through
+	// to PostgreSQL. Nil = no DB writes.
+	Persist Persist
 }
 
 type Loop struct {
@@ -153,6 +162,12 @@ func (l *Loop) pull(ctx context.Context, m market.Market) {
 	l.metrics.TradesIngested.WithLabelValues(string(m.ID)).Add(float64(len(trades)))
 	l.metrics.NotionalIngested.WithLabelValues(string(m.ID)).Add(notional)
 	l.setLastTs(m.ID, newest)
+
+	if l.cfg.Persist != nil {
+		if err := l.cfg.Persist(ctx, m, trades); err != nil {
+			l.log.Err(err).Str("market", string(m.ID)).Msg("collect: persist failed")
+		}
+	}
 }
 
 func (l *Loop) lookback(id vo.MarketID) time.Time {

@@ -13,6 +13,8 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 	t.Helper()
 	keys := []string{
 		"APP_ENV", "LOG_LEVEL", "METRICS_PORT", "SHUTDOWN_GRACE_PERIOD",
+		"POSTGRES_DSN", "POSTGRES_MAX_OPEN_CONNS", "POSTGRES_MAX_IDLE_CONNS",
+		"POSTGRES_CONN_MAX_LIFETIME", "POSTGRES_AUTO_MIGRATE",
 		"GAMMA_API_URL", "DATA_API_URL", "CLOB_API_URL",
 		"POLYMARKET_HTTP_TIMEOUT", "POLYMARKET_USER_AGENT", "POLYMARKET_PUBLIC_BASE_URL",
 		"RL_GAMMA_PER_SEC", "RL_GAMMA_BURST", "RL_DATAAPI_PER_SEC", "RL_DATAAPI_BURST",
@@ -31,11 +33,10 @@ func loadConfigWithEnv(t *testing.T, env map[string]string) (*Config, error) {
 		"CLUSTER_MIN_UNIQUE_TRADERS", "CLUSTER_MIN_TOTAL_NOTIONAL_USD",
 		"CLUSTER_COOLDOWN",
 		"VOLUME_MULTIPLIERS", "VOLUME_MIN_NOTIONAL_USD", "VOLUME_MIN_TRADES", "VOLUME_COOLDOWN",
-		"CATEGORY_BLACKLIST",
+		"CATEGORY_WHITELIST",
 		"ALERT_WEBHOOK_URL",
 		"TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 		"TELEGRAM_BASE_URL", "TELEGRAM_TIMEOUT",
-		"TELEGRAM_UPDATES_ENABLED", "TELEGRAM_UPDATES_INTERVAL",
 		"GRAFANA_BASE_URL", "GRAFANA_DASH_UID", "GRAFANA_CONTEXT_WINDOW",
 	}
 	for _, k := range keys {
@@ -111,38 +112,48 @@ func TestConfigRejectsInvalidOdds(t *testing.T) {
 	}
 }
 
-func TestConfigCategoryBlacklistDefaults(t *testing.T) {
+// TestConfigCategoryWhitelistDefault pins the shipped default: monitor only
+// Politics. Narrow on purpose — operators add categories explicitly rather
+// than discovering them implicitly via blacklist gaps.
+func TestConfigCategoryWhitelistDefault(t *testing.T) {
 	cfg, err := loadConfigWithEnv(t, nil)
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	// The default blacklist is intentionally narrow: only "sports" + "sport"
-	// so that the parent Polymarket sports category is excluded by identity.
-	// Markets whose titles or event slugs contain sports words but live under
-	// non-sports categories MUST still be analysed — that requirement is
-	// enforced in detect/detect_test.go.
-	want := map[string]bool{"sports": true, "sport": true}
-	if len(cfg.CategoryFilter.Blacklist) != len(want) {
-		t.Fatalf("default blacklist size: got %d want %d (%v)", len(cfg.CategoryFilter.Blacklist), len(want), cfg.CategoryFilter.Blacklist)
+	want := []string{"Politics"}
+	if len(cfg.CategoryFilter.Whitelist) != len(want) || cfg.CategoryFilter.Whitelist[0] != want[0] {
+		t.Fatalf("default whitelist: got %v want %v", cfg.CategoryFilter.Whitelist, want)
 	}
-	for _, g := range cfg.CategoryFilter.Blacklist {
-		if !want[g] {
-			t.Errorf("unexpected default blacklist entry: %q", g)
+	// And the filter built from that default actually admits Politics
+	// and rejects the common noise categories.
+	f := categoryFilter(cfg.CategoryFilter.Whitelist)
+	if !f.Allowed("politics", "Politics") {
+		t.Error("default whitelist must admit Politics")
+	}
+	for _, c := range []string{"Sports", "Crypto", "Culture", "Weather", "NBA"} {
+		if f.Allowed("", c) {
+			t.Errorf("default whitelist must reject %q", c)
 		}
 	}
 }
 
-func TestConfigCategoryBlacklistOverride(t *testing.T) {
-	cfg, err := loadConfigWithEnv(t, map[string]string{"CATEGORY_BLACKLIST": "weather, crypto"})
+// TestConfigCategoryWhitelistOverride confirms that comma-separated env
+// values parse into multiple whitelist tokens. Whitespace around each
+// token is trimmed by the filter so operators can format the env line
+// naturally.
+func TestConfigCategoryWhitelistOverride(t *testing.T) {
+	cfg, err := loadConfigWithEnv(t, map[string]string{
+		"CATEGORY_WHITELIST": "Politics, Macro",
+	})
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	f := categoryFilter(cfg.CategoryFilter.Blacklist)
-	if f.Allowed("", "Weather") || f.Allowed("", "Crypto Prices") {
-		t.Error("override not applied")
+	f := categoryFilter(cfg.CategoryFilter.Whitelist)
+	if !f.Allowed("politics", "Politics") || !f.Allowed("macro", "Macro") {
+		t.Error("multi-token whitelist must admit each listed category")
 	}
-	if !f.Allowed("", "Politics") {
-		t.Error("politics should pass")
+	if f.Allowed("", "Weather") {
+		t.Error("category not in whitelist must be blocked")
 	}
 }
 

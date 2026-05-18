@@ -1,0 +1,19 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "db/migrations"
+    queries: "db/queries"
+    gen:
+      go:
+        package: "sqlc"
+        sql_package: "pgx/v5"
+        out: "internal/infra/postgres/sqlc"
+        emit_interface: true
+        emit_json_tags: false
+        emit_pointers_for_null_types: true
+        emit_prepared_queries: false
+        emit_exact_table_names: true
+        # Repository wrappers in internal/infra/repository convert
+        # pgtype.Timestamptz to time.Time at the boundary so domain code
+        # never sees pgtype. (We tried sqlc overrides here; they're brittle
+        # across sqlc versions for the pgx/v5 sql_package.)

@@ -190,9 +190,9 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 		bestRef    anomaly.TradeRef
 	)
 	for _, cat := range categories {
-		// Defense in depth: discover should have stripped blacklisted ids
-		// before they reached the registry, but a missed entry must not be
-		// able to fire an alert here either.
+		// Defense in depth: discover should have stripped non-whitelisted
+		// category ids before they reached the registry, but a leak must
+		// not be able to fire an alert here either.
 		if !l.allowed(cat) {
 			l.metrics.CategoryFilterSkipped.WithLabelValues("detect").Inc()
 			continue
@@ -340,11 +340,14 @@ func (l *Loop) emitCategoryWatch(
 	}
 }
 
-// allowed reports whether the category passes the blacklist. Uncategorised
-// (id=0) always passes — we still want to score uncategorised whales.
+// allowed reports whether the category passes the whitelist. Uncategorised
+// (id=0) is treated as "not in any whitelist" and is blocked when the
+// filter is active — we cannot affirmatively match an empty category to a
+// whitelist token. With no whitelist configured the filter is disabled and
+// everything passes.
 func (l *Loop) allowed(cat vo.CategoryID) bool {
 	if cat == 0 {
-		return true
+		return l.cfg.Filter.Allowed("", "")
 	}
 	if c, ok := l.registry.Category(cat); ok {
 		return l.cfg.Filter.Allowed(c.Slug, c.Label)

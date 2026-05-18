@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,7 +76,7 @@ func sampleClusterFinding() anomaly.Finding {
 }
 
 func TestTelegramDisabledIsNoop(t *testing.T) {
-	s, err := NewTelegramSink(TelegramConfig{Enabled: false}, nil)
+	s, err := NewTelegramSink(TelegramConfig{Enabled: false})
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
@@ -86,12 +85,19 @@ func TestTelegramDisabledIsNoop(t *testing.T) {
 	}
 }
 
-func TestTelegramEnabledRequiresTokenAndSubscribers(t *testing.T) {
-	if _, err := NewTelegramSink(TelegramConfig{Enabled: true}, nil); err == nil {
-		t.Fatal("expected error w/o token")
+// TestTelegramEnabledRequiresTokenAndChatID locks in the fail-fast contract:
+// an enabled sink without both bot token and chat id must return an error
+// at construction so misconfiguration is visible at startup, not silently
+// at the first alert.
+func TestTelegramEnabledRequiresTokenAndChatID(t *testing.T) {
+	if _, err := NewTelegramSink(TelegramConfig{Enabled: true}); err == nil {
+		t.Fatal("expected error when bot token missing")
 	}
-	if _, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t"}, nil); err == nil {
-		t.Fatal("expected error w/o subscribers")
+	if _, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t"}); err == nil {
+		t.Fatal("expected error when chat id missing")
+	}
+	if _, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", ChatID: "1"}); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
 	}
 }
 
@@ -193,6 +199,10 @@ func TestCategoryWatchMessageHasAllRequiredFields(t *testing.T) {
 	}
 }
 
+// TestTelegramHTMLParseMode captures the wire payload from a fake Telegram
+// API server and asserts the contract: parse_mode=HTML, recipient is
+// exactly the configured chat (numeric form for groups/private chats), no
+// broadcast to anyone else.
 func TestTelegramHTMLParseMode(t *testing.T) {
 	var received atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -202,8 +212,9 @@ func TestTelegramHTMLParseMode(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	subs := NewSubscribers("1")
-	s, err := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "fake", BaseURL: srv.URL}, subs)
+	s, err := NewTelegramSink(TelegramConfig{
+		Enabled: true, BotToken: "fake", ChatID: "1", BaseURL: srv.URL,
+	})
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
@@ -223,95 +234,62 @@ func TestTelegramHTMLParseMode(t *testing.T) {
 	}
 }
 
+// TestTelegramAcceptsChannelUsername confirms that a non-numeric chat id
+// (e.g. "@watchtower-alerts") is forwarded verbatim as a string — Telegram
+// supports both encodings on the same endpoint.
+func TestTelegramAcceptsChannelUsername(t *testing.T) {
+	var received atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received.Store(body)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	s, _ := NewTelegramSink(TelegramConfig{
+		Enabled: true, BotToken: "t", ChatID: "@watchtower-alerts", BaseURL: srv.URL,
+	})
+	_ = s.Notify(context.Background(), sampleTradeFinding())
+	raw, _ := received.Load().([]byte)
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	if body["chat_id"] != "@watchtower-alerts" {
+		t.Errorf("non-numeric chat id must be forwarded as string, got %v (%T)",
+			body["chat_id"], body["chat_id"])
+	}
+}
+
 func TestTelegramReturnsErrorOnBadStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(400)
 	}))
 	defer srv.Close()
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, NewSubscribers("1"))
+	s, _ := NewTelegramSink(TelegramConfig{
+		Enabled: true, BotToken: "t", ChatID: "1", BaseURL: srv.URL,
+	})
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
 		t.Fatal("expected error for 400")
 	}
 }
 
-func TestBroadcastSendsToEveryChat(t *testing.T) {
-	var seen sync.Map
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var p struct {
-			ChatID int64 `json:"chat_id"`
-		}
-		_ = json.Unmarshal(body, &p)
-		seen.Store(p.ChatID, struct{}{})
+// TestTelegramSendsExactlyOncePerNotify proves the sink does not fan out to
+// multiple chats — the subscriber registry / getUpdates path was deleted on
+// purpose. Multiple Notify calls produce multiple sends; one Notify, one send.
+func TestTelegramSendsExactlyOncePerNotify(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer srv.Close()
-	subs := NewSubscribers("10", "20", "30")
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
+	s, _ := NewTelegramSink(TelegramConfig{
+		Enabled: true, BotToken: "t", ChatID: "42", BaseURL: srv.URL,
+	})
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
-	for _, id := range []int64{10, 20, 30} {
-		if _, ok := seen.Load(id); !ok {
-			t.Errorf("chat %d did not receive broadcast", id)
-		}
-	}
-}
-
-func TestBroadcastContinuesAfterPerChatError(t *testing.T) {
-	var sent atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var p struct {
-			ChatID int64 `json:"chat_id"`
-		}
-		_ = json.Unmarshal(body, &p)
-		if p.ChatID == 20 {
-			w.WriteHeader(400)
-			return
-		}
-		sent.Add(1)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-	subs := NewSubscribers("10", "20", "30")
-	s, _ := NewTelegramSink(TelegramConfig{Enabled: true, BotToken: "t", BaseURL: srv.URL}, subs)
-	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
-		t.Fatal("expected surfacing error")
-	}
-	if got := sent.Load(); got != 2 {
-		t.Fatalf("expected 2 successful sends, got %d", got)
-	}
-}
-
-func TestSubscribersAddDedupesAndSnapshots(t *testing.T) {
-	s := NewSubscribers("1", "", "abc", "2")
-	if s.Size() != 2 {
-		t.Fatalf("seed size: %d", s.Size())
-	}
-	if !s.Add(3) || s.Add(3) {
-		t.Fatal("Add dedupe broken")
-	}
-	if s.Size() != 3 {
-		t.Fatalf("size: %d", s.Size())
-	}
-}
-
-func TestSubscribersConcurrentAddRaceSafe(t *testing.T) {
-	s := NewSubscribers()
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(seed int) {
-			defer wg.Done()
-			for j := 0; j < 500; j++ {
-				s.Add(int64(seed*1000 + j))
-			}
-		}(i)
-	}
-	wg.Wait()
-	if s.Size() != 4000 {
-		t.Fatalf("expected 4000 unique ids, got %d", s.Size())
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 send, got %d", got)
 	}
 }
 
@@ -321,5 +299,168 @@ func TestEscapingHandlesSpecialCharsInTitle(t *testing.T) {
 	msg := FormatTelegramMessage(f)
 	if !strings.Contains(msg, "&gt; $100k &amp; &lt;") {
 		t.Errorf("HTML escaping missing in:\n%s", msg)
+	}
+}
+
+// --- Link rendering contract ------------------------------------------------
+// These tests pin the wire-format contract for the Links section. They are
+// the line of defence against the bug where "Grafana" once rendered as
+// plain text instead of a clickable anchor.
+
+// TestRenderLinkBuildsHTMLAnchor pins the helper used everywhere link
+// rendering happens. Anchor markup, href escaping, label escaping.
+func TestRenderLinkBuildsHTMLAnchor(t *testing.T) {
+	got := renderLink("Grafana", "http://grafana.public/d/uid/?a=1&b=2")
+	want := `<a href="http://grafana.public/d/uid/?a=1&amp;b=2">Grafana</a>`
+	if got != want {
+		t.Fatalf("renderLink mismatch:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestRenderLinkEscapesLabel guards against future labels accidentally
+// containing user-controlled text. The renderLink helper must escape both
+// sides regardless of caller — Telegram silently drops a malformed entity
+// and the link would degrade to plain text.
+func TestRenderLinkEscapesLabel(t *testing.T) {
+	got := renderLink("A <fancy> & rare label", "https://x.test/")
+	want := `<a href="https://x.test/">A &lt;fancy&gt; &amp; rare label</a>`
+	if got != want {
+		t.Fatalf("renderLink label escape:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestRenderLinkEmptyHrefReturnsPlainLabel documents the safety-net
+// branch. Callers are still expected to skip empty hrefs upstream.
+func TestRenderLinkEmptyHrefReturnsPlainLabel(t *testing.T) {
+	if got := renderLink("Grafana", ""); got != "Grafana" {
+		t.Fatalf("empty href: got %q want %q", got, "Grafana")
+	}
+}
+
+// TestLinksSectionExactFormat pins the entire Links block byte-for-byte
+// when all four URLs are present. If this test fails, the wire format
+// changed and operators' alert templates / parsers may regress with it.
+func TestLinksSectionExactFormat(t *testing.T) {
+	msg := FormatTelegramMessage(sampleTradeFinding())
+	const want = "\n<b>Links</b>\n" +
+		`• <a href="https://polymarket.com/event/rain-tomorrow">Polymarket market</a>` + "\n" +
+		`• <a href="https://polymarket.com/predictions/weather">Polymarket category</a>` + "\n" +
+		`• <a href="https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678">Trader</a>` + "\n" +
+		`• <a href="http://grafana.public/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>` + "\n"
+	if !strings.Contains(msg, want) {
+		t.Fatalf("exact Links block missing.\nwant block:\n%s\nfull message:\n%s", want, msg)
+	}
+}
+
+// TestGrafanaLinkClickableInWirePayload encodes the full integration: the
+// alert is rendered, JSON-marshalled, sent to a fake Telegram server, and
+// we assert that the captured `text` field contains a real `<a href>`
+// anchor (i.e. the bug-report case "Grafana as plain text" is impossible).
+func TestGrafanaLinkClickableInWirePayload(t *testing.T) {
+	var captured atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured.Store(body)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	s, err := NewTelegramSink(TelegramConfig{
+		Enabled: true, BotToken: "t", ChatID: "1", BaseURL: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramSink: %v", err)
+	}
+	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	raw, _ := captured.Load().([]byte)
+	var body struct {
+		Text      string `json:"text"`
+		ParseMode string `json:"parse_mode"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if body.ParseMode != "HTML" {
+		t.Fatalf("parse_mode: got %q want HTML", body.ParseMode)
+	}
+	const wantGrafana = `<a href="http://grafana.public/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>`
+	if !strings.Contains(body.Text, wantGrafana) {
+		t.Fatalf("wire payload missing clickable Grafana anchor.\nwant: %s\ngot text:\n%s", wantGrafana, body.Text)
+	}
+	const wantPolymarket = `<a href="https://polymarket.com/event/rain-tomorrow">Polymarket market</a>`
+	if !strings.Contains(body.Text, wantPolymarket) {
+		t.Fatalf("wire payload missing clickable Polymarket anchor.\nwant: %s\ngot text:\n%s", wantPolymarket, body.Text)
+	}
+}
+
+// TestLabelsNeverAppearAsPlainText is the regression guard for the bug
+// report: with the URL absent, the label must NOT show up at all (no
+// "Grafana" leftover bullet, no orphan bullet). Same for Polymarket-side
+// labels.
+func TestLabelsNeverAppearAsPlainText(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(f *anomaly.Finding)
+		// label that must NOT appear as plain text anywhere in the message
+		plainLabel string
+	}{
+		{"no_grafana_url", func(f *anomaly.Finding) { f.GrafanaURL = "" }, "Grafana"},
+		{"no_market_url", func(f *anomaly.Finding) { f.MarketURL = "" }, "Polymarket market"},
+		{"no_category_url", func(f *anomaly.Finding) { f.CategoryURL = "" }, "Polymarket category"},
+		{"no_trader_url", func(f *anomaly.Finding) { f.TraderURL = "" }, "Trader</a>"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := sampleTradeFinding()
+			c.mut(&f)
+			msg := FormatTelegramMessage(f)
+			// The label must never appear unwrapped by an anchor closing tag.
+			// We allow it to appear *inside* another anchor (other URLs are
+			// still present) but not as a bare bulleted line.
+			bareBullet := "• " + c.plainLabel
+			if strings.Contains(msg, bareBullet) {
+				t.Fatalf("plain-text bullet %q must not appear when URL is empty:\n%s", bareBullet, msg)
+			}
+		})
+	}
+}
+
+// TestLinksAllOmittedSkipsSectionHeader confirms that the "<b>Links</b>"
+// header is itself skipped when no links would render, so we never produce
+// a dangling header followed by nothing.
+func TestLinksAllOmittedSkipsSectionHeader(t *testing.T) {
+	f := sampleTradeFinding()
+	f.MarketURL, f.CategoryURL, f.TraderURL, f.GrafanaURL = "", "", "", ""
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<b>Links</b>") {
+		t.Fatalf("Links header must be omitted when no links render:\n%s", msg)
+	}
+}
+
+// TestLinksOnlyGrafanaPresent guards the edge case where the operator has
+// disabled Polymarket public URLs (PolymarketBase=="") but still has
+// Grafana wired. Section header renders, Grafana is the only bullet.
+func TestLinksOnlyGrafanaPresent(t *testing.T) {
+	f := sampleTradeFinding()
+	f.MarketURL, f.CategoryURL, f.TraderURL = "", "", ""
+	msg := FormatTelegramMessage(f)
+	const want = "\n<b>Links</b>\n" +
+		`• <a href="http://grafana.public/d/uid123/?from=1&amp;to=2&amp;var-category=Weather&amp;var-market=rain-tomorrow&amp;var-severity=critical">Grafana</a>` + "\n"
+	if !strings.Contains(msg, want) {
+		t.Fatalf("expected Grafana-only Links block:\n%s\nfull:\n%s", want, msg)
+	}
+}
+
+// TestSpecialCharsInHrefAreEscaped pins the contract for query strings
+// that carry characters Telegram's HTML parser is sensitive to. '&' is
+// the common one (every Grafana URL has multiple); '<' is theoretical
+// but cheap to cover.
+func TestSpecialCharsInHrefAreEscaped(t *testing.T) {
+	got := renderLink("Grafana", `https://g.test/d/u/?a=1&b=<x>&c="y"`)
+	const want = `<a href="https://g.test/d/u/?a=1&amp;b=&lt;x&gt;&amp;c=&#34;y&#34;">Grafana</a>`
+	if got != want {
+		t.Fatalf("href escape:\n got: %q\nwant: %q", got, want)
 	}
 }

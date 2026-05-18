@@ -72,10 +72,11 @@ The same baseline shape evaluated against the readiness gates:
 - Severity is the **conservative MIN** of the absolute (notional+odds) and
   multiplier (notional/baseline-median) ladders. Single-trade severity
   caps at `critical`; `hard` is reserved for the cluster detector.
-- `CATEGORY_BLACKLIST` filters by category slug+label only. Default
-  `sports,sport`. Market titles, event slugs, market slugs, and tags are
-  never scanned — a sports-themed market filed under a non-sports category
-  like `Hide From New` is still analysed normally.
+- `CATEGORY_WHITELIST` is the sole category-selection mechanism. ONLY
+  whitelisted categories are monitored; everything else is ignored. Default
+  `Politics`. Market titles, event slugs, market slugs, and tags are never
+  scanned — a sports-themed market filed under a whitelisted non-sports
+  category like `Hide From New` is still analysed normally.
 
 ## How to apply
 

@@ -153,7 +153,7 @@ func New() *Metrics {
 
 	m.CategoryFilterSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "filter", Name: "category_skipped_total",
-		Help: "Times a category was skipped by the blacklist, by stage (discover|detect).",
+		Help: "Times a category was skipped by the whitelist, by stage (discover|detect).",
 	}, []string{"stage"})
 
 	m.TelegramAlertsSent = prometheus.NewCounterVec(prometheus.CounterOpts{

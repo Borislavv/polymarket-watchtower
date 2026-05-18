@@ -53,6 +53,6 @@ produce wild multipliers that look anomalous but are statistical noise.
 ## What presets do NOT tune
 
 `POLYMARKET_*`, `RL_*`, `GAMMA_*`, `TELEGRAM_*`, `GRAFANA_*`,
-`MAX_MARKETS`, `DISCOVER_*`, `COLLECT_*`, `CATEGORY_BLACKLIST` — these are
+`MAX_MARKETS`, `DISCOVER_*`, `COLLECT_*`, `CATEGORY_WHITELIST` — these are
 infrastructure / wiring rather than detection sensitivity. Set them in
 `.env` or in deploy YAML.

@@ -35,15 +35,46 @@ func loadPresetEnv(t *testing.T, path string) {
 	}
 }
 
-func TestPresetBalancedMatchesDefaults(t *testing.T) {
+// TestPresetBalancedIsStructurallySound asserts the shape invariants of the
+// balanced preset rather than pinning exact values. Operators are expected
+// to tune the preset within the same shape: tiers monotonic, lifecycle gate
+// strictly between conservative and aggressive, baseline readiness gates
+// non-zero. Code defaults and preset values are deliberately allowed to
+// diverge — the preset is the operator's tuning surface.
+func TestPresetBalancedIsStructurallySound(t *testing.T) {
 	loadPresetEnv(t, filepath.Join("..", "..", "presets", "balanced.env"))
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Anomaly.InfoMinNotionalUSD != 10_000 || cfg.Anomaly.LifecycleAlertFromPct != 75 {
-		t.Fatalf("balanced preset diverged: notional=%v lifecycle=%v",
-			cfg.Anomaly.InfoMinNotionalUSD, cfg.Anomaly.LifecycleAlertFromPct)
+	a := cfg.Anomaly
+	// Severity ladders must be monotonically increasing.
+	if !(a.InfoMinNotionalUSD < a.WarningMinNotionalUSD && a.WarningMinNotionalUSD < a.CriticalMinNotionalUSD) {
+		t.Errorf("notional ladder not monotonic: %v / %v / %v",
+			a.InfoMinNotionalUSD, a.WarningMinNotionalUSD, a.CriticalMinNotionalUSD)
+	}
+	if !(a.InfoMinOdds <= a.WarningMinOdds && a.WarningMinOdds <= a.CriticalMinOdds) {
+		t.Errorf("odds ladder not monotonic: %v / %v / %v",
+			a.InfoMinOdds, a.WarningMinOdds, a.CriticalMinOdds)
+	}
+	if !(a.InfoMinMultiplier <= a.WarningMinMultiplier && a.WarningMinMultiplier <= a.CriticalMinMultiplier) {
+		t.Errorf("multiplier ladder not monotonic: %v / %v / %v",
+			a.InfoMinMultiplier, a.WarningMinMultiplier, a.CriticalMinMultiplier)
+	}
+	// Balanced sits between conservative and aggressive on lifecycle gate.
+	if a.LifecycleAlertFromPct <= 55 || a.LifecycleAlertFromPct >= 80 {
+		t.Errorf("balanced lifecycle gate must sit between aggressive and conservative, got %v", a.LifecycleAlertFromPct)
+	}
+	// Hot threshold is always above the alert gate.
+	if a.LifecycleHotFromPct < a.LifecycleAlertFromPct {
+		t.Errorf("hot threshold %v must be >= alert threshold %v",
+			a.LifecycleHotFromPct, a.LifecycleAlertFromPct)
+	}
+	// Baseline readiness gates must be set (otherwise the multiplier ladder
+	// fires on noise).
+	if a.SingleMinBaselineTrades <= 0 || a.SingleMinBaselineNotionalUSD <= 0 || a.BaselineMinReadySpan <= 0 {
+		t.Errorf("baseline readiness gates must be positive: trades=%d notional=%v span=%s",
+			a.SingleMinBaselineTrades, a.SingleMinBaselineNotionalUSD, a.BaselineMinReadySpan)
 	}
 }
 

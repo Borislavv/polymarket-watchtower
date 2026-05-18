@@ -199,7 +199,7 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 
 	tg, err := alerting2.NewTelegramSink(alerting2.TelegramConfig{
 		Enabled: true, BotToken: "test", ChatID: "1", BaseURL: telegramSrv.URL,
-	}, alerting2.NewSubscribers("1"))
+	})
 	if err != nil {
 		t.Fatalf("telegram sink: %v", err)
 	}

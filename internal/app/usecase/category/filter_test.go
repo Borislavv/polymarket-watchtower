@@ -2,90 +2,104 @@ package category
 
 import "testing"
 
-func TestEmptyBlacklistAllowsEverything(t *testing.T) {
+func TestEmptyWhitelistAllowsEverything(t *testing.T) {
 	f := NewFilter(nil)
 	if !f.Allowed("anything", "Anything Goes") {
-		t.Fatal("empty blacklist must allow")
+		t.Fatal("empty whitelist must allow everything (filter disabled)")
 	}
 	if f.Summary() != "disabled" {
 		t.Fatalf("summary: %s", f.Summary())
 	}
 }
 
-func TestTokenMatchesSubstring(t *testing.T) {
-	f := NewFilter([]string{"sport"})
+func TestWhitelistMatchesSubstring(t *testing.T) {
+	f := NewFilter([]string{"politics"})
 	if !f.Allowed("politics", "Politics") {
-		t.Fatal("politics must pass")
+		t.Fatal("politics category must pass when whitelisted")
+	}
+	if !f.Allowed("us-politics", "US Politics") {
+		t.Fatal("substring match must accept yearly/region variants")
 	}
 	if f.Allowed("sports", "Sports") {
-		t.Fatal("sports must be blocked")
+		t.Fatal("sports must be blocked when not whitelisted")
+	}
+	if f.Allowed("nba", "2026 NBA Playoffs") {
+		t.Fatal("non-whitelisted league must be blocked")
 	}
 }
 
-func TestSubstringMatchesYearPrefixedLabel(t *testing.T) {
-	f := NewFilter([]string{"nba", "nhl", "fifa", "uefa", "champions league", "stanley cup"})
-	cases := []struct {
-		label   string
-		blocked bool
-	}{
-		{"2026 NBA Playoffs", true},
-		{"2026 NHL Playoffs", true},
-		{"2026 FIFA World Cup", true},
-		{"UEFA Champions League Winner", true},
-		{"Champions League Top Scorer", true},
-		{"Stanley Cup", true},
-		{"US Election", false},
-		{"Politics", false},
-		{"Crypto Prices", false},
+func TestWhitelistDefaultPolitics(t *testing.T) {
+	// The shipped default. Verifies the operator's go-to setup actually
+	// admits Politics and rejects the common noise categories.
+	f := NewFilter([]string{"Politics"})
+	allowed := []struct{ slug, label string }{
+		{"politics", "Politics"},
+		{"us-politics", "US Politics"},
+		{"2026-elections", "2026 Elections (Politics)"},
 	}
-	for _, c := range cases {
-		got := !f.Allowed("", c.label)
-		if got != c.blocked {
-			t.Errorf("label=%q blocked=%v want %v", c.label, got, c.blocked)
+	blocked := []struct{ slug, label string }{
+		{"sports", "Sports"},
+		{"crypto", "Crypto"},
+		{"culture", "Culture"},
+		{"weather", "Weather"},
+		{"nba", "NBA"},
+	}
+	for _, c := range allowed {
+		if !f.Allowed(c.slug, c.label) {
+			t.Errorf("politics-shaped %q/%q must pass", c.slug, c.label)
+		}
+	}
+	for _, c := range blocked {
+		if f.Allowed(c.slug, c.label) {
+			t.Errorf("non-politics %q/%q must be blocked", c.slug, c.label)
 		}
 	}
 }
 
 func TestCaseInsensitive(t *testing.T) {
-	f := NewFilter([]string{"SOCCER"})
-	if f.Allowed("soccer", "Soccer") {
+	f := NewFilter([]string{"POLITICS"})
+	if !f.Allowed("politics", "Politics") {
 		t.Fatal("must be case-insensitive on input")
 	}
-	if f.Allowed("SOCCER", "SOCCER") {
+	if !f.Allowed("POLITICS", "POLITICS") {
 		t.Fatal("must be case-insensitive on label")
 	}
 }
 
 func TestSlugMatchedSeparatelyFromLabel(t *testing.T) {
-	f := NewFilter([]string{"sport"})
+	f := NewFilter([]string{"politics"})
 	// Slug carries the hint, label is empty.
-	if f.Allowed("sports-uk", "") {
-		t.Fatal("slug-based block must work")
+	if !f.Allowed("politics-uk", "") {
+		t.Fatal("slug-based match must work")
 	}
 	// Label carries the hint, slug is empty.
-	if f.Allowed("", "Sportsbook") {
-		t.Fatal("label-based block must work")
+	if !f.Allowed("", "Politics & Power") {
+		t.Fatal("label-based match must work")
 	}
 }
 
 func TestWhitespaceAndEmptyTokensIgnored(t *testing.T) {
-	f := NewFilter([]string{" ", "", "  Sport  ", "\tnba\n"})
-	if got := f.Tokens(); len(got) != 2 || got[0] != "sport" || got[1] != "nba" {
+	f := NewFilter([]string{" ", "", "  Politics  ", "\tmacro\n"})
+	got := f.Tokens()
+	if len(got) != 2 || got[0] != "politics" || got[1] != "macro" {
 		t.Fatalf("tokens normalised: %v", got)
 	}
 }
 
-func TestBothEmptyAllowed(t *testing.T) {
-	f := NewFilter([]string{"sport"})
-	// No slug, no label — we cannot decide; allow to avoid losing signal.
-	if !f.Allowed("", "") {
-		t.Fatal("uncategorised should pass even when blacklist non-empty")
+// TestUncategorisedBlockedUnderActiveWhitelist locks in the semantic
+// change: with a blacklist, an uncategorised market would pass (no token
+// to match against); under a whitelist, it must be blocked because it
+// cannot affirmatively match anything we asked for.
+func TestUncategorisedBlockedUnderActiveWhitelist(t *testing.T) {
+	f := NewFilter([]string{"politics"})
+	if f.Allowed("", "") {
+		t.Fatal("uncategorised market must be blocked when whitelist is active")
 	}
 }
 
 func TestSummaryListsActiveTokens(t *testing.T) {
-	f := NewFilter([]string{"NBA", "NHL"})
-	if got := f.Summary(); got != "nba,nhl" {
+	f := NewFilter([]string{"Politics", "Macro"})
+	if got := f.Summary(); got != "politics,macro" {
 		t.Fatalf("summary: %s", got)
 	}
 }

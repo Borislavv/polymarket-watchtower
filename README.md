@@ -150,9 +150,9 @@ Prometheus dimensions.
 
 ```bash
 cp .env.example .env
-make run        # local worker, real Polymarket APIs
+make run        # local worker, real Polymarket APIs (in-memory only)
 # or
-make up         # docker compose: app + prometheus + grafana
+make up         # docker compose: app + prometheus + grafana + postgres
 ```
 
 Local URLs after `make up`:
@@ -162,6 +162,26 @@ Local URLs after `make up`:
 - Prometheus: <http://localhost:9091>
 - Grafana: <http://localhost:3000> (anonymous viewer; `admin/admin` to edit)
   - Dashboard: **Polymarket Watchtower** (`/d/watchtower-main`)
+- Postgres: `postgres://watchtower:watchtower@localhost:5433/watchtower`
+  (host port 5433 to avoid clashing with a local 5432)
+
+### PostgreSQL persistence (Phase 2)
+
+When `POSTGRES_DSN` is set the watchtower writes every discovered
+category/market and every collected trade to PostgreSQL. Detection still
+runs from the in-memory baseline in this release — the DB-backed detector
+lands in the next changeset (see `doc/persistence.md` stage table).
+
+Bring just Postgres up, apply migrations, run the repo integration tests:
+
+```bash
+make pg-up          # start the postgres service
+make migrate        # apply embedded SQL migrations
+make pg-test        # run repository integration tests
+make sqlc           # regenerate db code (requires sqlc binary on PATH)
+```
+
+The full stack (compose `make up`) auto-applies migrations on app boot.
 
 ## Tests
 

@@ -60,9 +60,9 @@ A few rows worth highlighting:
 | Scenario                                       | Test                                       | Expected |
 |------------------------------------------------|--------------------------------------------|----------|
 | France/FIFA inside `Hide From New` (the original silenced alert) | `TestFranceFifaHideFromNewStillAlerts` | **Fires** Info |
-| Primary `sports` category                      | `TestPrimarySportsCategorySkipped`         | No alert |
-| Sports-themed market under non-sports category | `TestSportsLikeMarketUnderNonSportsCategoryAllowed` | **Fires** |
-| `sports` keyword only in market metadata        | `TestBlacklistStaysCategoryOnly`           | **Fires** |
+| Non-whitelisted category (e.g. Sports)         | `TestNonWhitelistedCategorySkipped`        | No alert |
+| Sports-themed market under whitelisted category | `TestSportsLikeMarketUnderWhitelistedCategoryAllowed` | **Fires** |
+| `sports` keyword only in market metadata, whitelisted category | `TestWhitelistStaysCategoryOnly` | **Fires** |
 
 ## Gates
 
@@ -74,7 +74,7 @@ A few rows worth highlighting:
 | Market age < `MARKET_MIN_AGE`         | `TestMarketMinAgeBlocksTooYoung`              | No alert. |
 | Baseline span < `BASELINE_MIN_READY_WINDOW` | `TestBaselineMinReadySpanBlocksThinSpan` | No alert. |
 | 1-month market on 1y `BASELINE_WINDOW`| `TestBaselineWindowDoesNotBlockShortMarkets`  | Fires; alert shows the actual ~29 d span. |
-| Blacklisted category                  | `TestBlacklistedCategoryNoAlert`              | No alert. |
+| Non-whitelisted category              | `TestNonWhitelistedCategoryProducesNoAlert`   | No alert. |
 
 ## Cluster
 

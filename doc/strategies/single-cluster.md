@@ -80,12 +80,12 @@ These gates **only block alert emission**. They never block baseline updates
 — the reservoir must warm continuously so it is ready the moment a market
 crosses the lifecycle threshold.
 
-- **Category filter** — `CATEGORY_BLACKLIST` is a case-insensitive substring
-  match against the category `slug + " " + label` and nothing else. Market
+- **Category filter** — `CATEGORY_WHITELIST` is a case-insensitive
+  substring match against the category `slug + " " + label`. ONLY
+  whitelisted categories are monitored; everything else is ignored. Market
   titles, event slugs, market slugs, and tags are NOT scanned. A market
-  whose title mentions FIFA or NBA but lives under a non-sports category
-  (e.g. Polymarket's `Hide From New`) is still analysed normally. Default:
-  `sports,sport`.
+  whose title mentions FIFA or NBA but whose category is whitelisted (e.g.
+  inside Politics) is still analysed normally. Default: `Politics`.
 - **Lifecycle gate** — `LIFECYCLE_ALERT_FROM_PCT` (alerts fire) and
   `LIFECYCLE_HOT_FROM_PCT` (alerts marked HOT). Markets without start/end
   dates are silenced when `ALLOW_UNKNOWN_MARKET_LIFECYCLE=false` (default).
@@ -123,5 +123,30 @@ Every Finding rendered to Telegram includes:
 - Lifecycle percent and a HOT marker when applicable.
 - Cluster context (`InCluster`, `ClusterPeerCount`) when peers exist.
 - Bulleted Links section: Polymarket event page, category page, trader
-  profile, Grafana deep-link. Links render only when the URL is non-empty.
+  profile, Grafana deep-link. **Each entry is a real Telegram HTML
+  `<a href>` anchor** rendered via the `renderLink` helper. Entries whose
+  URL is empty are omitted entirely — no bare "Grafana" / "Polymarket"
+  plain-text label is ever emitted. The whole section is skipped when
+  nothing is renderable.
 - The **actual** baseline span used, not the configured cap.
+
+### Link rendering contract
+
+The Telegram sink sends messages with `parse_mode=HTML`. URLs containing
+`&` (every Grafana deep-link) are escaped to `&amp;` via `html.EscapeString`
+so Telegram parses the anchor tag instead of treating the ampersand as
+literal text. Test coverage:
+
+- `telegram_test.go::TestRenderLinkBuildsHTMLAnchor` — exact anchor shape.
+- `telegram_test.go::TestRenderLinkEscapesLabel` — label escape contract.
+- `telegram_test.go::TestLinksSectionExactFormat` — byte-for-byte Links
+  block when all four URLs are present.
+- `telegram_test.go::TestGrafanaLinkClickableInWirePayload` — end-to-end:
+  captures the JSON payload sent to a fake Telegram server, decodes it,
+  asserts `parse_mode=HTML` and that the `text` field contains the full
+  `<a href="…">Grafana</a>` anchor.
+- `telegram_test.go::TestLabelsNeverAppearAsPlainText` — regression guard:
+  when any URL is empty, the corresponding label must NOT appear as a bare
+  bullet ("• Grafana" must never exist outside of an `<a>`).
+- `telegram_test.go::TestSpecialCharsInHrefAreEscaped` — `&`/`<`/`>`/`"`
+  in href values are escaped to entities.

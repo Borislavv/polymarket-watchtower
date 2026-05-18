@@ -15,11 +15,21 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// Persist is the optional Postgres side-channel. When set the loop hands
+// the filtered category + market sets to the sink AFTER the in-memory
+// registry update. Errors are logged but never fail the tick — the
+// in-memory path is the source of truth for live alerting until the DB
+// detector lands in a later stage.
+type Persist func(ctx context.Context, cats []market2.Category, markets []market2.Market) error
+
 type Config struct {
 	Interval   time.Duration
 	MaxMarkets int
 	ActiveOnly bool
 	OrderBy    string
+	// Persist optionally receives every discovered (categories, markets)
+	// pair for write-through to PostgreSQL. Nil = no DB writes.
+	Persist Persist
 }
 
 // Forgetter is the subset of aggregate.Engine that discover relies on to
@@ -145,6 +155,14 @@ func (l *Loop) tick(ctx context.Context) error {
 		Int("filtered_assignments", skippedAssignments).
 		Int("filtered_categories", len(denied)).
 		Msg("discover: refreshed")
+
+	if l.cfg.Persist != nil {
+		if err := l.cfg.Persist(ctx, cats, markets); err != nil {
+			// DB write failures are operational, not fatal — alerting
+			// keeps working off the in-memory registry. Log + continue.
+			l.log.Err(err).Msg("discover: persist failed")
+		}
+	}
 	return nil
 }
 

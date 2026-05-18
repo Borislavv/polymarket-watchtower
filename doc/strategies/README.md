@@ -65,6 +65,7 @@ For `single_cluster` (the product path):
   `MARKET_MIN_AGE` AND is past `LIFECYCLE_ALERT_FROM_PCT` of its lifetime.
   Markets with missing start/end dates are silenced by default
   (`ALLOW_UNKNOWN_MARKET_LIFECYCLE=false`, fail-closed).
-- **Category-only filtering:** `CATEGORY_BLACKLIST` matches the category
-  `slug + " " + label` and nothing else. Market titles, event slugs,
-  market slugs, and tags are not scanned. Default: `sports,sport`.
+- **Category whitelist:** `CATEGORY_WHITELIST` matches the category
+  `slug + " " + label` and nothing else. ONLY whitelisted categories are
+  monitored; everything else is ignored. Market titles, event slugs,
+  market slugs, and tags are not scanned. Default: `Politics`.
