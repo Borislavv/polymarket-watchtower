@@ -1,13 +1,13 @@
 // Package marketintel runs the 2h market-intelligence report.
 //
 // Pipeline:
-//   1. List top-N candidate markets (lifecycle + recent activity + liquidity)
-//   2. Build a compact MarketReportRequest
-//   3. Call analyzer.AnalyzeMarketReport
-//   4. Compose Telegram body (Overview / Markets to watch / What matters
-//      next / Analyst summary)
-//   5. Hash the body for dedup; INSERT ON CONFLICT (summary_hash) DO NOTHING
-//   6. On fresh insert, post to Telegram and update delivery_status
+//  1. List top-N candidate markets (lifecycle + recent activity + liquidity)
+//  2. Build a compact MarketReportRequest
+//  3. Call analyzer.AnalyzeMarketReport
+//  4. Compose Telegram body (Overview / Markets to watch / What matters
+//     next / Analyst summary)
+//  5. Hash the body for dedup; INSERT ON CONFLICT (summary_hash) DO NOTHING
+//  6. On fresh insert, post to Telegram and update delivery_status
 //
 // The worker is intentionally simple — the orchestration is mostly
 // data shaping. The hard parts (model call, cost control, content

@@ -130,14 +130,14 @@ func sampleResolvedAlert(t *testing.T, id int64, outcome repository.OutcomeStatu
 		t.Fatalf("marshal: %v", err)
 	}
 	a := repository.Alert{
-		ID:                id,
-		Kind:              repository.AlertKindTrade,
-		Severity:          "info",
-		Payload:           payload,
-		Status:            repository.AlertSent,
-		OutcomeStatus:     outcome,
+		ID:                  id,
+		Kind:                repository.AlertKindTrade,
+		Severity:            "info",
+		Payload:             payload,
+		Status:              repository.AlertSent,
+		OutcomeStatus:       outcome,
 		WinningOutcomeLabel: "Yes",
-		ResolvedAt:        time.Now().Add(-1 * time.Hour),
+		ResolvedAt:          time.Now().Add(-1 * time.Hour),
 	}
 	if msgID > 0 {
 		a.TelegramMessageID = &msgID

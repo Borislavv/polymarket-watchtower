@@ -3,11 +3,11 @@
 // these buckets is to let Grafana / SQL answer "which-setups-actually-
 // win" without recomputing them from raw payloads each time:
 //
-//   SELECT strategy_family, lifecycle_bucket, COUNT(*),
-//          SUM(CASE WHEN a.outcome_status='resolved_correct' THEN 1 ELSE 0 END)
-//     FROM polymarket_alert_strategy_dimensions d
-//     JOIN polymarket_alerts a ON a.id = d.alert_id
-//    GROUP BY strategy_family, lifecycle_bucket;
+//	SELECT strategy_family, lifecycle_bucket, COUNT(*),
+//	       SUM(CASE WHEN a.outcome_status='resolved_correct' THEN 1 ELSE 0 END)
+//	  FROM polymarket_alert_strategy_dimensions d
+//	  JOIN polymarket_alerts a ON a.id = d.alert_id
+//	 GROUP BY strategy_family, lifecycle_bucket;
 //
 // Bucket design rules:
 //   - Cardinality stays bounded. Lifecycle, odds, notional, return,

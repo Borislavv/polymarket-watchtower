@@ -144,7 +144,7 @@ func TestFromFinding_WhaleFlow(t *testing.T) {
 			NotionalUSD: 50_000,
 			Price:       0.6, // remaining return ≈ 66.7%
 		},
-		Category: &anomaly.CategoryRef{Slug: "Politics"},
+		Category:  &anomaly.CategoryRef{Slug: "Politics"},
 		NewWallet: &anomaly.NewWalletRef{IsNew: true},
 	}
 	got := FromFinding(101, f, "lean_yes")
@@ -256,7 +256,7 @@ func TestFromFinding_StableFavorite(t *testing.T) {
 
 func TestFromFinding_CategoryWatchCluster(t *testing.T) {
 	f := anomaly.Finding{
-		Kind: anomaly.KindCategoryWatch,
+		Kind:    anomaly.KindCategoryWatch,
 		Cluster: &anomaly.ClusterStats{TotalUSD: 75_000},
 	}
 	got := FromFinding(2, f, "")

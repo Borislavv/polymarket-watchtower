@@ -475,7 +475,13 @@ func scoreOf(in Input, cfg Config, cmStatus string) float64 {
 	case "conflict":
 		crossScore = 0
 	default:
-		crossScore = 0.5 // unavailable: neutral
+		// v7: "unavailable" is now near-neutral (was 0.5). The
+		// hard cross-market gate was removed, so a market with no
+		// paired venue must not be silently punished out of the
+		// Critical band by losing 2.5 score points it could
+		// otherwise reach. Still <1 so "confirmed" retains a
+		// meaningful edge.
+		crossScore = 0.8
 	}
 
 	return 100 * (0.25*lifecycleScore +

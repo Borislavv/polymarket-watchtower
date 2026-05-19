@@ -229,14 +229,14 @@ func (r *MarketIntelligenceRepository) Insert(ctx context.Context, rpt NewMarket
 // IntelligenceCandidate is the per-market row the worker hands the
 // AI analyzer.
 type IntelligenceCandidate struct {
-	ConditionID   string
-	Question      string
-	Category      string
-	LifecyclePct  float64
-	Trades24h     int64
-	Volume24hUSD  float64
-	LastPrice     float64
-	Alerts24h     int64
+	ConditionID  string
+	Question     string
+	Category     string
+	LifecyclePct float64
+	Trades24h    int64
+	Volume24hUSD float64
+	LastPrice    float64
+	Alerts24h    int64
 }
 
 // ListIntelligenceCandidates returns up to `limit` top-N markets

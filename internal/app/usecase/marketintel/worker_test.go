@@ -17,7 +17,9 @@ import (
 
 // --- fakes ---------------------------------------------------------------
 
-type fakeCandidates struct{ rows []repository.IntelligenceCandidate }
+type fakeCandidates struct {
+	rows []repository.IntelligenceCandidate
+}
 
 func (f *fakeCandidates) ListIntelligenceCandidates(_ context.Context, _ int32) ([]repository.IntelligenceCandidate, error) {
 	return f.rows, nil
@@ -39,7 +41,10 @@ func (s *fakeStore) Insert(_ context.Context, r repository.NewMarketIntelligence
 	return repository.MarketIntelligenceReport{SummaryHash: r.SummaryHash}, true, nil
 }
 
-type fakeAnalyzer struct{ out analysis.MarketReportAnalysis; err error }
+type fakeAnalyzer struct {
+	out analysis.MarketReportAnalysis
+	err error
+}
 
 func (f *fakeAnalyzer) AnalyzeMarketReport(_ context.Context, _ analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
 	return f.out, f.err
