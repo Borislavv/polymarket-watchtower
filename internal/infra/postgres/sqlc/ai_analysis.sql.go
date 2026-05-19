@@ -212,29 +212,31 @@ func (q *Queries) InsertAlertOutcomeAnalysis(ctx context.Context, arg InsertAler
 
 const insertMarketIntelligenceReport = `-- name: InsertMarketIntelligenceReport :one
 INSERT INTO polymarket_market_intelligence_reports (
-    period_start, period_end, summary_hash, report_text, markets_json,
+    period_key, period_start, period_end, summary_hash, report_text, markets_json,
     model, prompt_tokens, completion_tokens, estimated_cost_usd,
     telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error
 ) VALUES (
-    $1::timestamptz,
+    $1::text,
     $2::timestamptz,
-    $3::text,
+    $3::timestamptz,
     $4::text,
-    $5::jsonb,
-    $6::text,
-    $7::int,
+    $5::text,
+    $6::jsonb,
+    $7::text,
     $8::int,
-    $9::double precision,
-    $10::bigint,
-    $11::text,
+    $9::int,
+    $10::double precision,
+    $11::bigint,
     $12::text,
-    $13::text
+    $13::text,
+    $14::text
 )
-ON CONFLICT (summary_hash) DO NOTHING
-RETURNING id, generated_at, period_start, period_end, summary_hash, report_text, markets_json, model, prompt_tokens, completion_tokens, estimated_cost_usd, telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error, created_at
+ON CONFLICT (period_key) DO NOTHING
+RETURNING id, generated_at, period_start, period_end, summary_hash, report_text, markets_json, model, prompt_tokens, completion_tokens, estimated_cost_usd, telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error, created_at, period_key
 `
 
 type InsertMarketIntelligenceReportParams struct {
+	PeriodKey         string
 	PeriodStart       pgtype.Timestamptz
 	PeriodEnd         pgtype.Timestamptz
 	SummaryHash       string
@@ -250,10 +252,13 @@ type InsertMarketIntelligenceReportParams struct {
 	LastDeliveryError *string
 }
 
-// Persist one 2h report. summary_hash unique-conflict skips silently
-// so the caller can decide whether to retry-with-fresh-content.
+// Persist one 2h report. period_key UNIQUE — two ticks landing in the
+// same bucket (computed deterministically in the worker) collapse to
+// a single row, eliminating the duplicate-Telegram-send class of bug
+// that prompted migration 00014.
 func (q *Queries) InsertMarketIntelligenceReport(ctx context.Context, arg InsertMarketIntelligenceReportParams) (PolymarketMarketIntelligenceReports, error) {
 	row := q.db.QueryRow(ctx, insertMarketIntelligenceReport,
+		arg.PeriodKey,
 		arg.PeriodStart,
 		arg.PeriodEnd,
 		arg.SummaryHash,
@@ -286,6 +291,7 @@ func (q *Queries) InsertMarketIntelligenceReport(ctx context.Context, arg Insert
 		&i.DeliveryStatus,
 		&i.LastDeliveryError,
 		&i.CreatedAt,
+		&i.PeriodKey,
 	)
 	return i, err
 }
@@ -338,7 +344,7 @@ func (q *Queries) LatestAlertAnalysisVersion(ctx context.Context, alertID int64)
 }
 
 const latestMarketIntelligenceReport = `-- name: LatestMarketIntelligenceReport :one
-SELECT id, generated_at, period_start, period_end, summary_hash, report_text, markets_json, model, prompt_tokens, completion_tokens, estimated_cost_usd, telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error, created_at FROM polymarket_market_intelligence_reports
+SELECT id, generated_at, period_start, period_end, summary_hash, report_text, markets_json, model, prompt_tokens, completion_tokens, estimated_cost_usd, telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error, created_at, period_key FROM polymarket_market_intelligence_reports
 ORDER BY generated_at DESC
 LIMIT 1
 `
@@ -363,6 +369,7 @@ func (q *Queries) LatestMarketIntelligenceReport(ctx context.Context) (Polymarke
 		&i.DeliveryStatus,
 		&i.LastDeliveryError,
 		&i.CreatedAt,
+		&i.PeriodKey,
 	)
 	return i, err
 }

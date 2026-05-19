@@ -26,6 +26,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
@@ -85,16 +86,22 @@ type Worker struct {
 	store      Store
 	analyzer   Analyzer
 	bot        Bot
+	metrics    *metrics.Metrics
 	log        *zerolog.Logger
 }
 
 // New wires the worker. All deps required. Pass analysis.NoopAnalyzer
 // to disable the AI call (the worker still selects candidates and
 // persists a "skipped" row so an operator can audit the cadence).
+// Metrics is optional — when nil, observeSkip / observeAIError no-op.
 func New(cfg Config, candidates Candidates, store Store, analyzer Analyzer, bot Bot, log *zerolog.Logger) *Worker {
 	cfg.applyDefaults()
 	return &Worker{cfg: cfg, candidates: candidates, store: store, analyzer: analyzer, bot: bot, log: log}
 }
+
+// SetMetrics wires the optional metrics sink for skip/AI-error
+// counters. Called once at boot; nil keeps the worker metrics-agnostic.
+func (w *Worker) SetMetrics(m *metrics.Metrics) { w.metrics = m }
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -123,25 +130,53 @@ func (w *Worker) tick(ctx context.Context) {
 		w.log.Err(err).Msg("marketintel: list candidates failed")
 		return
 	}
+
+	// Bucketed period — the load-bearing dedup primitive. Two ticks
+	// inside the same Interval window resolve to the same
+	// periodStart/periodEnd and the same period_key, so the second
+	// INSERT collapses to ON CONFLICT DO NOTHING and no second
+	// Telegram send happens. Without this, body.summary_hash differs
+	// per tick (the body embeds the absolute `now` timestamp) and
+	// the previous content-hash dedup never triggered.
+	periodEnd, periodStart := bucketedPeriod(w.cfg.Clock(), w.cfg.Interval)
+	periodKey := formatPeriodKey(periodStart, periodEnd)
+
+	// Drop near-degenerate prices and per-market duplicates before
+	// classification — see filterAndDedupCandidates for the rules.
+	candidates = filterAndDedupCandidates(candidates)
+
+	// Empty periodic reports are never sent: an "everything is quiet"
+	// Telegram message every 2h is pure noise. Real Info/Warning/
+	// Critical alerts still ship via the alertsender — this skip
+	// applies ONLY to the periodic AI scout report.
 	if len(candidates) == 0 {
+		w.log.Info().
+			Str("period_key", periodKey).
+			Msg("marketintel: skipping empty periodic report")
+		w.observeSkip("empty_report")
 		return
 	}
-	now := w.cfg.Clock()
-	req := buildRequest(candidates, now, w.cfg.Interval)
+
+	req := buildRequest(candidates, periodEnd, w.cfg.Interval)
 	res, err := w.analyzer.AnalyzeMarketReport(ctx, req)
 	if err != nil {
-		w.log.Err(err).Msg("marketintel: analyzer returned error")
-		res = analysis.MarketReportAnalysis{Status: analysis.StatusError, Model: "unknown", LastError: err.Error()}
+		w.log.Err(err).
+			Str("period_key", periodKey).
+			Msg("marketintel: analyzer returned error")
+		res = analysis.MarketReportAnalysis{
+			Status:    analysis.StatusError,
+			Model:     "unknown",
+			LastError: err.Error(),
+		}
+		w.observeAIError("analyzer_error")
 	}
 	body, marketsJSON := composeReport(req, res)
 	hash := bodyHash(body)
 
-	// Dedup: identical content within a tick window is suppressed.
-	// The INSERT ON CONFLICT (summary_hash) DO NOTHING primitive
-	// makes this race-safe across replicas.
 	stored, fresh, err := w.store.Insert(ctx, repository.NewMarketIntelligenceReport{
-		PeriodStart:      now.Add(-w.cfg.Interval),
-		PeriodEnd:        now,
+		PeriodKey:        periodKey,
+		PeriodStart:      periodStart,
+		PeriodEnd:        periodEnd,
 		SummaryHash:      hash,
 		ReportText:       body,
 		MarketsJSON:      marketsJSON,
@@ -153,24 +188,109 @@ func (w *Worker) tick(ctx context.Context) {
 		DeliveryStatus:   "pending",
 	})
 	if err != nil {
-		w.log.Err(err).Msg("marketintel: persist failed")
+		w.log.Err(err).Str("period_key", periodKey).Msg("marketintel: persist failed")
 		return
 	}
 	if !fresh {
-		// Dedup hit — content identical to a prior report. Skip
-		// Telegram delivery so the operator's feed stays clean.
-		w.log.Debug().Msg("marketintel: dedup hit, skipping send")
+		// Same-period dedup — the canonical "we already sent the 2h
+		// report for this window" path. Common on app restart and
+		// expected on fast ticks; logged at debug to keep the noise
+		// level low.
+		w.log.Debug().
+			Str("period_key", periodKey).
+			Msg("marketintel: dedup hit on period_key, skipping send")
+		w.observeSkip("duplicate_period")
 		return
 	}
 	_ = stored
 
 	if w.bot == nil || w.cfg.ChatID == "" {
+		w.log.Warn().Msg("marketintel: bot or chat id not configured; report persisted but not delivered")
 		return
 	}
 	if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, body); err != nil {
-		w.log.Err(err).Msg("marketintel: telegram send failed")
+		w.log.Err(err).Str("period_key", periodKey).Msg("marketintel: telegram send failed")
 		return
 	}
+}
+
+// bucketedPeriod aligns `now` to the nearest interval boundary so a
+// 2h interval produces (10:00, 12:00) regardless of whether the tick
+// fired at 10:00:01 or 10:01:30. The end of the period is the
+// boundary AT OR BEFORE `now`; the start is end-interval. UTC because
+// the period_key is a string and operators reading it across
+// timezones must see the same value.
+func bucketedPeriod(now time.Time, interval time.Duration) (end, start time.Time) {
+	if interval <= 0 {
+		interval = 2 * time.Hour
+	}
+	end = now.UTC().Truncate(interval)
+	start = end.Add(-interval)
+	return end, start
+}
+
+// formatPeriodKey produces the deterministic string the UNIQUE index
+// is built on. RFC3339 keeps it human-readable in Postgres so an
+// operator looking at the table can correlate a row to a window
+// without decoding.
+func formatPeriodKey(start, end time.Time) string {
+	return start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)
+}
+
+// observeSkip increments the metric so dashboards can chart how often
+// periodic reports get suppressed and for which reason.
+func (w *Worker) observeSkip(reason string) {
+	if w.metrics == nil || w.metrics.MarketIntelligenceSkipped == nil {
+		return
+	}
+	w.metrics.MarketIntelligenceSkipped.WithLabelValues(reason).Inc()
+}
+
+// observeAIError increments the AI-failure counter so the dashboard
+// can chart the unavailable-summary rate.
+func (w *Worker) observeAIError(reason string) {
+	if w.metrics == nil || w.metrics.AIRequestErrors == nil {
+		return
+	}
+	w.metrics.AIRequestErrors.WithLabelValues("market_intelligence", reason).Inc()
+}
+
+// filterAndDedupCandidates implements the report-quality rules:
+//
+//  1. Drop near-degenerate prices. A market trading at ≤ 0.02 or ≥
+//     0.98 has effectively no remaining return (or no realistic flip
+//     risk) and is operationally useless in a scout report. The
+//     previous code surfaced these as "price 0.00 / price 1.00" rows
+//     which the operator flagged as junk.
+//  2. Collapse per-condition duplicates. The SQL query joins through
+//     polymarket_market_categories which can fan a single market
+//     into one row per category. Keep the first row per condition_id
+//     so the visible list is a clean "markets to watch" feed, not a
+//     join artefact.
+//
+// Stable: original order is preserved for the surviving rows so the
+// SQL ORDER BY lifecycle / volume continues to drive the report.
+func filterAndDedupCandidates(rows []repository.IntelligenceCandidate) []repository.IntelligenceCandidate {
+	if len(rows) == 0 {
+		return rows
+	}
+	const (
+		floor   = 0.02
+		ceiling = 0.98
+	)
+	seen := make(map[string]struct{}, len(rows))
+	out := make([]repository.IntelligenceCandidate, 0, len(rows))
+	for _, r := range rows {
+		if r.LastPrice > 0 && (r.LastPrice <= floor || r.LastPrice >= ceiling) {
+			continue
+		}
+		if _, dup := seen[r.ConditionID]; dup {
+			continue
+		}
+		seen[r.ConditionID] = struct{}{}
+		out = append(out, r)
+	}
+	return out
 }
 
 // buildRequest projects the candidate list into the analyzer's

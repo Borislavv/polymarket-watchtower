@@ -555,9 +555,20 @@ func New() (*App, error) {
 	// through detectLoop.Observe. The collect loop no longer calls
 	// Observe inline; that path lives only in the memory-only dev mode
 	// where there's no queue to drain.
-	var detectionWorker *detection.Worker
-	collectObserver := detectLoop // memory-mode default
-	var _ = collectObserver       // referenced below in collect.New
+	//
+	// IMPORTANT: collectObserver MUST be declared as the interface
+	// type, not *detect.Loop, so the Postgres branch can assign a true
+	// nil-interface. A typed-nil pointer boxed into an interface value
+	// is NOT nil under `!= nil` — the previous shape stored
+	// (type=*detect.Loop, value=nil) into collect.Loop.observer and
+	// caused (*detect.Loop).Observe to be invoked on a nil receiver
+	// for every trade in Postgres mode (incident: detect.go SIGSEGV at
+	// the first l.metrics field load).
+	var (
+		detectionWorker *detection.Worker
+		collectObserver collect.TradeObserver = detectLoop // memory-mode default
+		detectMode                            = "inline_memory"
+	)
 	if cfg.Postgres.Enabled() {
 		dw := detection.New(detection.Config{
 			Workers:        cfg.Detection.Workers,
@@ -567,9 +578,14 @@ func New() (*App, error) {
 			StaleThreshold: cfg.Anomaly.LiveAlertMaxLag,
 		}, tradesRepo, cache, detectLoop, walletResolver(tradersRepo), met, logger)
 		detectionWorker = dw
-		// Collect no longer drives detection in production.
+		// Collect no longer drives detection in production. Assigning
+		// nil to a variable already typed as collect.TradeObserver
+		// produces a true nil-interface value — the guard in
+		// collect.pull (`if l.observer != nil`) now skips correctly.
 		collectObserver = nil
+		detectMode = "db_queue"
 	}
+	logger.Info().Str("detect_mode", detectMode).Msg("detection pipeline wired")
 
 	collectCfg := collect.Config{
 		Interval:          cfg.Pipeline.CollectInterval,
@@ -732,6 +748,7 @@ func New() (*App, error) {
 			MaxOutputChars: cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
 			ChatID:         cfg.Alerting.TelegramChatID,
 		}, intelRepo, intelRepo, analyzerForReport, bot, logger)
+		marketIntelWorker.SetMetrics(met)
 	}
 
 	return &App{

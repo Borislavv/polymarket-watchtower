@@ -26,17 +26,25 @@ func (f *fakeCandidates) ListIntelligenceCandidates(_ context.Context, _ int32) 
 }
 
 type fakeStore struct {
-	mu        sync.Mutex
-	inserted  []repository.NewMarketIntelligenceReport
-	dedupHash string // pretend a row with this hash already exists
+	mu       sync.Mutex
+	inserted []repository.NewMarketIntelligenceReport
+	// periodKeys is the in-memory UNIQUE index that mirrors the
+	// production polymarket_market_intelligence_reports.period_key
+	// constraint: same key on a second insert → false ("dedup hit")
+	// with no error, exactly the way ON CONFLICT DO NOTHING behaves.
+	periodKeys map[string]struct{}
 }
 
 func (s *fakeStore) Insert(_ context.Context, r repository.NewMarketIntelligenceReport) (repository.MarketIntelligenceReport, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.dedupHash != "" && r.SummaryHash == s.dedupHash {
+	if s.periodKeys == nil {
+		s.periodKeys = make(map[string]struct{})
+	}
+	if _, dup := s.periodKeys[r.PeriodKey]; dup {
 		return repository.MarketIntelligenceReport{}, false, nil
 	}
+	s.periodKeys[r.PeriodKey] = struct{}{}
 	s.inserted = append(s.inserted, r)
 	return repository.MarketIntelligenceReport{SummaryHash: r.SummaryHash}, true, nil
 }
@@ -122,31 +130,85 @@ func TestTick_FullFlow(t *testing.T) {
 	}
 }
 
-// TestTick_DedupSkipsSend pins the SHA-256 dedup contract: a tick
-// whose content matches a prior summary_hash does NOT trigger a
-// Telegram send.
-func TestTick_DedupSkipsSend(t *testing.T) {
+// TestTick_DedupSkipsSendWithinSamePeriod pins the v8 dedup
+// contract: two ticks landing in the same bucketed period collapse
+// to a single Telegram send via ON CONFLICT (period_key) DO NOTHING.
+// This is the incident-driven fix — the previous summary_hash
+// primitive let "duplicate intelligence reports within one minute"
+// slip through because the body embedded the absolute `now`
+// timestamp.
+func TestTick_DedupSkipsSendWithinSamePeriod(t *testing.T) {
 	cand := &fakeCandidates{rows: sampleCandidates()}
 	st := &fakeStore{}
 	an := &fakeAnalyzer{out: analysis.MarketReportAnalysis{
 		Status: analysis.StatusOK, ReportText: "summary",
 	}}
 	bot := &fakeBot{}
-	w := New(Config{Enabled: true, MaxMarkets: 50, ChatID: "42"},
-		cand, st, an, bot, nopLogger())
+	// Freeze the clock inside the same 2h bucket for both ticks.
+	frozen := time.Date(2026, 5, 19, 10, 0, 30, 0, time.UTC)
+	w := New(Config{
+		Enabled: true, MaxMarkets: 50, ChatID: "42",
+		Interval: 2 * time.Hour,
+		Clock:    func() time.Time { return frozen },
+	}, cand, st, an, bot, nopLogger())
 
-	// First tick → fresh insert + send.
 	w.Tick(context.Background())
+	w.Tick(context.Background())
+
 	if len(bot.sends) != 1 {
-		t.Fatalf("first tick should send: %d", len(bot.sends))
+		t.Errorf("two ticks within one period must produce one send; got %d", len(bot.sends))
 	}
-	// Configure the store to refuse the same hash next time.
-	st.dedupHash = st.inserted[0].SummaryHash
+	if len(st.inserted) != 1 {
+		t.Errorf("expected 1 persisted row, got %d", len(st.inserted))
+	}
+}
 
-	// Second tick → dedup hit, NO send.
+// TestTick_DifferentPeriodsBothSend pins the inverse: two ticks in
+// different windows MUST both produce a Telegram send.
+func TestTick_DifferentPeriodsBothSend(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := &fakeAnalyzer{out: analysis.MarketReportAnalysis{Status: analysis.StatusOK, ReportText: "x"}}
+	bot := &fakeBot{}
+
+	clk := time.Date(2026, 5, 19, 10, 0, 0, 0, time.UTC)
+	w := New(Config{
+		Enabled: true, MaxMarkets: 50, ChatID: "42",
+		Interval: 2 * time.Hour,
+		Clock:    func() time.Time { return clk },
+	}, cand, st, an, bot, nopLogger())
+
 	w.Tick(context.Background())
-	if len(bot.sends) != 1 {
-		t.Errorf("second tick must not send on dedup hit; got %d total", len(bot.sends))
+	// Advance into the NEXT 2h bucket.
+	clk = clk.Add(3 * time.Hour)
+	w.Tick(context.Background())
+
+	if len(bot.sends) != 2 {
+		t.Errorf("two distinct periods must both send: %d", len(bot.sends))
+	}
+}
+
+// TestBucketedPeriod pins the deterministic bucket math used as the
+// period_key. A tick at 10:00:30 with a 2h interval must produce
+// (10:00, 12:00) — not (08:00:30, 10:00:30).
+func TestBucketedPeriod(t *testing.T) {
+	cases := []struct {
+		now      time.Time
+		interval time.Duration
+		wantEnd  time.Time
+	}{
+		{time.Date(2026, 5, 19, 10, 0, 30, 0, time.UTC), 2 * time.Hour, time.Date(2026, 5, 19, 10, 0, 0, 0, time.UTC)},
+		{time.Date(2026, 5, 19, 11, 59, 59, 0, time.UTC), 2 * time.Hour, time.Date(2026, 5, 19, 10, 0, 0, 0, time.UTC)},
+		{time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC), 2 * time.Hour, time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		end, start := bucketedPeriod(c.now, c.interval)
+		if !end.Equal(c.wantEnd) {
+			t.Errorf("now=%v end=%v want=%v", c.now, end, c.wantEnd)
+		}
+		if !start.Equal(c.wantEnd.Add(-c.interval)) {
+			t.Errorf("now=%v start=%v want=%v", c.now, start, c.wantEnd.Add(-c.interval))
+		}
 	}
 }
 
@@ -171,8 +233,13 @@ func TestTick_AnalyzerErrorStillProducesReport(t *testing.T) {
 	}
 }
 
-// TestTick_EmptyCandidatesIsNoop pins the quiet-day path.
-func TestTick_EmptyCandidatesIsNoop(t *testing.T) {
+// TestTick_EmptyCandidatesSkipsTelegram pins the v8 contract:
+// an empty periodic report is suppressed before Telegram delivery
+// AND nothing is persisted (so the next tick in a new period that
+// DOES have candidates can still run cleanly). Real Info/Warning/
+// Critical alerts are not affected — those ship through the
+// alertsender worker on a different path.
+func TestTick_EmptyCandidatesSkipsTelegram(t *testing.T) {
 	cand := &fakeCandidates{rows: nil}
 	st := &fakeStore{}
 	an := &fakeAnalyzer{}
@@ -182,9 +249,59 @@ func TestTick_EmptyCandidatesIsNoop(t *testing.T) {
 
 	w.Tick(context.Background())
 
-	if len(st.inserted) != 0 || len(bot.sends) != 0 {
-		t.Errorf("empty candidates must produce no work: stored=%d sent=%d",
-			len(st.inserted), len(bot.sends))
+	if len(bot.sends) != 0 {
+		t.Errorf("empty periodic report must NOT Telegram-send: %d", len(bot.sends))
+	}
+	if len(st.inserted) != 0 {
+		t.Errorf("empty periodic report must NOT persist a row: %d", len(st.inserted))
+	}
+}
+
+// TestFilterAndDedupCandidates pins the candidate-quality rules:
+// drop near-degenerate prices (≤0.02 / ≥0.98) and collapse
+// per-(condition_id) duplicates the SQL fan-out may produce.
+func TestFilterAndDedupCandidates(t *testing.T) {
+	rows := []repository.IntelligenceCandidate{
+		{ConditionID: "0xa", Question: "A", LastPrice: 0.65},     // keep
+		{ConditionID: "0xb", Question: "B", LastPrice: 0.01},     // drop (near-zero)
+		{ConditionID: "0xc", Question: "C", LastPrice: 0.995},    // drop (near-one)
+		{ConditionID: "0xa", Question: "A-dup", LastPrice: 0.65}, // drop (dup)
+		{ConditionID: "0xd", Question: "D", LastPrice: 0.55},     // keep
+		{ConditionID: "0xe", Question: "E", LastPrice: 0},        // keep (no price observed yet — let downstream decide)
+	}
+	got := filterAndDedupCandidates(rows)
+	wantIDs := []string{"0xa", "0xd", "0xe"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("got %d rows want %d: %+v", len(got), len(wantIDs), got)
+	}
+	for i, want := range wantIDs {
+		if got[i].ConditionID != want {
+			t.Errorf("row %d: id=%q want %q", i, got[i].ConditionID, want)
+		}
+	}
+}
+
+// TestTick_AllCandidatesFilteredSkipsSend pins that when every
+// upstream candidate fails the quality filter, the report is
+// treated as empty — no persistence, no Telegram send.
+func TestTick_AllCandidatesFilteredSkipsSend(t *testing.T) {
+	cand := &fakeCandidates{rows: []repository.IntelligenceCandidate{
+		{ConditionID: "0xa", Question: "A", LastPrice: 0.005}, // dropped
+		{ConditionID: "0xb", Question: "B", LastPrice: 0.999}, // dropped
+	}}
+	st := &fakeStore{}
+	an := &fakeAnalyzer{}
+	bot := &fakeBot{}
+	w := New(Config{Enabled: true, MaxMarkets: 50, ChatID: "42"},
+		cand, st, an, bot, nopLogger())
+
+	w.Tick(context.Background())
+
+	if len(bot.sends) != 0 {
+		t.Errorf("filtered-empty candidates must not send: %d", len(bot.sends))
+	}
+	if len(st.inserted) != 0 {
+		t.Errorf("filtered-empty candidates must not persist: %d", len(st.inserted))
 	}
 }
 

@@ -138,6 +138,16 @@ type Metrics struct {
 	StatsSummariesSent prometheus.Counter // periodic Telegram stats sends
 	StatsSummaryErrors prometheus.Counter // periodic stats send failures
 
+	// --- Market intelligence worker ---
+	// MarketIntelligenceSkipped: labelled by reason (empty_report,
+	// duplicate_period). Increments every time the 2h scout report
+	// is suppressed without Telegram delivery.
+	MarketIntelligenceSkipped *prometheus.CounterVec
+	// AIRequestErrors: labelled by kind (alert_note, market_intelligence,
+	// outcome_postmortem) and reason (analyzer_error, budget_exhausted,
+	// rate_limited, timeout). The single AI-failure visibility metric.
+	AIRequestErrors *prometheus.CounterVec
+
 	// --- Signal-quality reports + reactions (Strategy reporting) ---
 	// SignalReportsSent: labelled by period_type (daily / weekly /
 	// monthly / quarterly / yearly) and status (sent / failed).
@@ -449,6 +459,16 @@ func New() *Metrics {
 		Help: "Periodic stats summary send failures. Non-zero usually means Telegram delivery or a stats query is broken.",
 	})
 
+	m.MarketIntelligenceSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_intelligence", Name: "skipped_total",
+		Help: "Periodic 2h scout reports suppressed without Telegram delivery, by reason (empty_report, duplicate_period).",
+	}, []string{"reason"})
+
+	m.AIRequestErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "request_errors_total",
+		Help: "AI requests that failed before producing usable output, by kind (alert_note, market_intelligence, outcome_postmortem) and reason.",
+	}, []string{"kind", "reason"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -472,6 +492,7 @@ func New() *Metrics {
 		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,
 		m.BackfillPagesFetched, m.BackfillRunsTotal,
 		m.StatsSummariesSent, m.StatsSummaryErrors,
+		m.MarketIntelligenceSkipped, m.AIRequestErrors,
 		m.SignalReportsSent, m.TelegramReactions, m.AlertOutcomes,
 		m.AlertRealizedEdge,
 		m.AlertWeightedSuccessTotal, m.AlertWeightedResolvedTotal,

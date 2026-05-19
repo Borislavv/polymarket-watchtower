@@ -134,6 +134,7 @@ type PolymarketMarketIntelligenceReports struct {
 	DeliveryStatus    string
 	LastDeliveryError *string
 	CreatedAt         pgtype.Timestamptz
+	PeriodKey         string
 }
 
 type PolymarketMarketOutcomes struct {

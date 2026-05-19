@@ -157,12 +157,44 @@ func (l *Loop) pull(ctx context.Context, m market.Market) {
 	var notional float64
 	for _, t := range trades {
 		notional += t.NotionalUSD()
+		// In Postgres mode l.observer is the true nil-interface (see
+		// app.go wiring) and we just persist + skip; the detection
+		// worker drains the queue. In memory/dev mode the inline
+		// observer runs here. Per-trade recover prevents a single
+		// bad row from killing the whole collect goroutine (and
+		// therefore the process) — root cause must still be fixed
+		// downstream; this is last line of defense, not the
+		// architectural answer.
 		if l.observer != nil {
-			l.observer.Observe(ctx, m, t)
+			l.observeWithRecover(ctx, m, t)
 		}
 	}
-	l.metrics.TradesIngested.WithLabelValues(string(m.ID)).Add(float64(len(trades)))
-	l.metrics.NotionalIngested.WithLabelValues(string(m.ID)).Add(notional)
+	if l.metrics != nil {
+		if l.metrics.TradesIngested != nil {
+			l.metrics.TradesIngested.WithLabelValues(string(m.ID)).Add(float64(len(trades)))
+		}
+		if l.metrics.NotionalIngested != nil {
+			l.metrics.NotionalIngested.WithLabelValues(string(m.ID)).Add(notional)
+		}
+	}
+}
+
+// observeWithRecover invokes the inline observer with a per-trade
+// panic guard. Memory/dev mode only — in Postgres mode l.observer is
+// nil and this function is never reached. The detection worker has
+// its own boundary recover (safeObserve) and a DB row to stamp
+// `failed` against; here there's no row, so we just log and continue.
+func (l *Loop) observeWithRecover(ctx context.Context, m market.Market, t trade.Trade) {
+	defer func() {
+		if r := recover(); r != nil {
+			l.log.Error().
+				Interface("panic", r).
+				Str("market", string(m.ID)).
+				Str("trade_id", t.ID).
+				Msg("collect: observer panic (dev inline mode) — trade dropped")
+		}
+	}()
+	l.observer.Observe(ctx, m, t)
 }
 
 // lookback resolves the per-market "since" cutoff. Production order:

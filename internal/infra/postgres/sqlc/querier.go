@@ -86,8 +86,10 @@ type Querier interface {
 	// when the market resolves. Unique constraint on alert_id makes the
 	// write idempotent.
 	InsertAlertOutcomeAnalysis(ctx context.Context, arg InsertAlertOutcomeAnalysisParams) (PolymarketAlertOutcomeAnalyses, error)
-	// Persist one 2h report. summary_hash unique-conflict skips silently
-	// so the caller can decide whether to retry-with-fresh-content.
+	// Persist one 2h report. period_key UNIQUE — two ticks landing in the
+	// same bucket (computed deterministically in the worker) collapse to
+	// a single row, eliminating the duplicate-Telegram-send class of bug
+	// that prompted migration 00014.
 	InsertMarketIntelligenceReport(ctx context.Context, arg InsertMarketIntelligenceReportParams) (PolymarketMarketIntelligenceReports, error)
 	// Insert a single trade. ON CONFLICT (dedup_key) DO NOTHING is the dedup
 	// primitive — concurrent inserters of the same trade race to the unique

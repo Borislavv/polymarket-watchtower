@@ -41,13 +41,16 @@ ORDER BY version DESC
 LIMIT 1;
 
 -- name: InsertMarketIntelligenceReport :one
--- Persist one 2h report. summary_hash unique-conflict skips silently
--- so the caller can decide whether to retry-with-fresh-content.
+-- Persist one 2h report. period_key UNIQUE — two ticks landing in the
+-- same bucket (computed deterministically in the worker) collapse to
+-- a single row, eliminating the duplicate-Telegram-send class of bug
+-- that prompted migration 00014.
 INSERT INTO polymarket_market_intelligence_reports (
-    period_start, period_end, summary_hash, report_text, markets_json,
+    period_key, period_start, period_end, summary_hash, report_text, markets_json,
     model, prompt_tokens, completion_tokens, estimated_cost_usd,
     telegram_message_id, telegram_chat_id, delivery_status, last_delivery_error
 ) VALUES (
+    sqlc.arg(period_key)::text,
     sqlc.arg(period_start)::timestamptz,
     sqlc.arg(period_end)::timestamptz,
     sqlc.arg(summary_hash)::text,
@@ -62,7 +65,7 @@ INSERT INTO polymarket_market_intelligence_reports (
     sqlc.arg(delivery_status)::text,
     sqlc.narg(last_delivery_error)::text
 )
-ON CONFLICT (summary_hash) DO NOTHING
+ON CONFLICT (period_key) DO NOTHING
 RETURNING *;
 
 -- name: LatestMarketIntelligenceReport :one

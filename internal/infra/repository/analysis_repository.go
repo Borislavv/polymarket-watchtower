@@ -176,6 +176,10 @@ type MarketIntelligenceReport struct {
 
 // NewMarketIntelligenceReport — insert input.
 type NewMarketIntelligenceReport struct {
+	// PeriodKey is the load-bearing dedup column. The worker computes
+	// it from the bucketed period boundary so two ticks inside the
+	// same window collapse to one row.
+	PeriodKey         string
 	PeriodStart       time.Time
 	PeriodEnd         time.Time
 	SummaryHash       string
@@ -203,6 +207,7 @@ func NewMarketIntelligenceRepository(pool *pgxpool.Pool) *MarketIntelligenceRepo
 // (zero, false) on summary_hash conflict (dedup hit).
 func (r *MarketIntelligenceRepository) Insert(ctx context.Context, rpt NewMarketIntelligenceReport) (MarketIntelligenceReport, bool, error) {
 	row, err := r.q.InsertMarketIntelligenceReport(ctx, sqlc.InsertMarketIntelligenceReportParams{
+		PeriodKey:         rpt.PeriodKey,
 		PeriodStart:       tsFromTime(rpt.PeriodStart),
 		PeriodEnd:         tsFromTime(rpt.PeriodEnd),
 		SummaryHash:       rpt.SummaryHash,
