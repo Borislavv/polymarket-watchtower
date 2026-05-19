@@ -37,16 +37,24 @@ func sampleTradeFinding() anomaly.Finding {
 		},
 		Baseline: &anomaly.BaselineRef{
 			Scope:     "category=Weather market=rain outcome=Yes",
-			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, SampleN: 1240,
+			MedianUSD: 9.70, MeanUSD: 12.10, P95USD: 60, P99USD: 250, SampleN: 1240,
 			Span:      30*24*time.Hour + 6*time.Hour,
 			WindowMax: 365 * 24 * time.Hour,
 		},
+		TraderBaseline: &anomaly.BaselineRef{
+			Scope:     "trader=0xabc",
+			MedianUSD: 240, MeanUSD: 480, P95USD: 3_004, P99USD: 9_723, SampleN: 80,
+			Span: 88 * 24 * time.Hour,
+		},
 		Category:            &anomaly.CategoryRef{ID: 99, Slug: "weather", Label: "Weather & Climate"},
-		MarketMultiplier:    12_371,
-		EffectiveMultiplier: 12_371,
-		MultiplierAxis:      "market",
-		AbsoluteTier:        anomaly.SeverityCritical,
-		MultiplierTier:      anomaly.SeverityCritical,
+		GrossPayoutIfWinUSD: 2_400_000,
+		ProfitIfWinUSD:      2_280_000,
+		MarketP95Ratio:      2_000,
+		MarketP99Ratio:      480,
+		TraderP95Ratio:      39.95,
+		TraderP99Ratio:      12.34,
+		PayoffGatePassed:    true,
+		TailGatePassed:      true,
 		MarketURL:           "https://polymarket.com/event/rain-tomorrow",
 		CategoryURL:         "https://polymarket.com/predictions/weather",
 		TraderURL:           "https://polymarket.com/profile/0xabc1234567890def1234567890abcdef12345678",
@@ -106,8 +114,8 @@ func TestTelegramEnabledRequiresTokenAndChatID(t *testing.T) {
 func TestTradeAnomalyHeaderFormat(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	first := strings.SplitN(msg, "\n", 2)[0]
-	// Header: <b>SEV: xMUL · $NOTIONAL · HOT · TITLE</b>
-	for _, want := range []string{"<b>", "CRITICAL", "x12371", "$120,000", "HOT", "Will it rain &lt;tomorrow&gt;?", "</b>"} {
+	// v5 header: <b>SEV: profit $PROFIT · $NOTIONAL · HOT · TITLE</b>
+	for _, want := range []string{"<b>", "CRITICAL", "profit $2,280,000", "$120,000", "HOT", "Will it rain &lt;tomorrow&gt;?", "</b>"} {
 		if !strings.Contains(first, want) {
 			t.Errorf("header missing %q in:\n%s", want, first)
 		}
@@ -118,11 +126,18 @@ func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 	msg := FormatTelegramMessage(sampleTradeFinding())
 	for _, want := range []string{
 		"<b>Why</b>",
-		"<b>x12371</b> above market baseline median ($9.70)",
+		"payoff if win: profit <b>$2,280,000</b> (gross $2,400,000)",
+		"market tail: notional <b>$120,000</b>",
+		"<b>2000x p95</b> ($60.00)",
+		"<b>480x p99</b> ($250.00)",
+		"trader tail: notional <b>$120,000</b>",
+		"<b>40x p95</b> ($3,004)",
+		"<b>12x p99</b> ($9,723)",
 		"odds <b>20.0</b>, implied probability <b>5.0%</b>",
-		"baseline: <b>1240</b> trades, median $9.70",
+		"market baseline: <b>1240</b> trades, median $9.70",
+		"p95 $60.00, p99 $250.00",
+		"trader history: <b>80</b> trades, median $240.00, p95 $3,004, p99 $9,723",
 		"span 30d6h",
-		"tiers: absolute=<code>critical</code> multiplier=<code>critical</code>",
 		"market lifecycle: <b>93.5%</b> elapsed (HOT — final stretch)",
 		"<b>part of a forming cluster</b>: 4 anomalous trades",
 		"<b>Trade</b>",

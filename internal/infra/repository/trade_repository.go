@@ -173,6 +173,7 @@ type BaselineDistribution struct {
 	MeanNotionalUSD   float64
 	MedianNotionalUSD float64
 	P95NotionalUSD    float64
+	P99NotionalUSD    float64
 	OldestAt          time.Time // zero when bucket is empty
 	NewestAt          time.Time
 }
@@ -202,6 +203,7 @@ func (r *TradeRepository) Distribution(ctx context.Context, q BaselineQuery) (Ba
 		MeanNotionalUSD:   row.MeanNotionalUsd,
 		MedianNotionalUSD: row.MedianNotionalUsd,
 		P95NotionalUSD:    row.P95NotionalUsd,
+		P99NotionalUSD:    row.P99NotionalUsd,
 		OldestAt:          tsTime(row.OldestAt),
 		NewestAt:          tsTime(row.NewestAt),
 	}, nil

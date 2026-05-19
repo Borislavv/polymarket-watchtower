@@ -19,4 +19,4 @@ package anomaly
 // Naming convention: "<product>-v<N>". v1..v4 were env-driven; the move to
 // a code-owned constant is treated as the v4 generation since the decision
 // logic itself did not change at this cleanup.
-const StrategyIdentity = "informed-flow-v4"
+const StrategyIdentity = "informed-flow-v5"

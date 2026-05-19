@@ -160,6 +160,76 @@ func (q *Queries) LatestClusterAlertForCategory(ctx context.Context, arg LatestC
 	return i, err
 }
 
+const listAlertsForReaction = `-- name: ListAlertsForReaction :many
+SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity, a.market_id, a.trader_id, a.trade_id, a.payload, a.status, a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at, a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at, a.outcome_status, a.outcome_checked_at, a.resolved_at, a.winning_outcome_token, a.winning_outcome_label, a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h, a.telegram_reaction_status, a.telegram_reaction_emoji, a.last_reaction_at
+FROM polymarket_alerts a
+WHERE a.status                   = 'sent'
+  AND a.telegram_message_id     IS NOT NULL
+  AND a.outcome_status          IN ('resolved_correct','resolved_wrong','unknown')
+  AND a.telegram_reaction_status IN ('pending','failed')
+ORDER BY a.resolved_at DESC NULLS LAST, a.id
+LIMIT $1::integer
+`
+
+// Returns sent alerts with a known outcome that haven't yet had a
+// Telegram reaction applied. The index idx_alerts_reaction_pending
+// (migration 00007) makes this a partial-index scan. Ordering by
+// resolved_at keeps the reactor processing newest-resolution-first so
+// recent reactions appear before historical backfill.
+func (q *Queries) ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error) {
+	rows, err := q.db.Query(ctx, listAlertsForReaction, claimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PolymarketAlerts
+	for rows.Next() {
+		var i PolymarketAlerts
+		if err := rows.Scan(
+			&i.ID,
+			&i.DedupKey,
+			&i.StrategyVersion,
+			&i.Kind,
+			&i.Reason,
+			&i.Severity,
+			&i.MarketID,
+			&i.TraderID,
+			&i.TradeID,
+			&i.Payload,
+			&i.Status,
+			&i.TelegramMessageID,
+			&i.SendAttempts,
+			&i.LastSendError,
+			&i.SentAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.NextRetryAt,
+			&i.LastAttemptAt,
+			&i.OutcomeStatus,
+			&i.OutcomeCheckedAt,
+			&i.ResolvedAt,
+			&i.WinningOutcomeToken,
+			&i.WinningOutcomeLabel,
+			&i.DriftStatus,
+			&i.DriftCheckedAt,
+			&i.Clv15m,
+			&i.Clv1h,
+			&i.Clv6h,
+			&i.Clv24h,
+			&i.TelegramReactionStatus,
+			&i.TelegramReactionEmoji,
+			&i.LastReactionAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSentAlertsForDrift = `-- name: ListSentAlertsForDrift :many
 SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity, a.market_id, a.trader_id, a.trade_id, a.payload, a.status, a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at, a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at, a.outcome_status, a.outcome_checked_at, a.resolved_at, a.winning_outcome_token, a.winning_outcome_label, a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h, a.telegram_reaction_status, a.telegram_reaction_emoji, a.last_reaction_at
 FROM polymarket_alerts a
@@ -390,6 +460,32 @@ func (q *Queries) MarkAlertOutcomeUnavailableTouch(ctx context.Context, id int64
 	return err
 }
 
+const markAlertReactionApplied = `-- name: MarkAlertReactionApplied :exec
+UPDATE polymarket_alerts
+SET telegram_reaction_status = $2::text,
+    telegram_reaction_emoji  = $3::text,
+    last_reaction_at         = CASE
+                                  WHEN $2::text = 'applied' THEN NOW()
+                                  ELSE last_reaction_at
+                               END,
+    updated_at               = NOW()
+WHERE id = $1
+`
+
+type MarkAlertReactionAppliedParams struct {
+	ID     int64
+	Status string
+	Emoji  *string
+}
+
+// Stamps a successful setMessageReaction result on the alert row.
+// Status MUST be one of the CHECK-constrained values
+// (applied/unsupported/failed/disabled); the caller maps the verdict.
+func (q *Queries) MarkAlertReactionApplied(ctx context.Context, arg MarkAlertReactionAppliedParams) error {
+	_, err := q.db.Exec(ctx, markAlertReactionApplied, arg.ID, arg.Status, arg.Emoji)
+	return err
+}
+
 const markAlertSendFailed = `-- name: MarkAlertSendFailed :exec
 UPDATE polymarket_alerts
 SET status          = 'failed',
@@ -563,77 +659,4 @@ func (q *Queries) TryCreatePendingAlert(ctx context.Context, arg TryCreatePendin
 		&i.LastReactionAt,
 	)
 	return i, err
-}
-
-const listAlertsForReaction = `-- name: ListAlertsForReaction :many
-SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity,
-       a.market_id, a.trader_id, a.trade_id, a.payload, a.status,
-       a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at,
-       a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at,
-       a.outcome_status, a.outcome_checked_at, a.resolved_at,
-       a.winning_outcome_token, a.winning_outcome_label,
-       a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h, a.telegram_reaction_status, a.telegram_reaction_emoji, a.last_reaction_at,
-       a.telegram_reaction_status, a.telegram_reaction_emoji, a.last_reaction_at
-FROM polymarket_alerts a
-WHERE a.status                   = 'sent'
-  AND a.telegram_message_id     IS NOT NULL
-  AND a.outcome_status          IN ('resolved_correct','resolved_wrong','unknown')
-  AND a.telegram_reaction_status IN ('pending','failed')
-ORDER BY a.resolved_at DESC NULLS LAST, a.id
-LIMIT $1::integer
-`
-
-// Returns sent alerts with a known outcome that haven't yet had a
-// Telegram reaction applied. Backed by idx_alerts_reaction_pending.
-func (q *Queries) ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error) {
-	rows, err := q.db.Query(ctx, listAlertsForReaction, claimLimit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []PolymarketAlerts{}
-	for rows.Next() {
-		var i PolymarketAlerts
-		if err := rows.Scan(
-			&i.ID, &i.DedupKey, &i.StrategyVersion, &i.Kind, &i.Reason, &i.Severity,
-			&i.MarketID, &i.TraderID, &i.TradeID, &i.Payload, &i.Status,
-			&i.TelegramMessageID, &i.SendAttempts, &i.LastSendError, &i.SentAt,
-			&i.CreatedAt, &i.UpdatedAt, &i.NextRetryAt, &i.LastAttemptAt,
-			&i.OutcomeStatus, &i.OutcomeCheckedAt, &i.ResolvedAt,
-			&i.WinningOutcomeToken, &i.WinningOutcomeLabel,
-			&i.DriftStatus, &i.DriftCheckedAt, &i.Clv15m, &i.Clv1h, &i.Clv6h, &i.Clv24h,
-			&i.TelegramReactionStatus, &i.TelegramReactionEmoji, &i.LastReactionAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const markAlertReactionApplied = `-- name: MarkAlertReactionApplied :exec
-UPDATE polymarket_alerts
-SET telegram_reaction_status = $2::text,
-    telegram_reaction_emoji  = $3::text,
-    last_reaction_at         = CASE
-                                  WHEN $2::text = 'applied' THEN NOW()
-                                  ELSE last_reaction_at
-                               END,
-    updated_at               = NOW()
-WHERE id = $1
-`
-
-type MarkAlertReactionAppliedParams struct {
-	ID     int64
-	Status string
-	Emoji  *string
-}
-
-// Stamps a setMessageReaction outcome on the alert row.
-func (q *Queries) MarkAlertReactionApplied(ctx context.Context, arg MarkAlertReactionAppliedParams) error {
-	_, err := q.db.Exec(ctx, markAlertReactionApplied, arg.ID, arg.Status, arg.Emoji)
-	return err
 }

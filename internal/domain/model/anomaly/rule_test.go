@@ -4,9 +4,9 @@ import "testing"
 
 func defaultThresholds() Thresholds {
 	return Thresholds{
-		Info:                   Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
-		Warning:                Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
-		Critical:               Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
+		Info:                   Tier{MinNotionalUSD: 10_000, MinOdds: 3},
+		Warning:                Tier{MinNotionalUSD: 25_000, MinOdds: 5},
+		Critical:               Tier{MinNotionalUSD: 100_000, MinOdds: 8},
 		MinBaselineTrades:      20,
 		MinBaselineNotionalUSD: 1_000,
 	}
@@ -34,27 +34,6 @@ func TestAbsoluteTierRequiresBothNotionalAndOdds(t *testing.T) {
 				t.Fatalf("notional=%v odds=%v: got %q want %q", c.notional, c.odds, got, c.want)
 			}
 		})
-	}
-}
-
-func TestMultiplierTier(t *testing.T) {
-	th := defaultThresholds()
-	cases := []struct {
-		mul  float64
-		want Severity
-	}{
-		{99, ""},
-		{100, SeverityInfo},
-		{999, SeverityInfo},
-		{1000, SeverityWarning},
-		{9999, SeverityWarning},
-		{10_000, SeverityCritical},
-		{1_000_000, SeverityCritical},
-	}
-	for _, c := range cases {
-		if got := th.MultiplierTier(c.mul); got != c.want {
-			t.Errorf("mul=%v: got %q want %q", c.mul, got, c.want)
-		}
 	}
 }
 

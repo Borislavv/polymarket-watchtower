@@ -51,9 +51,29 @@ func (e *capturingEmitter) of(k anomaly.Kind) []anomaly.Finding {
 
 func defaultThresholds() anomaly.Thresholds {
 	return anomaly.Thresholds{
-		Info:                   anomaly.Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
-		Warning:                anomaly.Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
-		Critical:               anomaly.Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
+		Info: anomaly.Tier{
+			MinNotionalUSD:    10_000,
+			MinOdds:           3,
+			MinProfitUSD:      0, // disabled in legacy detect tests so existing fixtures still fire
+			MinMarketP95Ratio: 1,
+			MinTraderP95Ratio: 1,
+			// MinMultiplier carried for accumulation-detector path only.
+			MinMultiplier: 100,
+		},
+		Warning: anomaly.Tier{
+			MinNotionalUSD:    25_000,
+			MinOdds:           5,
+			MinMarketP95Ratio: 2,
+			MinTraderP95Ratio: 1.5,
+			MinMultiplier:     1_000,
+		},
+		Critical: anomaly.Tier{
+			MinNotionalUSD:    100_000,
+			MinOdds:           8,
+			MinMarketP95Ratio: 4,
+			MinTraderP95Ratio: 2,
+			MinMultiplier:     10_000,
+		},
 		MinBaselineTrades:      20,
 		MinBaselineNotionalUSD: 1_000,
 	}
@@ -119,15 +139,19 @@ func TestNoAlertBelowAbsoluteFloor(t *testing.T) {
 	}
 }
 
-func TestNoAlertBelowMultiplierFloor(t *testing.T) {
+// TestNoAlertBelowMarketP95Ratio pins the v5 tail gate: a trade whose
+// notional sits at or below the market p95 must not fire. Constant-warming
+// at $20k makes p95 = $20k; a $10k bet has ratio 0.5 < Info 1.0×.
+func TestNoAlertBelowMarketP95Ratio(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	m, _ := reg.Get("0xa")
-	warm(loop, m, 30, 500, 0.5, now)
-	// $10k at odds 3 absolute=info, but multiplier = 10000/500=20 → below 100.
+	warm(loop, m, 30, 20_000, 0.5, now)
+	// $10k at odds 3 → notional ≥ Info $10k, odds ≥ 3, but
+	// notional / market.p95 = 10000/20000 = 0.5 < Info 1.0 → no fire.
 	loop.Observe(context.Background(), m, bet(10_000, 1.0/3, "bigfish", now))
 	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("expected no fire, got %+v", got)
+		t.Fatalf("expected no fire below market p95 ratio, got %+v", got)
 	}
 }
 
@@ -147,16 +171,19 @@ func TestInfoAlertFires(t *testing.T) {
 	}
 }
 
-func TestWarningRequiresBoth(t *testing.T) {
+// TestWarningFiresOnAllWarningGates: under v5 a trade that clears EVERY
+// Warning gate fires at Warning directly (conservative-MIN of two ladders
+// is gone). $30k @ odds 6 with market p95 $60 → ratio 500× clears
+// Warning's 2× floor; trader axis disabled so trader gates unenforced.
+func TestWarningFiresOnAllWarningGates(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	m, _ := reg.Get("0xa")
 	warm(loop, m, 30, 60, 0.5, now)
-	// $30k at odds 6, multiplier 30000/60=500 → absolute=warning, multiplier=info → conservative info.
 	loop.Observe(context.Background(), m, bet(30_000, 1.0/6, "mid", now))
 	got := emit.of(anomaly.KindTradeAnomaly)
-	if len(got) != 1 || got[0].Severity != anomaly.SeverityInfo {
-		t.Fatalf("expected conservative info, got %+v", got)
+	if len(got) != 1 || got[0].Severity != anomaly.SeverityWarning {
+		t.Fatalf("expected warning, got %+v", got)
 	}
 }
 
@@ -182,8 +209,11 @@ func TestCriticalRequiresAllThree(t *testing.T) {
 	if tr == nil || tr.NotionalUSD < 699_000 || tr.Odds < 7.99 {
 		t.Fatalf("trade ref: %+v", tr)
 	}
-	if got[0].EffectiveMultiplier < 10_000 {
-		t.Fatalf("multiplier: %v", got[0].EffectiveMultiplier)
+	if got[0].MarketP95Ratio < 100 {
+		t.Fatalf("market p95 ratio must reflect the huge bet vs $60 baseline, got %v", got[0].MarketP95Ratio)
+	}
+	if got[0].ProfitIfWinUSD < 4_000_000 {
+		t.Fatalf("profit if win: got $%v want ~$4.9M", got[0].ProfitIfWinUSD)
 	}
 	if got[0].MarketURL != "https://polymarket.com/event/us-pres-2028" {
 		t.Fatalf("market URL: %q", got[0].MarketURL)
@@ -193,15 +223,25 @@ func TestCriticalRequiresAllThree(t *testing.T) {
 	}
 }
 
-func TestInsufficientBaselineNoAlert(t *testing.T) {
+// TestThinBaselineFiresOnAbsolutePayoffAlone documents the v5 behaviour:
+// when the market baseline is too thin to be ready AND no trader axis is
+// available, the tail gate is unenforced. The trade can still fire on
+// absolute + payoff alone. This is the documented "no baselines ready"
+// branch — the operator-facing payload makes the unenforced gate visible
+// (TailGatePassed=false).
+func TestThinBaselineFiresOnAbsolutePayoffAlone(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, reg, emit := newLoop(t, now, defaultThresholds(), cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 	m, _ := reg.Get("0xa")
-	// only 5 baseline samples
+	// only 5 baseline samples → below MinBaselineTrades=20
 	warm(loop, m, 5, 100, 0.5, now)
 	loop.Observe(context.Background(), m, bet(100_000, 1.0/8, "shark", now))
-	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("expected no fire on thin baseline, got %+v", got)
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 fire on absolute+payoff alone with thin baseline, got %d", len(got))
+	}
+	if got[0].TailGatePassed {
+		t.Errorf("TailGatePassed must be false when no baseline was ready: %+v", got[0])
 	}
 }
 
@@ -537,7 +577,11 @@ func TestMarketMinAgeBlocksTooYoung(t *testing.T) {
 	}
 }
 
-func TestBaselineMinReadySpanBlocksThinSpan(t *testing.T) {
+// TestBaselineMinReadySpanDisablesMarketTailGate documents the v5 contract:
+// when the market baseline's observed span is below BaselineMinReadySpan,
+// the market tail gates are unenforced — but the trade can still fire on
+// absolute+payoff alone (with TailGatePassed=false visible in the payload).
+func TestBaselineMinReadySpanDisablesMarketTailGate(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	start := now.Add(-30 * 24 * time.Hour)
 	end := now.Add(time.Hour)
@@ -562,14 +606,20 @@ func TestBaselineMinReadySpanBlocksThinSpan(t *testing.T) {
 		loop.Observe(context.Background(), m, bet(60, 0.5, "wb", now.Add(-time.Duration(i)*20*time.Second)))
 	}
 	loop.Observe(context.Background(), m, bet(700_000, 1.0/8, "shark", now))
-	if got := emit.all(); len(got) != 0 {
-		t.Fatalf("thin-span baseline must not alert, got %d", len(got))
+	got := emit.of(anomaly.KindTradeAnomaly)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 fire on absolute+payoff with unenforced market tail, got %d", len(got))
+	}
+	if got[0].TailGatePassed {
+		t.Errorf("market tail gate must be marked unenforced when span < BaselineMinReadySpan: %+v", got[0])
 	}
 }
 
-// TestSeverityTableFromStrategy is the canonical table from the strategy
-// document — every row asserts the chosen severity for the new defaults.
-func TestSeverityTableFromStrategy(t *testing.T) {
+// TestSeverityTableFromStrategy_V5 sweeps the v5 tail+payoff strategy with
+// the test defaults (MinProfitUSD=0, MinMarketP95Ratio=1/2/4). The baseline
+// is constant-warmed so p95 == warm median; that means
+// notional/p95 = notional/warmMedian is the deciding tail ratio.
+func TestSeverityTableFromStrategy_V5(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name     string
@@ -579,41 +629,37 @@ func TestSeverityTableFromStrategy(t *testing.T) {
 		wantFire bool
 		wantSev  anomaly.Severity
 	}{
-		// median $100
-		// $100k @ odds 8, mul 1000: absTier=Critical (notional & odds clear),
-		// mulTier=Warning (>=1000, <10000) → conservative-MIN = Warning.
-		{"100k_odds8_mul1000_warning", 100, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
-		{"100k_odds3_mul1000_info", 100, 100_000, 1.0 / 3, true, anomaly.SeverityInfo},
-		{"25k_odds5_mul250_info", 100, 25_000, 1.0 / 5, true, anomaly.SeverityInfo},
-		{"10k_odds3_mul100_info", 100, 10_000, 1.0 / 3, true, anomaly.SeverityInfo},
+		// median $100; ratio = notional/100
+		// $100k @ odds 8: absolute=Critical (≥100k & ≥8), ratio=1000 (≥4) → Critical.
+		{"100k_odds8_critical", 100, 100_000, 1.0 / 8, true, anomaly.SeverityCritical},
+		// $100k @ odds 3: absolute=Info (≥10k & ≥3, but <Warning notional or odds)
+		{"100k_odds3_info", 100, 100_000, 1.0 / 3, true, anomaly.SeverityInfo},
+		// $25k @ odds 5: clears Warning absolute; ratio=250 (≥2) → Warning.
+		{"25k_odds5_warning", 100, 25_000, 1.0 / 5, true, anomaly.SeverityWarning},
+		// $10k @ odds 3: clears Info absolute; ratio=100 (≥1) → Info.
+		{"10k_odds3_info", 100, 10_000, 1.0 / 3, true, anomaly.SeverityInfo},
 		// boundary fails
 		{"9999_odds3_no_fire", 100, 9_999, 1.0 / 3, false, ""},
 		{"10k_odds299_no_fire", 100, 10_000, 1.0 / 2.99, false, ""},
-		// median $60 (just above the $50 baseline dust filter)
-		// $100k @ odds 8 / median 60 → mul≈1666 → conservative-MIN = Warning.
-		{"100k_odds8_mul1666_warning", 60, 100_000, 1.0 / 8, true, anomaly.SeverityWarning},
-		// $1M @ odds 3 / median 60 → absTier=Info (odds 3 < 5 so not Warning),
-		// mulTier=Critical (16666 ≥ 10000) → conservative-MIN = Info.
-		// Single-trade severity caps at Critical; HARD is cluster-only.
-		{"1M_odds3_low_odds_info", 60, 1_000_000, 1.0 / 3, true, anomaly.SeverityInfo},
-		// $100k @ odds 8 / median 1000 → mul=100 → mulTier=Info → conservative = Info.
-		{"100k_odds8_mul100_info", 1_000, 100_000, 1.0 / 8, true, anomaly.SeverityInfo},
-		// Whale-grade insider trade: $300k @ odds 6 / median 60 → mul=5000.
-		// absTier=Warning (odds 6 < 8), mulTier=Warning (5000 < 10000) → Warning.
-		{"300k_odds6_mul5000_warning", 60, 300_000, 1.0 / 6, true, anomaly.SeverityWarning},
-		// Long-shot insider: $150k @ odds 12 / median 60 → mul=2500.
-		// absTier=Critical (150k ≥ 100k ∧ 12 ≥ 8), mulTier=Warning → Warning.
-		{"150k_odds12_mul2500_warning", 60, 150_000, 1.0 / 12, true, anomaly.SeverityWarning},
-		// Genuine top-tier shark: $700k @ odds 10 / median 60 → mul≈11666.
-		// absTier=Critical, mulTier=Critical → conservative-MIN = Critical.
-		{"700k_odds10_mul11666_critical", 60, 700_000, 1.0 / 10, true, anomaly.SeverityCritical},
+		// median $60
+		// $100k @ odds 8: ratio=1666 (≥4) → Critical (all critical gates clear).
+		{"100k_odds8_60base_critical", 60, 100_000, 1.0 / 8, true, anomaly.SeverityCritical},
+		// $1M @ odds 3: absolute=Info (odds <5 disqualifies higher tiers); ratio=16666 → Info.
+		{"1M_odds3_info", 60, 1_000_000, 1.0 / 3, true, anomaly.SeverityInfo},
+		// $100k @ odds 8 / median 1000: ratio=100 (≥4) → Critical.
+		{"100k_odds8_1000base_critical", 1_000, 100_000, 1.0 / 8, true, anomaly.SeverityCritical},
+		// $300k @ odds 6: absolute=Warning (odds <8 stops Critical); ratio=5000 (≥2).
+		{"300k_odds6_warning", 60, 300_000, 1.0 / 6, true, anomaly.SeverityWarning},
+		// $150k @ odds 12: absolute=Critical (≥100k & ≥8); ratio=2500 (≥4) → Critical.
+		{"150k_odds12_critical", 60, 150_000, 1.0 / 12, true, anomaly.SeverityCritical},
+		// $700k @ odds 10: absolute=Critical; ratio=11666 → Critical.
+		{"700k_odds10_critical", 60, 700_000, 1.0 / 10, true, anomaly.SeverityCritical},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			loop, reg, emit := newLoop(t, now, defaultThresholds(),
 				cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99})
 			m, _ := reg.Get("0xa")
-			// Seed baseline at the desired median (notional = c.median).
 			for i := 0; i < 30; i++ {
 				loop.Observe(context.Background(), m, bet(c.median, 0.5, "wb", now))
 			}
@@ -624,8 +670,8 @@ func TestSeverityTableFromStrategy(t *testing.T) {
 				t.Fatalf("fired=%v want=%v findings=%+v", fired, c.wantFire, got)
 			}
 			if fired && got[0].Severity != c.wantSev {
-				t.Fatalf("severity=%s want=%s (multiplier=%v abs=%s mul=%s)",
-					got[0].Severity, c.wantSev, got[0].EffectiveMultiplier, got[0].AbsoluteTier, got[0].MultiplierTier)
+				t.Fatalf("severity=%s want=%s (mp95_ratio=%v)",
+					got[0].Severity, c.wantSev, got[0].MarketP95Ratio)
 			}
 		})
 	}
@@ -741,20 +787,20 @@ func TestFranceFifaHideFromNewStillAlerts(t *testing.T) {
 		t.Fatalf("expected 1 single-trade alert, got %d: %+v", len(got), got)
 	}
 	f := got[0]
-	if f.Severity != anomaly.SeverityInfo {
-		t.Errorf("expected Info (conservative-MIN of abs=Warning, mul=Info), got %s", f.Severity)
-	}
-	if f.AbsoluteTier != anomaly.SeverityWarning {
-		t.Errorf("absolute tier: got %q want warning", f.AbsoluteTier)
-	}
-	if f.MultiplierTier != anomaly.SeverityInfo {
-		t.Errorf("multiplier tier: got %q want info", f.MultiplierTier)
+	// v5 evaluation:
+	//   absolute    : $26,999 ≥ Warning $25k AND 5.66 ≥ Warning 5 → Warning ok
+	//                 $26,999 < Critical $100k → Critical absolute fails
+	//   payoff      : profit $26,999 × (5.66 − 1) ≈ $125k — no gate set in test defaults
+	//   market p95  : 26999/100 ≈ 270 — clears every tier's p95 ratio (1/2/4)
+	// → highest passing tier is Warning.
+	if f.Severity != anomaly.SeverityWarning {
+		t.Errorf("expected Warning under v5 (Critical notional not cleared), got %s", f.Severity)
 	}
 	if f.Trade == nil || f.Trade.NotionalUSD < 26_998 || f.Trade.NotionalUSD > 27_000 {
 		t.Errorf("trade notional: %+v", f.Trade)
 	}
-	if f.EffectiveMultiplier < 200 || f.EffectiveMultiplier > 350 {
-		t.Errorf("multiplier must reflect 26999/100 ≈ 270, got %v", f.EffectiveMultiplier)
+	if f.MarketP95Ratio < 200 || f.MarketP95Ratio > 350 {
+		t.Errorf("market p95 ratio should reflect 26999/100 ≈ 270, got %v", f.MarketP95Ratio)
 	}
 	if !f.Hot && f.LifecyclePct < 75 {
 		t.Errorf("expected lifecycle past 75%%, got %v hot=%v", f.LifecyclePct, f.Hot)

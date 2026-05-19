@@ -1,29 +1,35 @@
-// Package score evaluates one trade against two baselines (market and
-// trader-history) and the configured single-trade thresholds, returning at
-// most one anomaly result. It is pure (no I/O, no clock, no goroutines) and
-// trivial to test exhaustively.
+// Package score evaluates one trade against the market and trader-history
+// distributions and the configured single-trade thresholds. It is pure (no
+// I/O, no clock, no goroutines) and trivial to test exhaustively.
 //
-// A trade fires only when BOTH ladders qualify at Info or above:
+// Strategy v5 — tail + payoff
 //
-//   - Absolute  : trade USD notional ≥ tier floor AND implied odds (1/price)
-//     ≥ tier floor. Guards against tiny bets and against bets at near-even
-//     odds where there's no asymmetric-payoff insider angle.
-//   - Multiplier: effective = max(marketMultiplier, traderMultiplier), where
-//     marketMultiplier = notional / marketMedian (per-bucket) and
-//     traderMultiplier = notional / traderMedian (over the wallet's history).
-//     A trade qualifies if it is anomalous on EITHER axis — a small wallet
-//     making an outsized bet is just as informative as a big bet on a quiet
-//     market, and the surveillance literature treats them as complementary.
+// A trade fires at the highest tier (Critical → Warning → Info) whose every
+// configured gate clears:
 //
-// Final severity is the lower (conservative) of the two ladders — see
-// anomaly.ConservativeMin. Either side below Info ⇒ no alert. The absolute
-// ladder remains the spam filter; the multiplier ladder is the rarity filter.
+//  1. Absolute floors: notional ≥ tier.MinNotionalUSD AND odds ≥ tier.MinOdds.
+//     Pure spam filter, retained from v4.
+//  2. Payoff floor: profitIfWin = notional × (odds − 1) ≥ tier.MinProfitUSD.
+//     Filters "big bet at fair odds" — a $100k stake at 1.05× pays
+//     $5k if it wins, which is not insider-grade. 0 disables.
+//  3. Market tail (enforced only when the market baseline is ready):
+//     notional/marketP95 ≥ tier.MinMarketP95Ratio AND
+//     notional/marketP99 ≥ tier.MinMarketP99Ratio (each 0 disables).
+//  4. Trader tail (enforced only when the trader baseline is ready):
+//     notional/traderP95 ≥ tier.MinTraderP95Ratio AND
+//     notional/traderP99 ≥ tier.MinTraderP99Ratio (each 0 disables).
 //
-// Readiness is the caller's responsibility: pass an empty baseline.Stats
-// (Count=0 or MedianUSD<=0) to disable that axis. The detector enforces
-// MinBaselineTrades, MinBaselineNotionalUSD, BaselineMinReadySpan on the
-// market side and MinTraderHistoryTrades on the trader side before calling
-// Score; this package does NOT re-check those gates.
+// Median multipliers are not deciding gates anymore — they were the v4
+// false-positive source (a $2k bet on a quiet outcome sits 300× above the
+// $6 median while still being below the wallet's own typical trade). They
+// remain accessible via baseline.Stats.MedianUSD for display only.
+//
+// Readiness rules:
+//   - Market ready: market.Count ≥ t.MinBaselineTrades AND
+//     market.TotalUSD ≥ t.MinBaselineNotionalUSD AND market.P95USD > 0.
+//   - Trader ready: trader.Count ≥ t.MinBaselineTrades AND trader.P95USD > 0.
+//     The detector enforces its own additional MinTraderHistoryTrades gate
+//     before calling Score (zero-stats Stats{} disables this axis cleanly).
 //
 // Single-trade severity caps at Critical. HARD is reserved for the cluster
 // detector (multiple sharks converging on one category).
@@ -34,122 +40,183 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 )
 
-// MultiplierAxis names which baseline contributed the effective multiplier.
-// Surfaced in the alert so operators can tell "this fired because the wallet
-// is small" vs "this fired because the market is quiet" at a glance.
-type MultiplierAxis string
-
+// Suppression reasons surfaced on Result.SuppressedReason when Fired=false.
+// Operators see these in the structured detector log even though Telegram
+// never receives a "would-have-fired" message.
 const (
-	MultiplierAxisNone   MultiplierAxis = ""
-	MultiplierAxisMarket MultiplierAxis = "market"
-	MultiplierAxisTrader MultiplierAxis = "trader"
-	MultiplierAxisBoth   MultiplierAxis = "both"
+	SuppressedBelowAbsolute  = "below_min_notional_or_odds"
+	SuppressedBelowPayoff    = "below_min_profit"
+	SuppressedBelowMarketP95 = "below_market_p95_ratio"
+	SuppressedBelowMarketP99 = "below_market_p99_ratio"
+	SuppressedBelowTraderP95 = "below_trader_p95_ratio"
+	SuppressedBelowTraderP99 = "below_trader_p99_ratio"
+	SuppressedInvalidInput   = "invalid_input"
 )
 
-// Result is the outcome of scoring one trade.
+// Result is the outcome of scoring one trade. Even when Fired=false the
+// payoff and ratio fields are populated so a debug/diagnostic caller can
+// inspect why the trade was suppressed.
 type Result struct {
-	Fired               bool
-	Severity            anomaly.Severity // conservative-MIN of absolute and multiplier tiers
-	AbsoluteTier        anomaly.Severity // tier crossed by (notional, odds)
-	MultiplierTier      anomaly.Severity // tier crossed by effective multiplier
-	MarketMultiplier    float64          // notional / market-median (0 if market leg not ready)
-	TraderMultiplier    float64          // notional / trader-median (0 if trader leg not ready)
-	EffectiveMultiplier float64          // max(market, trader) — what the multiplier tier was evaluated on
-	MultiplierAxis      MultiplierAxis   // which axis contributed the effective multiplier
-	Odds                float64          // 1 / price
+	Fired    bool
+	Severity anomaly.Severity
+
+	Odds float64
+
+	GrossPayoutIfWinUSD float64
+	ProfitIfWinUSD      float64
+
+	MarketP95Ratio float64
+	MarketP99Ratio float64
+	TraderP95Ratio float64
+	TraderP99Ratio float64
+
+	// PayoffGatePassed reflects whether the profit floor of the firing
+	// tier (or the Info tier, when no tier fired) was satisfied.
+	PayoffGatePassed bool
+	// TailGatePassed reflects whether the firing tier's tail gates were
+	// satisfied. When neither baseline was ready, the gates are
+	// unenforceable and TailGatePassed=false even on a firing trade.
+	TailGatePassed bool
+
+	// SuppressedReason names the first blocking gate when Fired=false.
+	// Empty when Fired=true or when the input was invalid.
+	SuppressedReason string
 }
 
 // Score evaluates the trade.
 //
 //   - price is the implied probability in (0, 1); odds = 1/price.
-//   - market is the per-bucket distribution. Pass baseline.Stats{} to disable
-//     the market axis (caller's readiness gate failed).
-//   - trader is the wallet's full-history distribution. Pass baseline.Stats{}
-//     to disable the trader axis (wallet too new, or trader unknown).
+//   - market is the per-bucket distribution; pass baseline.Stats{} to mark
+//     the market baseline unavailable.
+//   - trader is the wallet's full-history distribution; pass baseline.Stats{}
+//     to mark the trader axis unavailable.
 //
-// Both axes can be disabled simultaneously: in that case only the absolute
-// tier is computed and no fire is possible. The function is pure.
+// The function is pure.
 func Score(notionalUSD, price float64, market, trader baseline.Stats, t anomaly.Thresholds) Result {
-	if notionalUSD <= 0 || price <= 0 {
-		return Result{}
+	if notionalUSD <= 0 || price <= 0 || price >= 1 {
+		return Result{SuppressedReason: SuppressedInvalidInput}
 	}
 	odds := 1.0 / price
 
-	absoluteTier := t.AbsoluteTier(notionalUSD, odds)
-	if absoluteTier == "" {
-		// Spam filter rejected — no need to evaluate the rarity filter.
-		return Result{Odds: odds}
-	}
-
-	marketMultiplier := multiplierFor(notionalUSD, market, t)
-	traderMultiplier := multiplierFor(notionalUSD, trader, t)
-
-	effective, axis := pickEffective(marketMultiplier, traderMultiplier)
-	if effective <= 0 {
-		// Both axes disabled or no median yet — preserve the v1 contract of
-		// refusing to rank rarity without a baseline.
-		return Result{
-			Odds:             odds,
-			AbsoluteTier:     absoluteTier,
-			MarketMultiplier: marketMultiplier,
-			TraderMultiplier: traderMultiplier,
-		}
-	}
-	multiplierTier := t.MultiplierTier(effective)
-	if multiplierTier == "" {
-		return Result{
-			Odds:                odds,
-			AbsoluteTier:        absoluteTier,
-			MarketMultiplier:    marketMultiplier,
-			TraderMultiplier:    traderMultiplier,
-			EffectiveMultiplier: effective,
-			MultiplierAxis:      axis,
-		}
-	}
-
-	return Result{
-		Fired:               true,
-		Severity:            anomaly.ConservativeMin(absoluteTier, multiplierTier),
-		AbsoluteTier:        absoluteTier,
-		MultiplierTier:      multiplierTier,
-		MarketMultiplier:    marketMultiplier,
-		TraderMultiplier:    traderMultiplier,
-		EffectiveMultiplier: effective,
-		MultiplierAxis:      axis,
+	base := Result{
 		Odds:                odds,
+		GrossPayoutIfWinUSD: notionalUSD * odds,
+		ProfitIfWinUSD:      notionalUSD * (odds - 1),
+		MarketP95Ratio:      safeRatio(notionalUSD, market.P95USD),
+		MarketP99Ratio:      safeRatio(notionalUSD, market.P99USD),
+		TraderP95Ratio:      safeRatio(notionalUSD, trader.P95USD),
+		TraderP99Ratio:      safeRatio(notionalUSD, trader.P99USD),
 	}
+
+	marketReady := market.Count >= t.MinBaselineTrades &&
+		market.TotalUSD >= t.MinBaselineNotionalUSD &&
+		market.P95USD > 0
+	// Trader axis does not gate on TotalUSD: a small wallet's p95 is
+	// still meaningful at low aggregate USD. The detector layer applies
+	// MinTraderHistoryTrades upstream of Score.
+	traderReady := trader.Count >= t.MinBaselineTrades && trader.P95USD > 0
+
+	for _, tier := range []struct {
+		sev  anomaly.Severity
+		spec anomaly.Tier
+	}{
+		{anomaly.SeverityCritical, t.Critical},
+		{anomaly.SeverityWarning, t.Warning},
+		{anomaly.SeverityInfo, t.Info},
+	} {
+		v := evaluateTier(notionalUSD, odds, base.ProfitIfWinUSD,
+			base.MarketP95Ratio, base.MarketP99Ratio,
+			base.TraderP95Ratio, base.TraderP99Ratio,
+			marketReady, traderReady, tier.spec)
+		if v.passed {
+			r := base
+			r.Fired = true
+			r.Severity = tier.sev
+			r.PayoffGatePassed = v.payoffPassed
+			r.TailGatePassed = v.tailPassed
+			return r
+		}
+	}
+
+	// No tier passed — report the strongest blocking gate at the Info
+	// tier (the easiest rung) so operators can see what's holding fires
+	// back. evaluateTier returns the first failing gate; at Info that's
+	// the most lenient evaluation we did.
+	v := evaluateTier(notionalUSD, odds, base.ProfitIfWinUSD,
+		base.MarketP95Ratio, base.MarketP99Ratio,
+		base.TraderP95Ratio, base.TraderP99Ratio,
+		marketReady, traderReady, t.Info)
+	base.SuppressedReason = v.suppression
+	base.PayoffGatePassed = v.payoffPassed
+	return base
 }
 
-// multiplierFor returns notional / median when the supplied baseline clears
-// the count + total + median sanity floors. Returns 0 to signal "axis not
-// ready"; callers treat 0 as "this leg does not contribute".
-//
-// Readiness for the count/total floors is shared between market and trader
-// legs by design — a one-trade baseline gives a one-trade median and is too
-// noisy to rank rarity from, regardless of whose history it is.
-func multiplierFor(notionalUSD float64, bs baseline.Stats, t anomaly.Thresholds) float64 {
-	if bs.Count < t.MinBaselineTrades || bs.TotalUSD < t.MinBaselineNotionalUSD || bs.MedianUSD <= 0 {
+type tierVerdict struct {
+	passed       bool
+	payoffPassed bool
+	tailPassed   bool
+	suppression  string
+}
+
+// evaluateTier checks every configured gate for a single tier in a fixed
+// order: absolute → payoff → market tail → trader tail. Returns the first
+// blocking gate's suppression code when any fails.
+func evaluateTier(
+	notional, odds, profit, mp95, mp99, tp95, tp99 float64,
+	marketReady, traderReady bool,
+	tier anomaly.Tier,
+) tierVerdict {
+	if notional < tier.MinNotionalUSD || (tier.MinOdds > 0 && odds < tier.MinOdds) {
+		return tierVerdict{suppression: SuppressedBelowAbsolute}
+	}
+
+	payoffPassed := tier.MinProfitUSD <= 0 || profit >= tier.MinProfitUSD
+	if !payoffPassed {
+		return tierVerdict{suppression: SuppressedBelowPayoff}
+	}
+
+	// Tail gates are only meaningful when their baseline is ready.
+	// Count enforced gates so TailGatePassed reflects "at least one tail
+	// dimension actually constrained the trade".
+	enforcedTail := 0
+	if marketReady {
+		if tier.MinMarketP95Ratio > 0 {
+			if mp95 < tier.MinMarketP95Ratio {
+				return tierVerdict{payoffPassed: true, suppression: SuppressedBelowMarketP95}
+			}
+			enforcedTail++
+		}
+		if tier.MinMarketP99Ratio > 0 {
+			if mp99 < tier.MinMarketP99Ratio {
+				return tierVerdict{payoffPassed: true, suppression: SuppressedBelowMarketP99}
+			}
+			enforcedTail++
+		}
+	}
+	if traderReady {
+		if tier.MinTraderP95Ratio > 0 {
+			if tp95 < tier.MinTraderP95Ratio {
+				return tierVerdict{payoffPassed: true, suppression: SuppressedBelowTraderP95}
+			}
+			enforcedTail++
+		}
+		if tier.MinTraderP99Ratio > 0 {
+			if tp99 < tier.MinTraderP99Ratio {
+				return tierVerdict{payoffPassed: true, suppression: SuppressedBelowTraderP99}
+			}
+			enforcedTail++
+		}
+	}
+
+	return tierVerdict{passed: true, payoffPassed: payoffPassed, tailPassed: enforcedTail > 0}
+}
+
+// safeRatio guards against division by zero. Returns 0 when the divisor is
+// non-positive — callers treat 0 as "unavailable", which matches the
+// "baseline not ready" semantics.
+func safeRatio(num, denom float64) float64 {
+	if denom <= 0 {
 		return 0
 	}
-	return notionalUSD / bs.MedianUSD
-}
-
-// pickEffective returns the higher of the two multipliers and names the
-// contributing axis. Equal & both non-zero → axis="both" (the trade is an
-// outlier on both axes, which is the strongest single-trade evidence).
-func pickEffective(market, trader float64) (float64, MultiplierAxis) {
-	switch {
-	case market <= 0 && trader <= 0:
-		return 0, MultiplierAxisNone
-	case trader <= 0:
-		return market, MultiplierAxisMarket
-	case market <= 0:
-		return trader, MultiplierAxisTrader
-	case market > trader:
-		return market, MultiplierAxisMarket
-	case trader > market:
-		return trader, MultiplierAxisTrader
-	default: // equal, both > 0
-		return market, MultiplierAxisBoth
-	}
+	return num / denom
 }

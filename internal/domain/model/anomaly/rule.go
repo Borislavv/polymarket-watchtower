@@ -53,53 +53,77 @@ const (
 	ReasonWalletDominatesOutcome = "WALLET_DOMINATES_OUTCOME"
 )
 
-// Tier is one rung on either the absolute (notional+odds) or multiplier ladder.
-// A trade must clear ALL non-zero floors of a tier to qualify at that rung.
+// Tier is one severity rung on the single-trade ladder. A trade qualifies at
+// a tier only when it clears EVERY non-zero floor declared by that tier.
+// Tier semantics (v5 — tail+payoff strategy):
+//
+//   - MinNotionalUSD : absolute trade-size floor (spam filter).
+//   - MinOdds        : implied-odds floor (= 1/price); guards against
+//     near-even-money bets where there is no asymmetric-payoff angle.
+//   - MinProfitUSD   : payoff floor — `notional × (odds−1)`. Filters out
+//     "big bet at fair odds" shapes that scale notional without paying
+//     the operator's attention.
+//   - MinMarketP95Ratio / MinMarketP99Ratio : the trade must sit in the
+//     tail of the per-bucket market distribution. Ratio is
+//     `notional / marketP*`. Gate enforced only when the market
+//     baseline is ready.
+//   - MinTraderP95Ratio / MinTraderP99Ratio : same shape against the
+//     wallet's own history distribution. Gate enforced only when the
+//     trader baseline is ready (count ≥ Thresholds.MinBaselineTrades).
+//
+// A zero floor disables that specific gate. The median multiplier is no
+// longer a deciding gate — see the package doc on score.Score.
 type Tier struct {
-	// MinNotionalUSD is the trade USD notional floor.
 	MinNotionalUSD float64
-	// MinOdds is the implied-odds floor (= 1/price). 0 disables this gate
-	// for the absolute ladder (rarely useful — operators usually keep it set).
+
 	MinOdds float64
-	// MinMultiplier is the (notional / baseline-median) floor on the
-	// multiplier ladder. 0 disables this gate.
+
+	MinProfitUSD float64
+
+	MinMarketP95Ratio float64
+	MinMarketP99Ratio float64
+
+	MinTraderP95Ratio float64
+	MinTraderP99Ratio float64
+
+	// MinMultiplier is the line-total / market-median floor used by the
+	// accumulation detector only. Single-trade scoring ignores it — the
+	// p95/p99 tail ratios above are the v5 replacement for the per-trade
+	// median multiplier gate.
 	MinMultiplier float64
 }
 
 // Thresholds defines the three single-trade severity rungs (Info, Warning,
-// Critical) and the baseline-readiness floors required before any rung can
-// be evaluated.
+// Critical) and the baseline-readiness floors required before the tail
+// gates can be enforced.
 //
-// A trade fires only when BOTH ladders qualify at Info or above:
+// Final severity is the HIGHEST tier whose every configured gate clears.
+// "Conservative-MIN of two ladders" is gone — there is now a single
+// per-tier evaluation that combines absolute size, payoff, and tail.
 //
-//   - Absolute  : trade USD notional ≥ tier.MinNotionalUSD
-//     AND implied odds (1/price) ≥ tier.MinOdds
-//   - Multiplier: trade USD notional / baseline median ≥ tier.MinMultiplier
-//
-// Final severity is the *lower* of the two tier outcomes — the conservative
-// minimum. This keeps precision high: a $1M bet at fair odds isn't called
-// Critical just because the size is huge, and a 10,000× multiplier on a $500
-// bet isn't called Critical just because the ratio is wild. Both signals
-// must be present.
-//
-// Single-trade severity caps at Critical. HARD is reserved for the cluster
-// detector (multiple sharks converging on one category) — a qualitatively
-// different signal that warrants human review.
+// Single-trade severity caps at Critical. HARD is reserved for the
+// cluster detector (multiple sharks converging on one category) — a
+// qualitatively different signal that warrants human review.
 type Thresholds struct {
 	Info     Tier
 	Warning  Tier
 	Critical Tier
 
-	// MinBaselineTrades is the minimum sample count required on the bucket
-	// reservoir before the multiplier ladder is evaluated.
+	// MinBaselineTrades is the minimum sample count required on a
+	// baseline (market OR trader) before its tail percentiles can be
+	// trusted. Below this, gates against that side are skipped (left
+	// unenforced) rather than failed.
 	MinBaselineTrades int
-	// MinBaselineNotionalUSD is the minimum aggregate USD in the reservoir
-	// required before the multiplier ladder is evaluated.
+	// MinBaselineNotionalUSD is the minimum aggregate USD in the
+	// market reservoir required before the market tail gates are
+	// trusted. Does not apply to the trader axis — a small wallet's
+	// p95 is meaningful at low total USD as long as the count clears.
 	MinBaselineNotionalUSD float64
 }
 
 // AbsoluteTier returns the highest rung where notional AND odds both clear
-// the rung's floors, or "" when none qualifies.
+// the rung's floors, or "" when none qualifies. Retained as a public helper
+// for the tier-by-tier evaluator and for diagnostic introspection.
 func (t Thresholds) AbsoluteTier(notionalUSD, odds float64) Severity {
 	switch {
 	case notionalUSD >= t.Critical.MinNotionalUSD && odds >= t.Critical.MinOdds:
@@ -112,22 +136,9 @@ func (t Thresholds) AbsoluteTier(notionalUSD, odds float64) Severity {
 	return ""
 }
 
-// MultiplierTier returns the highest rung the multiplier clears, or "" when
-// it doesn't clear the Info rung.
-func (t Thresholds) MultiplierTier(multiplier float64) Severity {
-	switch {
-	case multiplier >= t.Critical.MinMultiplier:
-		return SeverityCritical
-	case multiplier >= t.Warning.MinMultiplier:
-		return SeverityWarning
-	case multiplier >= t.Info.MinMultiplier:
-		return SeverityInfo
-	}
-	return ""
-}
-
 // ConservativeMin returns the lower (more conservative) of two non-empty
-// severities. Either side empty ⇒ "".
+// severities. Either side empty ⇒ "". Retained because the cluster path
+// and some accumulation paths still compose severities pairwise.
 func ConservativeMin(a, b Severity) Severity {
 	if a == "" || b == "" {
 		return ""

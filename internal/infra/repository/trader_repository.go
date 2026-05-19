@@ -30,6 +30,7 @@ type TraderDistribution struct {
 	MeanNotionalUSD   float64
 	MedianNotionalUSD float64
 	P95NotionalUSD    float64
+	P99NotionalUSD    float64
 	OldestAt          time.Time
 	NewestAt          time.Time
 }
@@ -114,6 +115,7 @@ func (r *TraderRepository) Distribution(ctx context.Context, traderID int64, sin
 		MeanNotionalUSD:   row.MeanNotionalUsd,
 		MedianNotionalUSD: row.MedianNotionalUsd,
 		P95NotionalUSD:    row.P95NotionalUsd,
+		P99NotionalUSD:    row.P99NotionalUsd,
 		OldestAt:          tsTime(row.OldestAt),
 		NewestAt:          tsTime(row.NewestAt),
 	}, nil

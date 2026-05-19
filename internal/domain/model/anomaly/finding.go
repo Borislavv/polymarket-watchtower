@@ -99,6 +99,7 @@ type BaselineRef struct {
 	MedianUSD float64
 	MeanUSD   float64
 	P95USD    float64
+	P99USD    float64
 	SampleN   int
 	// Span is the actual time-span the baseline samples cover (newest minus
 	// oldest). This is what sinks should display — operators must see the
@@ -245,15 +246,26 @@ type Finding struct {
 	Trade          *TradeRef
 	Baseline       *BaselineRef // per-(category,market,outcome) market distribution
 	TraderBaseline *BaselineRef // wallet's full-history distribution (nil when trader axis disabled)
-	AbsoluteTier   Severity     // tier crossed by the (notional, odds) pair
-	MultiplierTier Severity     // tier crossed by the effective multiplier (max of market, trader)
-	// Multiplier components. EffectiveMultiplier is what the tier was
-	// evaluated on; MultiplierAxis names which baseline contributed it
-	// ("market", "trader", "both", or "" when neither axis was ready).
-	MarketMultiplier    float64
-	TraderMultiplier    float64
-	EffectiveMultiplier float64
-	MultiplierAxis      string
+
+	// Payoff (computed from notional and price; surfaced so the Telegram
+	// formatter doesn't redo the math).
+	GrossPayoutIfWinUSD float64 // notional × odds
+	ProfitIfWinUSD      float64 // notional × (odds − 1)
+
+	// Tail ratios — notional divided by the corresponding p95/p99 of
+	// each baseline. 0 means "baseline not ready or percentile missing";
+	// formatter skips zero-valued rows.
+	MarketP95Ratio float64
+	MarketP99Ratio float64
+	TraderP95Ratio float64
+	TraderP99Ratio float64
+
+	// Aggregate gate verdicts. PayoffGatePassed=false on a fired Finding
+	// can only happen if every tier had MinProfitUSD=0 (gate disabled).
+	// TailGatePassed=false means the trade fired on absolute+payoff with
+	// no enforceable tail gate (neither baseline was ready).
+	PayoffGatePassed bool
+	TailGatePassed   bool
 
 	// Cluster fields.
 	Category *CategoryRef

@@ -9,56 +9,39 @@ import (
 )
 
 type PolymarketAlerts struct {
-	ID                  int64
-	DedupKey            string
-	StrategyVersion     string
-	Kind                string
-	Reason              string
-	Severity            string
-	MarketID            *int64
-	TraderID            *int64
-	TradeID             *int64
-	Payload             []byte
-	Status              string
-	TelegramMessageID   *int64
-	SendAttempts        int32
-	LastSendError       *string
-	SentAt              pgtype.Timestamptz
-	CreatedAt           pgtype.Timestamptz
-	UpdatedAt           pgtype.Timestamptz
-	NextRetryAt         pgtype.Timestamptz
-	LastAttemptAt       pgtype.Timestamptz
-	OutcomeStatus       string
-	OutcomeCheckedAt    pgtype.Timestamptz
-	ResolvedAt          pgtype.Timestamptz
-	WinningOutcomeToken *string
-	WinningOutcomeLabel *string
-	DriftStatus         string
-	DriftCheckedAt      pgtype.Timestamptz
-	Clv15m              *float64
-	Clv1h               *float64
-	Clv6h               *float64
-	Clv24h              *float64
-	// Telegram outcome-reaction state. Added by migration 00007.
+	ID                     int64
+	DedupKey               string
+	StrategyVersion        string
+	Kind                   string
+	Reason                 string
+	Severity               string
+	MarketID               *int64
+	TraderID               *int64
+	TradeID                *int64
+	Payload                []byte
+	Status                 string
+	TelegramMessageID      *int64
+	SendAttempts           int32
+	LastSendError          *string
+	SentAt                 pgtype.Timestamptz
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+	NextRetryAt            pgtype.Timestamptz
+	LastAttemptAt          pgtype.Timestamptz
+	OutcomeStatus          string
+	OutcomeCheckedAt       pgtype.Timestamptz
+	ResolvedAt             pgtype.Timestamptz
+	WinningOutcomeToken    *string
+	WinningOutcomeLabel    *string
+	DriftStatus            string
+	DriftCheckedAt         pgtype.Timestamptz
+	Clv15m                 *float64
+	Clv1h                  *float64
+	Clv6h                  *float64
+	Clv24h                 *float64
 	TelegramReactionStatus string
 	TelegramReactionEmoji  *string
 	LastReactionAt         pgtype.Timestamptz
-}
-
-type PolymarketSignalReports struct {
-	ID                int64
-	PeriodType        string
-	PeriodStart       pgtype.Timestamptz
-	PeriodEnd         pgtype.Timestamptz
-	ScheduledAt       pgtype.Timestamptz
-	SentAt            pgtype.Timestamptz
-	Status            string
-	TelegramMessageID *int64
-	LastError         *string
-	Payload           []byte
-	DedupKey          string
-	CreatedAt         pgtype.Timestamptz
-	UpdatedAt         pgtype.Timestamptz
 }
 
 type PolymarketCategories struct {
@@ -107,9 +90,24 @@ type PolymarketMarkets struct {
 	UpdatedAt               pgtype.Timestamptz
 	DeletedAt               pgtype.Timestamptz
 	PurgedAt                pgtype.Timestamptz
-	// Added by migration 00009. NULL when the market has never been
-	// touched by the collect path (first-sight or backfill-only).
+	// Cursor for the collect loop. MAX(traded_at) of trades the COLLECT path persisted. Backfill never updates this column.
 	LastCollectTradedAt pgtype.Timestamptz
+}
+
+type PolymarketSignalReports struct {
+	ID                int64
+	PeriodType        string
+	PeriodStart       pgtype.Timestamptz
+	PeriodEnd         pgtype.Timestamptz
+	ScheduledAt       pgtype.Timestamptz
+	SentAt            pgtype.Timestamptz
+	Status            string
+	TelegramMessageID *int64
+	LastError         *string
+	Payload           []byte
+	DedupKey          string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
 }
 
 type PolymarketTraders struct {

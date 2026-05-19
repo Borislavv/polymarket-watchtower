@@ -418,6 +418,22 @@ func (q *Queries) MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsI
 	return result.RowsAffected(), nil
 }
 
+const marketCollectCursor = `-- name: MarketCollectCursor :one
+SELECT last_collect_traded_at
+FROM polymarket_markets
+WHERE id = $1
+`
+
+// Reads the per-market collect cursor. Returns NULL when the market
+// has never been touched by collect (first-sight or backfill-only),
+// which the caller maps to the BootstrapLookback default.
+func (q *Queries) MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, marketCollectCursor, id)
+	var last_collect_traded_at pgtype.Timestamptz
+	err := row.Scan(&last_collect_traded_at)
+	return last_collect_traded_at, err
+}
+
 const requeueResumedMarket = `-- name: RequeueResumedMarket :exec
 UPDATE polymarket_markets
 SET active          = TRUE,
@@ -466,6 +482,29 @@ type UnlinkMarketCategoriesNotInParams struct {
 
 func (q *Queries) UnlinkMarketCategoriesNotIn(ctx context.Context, arg UnlinkMarketCategoriesNotInParams) error {
 	_, err := q.db.Exec(ctx, unlinkMarketCategoriesNotIn, arg.MarketID, arg.KeepCategoryIds)
+	return err
+}
+
+const updateMarketCollectCursor = `-- name: UpdateMarketCollectCursor :exec
+UPDATE polymarket_markets
+SET last_collect_traded_at = $1::timestamptz,
+    updated_at             = NOW()
+WHERE id = $2::bigint
+  AND (last_collect_traded_at IS NULL OR last_collect_traded_at < $1::timestamptz)
+`
+
+type UpdateMarketCollectCursorParams struct {
+	TradedAt pgtype.Timestamptz
+	MarketID int64
+}
+
+// Advances polymarket_markets.last_collect_traded_at to the supplied
+// timestamp, but only when it is strictly greater than the current
+// value (or the current value is NULL). Idempotent — re-running
+// against the same trade batch is a no-op. Called by persist.Sink
+// after collect's UpsertBatch; backfill never calls this.
+func (q *Queries) UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error {
+	_, err := q.db.Exec(ctx, updateMarketCollectCursor, arg.TradedAt, arg.MarketID)
 	return err
 }
 
@@ -571,39 +610,4 @@ type UpsertMarketOutcomeParams struct {
 func (q *Queries) UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error {
 	_, err := q.db.Exec(ctx, upsertMarketOutcome, arg.MarketID, arg.TokenID, arg.Label)
 	return err
-}
-
-const updateMarketCollectCursor = `-- name: UpdateMarketCollectCursor :exec
-UPDATE polymarket_markets
-SET last_collect_traded_at = $2::timestamptz,
-    updated_at             = NOW()
-WHERE id = $1::bigint
-  AND (last_collect_traded_at IS NULL OR last_collect_traded_at < $2::timestamptz)
-`
-
-type UpdateMarketCollectCursorParams struct {
-	MarketID int64
-	TradedAt pgtype.Timestamptz
-}
-
-// Advances the per-market collect cursor monotonically. No-op when
-// the supplied timestamp is older than the persisted one.
-func (q *Queries) UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error {
-	_, err := q.db.Exec(ctx, updateMarketCollectCursor, arg.MarketID, arg.TradedAt)
-	return err
-}
-
-const marketCollectCursor = `-- name: MarketCollectCursor :one
-SELECT last_collect_traded_at
-FROM polymarket_markets
-WHERE id = $1
-`
-
-// Returns NULL when the market has never been touched by the collect
-// path. Caller maps NULL to "use BootstrapLookback".
-func (q *Queries) MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, marketCollectCursor, id)
-	var ts pgtype.Timestamptz
-	err := row.Scan(&ts)
-	return ts, err
 }

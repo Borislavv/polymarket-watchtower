@@ -109,6 +109,7 @@ func (p *Provider) Stats(ctx context.Context, wallet string) (baseline.Stats, er
 		MeanUSD:    dist.MeanNotionalUSD,
 		MedianUSD:  dist.MedianNotionalUSD,
 		P95USD:     dist.P95NotionalUSD,
+		P99USD:     dist.P99NotionalUSD,
 		TotalUSD:   dist.TotalNotionalUSD,
 		SpanActual: dist.Span(),
 		OldestAt:   dist.OldestAt,

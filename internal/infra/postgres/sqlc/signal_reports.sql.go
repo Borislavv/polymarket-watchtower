@@ -11,6 +11,250 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const latestSignalReportByPeriodType = `-- name: LatestSignalReportByPeriodType :one
+SELECT id, period_type, period_start, period_end, scheduled_at, sent_at,
+       status, telegram_message_id, last_error, payload, dedup_key,
+       created_at, updated_at
+FROM polymarket_signal_reports
+WHERE period_type = $1
+ORDER BY period_end DESC
+LIMIT 1
+`
+
+// Returns the most recent signal report of the given period_type, or
+// empty if none exists. Used at scheduler startup to decide whether
+// we missed a tick.
+func (q *Queries) LatestSignalReportByPeriodType(ctx context.Context, periodType string) (PolymarketSignalReports, error) {
+	row := q.db.QueryRow(ctx, latestSignalReportByPeriodType, periodType)
+	var i PolymarketSignalReports
+	err := row.Scan(
+		&i.ID,
+		&i.PeriodType,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ScheduledAt,
+		&i.SentAt,
+		&i.Status,
+		&i.TelegramMessageID,
+		&i.LastError,
+		&i.Payload,
+		&i.DedupKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markSignalReportFailed = `-- name: MarkSignalReportFailed :exec
+UPDATE polymarket_signal_reports
+SET status     = 'failed',
+    last_error = $2::text,
+    updated_at = NOW()
+WHERE id = $1
+`
+
+type MarkSignalReportFailedParams struct {
+	ID        int64
+	LastError string
+}
+
+// Captures a send failure on the row. The scheduler treats failed rows
+// as permanently failed for the period (idempotency over correctness:
+// a flapping Telegram send is far worse than a missed report).
+func (q *Queries) MarkSignalReportFailed(ctx context.Context, arg MarkSignalReportFailedParams) error {
+	_, err := q.db.Exec(ctx, markSignalReportFailed, arg.ID, arg.LastError)
+	return err
+}
+
+const markSignalReportSent = `-- name: MarkSignalReportSent :exec
+UPDATE polymarket_signal_reports
+SET status              = 'sent',
+    sent_at             = NOW(),
+    telegram_message_id = $2::bigint,
+    last_error          = NULL,
+    updated_at          = NOW()
+WHERE id = $1
+`
+
+type MarkSignalReportSentParams struct {
+	ID                int64
+	TelegramMessageID *int64
+}
+
+// Flips the row to 'sent' and persists the upstream Telegram message
+// id. Called once per successful send. last_error is intentionally
+// cleared on success so a row that recovered after a transient failure
+// doesn't keep its stale error text.
+func (q *Queries) MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error {
+	_, err := q.db.Exec(ctx, markSignalReportSent, arg.ID, arg.TelegramMessageID)
+	return err
+}
+
+const signalQualityAggregate = `-- name: SignalQualityAggregate :one
+SELECT
+    COUNT(*)::bigint                                                                           AS total_alerts,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint                       AS success_count,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint                         AS failure_count,
+    COUNT(*) FILTER (WHERE outcome_status = 'unknown')::bigint                                AS ambiguous_count,
+    COUNT(*) FILTER (WHERE outcome_status = 'unavailable')::bigint                            AS unavailable_count,
+    COUNT(*) FILTER (WHERE outcome_status = 'pending')::bigint                                AS pending_count,
+    COALESCE(AVG(clv_24h) FILTER (WHERE clv_24h IS NOT NULL), 0)::double precision            AS avg_clv_24h,
+    COUNT(*) FILTER (WHERE clv_24h IS NOT NULL AND clv_24h > 0)::bigint                       AS positive_clv_24h_count,
+    COUNT(*) FILTER (WHERE clv_24h IS NOT NULL)::bigint                                       AS clv_24h_sample_count
+FROM polymarket_alerts
+WHERE sent_at IS NOT NULL
+  AND sent_at >= $1::timestamptz
+  AND sent_at <  $2::timestamptz
+`
+
+type SignalQualityAggregateParams struct {
+	PeriodStart pgtype.Timestamptz
+	PeriodEnd   pgtype.Timestamptz
+}
+
+type SignalQualityAggregateRow struct {
+	TotalAlerts         int64
+	SuccessCount        int64
+	FailureCount        int64
+	AmbiguousCount      int64
+	UnavailableCount    int64
+	PendingCount        int64
+	AvgClv24h           float64
+	PositiveClv24hCount int64
+	Clv24hSampleCount   int64
+}
+
+// One-shot aggregate that powers the daily/weekly/monthly/quarterly/yearly
+// reports. Returns total counts, resolved counts, success/failure
+// counts, and the CLV-summary fields — all in a single roundtrip so
+// the renderer stays pure and the worker stays fast.
+func (q *Queries) SignalQualityAggregate(ctx context.Context, arg SignalQualityAggregateParams) (SignalQualityAggregateRow, error) {
+	row := q.db.QueryRow(ctx, signalQualityAggregate, arg.PeriodStart, arg.PeriodEnd)
+	var i SignalQualityAggregateRow
+	err := row.Scan(
+		&i.TotalAlerts,
+		&i.SuccessCount,
+		&i.FailureCount,
+		&i.AmbiguousCount,
+		&i.UnavailableCount,
+		&i.PendingCount,
+		&i.AvgClv24h,
+		&i.PositiveClv24hCount,
+		&i.Clv24hSampleCount,
+	)
+	return i, err
+}
+
+const signalQualityByKind = `-- name: SignalQualityByKind :many
+SELECT
+    kind                                                                AS kind,
+    COUNT(*)::bigint                                                    AS total,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint AS success,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint   AS failure,
+    COUNT(*) FILTER (WHERE outcome_status IN ('pending','unavailable','unknown'))::bigint AS unresolved
+FROM polymarket_alerts
+WHERE sent_at IS NOT NULL
+  AND sent_at >= $1::timestamptz
+  AND sent_at <  $2::timestamptz
+GROUP BY kind
+ORDER BY total DESC
+`
+
+type SignalQualityByKindParams struct {
+	PeriodStart pgtype.Timestamptz
+	PeriodEnd   pgtype.Timestamptz
+}
+
+type SignalQualityByKindRow struct {
+	Kind       string
+	Total      int64
+	Success    int64
+	Failure    int64
+	Unresolved int64
+}
+
+// Per-kind breakdown for the report's "by kind" section.
+func (q *Queries) SignalQualityByKind(ctx context.Context, arg SignalQualityByKindParams) ([]SignalQualityByKindRow, error) {
+	rows, err := q.db.Query(ctx, signalQualityByKind, arg.PeriodStart, arg.PeriodEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SignalQualityByKindRow
+	for rows.Next() {
+		var i SignalQualityByKindRow
+		if err := rows.Scan(
+			&i.Kind,
+			&i.Total,
+			&i.Success,
+			&i.Failure,
+			&i.Unresolved,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const signalQualityBySeverity = `-- name: SignalQualityBySeverity :many
+SELECT
+    severity                                                            AS severity,
+    COUNT(*)::bigint                                                    AS total,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint AS success,
+    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint   AS failure,
+    COUNT(*) FILTER (WHERE outcome_status IN ('pending','unavailable','unknown'))::bigint AS unresolved
+FROM polymarket_alerts
+WHERE sent_at IS NOT NULL
+  AND sent_at >= $1::timestamptz
+  AND sent_at <  $2::timestamptz
+GROUP BY severity
+ORDER BY total DESC
+`
+
+type SignalQualityBySeverityParams struct {
+	PeriodStart pgtype.Timestamptz
+	PeriodEnd   pgtype.Timestamptz
+}
+
+type SignalQualityBySeverityRow struct {
+	Severity   string
+	Total      int64
+	Success    int64
+	Failure    int64
+	Unresolved int64
+}
+
+// Per-severity breakdown for the report's "by severity" section.
+func (q *Queries) SignalQualityBySeverity(ctx context.Context, arg SignalQualityBySeverityParams) ([]SignalQualityBySeverityRow, error) {
+	rows, err := q.db.Query(ctx, signalQualityBySeverity, arg.PeriodStart, arg.PeriodEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SignalQualityBySeverityRow
+	for rows.Next() {
+		var i SignalQualityBySeverityRow
+		if err := rows.Scan(
+			&i.Severity,
+			&i.Total,
+			&i.Success,
+			&i.Failure,
+			&i.Unresolved,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const tryCreatePendingSignalReport = `-- name: TryCreatePendingSignalReport :one
 INSERT INTO polymarket_signal_reports (
     period_type, period_start, period_end, scheduled_at,
@@ -37,199 +281,27 @@ type TryCreatePendingSignalReportParams struct {
 	DedupKey    string
 }
 
-// Idempotent claim. ON CONFLICT DO NOTHING + RETURNING id means a
-// "no row returned" result on a duplicate, mapped to pgx.ErrNoRows by
-// the caller — that's the "another worker already inserted" path.
+// Idempotent claim primitive for the signal-quality reports scheduler.
+// A worker that has decided "it is time to send the daily report for
+// 2026-05-17" calls this with the canonical dedup_key
+//
+//	signal-report:<period_type>:<period_start>:<period_end>
+//
+// The UNIQUE constraint on dedup_key collapses concurrent claims to
+// exactly one row; ON CONFLICT DO NOTHING + the RETURNING-or-empty
+// pattern means the caller can distinguish "I won" (row returned)
+// from "someone else already inserted" (no row). Restart-safe by
+// construction.
 func (q *Queries) TryCreatePendingSignalReport(ctx context.Context, arg TryCreatePendingSignalReportParams) (int64, error) {
 	row := q.db.QueryRow(ctx, tryCreatePendingSignalReport,
-		arg.PeriodType, arg.PeriodStart, arg.PeriodEnd, arg.ScheduledAt,
-		arg.Payload, arg.DedupKey,
+		arg.PeriodType,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+		arg.ScheduledAt,
+		arg.Payload,
+		arg.DedupKey,
 	)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
-}
-
-const markSignalReportSent = `-- name: MarkSignalReportSent :exec
-UPDATE polymarket_signal_reports
-SET status              = 'sent',
-    sent_at             = NOW(),
-    telegram_message_id = $2::bigint,
-    last_error          = NULL,
-    updated_at          = NOW()
-WHERE id = $1
-`
-
-type MarkSignalReportSentParams struct {
-	ID                int64
-	TelegramMessageID *int64
-}
-
-func (q *Queries) MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error {
-	_, err := q.db.Exec(ctx, markSignalReportSent, arg.ID, arg.TelegramMessageID)
-	return err
-}
-
-const markSignalReportFailed = `-- name: MarkSignalReportFailed :exec
-UPDATE polymarket_signal_reports
-SET status     = 'failed',
-    last_error = $2::text,
-    updated_at = NOW()
-WHERE id = $1
-`
-
-type MarkSignalReportFailedParams struct {
-	ID        int64
-	LastError string
-}
-
-func (q *Queries) MarkSignalReportFailed(ctx context.Context, arg MarkSignalReportFailedParams) error {
-	_, err := q.db.Exec(ctx, markSignalReportFailed, arg.ID, arg.LastError)
-	return err
-}
-
-const latestSignalReportByPeriodType = `-- name: LatestSignalReportByPeriodType :one
-SELECT id, period_type, period_start, period_end, scheduled_at, sent_at,
-       status, telegram_message_id, last_error, payload, dedup_key,
-       created_at, updated_at
-FROM polymarket_signal_reports
-WHERE period_type = $1
-ORDER BY period_end DESC
-LIMIT 1
-`
-
-func (q *Queries) LatestSignalReportByPeriodType(ctx context.Context, periodType string) (PolymarketSignalReports, error) {
-	row := q.db.QueryRow(ctx, latestSignalReportByPeriodType, periodType)
-	var i PolymarketSignalReports
-	err := row.Scan(
-		&i.ID, &i.PeriodType, &i.PeriodStart, &i.PeriodEnd, &i.ScheduledAt, &i.SentAt,
-		&i.Status, &i.TelegramMessageID, &i.LastError, &i.Payload, &i.DedupKey,
-		&i.CreatedAt, &i.UpdatedAt,
-	)
-	return i, err
-}
-
-const signalQualityAggregate = `-- name: SignalQualityAggregate :one
-SELECT
-    COUNT(*)::bigint                                                                     AS total_alerts,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint                 AS success_count,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint                   AS failure_count,
-    COUNT(*) FILTER (WHERE outcome_status = 'unknown')::bigint                          AS ambiguous_count,
-    COUNT(*) FILTER (WHERE outcome_status = 'unavailable')::bigint                      AS unavailable_count,
-    COUNT(*) FILTER (WHERE outcome_status = 'pending')::bigint                          AS pending_count,
-    COALESCE(AVG(clv_24h) FILTER (WHERE clv_24h IS NOT NULL), 0)::double precision      AS avg_clv_24h,
-    COUNT(*) FILTER (WHERE clv_24h IS NOT NULL AND clv_24h > 0)::bigint                 AS positive_clv_24h_count,
-    COUNT(*) FILTER (WHERE clv_24h IS NOT NULL)::bigint                                 AS clv_24h_sample_count
-FROM polymarket_alerts
-WHERE sent_at IS NOT NULL
-  AND sent_at >= $1::timestamptz
-  AND sent_at <  $2::timestamptz
-`
-
-type SignalQualityAggregateParams struct {
-	PeriodStart pgtype.Timestamptz
-	PeriodEnd   pgtype.Timestamptz
-}
-
-type SignalQualityAggregateRow struct {
-	TotalAlerts         int64
-	SuccessCount        int64
-	FailureCount        int64
-	AmbiguousCount      int64
-	UnavailableCount    int64
-	PendingCount        int64
-	AvgClv24h           float64
-	PositiveClv24hCount int64
-	Clv24hSampleCount   int64
-}
-
-func (q *Queries) SignalQualityAggregate(ctx context.Context, arg SignalQualityAggregateParams) (SignalQualityAggregateRow, error) {
-	row := q.db.QueryRow(ctx, signalQualityAggregate, arg.PeriodStart, arg.PeriodEnd)
-	var i SignalQualityAggregateRow
-	err := row.Scan(
-		&i.TotalAlerts, &i.SuccessCount, &i.FailureCount, &i.AmbiguousCount,
-		&i.UnavailableCount, &i.PendingCount,
-		&i.AvgClv24h, &i.PositiveClv24hCount, &i.Clv24hSampleCount,
-	)
-	return i, err
-}
-
-const signalQualityByKind = `-- name: SignalQualityByKind :many
-SELECT
-    kind,
-    COUNT(*)::bigint                                                                  AS total,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint              AS success,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint                AS failure,
-    COUNT(*) FILTER (WHERE outcome_status IN ('pending','unavailable','unknown'))::bigint AS unresolved
-FROM polymarket_alerts
-WHERE sent_at IS NOT NULL
-  AND sent_at >= $1::timestamptz
-  AND sent_at <  $2::timestamptz
-GROUP BY kind
-ORDER BY total DESC
-`
-
-type SignalQualityByKindRow struct {
-	Kind       string
-	Total      int64
-	Success    int64
-	Failure    int64
-	Unresolved int64
-}
-
-func (q *Queries) SignalQualityByKind(ctx context.Context, arg SignalQualityAggregateParams) ([]SignalQualityByKindRow, error) {
-	rows, err := q.db.Query(ctx, signalQualityByKind, arg.PeriodStart, arg.PeriodEnd)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []SignalQualityByKindRow{}
-	for rows.Next() {
-		var r SignalQualityByKindRow
-		if err := rows.Scan(&r.Kind, &r.Total, &r.Success, &r.Failure, &r.Unresolved); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-const signalQualityBySeverity = `-- name: SignalQualityBySeverity :many
-SELECT
-    severity,
-    COUNT(*)::bigint                                                                  AS total,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_correct')::bigint              AS success,
-    COUNT(*) FILTER (WHERE outcome_status = 'resolved_wrong')::bigint                AS failure,
-    COUNT(*) FILTER (WHERE outcome_status IN ('pending','unavailable','unknown'))::bigint AS unresolved
-FROM polymarket_alerts
-WHERE sent_at IS NOT NULL
-  AND sent_at >= $1::timestamptz
-  AND sent_at <  $2::timestamptz
-GROUP BY severity
-ORDER BY total DESC
-`
-
-type SignalQualityBySeverityRow struct {
-	Severity   string
-	Total      int64
-	Success    int64
-	Failure    int64
-	Unresolved int64
-}
-
-func (q *Queries) SignalQualityBySeverity(ctx context.Context, arg SignalQualityAggregateParams) ([]SignalQualityBySeverityRow, error) {
-	rows, err := q.db.Query(ctx, signalQualityBySeverity, arg.PeriodStart, arg.PeriodEnd)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []SignalQualityBySeverityRow{}
-	for rows.Next() {
-		var r SignalQualityBySeverityRow
-		if err := rows.Scan(&r.Severity, &r.Total, &r.Success, &r.Failure, &r.Unresolved); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
 }

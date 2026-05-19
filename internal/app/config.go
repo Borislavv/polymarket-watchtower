@@ -245,17 +245,53 @@ type CategoryFilterConfig struct {
 // an operator-facing env (it has a hardcoded default inside the
 // in-memory dev-only fallback).
 type AnomalyConfig struct {
-	// Single-trade severity ladders. Both ladders must qualify at the same
-	// rung or higher; final severity is the lower of the two.
+	// Single-trade severity ladders (v5 tail+payoff strategy).
+	//
+	// A trade fires at the highest tier whose every configured gate
+	// clears: absolute (notional + odds), payoff (profit if win), market
+	// tail (notional / market.p95 or .p99), and trader tail
+	// (notional / trader.p95 or .p99). Median multipliers are no longer
+	// deciding gates — see internal/app/usecase/analytics/score doc.
 	InfoMinNotionalUSD     float64 `env:"ALERT_INFO_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
 	InfoMinOdds            float64 `env:"ALERT_INFO_MIN_ODDS" envDefault:"3" validate:"gte=1"`
-	InfoMinMultiplier      float64 `env:"ALERT_INFO_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
 	WarningMinNotionalUSD  float64 `env:"ALERT_WARNING_MIN_NOTIONAL_USD" envDefault:"25000" validate:"gte=0"`
 	WarningMinOdds         float64 `env:"ALERT_WARNING_MIN_ODDS" envDefault:"5" validate:"gte=1"`
-	WarningMinMultiplier   float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 	CriticalMinNotionalUSD float64 `env:"ALERT_CRITICAL_MIN_NOTIONAL_USD" envDefault:"100000" validate:"gte=0"`
 	CriticalMinOdds        float64 `env:"ALERT_CRITICAL_MIN_ODDS" envDefault:"8" validate:"gte=1"`
-	CriticalMinMultiplier  float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
+
+	// Payoff floor — profit if win = notional × (odds − 1). 0 disables
+	// the gate for that tier. Filters "big bet at fair odds" shapes.
+	InfoMinProfitUSD     float64 `env:"ALERT_INFO_MIN_PROFIT_USD" envDefault:"5000" validate:"gte=0"`
+	WarningMinProfitUSD  float64 `env:"ALERT_WARNING_MIN_PROFIT_USD" envDefault:"15000" validate:"gte=0"`
+	CriticalMinProfitUSD float64 `env:"ALERT_CRITICAL_MIN_PROFIT_USD" envDefault:"50000" validate:"gte=0"`
+
+	// Market-tail floors — required ratio of notional / market.pXX. 0
+	// disables the gate. Enforced only when the market baseline is ready.
+	InfoMinMarketP95Ratio     float64 `env:"ALERT_INFO_MIN_MARKET_P95_RATIO" envDefault:"1" validate:"gte=0"`
+	WarningMinMarketP95Ratio  float64 `env:"ALERT_WARNING_MIN_MARKET_P95_RATIO" envDefault:"2" validate:"gte=0"`
+	CriticalMinMarketP95Ratio float64 `env:"ALERT_CRITICAL_MIN_MARKET_P95_RATIO" envDefault:"4" validate:"gte=0"`
+	InfoMinMarketP99Ratio     float64 `env:"ALERT_INFO_MIN_MARKET_P99_RATIO" envDefault:"0" validate:"gte=0"`
+	WarningMinMarketP99Ratio  float64 `env:"ALERT_WARNING_MIN_MARKET_P99_RATIO" envDefault:"0" validate:"gte=0"`
+	CriticalMinMarketP99Ratio float64 `env:"ALERT_CRITICAL_MIN_MARKET_P99_RATIO" envDefault:"0" validate:"gte=0"`
+
+	// Trader-tail floors — required ratio of notional / trader.pXX. 0
+	// disables. Enforced only when the trader baseline is ready (count
+	// ≥ SingleMinBaselineTrades AND trader.P95 > 0). The detector's
+	// MinTraderHistoryTrades gate is applied upstream of the scorer.
+	InfoMinTraderP95Ratio     float64 `env:"ALERT_INFO_MIN_TRADER_P95_RATIO" envDefault:"1" validate:"gte=0"`
+	WarningMinTraderP95Ratio  float64 `env:"ALERT_WARNING_MIN_TRADER_P95_RATIO" envDefault:"1.5" validate:"gte=0"`
+	CriticalMinTraderP95Ratio float64 `env:"ALERT_CRITICAL_MIN_TRADER_P95_RATIO" envDefault:"2" validate:"gte=0"`
+	InfoMinTraderP99Ratio     float64 `env:"ALERT_INFO_MIN_TRADER_P99_RATIO" envDefault:"0" validate:"gte=0"`
+	WarningMinTraderP99Ratio  float64 `env:"ALERT_WARNING_MIN_TRADER_P99_RATIO" envDefault:"0" validate:"gte=0"`
+	CriticalMinTraderP99Ratio float64 `env:"ALERT_CRITICAL_MIN_TRADER_P99_RATIO" envDefault:"0" validate:"gte=0"`
+
+	// Accumulation-only multiplier floors (line total / market median).
+	// Consumed by analytics/accumulation.Detector; single-trade scoring
+	// ignores these. Retained as ALERT_*_MIN_MULTIPLIER for env-key
+	// continuity with the v4 accumulation tuning.
+	InfoMinMultiplier     float64 `env:"ALERT_INFO_MIN_MULTIPLIER" envDefault:"100" validate:"gte=0"`
+	WarningMinMultiplier  float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
+	CriticalMinMultiplier float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
 
 	// Baseline shape. Every valid trade enters the reservoir — there is no
 	// per-trade size filter. Readiness gates below protect against thin or

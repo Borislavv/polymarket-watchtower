@@ -314,9 +314,12 @@ func writeTradeHeader(b *strings.Builder, f anomaly.Finding) {
 	if f.Hot {
 		hot = " · HOT"
 	}
-	fmt.Fprintf(b, "<b>%s: x%s · $%s%s · %s</b>\n",
+	// v5 header: severity, profit-if-win (the operator-relevant magnitude),
+	// notional, optional HOT tag, title. Multiplier-x was removed when the
+	// median multiplier stopped being a deciding gate.
+	fmt.Fprintf(b, "<b>%s: profit $%s · $%s%s · %s</b>\n",
 		strings.ToUpper(string(f.Severity)),
-		multiplierFmt(f.EffectiveMultiplier),
+		money(f.ProfitIfWinUSD),
 		money(notional(f)),
 		hot,
 		html.EscapeString(title),
@@ -344,43 +347,40 @@ func writeClusterHeader(b *strings.Builder, f anomaly.Finding) {
 
 func writeWhy(b *strings.Builder, f anomaly.Finding) {
 	b.WriteString("\n<b>Why</b>\n")
-	if f.EffectiveMultiplier > 0 {
-		axis := f.MultiplierAxis
-		switch axis {
-		case "market":
-			if f.Baseline != nil {
-				fmt.Fprintf(b, "• <b>x%s</b> above market baseline median ($%s)\n",
-					multiplierFmt(f.MarketMultiplier), money(f.Baseline.MedianUSD))
-			}
-		case "trader":
-			if f.TraderBaseline != nil {
-				fmt.Fprintf(b, "• <b>x%s</b> above wallet's typical trade ($%s median)\n",
-					multiplierFmt(f.TraderMultiplier), money(f.TraderBaseline.MedianUSD))
-			}
-		case "both":
-			fmt.Fprintf(b, "• <b>x%s</b> above both market and wallet medians (rare on both axes)\n",
-				multiplierFmt(f.EffectiveMultiplier))
-		default:
-			fmt.Fprintf(b, "• <b>x%s</b> above baseline median\n", multiplierFmt(f.EffectiveMultiplier))
-		}
+	// Payoff first — the operator-relevant magnitude.
+	if f.ProfitIfWinUSD > 0 {
+		fmt.Fprintf(b, "• payoff if win: profit <b>$%s</b> (gross $%s)\n",
+			money(f.ProfitIfWinUSD), money(f.GrossPayoutIfWinUSD))
+	}
+	// Market tail row — only when the market baseline was ready.
+	if f.Baseline != nil && f.Baseline.SampleN > 0 && (f.MarketP95Ratio > 0 || f.MarketP99Ratio > 0) {
+		writeTailRow(b, "market tail", notional(f), f.MarketP95Ratio, f.Baseline.P95USD, f.MarketP99Ratio, f.Baseline.P99USD)
+	}
+	// Trader tail row — only when the trader baseline was ready.
+	if f.TraderBaseline != nil && f.TraderBaseline.SampleN > 0 && (f.TraderP95Ratio > 0 || f.TraderP99Ratio > 0) {
+		writeTailRow(b, "trader tail", notional(f), f.TraderP95Ratio, f.TraderBaseline.P95USD, f.TraderP99Ratio, f.TraderBaseline.P99USD)
 	}
 	if f.Trade != nil && f.Trade.Odds > 0 {
 		fmt.Fprintf(b, "• odds <b>%s</b>, implied probability <b>%.1f%%</b>\n",
 			multiplierFmt(f.Trade.Odds), f.Trade.Price*100)
 	}
 	if f.Baseline != nil {
-		fmt.Fprintf(b, "• market baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, span %s\n",
-			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD), money(f.Baseline.P95USD),
+		fmt.Fprintf(b, "• market baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, p99 $%s, span %s\n",
+			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD),
+			money(f.Baseline.P95USD), money(f.Baseline.P99USD),
 			humanDuration(f.Baseline.Span))
 	}
 	if f.TraderBaseline != nil {
-		fmt.Fprintf(b, "• trader history: <b>%d</b> trades, median $%s, p95 $%s, span %s\n",
-			f.TraderBaseline.SampleN, money(f.TraderBaseline.MedianUSD), money(f.TraderBaseline.P95USD),
+		fmt.Fprintf(b, "• trader history: <b>%d</b> trades, median $%s, p95 $%s, p99 $%s, span %s\n",
+			f.TraderBaseline.SampleN, money(f.TraderBaseline.MedianUSD),
+			money(f.TraderBaseline.P95USD), money(f.TraderBaseline.P99USD),
 			humanDuration(f.TraderBaseline.Span))
 	}
-	if f.AbsoluteTier != "" || f.MultiplierTier != "" {
-		fmt.Fprintf(b, "• tiers: absolute=<code>%s</code> multiplier=<code>%s</code> (axis=%s) → final=<b>%s</b>\n",
-			string(f.AbsoluteTier), string(f.MultiplierTier), nonEmptyOr(f.MultiplierAxis, "n/a"), string(f.Severity))
+	if !f.PayoffGatePassed && f.ProfitIfWinUSD > 0 {
+		b.WriteString("• payoff gate: unenforced (MinProfitUSD=0 for tier)\n")
+	}
+	if !f.TailGatePassed {
+		b.WriteString("• tail gate: unenforced (no baseline was ready)\n")
 	}
 	if f.LifecyclePct > 0 {
 		hot := ""
@@ -432,6 +432,34 @@ func writeNewWallet(b *strings.Builder, f anomaly.Finding) {
 	}
 	// Fallback for the history-only path (FirstSeenAt missing).
 	fmt.Fprintf(b, "• <b>new wallet</b>: %d stored trades\n", nw.HistoryTrades)
+}
+
+// writeTailRow renders a single tail row: "<label>: notional $N = <r95>x p95
+// ($P95), <r99>x p99 ($P99)". Each ratio segment is elided when the input
+// is zero so the formatter never claims "0x p99" — that would imply the
+// gate exists with a 0 value, which is misleading.
+func writeTailRow(b *strings.Builder, label string, notionalUSD, r95, p95 float64, r99, p99 float64) {
+	fmt.Fprintf(b, "• %s: notional <b>$%s</b>", label, money(notionalUSD))
+	if r95 > 0 {
+		fmt.Fprintf(b, " = <b>%sx p95</b> ($%s)", ratioFmt(r95), money(p95))
+	}
+	if r99 > 0 {
+		sep := ","
+		if r95 <= 0 {
+			sep = " ="
+		}
+		fmt.Fprintf(b, "%s <b>%sx p99</b> ($%s)", sep, ratioFmt(r99), money(p99))
+	}
+	b.WriteByte('\n')
+}
+
+// ratioFmt prints with a decimal when below 10 so "0.65x" reads correctly,
+// and as an integer above.
+func ratioFmt(v float64) string {
+	if v >= 10 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.2f", v)
 }
 
 // ratePerDay formats a per-day trade count. ≥10 → integer; otherwise one

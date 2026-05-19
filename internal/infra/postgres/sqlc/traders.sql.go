@@ -87,6 +87,7 @@ SELECT
     COALESCE(AVG(notional_usd), 0)::double precision                                           AS mean_notional_usd,
     COALESCE(PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS median_notional_usd,
     COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS p95_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS p99_notional_usd,
     MIN(traded_at)::timestamptz                                                                AS oldest_at,
     MAX(traded_at)::timestamptz                                                                AS newest_at
 FROM polymarket_trades
@@ -105,6 +106,7 @@ type TraderStatsRow struct {
 	MeanNotionalUsd   float64
 	MedianNotionalUsd float64
 	P95NotionalUsd    float64
+	P99NotionalUsd    float64
 	OldestAt          pgtype.Timestamptz
 	NewestAt          pgtype.Timestamptz
 }
@@ -127,6 +129,7 @@ func (q *Queries) TraderStats(ctx context.Context, arg TraderStatsParams) (Trade
 		&i.MeanNotionalUsd,
 		&i.MedianNotionalUsd,
 		&i.P95NotionalUsd,
+		&i.P99NotionalUsd,
 		&i.OldestAt,
 		&i.NewestAt,
 	)

@@ -39,10 +39,10 @@ type Metrics struct {
 	// --- Per-trade anomaly model (primary signal) ---
 	TradeSizeUSD            prometheus.Histogram   // every trade's USD notional
 	TradeOdds               prometheus.Histogram   // every trade's 1/price odds
-	TradeAnomalyMultiplier  prometheus.Histogram   // observed effective multiplier for fired anomalies
-	TraderMultiplier        prometheus.Histogram   // observed trader-axis multiplier when known
+	TradeMarketP95Ratio     prometheus.Histogram   // notional / market.p95 for fired anomalies
+	TradeTraderP95Ratio     prometheus.Histogram   // notional / trader.p95 for fired anomalies (when trader axis enforced)
+	TradeProfitIfWinUSD     prometheus.Histogram   // profit if win = notional × (odds − 1) for fired anomalies
 	TradeAnomalies          *prometheus.CounterVec // severity, category, reason
-	TradeAnomalyAxis        *prometheus.CounterVec // axis = market|trader|both — which baseline drove the alert
 	HighOddsTrades          *prometheus.CounterVec // severity, category — odds-driven anomalies
 	CategoryAnomalousTrades *prometheus.CounterVec // category, severity
 	CategoryAnomalousUSD    *prometheus.CounterVec // category, severity
@@ -182,27 +182,28 @@ func New() *Metrics {
 		Buckets: []float64{1, 1.5, 2, 3, 5, 10, 25, 50, 100, 1000},
 	})
 
-	m.TradeAnomalyMultiplier = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "watchtower", Subsystem: "trade", Name: "anomaly_multiplier",
-		Help:    "Observed effective notional/baseline multiplier when a single-trade anomaly fires (max of market and trader axes).",
-		Buckets: []float64{10, 30, 100, 300, 1_000, 3_000, 10_000, 100_000, 1_000_000},
+	m.TradeMarketP95Ratio = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "market_p95_ratio",
+		Help:    "Observed notional / market-p95 ratio when a single-trade anomaly fires. 0 when the market baseline was not ready.",
+		Buckets: []float64{0.5, 1, 2, 3, 5, 10, 30, 100, 300, 1_000},
 	})
 
-	m.TraderMultiplier = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "watchtower", Subsystem: "trade", Name: "trader_multiplier",
-		Help:    "Observed trader-axis multiplier (notional / trader history median) when the trader baseline was available.",
-		Buckets: []float64{1, 3, 10, 30, 100, 300, 1_000, 3_000, 10_000, 100_000},
+	m.TradeTraderP95Ratio = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "trader_p95_ratio",
+		Help:    "Observed notional / trader-p95 ratio when a single-trade anomaly fires. 0 when the trader baseline was not ready.",
+		Buckets: []float64{0.5, 1, 1.5, 2, 3, 5, 10, 30, 100},
+	})
+
+	m.TradeProfitIfWinUSD = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "trade", Name: "profit_if_win_usd",
+		Help:    "Profit if the firing trade resolves favourably (notional × (odds-1)).",
+		Buckets: []float64{1_000, 5_000, 15_000, 50_000, 100_000, 250_000, 1_000_000, 10_000_000},
 	})
 
 	m.TradeAnomalies = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "anomalies_total",
 		Help: "Single-trade anomalies emitted, by severity/category/reason.",
 	}, []string{"severity", "category", "reason"})
-
-	m.TradeAnomalyAxis = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "watchtower", Subsystem: "trade", Name: "anomaly_axis_total",
-		Help: "Single-trade anomalies by the multiplier axis that drove the tier (market|trader|both).",
-	}, []string{"axis"})
 
 	m.HighOddsTrades = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "trade", Name: "high_odds_total",
@@ -377,8 +378,9 @@ func New() *Metrics {
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
 		m.TradesIngested, m.NotionalIngested,
-		m.TradeSizeUSD, m.TradeOdds, m.TradeAnomalyMultiplier, m.TraderMultiplier,
-		m.TradeAnomalies, m.TradeAnomalyAxis, m.HighOddsTrades,
+		m.TradeSizeUSD, m.TradeOdds,
+		m.TradeMarketP95Ratio, m.TradeTraderP95Ratio, m.TradeProfitIfWinUSD,
+		m.TradeAnomalies, m.HighOddsTrades,
 		m.CategoryAnomalousTrades, m.CategoryAnomalousUSD, m.CategoryHardAlerts,
 		m.AccumulationAlerts,
 		m.OwnershipAlerts,

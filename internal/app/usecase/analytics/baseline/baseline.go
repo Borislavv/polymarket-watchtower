@@ -24,11 +24,16 @@ type Key struct {
 }
 
 // Stats is a read-only summary of a bucket's recent samples.
+//
+// The two tail percentiles (P95USD, P99USD) drive single-trade scoring.
+// MedianUSD/MeanUSD are explanatory only — they appear in alert payloads
+// for context but no longer participate in the fire decision.
 type Stats struct {
 	Count     int
 	MeanUSD   float64
 	MedianUSD float64
 	P95USD    float64
+	P99USD    float64
 	TotalUSD  float64
 	// SpanActual is the observed time between the oldest and newest live
 	// sample (after window trimming). 0 when fewer than two samples exist.
@@ -148,6 +153,7 @@ func (b *Baseline) Stats(k Key) Stats {
 		MeanUSD:    mean,
 		MedianUSD:  percentile(notionals, 0.5),
 		P95USD:     percentile(notionals, 0.95),
+		P99USD:     percentile(notionals, 0.99),
 		TotalUSD:   r.sum,
 		SpanActual: newest.Sub(oldest),
 		OldestAt:   oldest,

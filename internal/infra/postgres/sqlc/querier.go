@@ -71,6 +71,10 @@ type Querier interface {
 	// Used by the cluster cooldown gate. Returns NULL when there's been no
 	// cluster alert for this market+outcome under the current strategy.
 	LatestClusterAlertForCategory(ctx context.Context, arg LatestClusterAlertForCategoryParams) (PolymarketAlerts, error)
+	// Returns the most recent signal report of the given period_type, or
+	// empty if none exists. Used at scheduler startup to decide whether
+	// we missed a tick.
+	LatestSignalReportByPeriodType(ctx context.Context, periodType string) (PolymarketSignalReports, error)
 	// Used by the collector to advance the per-market sync cursor without
 	// keeping an in-process map. Returns NULL when no trades yet exist.
 	LatestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
@@ -84,6 +88,12 @@ type Querier interface {
 	// recent trades only makes sense once we know how far back history goes.
 	// Excludes soft-deleted and purged markets.
 	ListActiveMarketsForCollection(ctx context.Context) ([]PolymarketMarkets, error)
+	// Returns sent alerts with a known outcome that haven't yet had a
+	// Telegram reaction applied. The index idx_alerts_reaction_pending
+	// (migration 00007) makes this a partial-index scan. Ordering by
+	// resolved_at keeps the reactor processing newest-resolution-first so
+	// recent reactions appear before historical backfill.
+	ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
 	ListAllCategories(ctx context.Context) ([]PolymarketCategories, error)
 	// Per-(market, outcome) baseline samples within the lookback window.
 	// Returned newest-first; callers compute median/mean/p95 in domain code
@@ -127,20 +137,15 @@ type Querier interface {
 	// worker after it has consulted Polymarket's market state. status must
 	// be one of: resolved_correct, resolved_wrong, unknown, unavailable.
 	MarkAlertOutcome(ctx context.Context, arg MarkAlertOutcomeParams) error
-	// Stamps a setMessageReaction verdict on the alert row.
-	MarkAlertReactionApplied(ctx context.Context, arg MarkAlertReactionAppliedParams) error
-	// Returns sent alerts with a known outcome that still need a reaction.
-	ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
-	// Signal-quality scheduled reports (migration 00008).
-	TryCreatePendingSignalReport(ctx context.Context, arg TryCreatePendingSignalReportParams) (int64, error)
-	MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error
-	MarkSignalReportFailed(ctx context.Context, arg MarkSignalReportFailedParams) error
-	LatestSignalReportByPeriodType(ctx context.Context, periodType string) (PolymarketSignalReports, error)
 	// Bumps outcome_checked_at on alerts where the upstream check failed
 	// transiently (e.g. Polymarket /markets/{id} returned an error or a
 	// not-yet-resolved market). Keeps the row scheduled for re-check at the
 	// next tick without changing the verdict.
 	MarkAlertOutcomeUnavailableTouch(ctx context.Context, id int64) error
+	// Stamps a successful setMessageReaction result on the alert row.
+	// Status MUST be one of the CHECK-constrained values
+	// (applied/unsupported/failed/disabled); the caller maps the verdict.
+	MarkAlertReactionApplied(ctx context.Context, arg MarkAlertReactionAppliedParams) error
 	// Records a failed delivery attempt. The caller has already computed
 	// next_retry_at (NULL = exhausted / permanent; non-NULL = retryable
 	// at the supplied wall-clock time). Status flips to 'failed' regardless
@@ -162,10 +167,6 @@ type Querier interface {
 	// analytics — the FK from polymarket_trades.market_id does not CASCADE
 	// on the trade side, so a row delete would orphan trades.
 	MarkMarketPurged(ctx context.Context, id int64) error
-	// Per-market collect cursor (migration 00009). Updated only by
-	// persist.Sink on the collect path; backfill never touches it.
-	UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error
-	MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error)
 	// Mark active markets inactive AND stamp deleted_at when they did not
 	// appear in the latest whitelisted-categories discovery sweep. Scoped by
 	// category so markets in non-whitelisted categories are untouched.
@@ -174,9 +175,30 @@ type Querier interface {
 	// so the sanity worker's retention window starts at the original
 	// disappearance, not at every subsequent tick.
 	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) (int64, error)
+	// Captures a send failure on the row. The scheduler treats failed rows
+	// as permanently failed for the period (idempotency over correctness:
+	// a flapping Telegram send is far worse than a missed report).
+	MarkSignalReportFailed(ctx context.Context, arg MarkSignalReportFailedParams) error
+	// Flips the row to 'sent' and persists the upstream Telegram message
+	// id. Called once per successful send. last_error is intentionally
+	// cleared on success so a row that recovered after a transient failure
+	// doesn't keep its stale error text.
+	MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error
+	// Reads the per-market collect cursor. Returns NULL when the market
+	// has never been touched by collect (first-sight or backfill-only),
+	// which the caller maps to the BootstrapLookback default.
+	MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error)
 	OldestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
 	// Server-side aggregate of (wallet, market, outcome) share-count flow
-	// vs the outcome's total BUY-side flow. Approximation — see SQL comment.
+	// vs the outcome's total BUY-side flow. Powers the trade-flow
+	// approximation of market-ownership concentration.
+	//
+	// IMPORTANT: this is an APPROXIMATION, not a holders read. The CLOB
+	// API holders endpoint is not wired upstream. `wallet_buy_shares` and
+	// `wallet_sell_shares` are summed only over trades the watchtower
+	// ingested; a wallet that transferred shares off-chain or sold to a
+	// counterparty whose trade we didn't observe is invisible to this
+	// query. Treat the percentage as directional, not authoritative.
 	OwnershipShares(ctx context.Context, arg OwnershipSharesParams) (OwnershipSharesRow, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending
@@ -193,6 +215,15 @@ type Querier interface {
 	// supplied cutoff is moved back to 'pending'. Called by the sender worker
 	// on each tick (cheap when zero rows match).
 	ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.Timestamptz) error
+	// One-shot aggregate that powers the daily/weekly/monthly/quarterly/yearly
+	// reports. Returns total counts, resolved counts, success/failure
+	// counts, and the CLV-summary fields — all in a single roundtrip so
+	// the renderer stays pure and the worker stays fast.
+	SignalQualityAggregate(ctx context.Context, arg SignalQualityAggregateParams) (SignalQualityAggregateRow, error)
+	// Per-kind breakdown for the report's "by kind" section.
+	SignalQualityByKind(ctx context.Context, arg SignalQualityByKindParams) ([]SignalQualityByKindRow, error)
+	// Per-severity breakdown for the report's "by severity" section.
+	SignalQualityBySeverity(ctx context.Context, arg SignalQualityBySeverityParams) ([]SignalQualityBySeverityRow, error)
 	// Returns the price of the FIRST trade on (market, outcome_token) at or
 	// after the supplied timestamp. NULL when no later trade exists yet.
 	// Powers the CLV-lite drift worker's per-window reference price lookup.
@@ -222,7 +253,23 @@ type Querier interface {
 	// that to "skip send". Concurrent detectors arriving at the same finding
 	// still produce exactly one row.
 	TryCreatePendingAlert(ctx context.Context, arg TryCreatePendingAlertParams) (PolymarketAlerts, error)
+	// Idempotent claim primitive for the signal-quality reports scheduler.
+	// A worker that has decided "it is time to send the daily report for
+	// 2026-05-17" calls this with the canonical dedup_key
+	//   signal-report:<period_type>:<period_start>:<period_end>
+	// The UNIQUE constraint on dedup_key collapses concurrent claims to
+	// exactly one row; ON CONFLICT DO NOTHING + the RETURNING-or-empty
+	// pattern means the caller can distinguish "I won" (row returned)
+	// from "someone else already inserted" (no row). Restart-safe by
+	// construction.
+	TryCreatePendingSignalReport(ctx context.Context, arg TryCreatePendingSignalReportParams) (int64, error)
 	UnlinkMarketCategoriesNotIn(ctx context.Context, arg UnlinkMarketCategoriesNotInParams) error
+	// Advances polymarket_markets.last_collect_traded_at to the supplied
+	// timestamp, but only when it is strictly greater than the current
+	// value (or the current value is NULL). Idempotent — re-running
+	// against the same trade batch is a no-op. Called by persist.Sink
+	// after collect's UpsertBatch; backfill never calls this.
+	UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error
 	// Insert-or-update a Polymarket category. `enabled` is preserved on update
 	// (it's a local setting driven by CATEGORY_WHITELIST, not Polymarket data).
 	UpsertCategory(ctx context.Context, arg UpsertCategoryParams) (PolymarketCategories, error)

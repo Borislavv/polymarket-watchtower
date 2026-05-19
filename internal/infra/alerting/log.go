@@ -52,6 +52,7 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 			Float64("baseline_median_usd", f.Baseline.MedianUSD).
 			Float64("baseline_mean_usd", f.Baseline.MeanUSD).
 			Float64("baseline_p95_usd", f.Baseline.P95USD).
+			Float64("baseline_p99_usd", f.Baseline.P99USD).
 			Int("baseline_n", f.Baseline.SampleN).
 			Dur("baseline_span", f.Baseline.Span).
 			Dur("baseline_window_max", f.Baseline.WindowMax)
@@ -69,31 +70,35 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 			Int("cluster_wallets", f.Cluster.UniqueWallets).
 			Float64("cluster_total_usd", f.Cluster.TotalUSD)
 	}
-	if f.EffectiveMultiplier > 0 {
-		evt = evt.Float64("multiplier_effective", f.EffectiveMultiplier)
+	if f.ProfitIfWinUSD > 0 {
+		evt = evt.Float64("profit_if_win_usd", f.ProfitIfWinUSD)
 	}
-	if f.MarketMultiplier > 0 {
-		evt = evt.Float64("multiplier_market", f.MarketMultiplier)
+	if f.GrossPayoutIfWinUSD > 0 {
+		evt = evt.Float64("gross_payout_if_win_usd", f.GrossPayoutIfWinUSD)
 	}
-	if f.TraderMultiplier > 0 {
-		evt = evt.Float64("multiplier_trader", f.TraderMultiplier)
+	if f.MarketP95Ratio > 0 {
+		evt = evt.Float64("market_p95_ratio", f.MarketP95Ratio)
 	}
-	if f.MultiplierAxis != "" {
-		evt = evt.Str("multiplier_axis", f.MultiplierAxis)
+	if f.MarketP99Ratio > 0 {
+		evt = evt.Float64("market_p99_ratio", f.MarketP99Ratio)
+	}
+	if f.TraderP95Ratio > 0 {
+		evt = evt.Float64("trader_p95_ratio", f.TraderP95Ratio)
+	}
+	if f.TraderP99Ratio > 0 {
+		evt = evt.Float64("trader_p99_ratio", f.TraderP99Ratio)
 	}
 	if f.TraderBaseline != nil {
 		evt = evt.
 			Float64("trader_baseline_median_usd", f.TraderBaseline.MedianUSD).
 			Float64("trader_baseline_p95_usd", f.TraderBaseline.P95USD).
+			Float64("trader_baseline_p99_usd", f.TraderBaseline.P99USD).
 			Int("trader_baseline_n", f.TraderBaseline.SampleN).
 			Dur("trader_baseline_span", f.TraderBaseline.Span)
 	}
-	if f.AbsoluteTier != "" {
-		evt = evt.Str("absolute_tier", string(f.AbsoluteTier))
-	}
-	if f.MultiplierTier != "" {
-		evt = evt.Str("multiplier_tier", string(f.MultiplierTier))
-	}
+	evt = evt.
+		Bool("payoff_gate_passed", f.PayoffGatePassed).
+		Bool("tail_gate_passed", f.TailGatePassed)
 	if f.Trade != nil && f.Trade.Odds > 0 {
 		evt = evt.Float64("odds", f.Trade.Odds)
 	}

@@ -8,7 +8,6 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cluster"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
@@ -114,118 +113,110 @@ func getCounter(t *testing.T, cv *prometheus.CounterVec, lvs ...string) float64 
 	return m.GetCounter().GetValue()
 }
 
-// TestTraderAxisDrivesAlertOnSmallWallet pins the v2 capability: a market
-// that is too busy for v1 to flag (multiplier 5) still fires when the
-// wallet's own history makes the trade an outlier (multiplier 250).
-func TestTraderAxisDrivesAlertOnSmallWallet(t *testing.T) {
+// TestTraderTailDrivesAlertOnSmallWallet pins the v5 trader-axis path:
+// the market p95 ratio alone wouldn't qualify (busy market), but the
+// wallet's own p95 is tiny so the trader tail ratio is comfortably above
+// Info's 1.0× floor.
+func TestTraderTailDrivesAlertOnSmallWallet(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	traders := &fakeTraderBaseline{byWallet: map[string]baseline.Stats{
 		"0xsmall": {
-			Count: 40, MedianUSD: 200, MeanUSD: 220, TotalUSD: 8_800,
+			Count: 40, MedianUSD: 200, MeanUSD: 220, P95USD: 500, P99USD: 1_000, TotalUSD: 8_800,
 			SpanActual: 30 * 24 * time.Hour,
 		},
 	}}
 	loop, m, emit := newLoopV2(t, now, defaultThresholds(), traders, nil, 5)
 
-	// Warm the market baseline to make per-bucket multiplier small (busy market).
-	warm(loop, m, 30, 5_000, 0.5, now.Add(-24*time.Hour))
+	// Warm the market so it's "ready" but the trade sits in the tail.
+	// 30 × $1000 → market median/p95/p99 all $1000.
+	warm(loop, m, 30, 1_000, 0.5, now.Add(-24*time.Hour))
 
-	// $25k at odds 5 — market multiplier $25k/$5k = 5 (no rung).
-	// Trader multiplier $25k/$200 = 125 (info rung).
-	// Absolute Warning ($25k & odds 5).
-	// ConservativeMin(Warning, Info) = Info → fire.
+	// $25k at odds 5 → market p95 ratio 25 (≥ Warning 2), trader p95 ratio 50
+	// (≥ Warning 1.5). Absolute clears Warning ($25k & odds 5). Critical
+	// absolute fails ($25k < $100k) → tier=Warning.
 	loop.Observe(context.Background(), m, bet(25_000, 1.0/5, "0xsmall", now))
 
 	got := emit.of(anomaly.KindTradeAnomaly)
 	if len(got) != 1 {
-		t.Fatalf("expected 1 fire from trader axis, got %d: %+v", len(got), got)
+		t.Fatalf("expected 1 fire, got %d: %+v", len(got), got)
 	}
 	f := got[0]
-	if f.Severity != anomaly.SeverityInfo {
-		t.Errorf("severity: got %s want info", f.Severity)
+	if f.Severity != anomaly.SeverityWarning {
+		t.Errorf("severity: got %s want warning", f.Severity)
 	}
-	if f.MultiplierAxis != string(score.MultiplierAxisTrader) {
-		t.Errorf("axis: got %q want trader", f.MultiplierAxis)
+	if f.TraderP95Ratio < 45 || f.TraderP95Ratio > 55 {
+		t.Errorf("trader p95 ratio: got %v want ~50", f.TraderP95Ratio)
 	}
-	if f.TraderMultiplier < 120 || f.TraderMultiplier > 130 {
-		t.Errorf("trader multiplier: got %v want ~125", f.TraderMultiplier)
-	}
-	if f.MarketMultiplier > 10 {
-		t.Errorf("market multiplier should be small (busy market), got %v", f.MarketMultiplier)
-	}
-	if f.TraderBaseline == nil {
-		t.Fatal("trader baseline must be populated for trader-axis alerts")
-	}
-	if f.TraderBaseline.MedianUSD != 200 {
-		t.Errorf("trader baseline median: got %v want 200", f.TraderBaseline.MedianUSD)
+	if f.TraderBaseline == nil || f.TraderBaseline.P95USD != 500 {
+		t.Errorf("trader baseline must populate p95=500: %+v", f.TraderBaseline)
 	}
 }
 
-// TestTraderAxisSilencesBigWhaleRoutineTrade pins the FP suppression: a
-// whale doing its routine $20k trades is now ignored even though v1
-// market-multiplier might have caught it (depending on the market's
-// distribution).
-func TestTraderAxisSilencesBigWhaleRoutineTrade(t *testing.T) {
+// TestTraderTailSilencesRoutineWhaleTrade pins the FP suppression: a whale
+// whose routine bet sits below its own p95 fails the trader p95 gate.
+func TestTraderTailSilencesRoutineWhaleTrade(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	traders := &fakeTraderBaseline{byWallet: map[string]baseline.Stats{
 		"0xwhale": {
-			Count: 100, MedianUSD: 20_000, TotalUSD: 2_000_000,
+			Count: 100, MedianUSD: 20_000, P95USD: 50_000, P99USD: 80_000, TotalUSD: 2_000_000,
 			SpanActual: 30 * 24 * time.Hour,
 		},
 	}}
 	loop, m, emit := newLoopV2(t, now, defaultThresholds(), traders, nil, 5)
 
-	// Warm market so per-bucket multiplier is small too.
+	// Market: 30 × $5k. p95 = $5k.
 	warm(loop, m, 30, 5_000, 0.5, now.Add(-24*time.Hour))
 
-	// $25k at odds 5 from a $20k-history whale → market mult 5, trader mult
-	// 1.25, both below Info → no fire.
+	// $25k at odds 5 → market p95 ratio 5 (passes); trader p95 ratio 0.5 (FAILS Info 1.0).
 	loop.Observe(context.Background(), m, bet(25_000, 1.0/5, "0xwhale", now))
 
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 0 {
-		t.Fatalf("expected no fire on whale routine trade, got %d: %+v", len(got), got)
+		t.Fatalf("expected no fire — trader p95 gate must block routine whale: %+v", got)
 	}
 }
 
-// TestTraderAxisDisabledFallsBackToV1 pins the backwards-compatibility
-// contract: with no TraderBaseliner wired (or no trader history for the
-// wallet), behaviour is identical to v1.
-func TestTraderAxisDisabledFallsBackToV1(t *testing.T) {
+// TestTraderAxisDisabledFallsBackToMarketOnly pins the contract: with no
+// TraderBaseliner wired (or no trader history), the trader gate is
+// unenforced and the market tail/payoff gates decide alone.
+func TestTraderAxisDisabledFallsBackToMarketOnly(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	loop, m, emit := newLoopV2(t, now, defaultThresholds(), nil, nil, 0)
 
-	// Quiet market baseline so v1 catches it.
+	// 30 × $50 baseline. p95 = $50.
 	warm(loop, m, 30, 50, 0.5, now.Add(-24*time.Hour))
-	// $10k at odds 3, mult 200 → info × info → info.
+	// $10k at odds 3 → market p95 ratio 200 (≥ 1) → Info fires.
 	loop.Observe(context.Background(), m, bet(10_000, 1.0/3, "0xanyone", now))
 
 	got := emit.of(anomaly.KindTradeAnomaly)
 	if len(got) != 1 {
-		t.Fatalf("expected 1 fire (v1 behaviour), got %d", len(got))
-	}
-	if got[0].MultiplierAxis != string(score.MultiplierAxisMarket) {
-		t.Errorf("axis: got %q want market", got[0].MultiplierAxis)
+		t.Fatalf("expected 1 fire (market-only), got %d", len(got))
 	}
 	if got[0].TraderBaseline != nil {
 		t.Error("trader baseline must be nil when trader axis disabled")
 	}
+	if got[0].MarketP95Ratio < 100 {
+		t.Errorf("market p95 ratio: got %v want ≥100", got[0].MarketP95Ratio)
+	}
 }
 
 // TestTraderHistoryReadinessGate pins the count gate: a trader with only
-// 2 trades on record should NOT contribute the trader axis even if the
-// median is small.
+// 2 trades on record (below default MinTraderHistoryTrades=5) should NOT
+// contribute the trader axis. Combined with a market where the trade
+// fails the market p95 ratio, the trade has no qualifying gate → no fire.
 func TestTraderHistoryReadinessGate(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	traders := &fakeTraderBaseline{byWallet: map[string]baseline.Stats{
-		"0xnew": {Count: 2, MedianUSD: 200}, // below default MinTraderHistoryTrades=5
+		"0xnew": {Count: 2, MedianUSD: 200, P95USD: 500},
 	}}
 	loop, m, emit := newLoopV2(t, now, defaultThresholds(), traders, nil, 5)
-	warm(loop, m, 30, 5_000, 0.5, now.Add(-24*time.Hour))
+	// Warm 30 × $50000 → market p95 = $50000. Test trade $25k → ratio
+	// 0.5 < Info 1.0 → market gate FAILS. Trader axis disabled by count
+	// gate. Result: no fire.
+	warm(loop, m, 30, 50_000, 0.5, now.Add(-24*time.Hour))
 
-	// Without trader axis: market mult 5 (no rung) → no fire.
 	loop.Observe(context.Background(), m, bet(25_000, 1.0/5, "0xnew", now))
 	if got := emit.of(anomaly.KindTradeAnomaly); len(got) != 0 {
-		t.Fatalf("expected no fire — trader history below readiness gate: %+v", got)
+		t.Fatalf("expected no fire — market p95 fails AND trader axis disabled: %+v", got)
 	}
 }
 

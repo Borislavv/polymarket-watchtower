@@ -212,9 +212,21 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 
 	det := detect.New(detect.Config{
 		Thresholds: anomaly2.Thresholds{
-			Info:                   anomaly2.Tier{MinNotionalUSD: 10_000, MinOdds: 3, MinMultiplier: 100},
-			Warning:                anomaly2.Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
-			Critical:               anomaly2.Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
+			Info: anomaly2.Tier{
+				MinNotionalUSD: 10_000, MinOdds: 3,
+				MinMarketP95Ratio: 1, MinTraderP95Ratio: 1,
+				MinMultiplier: 100,
+			},
+			Warning: anomaly2.Tier{
+				MinNotionalUSD: 25_000, MinOdds: 5,
+				MinMarketP95Ratio: 2, MinTraderP95Ratio: 1.5,
+				MinMultiplier: 1_000,
+			},
+			Critical: anomaly2.Tier{
+				MinNotionalUSD: 100_000, MinOdds: 8,
+				MinMarketP95Ratio: 4, MinTraderP95Ratio: 2,
+				MinMultiplier: 10_000,
+			},
 			MinBaselineTrades:      20,
 			MinBaselineNotionalUSD: 100,
 		},
@@ -249,14 +261,15 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	}
 
 	var tradeAnoms, hardAlerts int
-	var sawWarning, sawHard bool
+	var sawCritical, sawHard bool
 	for _, f := range findings {
 		switch f.Kind {
 		case anomaly2.KindTradeAnomaly:
 			tradeAnoms++
-			// Conservative MIN of absolute=critical + multiplier=warning => warning.
-			if f.Severity == anomaly2.SeverityWarning {
-				sawWarning = true
+			// v5: each $100k whale clears every Critical gate (notional,
+			// odds 20, market p95 ratio ~1000) → Critical severity.
+			if f.Severity == anomaly2.SeverityCritical {
+				sawCritical = true
 			}
 			if f.Trade == nil || f.Trade.Outcome != "Yes" {
 				t.Errorf("trade ref missing outcome: %+v", f.Trade)
@@ -284,8 +297,8 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	if tradeAnoms < 3 {
 		t.Errorf("expected >=3 single-trade findings (one per whale), got %d", tradeAnoms)
 	}
-	if !sawWarning {
-		t.Errorf("expected at least one warning single-trade finding")
+	if !sawCritical {
+		t.Errorf("expected at least one critical single-trade finding")
 	}
 	if hardAlerts != 1 || !sawHard {
 		t.Errorf("expected exactly 1 HARD category-watch alert, got %d", hardAlerts)

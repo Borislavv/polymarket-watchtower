@@ -72,7 +72,7 @@ func (r *SignalReportRepository) SignalQualityAggregate(ctx context.Context, per
 
 // SignalQualityByKind returns the per-alert-kind breakdown.
 func (r *SignalReportRepository) SignalQualityByKind(ctx context.Context, periodStart, periodEnd time.Time) ([]SignalQualityBreakdownRow, error) {
-	rows, err := r.q.SignalQualityByKind(ctx, sqlc.SignalQualityAggregateParams{
+	rows, err := r.q.SignalQualityByKind(ctx, sqlc.SignalQualityByKindParams{
 		PeriodStart: tsFromTime(periodStart),
 		PeriodEnd:   tsFromTime(periodEnd),
 	})
@@ -88,7 +88,7 @@ func (r *SignalReportRepository) SignalQualityByKind(ctx context.Context, period
 
 // SignalQualityBySeverity returns the per-severity breakdown.
 func (r *SignalReportRepository) SignalQualityBySeverity(ctx context.Context, periodStart, periodEnd time.Time) ([]SignalQualityBreakdownRow, error) {
-	rows, err := r.q.SignalQualityBySeverity(ctx, sqlc.SignalQualityAggregateParams{
+	rows, err := r.q.SignalQualityBySeverity(ctx, sqlc.SignalQualityBySeverityParams{
 		PeriodStart: tsFromTime(periodStart),
 		PeriodEnd:   tsFromTime(periodEnd),
 	})

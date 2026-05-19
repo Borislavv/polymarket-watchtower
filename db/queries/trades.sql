@@ -56,6 +56,7 @@ SELECT
     COALESCE(AVG(notional_usd), 0)::double precision                                           AS mean_notional_usd,
     COALESCE(PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS median_notional_usd,
     COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS p95_notional_usd,
+    COALESCE(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY notional_usd), 0)::double precision  AS p99_notional_usd,
     MIN(traded_at)::timestamptz                                                                AS oldest_at,
     MAX(traded_at)::timestamptz                                                                AS newest_at
 FROM polymarket_trades

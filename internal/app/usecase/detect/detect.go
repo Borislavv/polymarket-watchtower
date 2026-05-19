@@ -600,16 +600,19 @@ func (l *Loop) emitTradeAnomaly(
 			MedianUSD: stats.MedianUSD,
 			MeanUSD:   stats.MeanUSD,
 			P95USD:    stats.P95USD,
+			P99USD:    stats.P99USD,
 			SampleN:   stats.Count,
 			Span:      stats.SpanActual,
 			WindowMax: l.cfg.Baseline.Window,
 		},
-		MarketMultiplier:    sr.MarketMultiplier,
-		TraderMultiplier:    sr.TraderMultiplier,
-		EffectiveMultiplier: sr.EffectiveMultiplier,
-		MultiplierAxis:      string(sr.MultiplierAxis),
-		AbsoluteTier:        sr.AbsoluteTier,
-		MultiplierTier:      sr.MultiplierTier,
+		GrossPayoutIfWinUSD: sr.GrossPayoutIfWinUSD,
+		ProfitIfWinUSD:      sr.ProfitIfWinUSD,
+		MarketP95Ratio:      sr.MarketP95Ratio,
+		MarketP99Ratio:      sr.MarketP99Ratio,
+		TraderP95Ratio:      sr.TraderP95Ratio,
+		TraderP99Ratio:      sr.TraderP99Ratio,
+		PayoffGatePassed:    sr.PayoffGatePassed,
+		TailGatePassed:      sr.TailGatePassed,
 		LifecyclePct:        lifecyclePct,
 		Hot:                 hot,
 		InCluster:           peerCount >= 2,
@@ -627,6 +630,7 @@ func (l *Loop) emitTradeAnomaly(
 			MedianUSD: traderStats.MedianUSD,
 			MeanUSD:   traderStats.MeanUSD,
 			P95USD:    traderStats.P95USD,
+			P99USD:    traderStats.P99USD,
 			SampleN:   traderStats.Count,
 			Span:      traderStats.SpanActual,
 		}
@@ -652,14 +656,14 @@ func (l *Loop) emitTradeAnomaly(
 	}
 
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
-	if axis := string(sr.MultiplierAxis); axis != "" {
-		l.metrics.TradeAnomalyAxis.WithLabelValues(axis).Inc()
+	if sr.MarketP95Ratio > 0 {
+		l.metrics.TradeMarketP95Ratio.Observe(sr.MarketP95Ratio)
 	}
-	if sr.EffectiveMultiplier > 0 {
-		l.metrics.TradeAnomalyMultiplier.Observe(sr.EffectiveMultiplier)
+	if sr.TraderP95Ratio > 0 {
+		l.metrics.TradeTraderP95Ratio.Observe(sr.TraderP95Ratio)
 	}
-	if sr.TraderMultiplier > 0 {
-		l.metrics.TraderMultiplier.Observe(sr.TraderMultiplier)
+	if sr.ProfitIfWinUSD > 0 {
+		l.metrics.TradeProfitIfWinUSD.Observe(sr.ProfitIfWinUSD)
 	}
 	if ref.Odds > 0 {
 		l.metrics.TradeOdds.Observe(ref.Odds)
