@@ -13,6 +13,18 @@ strategy or terminology. For usage see README.md and presets/README.md.
 - `doc/observability/ai-metrics.md` — AI metric inventory + log events.
 - `doc/observability/dashboards.md` — Grafana panel reference.
 
+**AI handoff bundle (for ChatGPT / fresh Claude sessions):**
+- `doc/ai/chatgpt-handoff.md` — dense AI-to-AI; paste this first.
+- `doc/ai/project-philosophy.md` — WHY the project exists.
+- `doc/ai/strategy-philosophy.md` — which signals matter and why.
+- `doc/ai/runtime-mental-model.md` — runtime behaviour at a glance.
+- `doc/ai/current-state.md` — what is true today (refresh after big changes).
+- `doc/ai/context-recovery.md` — bootstrapping a fresh AI session.
+- Regenerate with `./scripts/generate-chatgpt-context.sh` →
+  outputs `tmp/chatgpt-context-{compact,full}.md`. The compact
+  bundle (~34KB) is the load-bearing paste for a new session;
+  the full bundle (~115KB) adds gate-level detail.
+
 ## Alerting strategy
 
 Goal: surface large risky bets and suspicious wallet clusters near the end

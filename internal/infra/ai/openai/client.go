@@ -80,7 +80,11 @@ func (c *Config) applyDefaults() {
 		c.MaxPromptChars = 2500
 	}
 	if c.MaxOutputChars <= 0 {
-		c.MaxOutputChars = 700
+		// 4000 chars ≈ 1333 tokens at the standard 4-chars/token
+		// rule of thumb. The model is asked to target 1200-2500
+		// chars and stay under 4000; this is the BUDGET for the
+		// max_completion_tokens parameter, not a post-hoc clip.
+		c.MaxOutputChars = 4000
 	}
 	if c.RatePerMin <= 0 {
 		c.RatePerMin = 10
@@ -127,27 +131,37 @@ func New(cfg Config) *Client {
 // keep prompts compact.
 func (c *Client) SetSystemPrompt(s string) { c.systemPrompt = s }
 
-// defaultSystemPrompt — the one and only model guidance. Short on
-// purpose; the user-message carries all data.
-const defaultSystemPrompt = `You are a professional prediction-market analyst.
-You analyze public-data prediction-market signals.
-You do not claim insider trading. You do not guarantee profit.
-You write concise, cautious, decision-useful analysis.
+// defaultSystemPrompt — the analyst persona + load-bearing rules.
+// Single source for tone, anti-hallucination, density bias, and
+// output discipline. The per-call user message carries DATA + TASK
+// only; everything stylistic lives here so we don't pay tokens for
+// duplicated instructions.
+const defaultSystemPrompt = `You are a senior prediction-market and political-risk analyst.
+Style: institutional, dense, analytical, skeptical, uncertainty-aware.
+Audience: a surveillance operator hunting informed flow on Polymarket.
 
-You must explain: why a setup may work, why it may fail, what event
-or date or news matters next.
+Form a real opinion. Express judgment. Call weak signals weak. Say "likely market-making", "edge already gone", "contradictory flow", "probably noise" when that is the honest read. Do not summarize the alert back at the operator.
 
-Do not invent facts not present in the input.
-If live external context was not checked, say so explicitly.
-Use simple readable English. No hype.
-Maximum 700 characters unless explicitly allowed.`
+Anti-hallucination (load-bearing):
+- Prefer being correct over being comprehensive.
+- If evidence is weak, say so directly.
+- Do not manufacture depth where depth does not exist.
+- If public/live context was not checked, write "Live public context was not checked." rather than implying confirmation.
+- Never invent polls, endorsements, rulings, or news. Reason about observable factors only: polling cadence, endorsements on record, filings, legal rulings, debates, coalition shifts, official statements, election-calendar events, sanctions, negotiations, legislation, military escalations, treaty developments.
+- Never claim insider trading. Never use "guaranteed", "risk-free", "sure thing", "easy money".
+
+Density discipline:
+- Target 1200-2500 characters. Use up to 4000 only when the setup is genuinely complex.
+- No filler. Never pad to satisfy a length target.
+- No markdown tables. Minimal bullets. Short paragraphs allowed.
+- Plain readable English. No hype.`
 
 // AnalyzeAlert builds the prompt, calls OpenAI, returns the parsed
 // analyst note. On budget/rate-limit/timeout/error it returns a
 // non-error AlertAnalysis with Status set so the caller can persist
 // the skip-reason and still emit the underlying alert.
 func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisRequest) (analysis.AlertAnalysis, error) {
-	prompt := buildAlertPrompt(req, c.cfg.MaxPromptChars)
+	prompt := buildAlertPrompt(req)
 	if c.cfg.APIKey == "" {
 		return analysis.AlertAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "no_api_key"}, nil
 	}
@@ -174,7 +188,15 @@ func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisReq
 	}
 	cost := c.estimateCost(resp.PromptTokens, resp.CompletionTokens)
 	c.ledger.consume(cost)
-	text := truncate(resp.Text, c.cfg.MaxOutputChars)
+	// v8.2: post-hoc output truncation removed. The model is asked to
+	// self-regulate via the system prompt and `max_completion_tokens`
+	// budget; arbitrary mid-sentence clipping was throwing away
+	// useful analysis. The Telegram formatter is the only remaining
+	// length consumer downstream — if a single alert body grows past
+	// Telegram's 4096-char limit, the sender marks the row as a
+	// permanent failure with a clear "message is too long" error,
+	// which is the right place to fail loud rather than silent.
+	text := strings.TrimSpace(resp.Text)
 	verdict := pickVerdict(text)
 	return analysis.AlertAnalysis{
 		Status:           analysis.StatusOK,
@@ -207,7 +229,7 @@ func statusForCategory(cat ErrorCategory) analysis.Status {
 // only the periodic top-N selection + dedup logic lives in the
 // usecase layer.
 func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
-	prompt := buildMarketReportPrompt(req, c.cfg.MaxPromptChars*2) // reports are bigger
+	prompt := buildMarketReportPrompt(req) // reports are bigger
 	if c.cfg.APIKey == "" {
 		return analysis.MarketReportAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "no_api_key"}, nil
 	}
@@ -243,7 +265,7 @@ func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketRep
 
 // AnalyzeOutcome — postmortem path.
 func (c *Client) AnalyzeOutcome(ctx context.Context, req analysis.OutcomeAnalysisRequest) (analysis.OutcomeAnalysis, error) {
-	prompt := buildOutcomePrompt(req, c.cfg.MaxPromptChars)
+	prompt := buildOutcomePrompt(req)
 	if c.cfg.APIKey == "" {
 		return analysis.OutcomeAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "no_api_key"}, nil
 	}
