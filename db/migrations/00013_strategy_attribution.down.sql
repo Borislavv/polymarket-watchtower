@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS polymarket_alert_strategy_dimensions;

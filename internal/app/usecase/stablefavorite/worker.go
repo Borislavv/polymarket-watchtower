@@ -117,7 +117,10 @@ type Config struct {
 
 func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
-		c.Interval = 5 * time.Minute
+		// v7: 15m (was 5m) — matches the relaxed stability window.
+		// The strategy is state-driven, not per-trade; faster polls
+		// just retry the same gates.
+		c.Interval = 15 * time.Minute
 	}
 	if c.CandidateLimit <= 0 {
 		c.CandidateLimit = 200
@@ -287,6 +290,7 @@ func (w *Worker) buildFinding(in det.Input, v det.Verdict, m repository.LateMark
 		LifecyclePct:       in.LifecyclePct,
 		Score:              v.Score,
 		Confidence:         v.Confidence,
+		RiskAdjustedReturn: v.RiskAdjustedReturn,
 		CrossMarketStatus:  v.CrossMarketStatus,
 		CrossMarketDelta:   v.CrossMarketDelta,
 	}

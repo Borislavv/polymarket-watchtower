@@ -24,6 +24,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/attribution"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
@@ -100,15 +101,39 @@ type Config struct {
 	Rand *rand.Rand
 }
 
+// AIEnricher is the optional pre-render hook that stamps an AI
+// analyst note on the outgoing Finding. *aianalysis.Service from
+// internal/app/usecase/aianalysis satisfies it. nil → enrichment is
+// skipped and the alert sends without an Analyst-note block.
+type AIEnricher interface {
+	// AnalyzeAndStore is called per-alert before render. It MUST
+	// degrade gracefully on its own — never blocks the send path,
+	// never returns a Go error on AI failure (AI failures are
+	// persisted as Status=skipped/error and rendered as "no note").
+	AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.Finding) (repository.AlertAnalysis, error)
+	// LatestText returns the most recent OK analysis text for this
+	// alert, or empty string when none.
+	LatestText(ctx context.Context, alertID int64) string
+}
+
+// AttributionStore persists the bucketed strategy-attribution row that
+// dashboards group by. *repository.StrategyDimensionsRepository
+// satisfies it. nil → writes are skipped silently.
+type AttributionStore interface {
+	Upsert(ctx context.Context, d repository.StrategyDimensions) error
+}
+
 // Worker is the long-running sender loop.
 type Worker struct {
-	cfg     Config
-	store   AlertStore
-	tg      Telegram
-	metrics *metrics.Metrics
-	log     *zerolog.Logger
-	now     func() time.Time
-	rng     *rand.Rand
+	cfg         Config
+	store       AlertStore
+	tg          Telegram
+	enricher    AIEnricher
+	attribution AttributionStore
+	metrics     *metrics.Metrics
+	log         *zerolog.Logger
+	now         func() time.Time
+	rng         *rand.Rand
 }
 
 // New wires the worker. Telegram and the store are required; metrics is
@@ -150,6 +175,18 @@ func New(cfg Config, store AlertStore, tg Telegram, m *metrics.Metrics, log *zer
 	}
 	return &Worker{cfg: cfg, store: store, tg: tg, metrics: m, log: log, now: now, rng: rng}
 }
+
+// SetAIEnricher wires an optional pre-render AI hook. Pass nil (or
+// don't call this method) to keep the sender AI-agnostic. The
+// enricher is called once per claimed alert before render; failures
+// degrade silently and never block the send.
+func (w *Worker) SetAIEnricher(e AIEnricher) { w.enricher = e }
+
+// SetAttributionStore wires the optional strategy-attribution writer.
+// Called once at boot; nil keeps the sender attribution-agnostic.
+// Failures degrade silently — attribution is a research signal, never
+// gates Telegram delivery.
+func (w *Worker) SetAttributionStore(s AttributionStore) { w.attribution = s }
 
 // Run blocks until ctx is cancelled. Fires an initial drain immediately
 // so alerts queued during startup don't wait one full interval.
@@ -210,13 +247,22 @@ func (w *Worker) drainOne(ctx context.Context) {
 }
 
 func (w *Worker) send(ctx context.Context, a repository.Alert) {
-	text, err := renderText(a)
+	f, err := unmarshalFinding(a)
 	if err != nil {
-		// A row that can't be rendered will keep failing forever; we still
+		// A row that can't be unmarshalled will keep failing forever;
 		// record the failure but do not stop the worker.
 		w.markFailed(ctx, a, fmt.Errorf("render: %w", err))
 		return
 	}
+	// AI enrichment: generate or refresh the analyst note BEFORE
+	// rendering. Failures here are non-fatal — the note will simply
+	// be empty and the formatter will elide the Analyst-note block.
+	aiVerdict := w.stampAnalystNote(ctx, &f, a.ID)
+	// Strategy attribution: write bucketed dimensions for dashboards
+	// BEFORE delivery so a flake in Telegram doesn't drop the row.
+	// Best-effort; failures are logged but never block.
+	w.writeAttribution(ctx, a.ID, f, aiVerdict)
+	text := alerting.FormatTelegramMessage(f)
 	res, err := w.tg.SendHTML(ctx, w.cfg.ChatID, text)
 	if err != nil {
 		// Context cancellation is graceful: leave the row pending. Any
@@ -327,16 +373,58 @@ func isPermanentError(err error) bool {
 	return false
 }
 
-// renderText unmarshals the persisted Finding payload and renders the
-// HTML message via the alerting package's formatter. The formatter is the
-// single source of truth for message layout — the sender owns delivery,
-// not composition.
-func renderText(a repository.Alert) (string, error) {
+// unmarshalFinding extracts the persisted anomaly.Finding from one
+// alert row. Surfaced as a small helper so the AI-enrichment hook
+// can mutate the Finding before render.
+func unmarshalFinding(a repository.Alert) (anomaly.Finding, error) {
 	var f anomaly.Finding
 	if err := json.Unmarshal(a.Payload, &f); err != nil {
-		return "", err
+		return anomaly.Finding{}, err
 	}
-	return alerting.FormatTelegramMessage(f), nil
+	return f, nil
+}
+
+// stampAnalystNote calls the optional AI enricher and stamps the
+// resulting note text on the Finding before render. All failures
+// degrade silently: the enricher is allowed to return Status=skipped
+// or Status=error, and we simply leave AnalystNote empty so the
+// formatter elides the Analyst-note block.
+//
+// Returns the AI verdict (best-effort, "" when unavailable) so the
+// caller can carry it into strategy-attribution writes.
+//
+// Cost-control safety: the enricher MUST honour the per-minute rate
+// limit and daily budget inside its own implementation. The sender
+// trusts that contract and does not double-gate.
+func (w *Worker) stampAnalystNote(ctx context.Context, f *anomaly.Finding, alertID int64) string {
+	if w.enricher == nil {
+		return ""
+	}
+	res, err := w.enricher.AnalyzeAndStore(ctx, alertID, *f)
+	if err != nil {
+		// Logged but non-fatal — the alert still ships.
+		w.log.Err(err).Int64("alert_id", alertID).Msg("alertsender: AI enrich failed")
+		return ""
+	}
+	note := w.enricher.LatestText(ctx, alertID)
+	if note != "" {
+		f.AnalystNote = note
+	}
+	return res.Verdict
+}
+
+// writeAttribution persists the bucketed strategy-attribution row for
+// dashboards. Best-effort: a failure here logs and returns, never
+// affecting Telegram delivery. The bucketing is pure (no I/O) so the
+// only failure mode is the Postgres write itself.
+func (w *Worker) writeAttribution(ctx context.Context, alertID int64, f anomaly.Finding, aiVerdict string) {
+	if w.attribution == nil {
+		return
+	}
+	d := attribution.FromFinding(alertID, f, aiVerdict)
+	if err := w.attribution.Upsert(ctx, d); err != nil {
+		w.log.Err(err).Int64("alert_id", alertID).Msg("alertsender: attribution upsert failed")
+	}
 }
 
 func (w *Worker) observeOK(severity string) {

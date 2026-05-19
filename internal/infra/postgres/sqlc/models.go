@@ -46,6 +46,25 @@ type PolymarketAlertOutcomeAnalyses struct {
 	CreatedAt         pgtype.Timestamptz
 }
 
+type PolymarketAlertStrategyDimensions struct {
+	AlertID              int64
+	StrategyFamily       string
+	LifecycleBucket      string
+	OddsBucket           *string
+	NotionalBucket       *string
+	ReturnBucket         *string
+	Category             *string
+	AccumulationWindow   *string
+	OwnershipShareBucket *string
+	VolatilityRegime     *string
+	NewWallet            bool
+	QuietMarket          bool
+	DormantWallet        bool
+	DriftRegime          *string
+	AiVerdict            *string
+	CreatedAt            pgtype.Timestamptz
+}
+
 type PolymarketAlerts struct {
 	ID                     int64
 	DedupKey               string

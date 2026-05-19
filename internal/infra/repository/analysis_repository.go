@@ -226,6 +226,45 @@ func (r *MarketIntelligenceRepository) Insert(ctx context.Context, rpt NewMarket
 	return marketIntelFromSQLC(row), true, nil
 }
 
+// IntelligenceCandidate is the per-market row the worker hands the
+// AI analyzer.
+type IntelligenceCandidate struct {
+	ConditionID   string
+	Question      string
+	Category      string
+	LifecyclePct  float64
+	Trades24h     int64
+	Volume24hUSD  float64
+	LastPrice     float64
+	Alerts24h     int64
+}
+
+// ListIntelligenceCandidates returns up to `limit` top-N markets
+// for the 2h intelligence report.
+func (r *MarketIntelligenceRepository) ListIntelligenceCandidates(ctx context.Context, limit int32) ([]IntelligenceCandidate, error) {
+	rows, err := r.q.ListMarketIntelligenceCandidates(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list intelligence candidates: %w", err)
+	}
+	out := make([]IntelligenceCandidate, 0, len(rows))
+	for _, row := range rows {
+		c := IntelligenceCandidate{
+			ConditionID:  row.ConditionID,
+			Question:     row.Question,
+			Trades24h:    row.Trades24h,
+			Volume24hUSD: row.Volume24hUsd,
+			LastPrice:    row.LastPrice,
+			Alerts24h:    row.Alerts24h,
+		}
+		if row.Category != nil {
+			c.Category = *row.Category
+		}
+		c.LifecyclePct = row.LifecyclePct
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 func (r *MarketIntelligenceRepository) Latest(ctx context.Context) (MarketIntelligenceReport, error) {
 	row, err := r.q.LatestMarketIntelligenceReport(ctx)
 	if err != nil {
@@ -342,6 +381,70 @@ func (r *AlertOutcomeAnalysisRepository) Get(ctx context.Context, alertID int64)
 		return AlertOutcomeAnalysis{}, fmt.Errorf("get alert outcome analysis: %w", err)
 	}
 	return alertOutcomeFromSQLC(row), nil
+}
+
+// --- StrategyDimensionsRepository ------------------------------------------
+
+// StrategyDimensions is the bucketed attribution row written for every
+// alert. Optional buckets are empty strings; the writer maps "" to a
+// SQL NULL so dashboards can `WHERE odds_bucket IS NOT NULL` cleanly.
+//
+// Cardinality discipline: every bucket below is a coarse label
+// (lifecycle bands, log10 notional bands, return bands). The
+// strategy_family column is THE primary group-by axis for
+// "which-setups-actually-win" panels.
+type StrategyDimensions struct {
+	AlertID              int64
+	StrategyFamily       string
+	LifecycleBucket      string
+	OddsBucket           string
+	NotionalBucket       string
+	ReturnBucket         string
+	Category             string
+	AccumulationWindow   string
+	OwnershipShareBucket string
+	VolatilityRegime     string
+	NewWallet            bool
+	QuietMarket          bool
+	DormantWallet        bool
+	DriftRegime          string
+	AIVerdict            string
+}
+
+// StrategyDimensionsRepository wraps polymarket_alert_strategy_dimensions.
+type StrategyDimensionsRepository struct {
+	q *sqlc.Queries
+}
+
+func NewStrategyDimensionsRepository(pool *pgxpool.Pool) *StrategyDimensionsRepository {
+	return &StrategyDimensionsRepository{q: sqlc.New(pool)}
+}
+
+// Upsert writes (or overwrites) the attribution row for an alert.
+// Idempotent — multiple calls with identical payload are a no-op,
+// and a re-run after a schema fix overwrites any prior bucketing
+// rather than accumulating ghosts.
+func (r *StrategyDimensionsRepository) Upsert(ctx context.Context, d StrategyDimensions) error {
+	if err := r.q.UpsertAlertStrategyDimensions(ctx, sqlc.UpsertAlertStrategyDimensionsParams{
+		AlertID:              d.AlertID,
+		StrategyFamily:       d.StrategyFamily,
+		LifecycleBucket:      d.LifecycleBucket,
+		OddsBucket:           strPtr(d.OddsBucket),
+		NotionalBucket:       strPtr(d.NotionalBucket),
+		ReturnBucket:         strPtr(d.ReturnBucket),
+		Category:             strPtr(d.Category),
+		AccumulationWindow:   strPtr(d.AccumulationWindow),
+		OwnershipShareBucket: strPtr(d.OwnershipShareBucket),
+		VolatilityRegime:     strPtr(d.VolatilityRegime),
+		NewWallet:            d.NewWallet,
+		QuietMarket:          d.QuietMarket,
+		DormantWallet:        d.DormantWallet,
+		DriftRegime:          strPtr(d.DriftRegime),
+		AiVerdict:            strPtr(d.AIVerdict),
+	}); err != nil {
+		return fmt.Errorf("upsert alert strategy dimensions: %w", err)
+	}
+	return nil
 }
 
 func alertOutcomeFromSQLC(row sqlc.PolymarketAlertOutcomeAnalyses) AlertOutcomeAnalysis {

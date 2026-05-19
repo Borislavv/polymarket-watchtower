@@ -122,7 +122,188 @@ func sampleAlert(t *testing.T, id int64, sev string) repository.Alert {
 	}
 }
 
+// fakeEnricher implements the AIEnricher seam.
+type fakeEnricher struct {
+	calls int
+	text  string
+	err   error
+}
+
+func (f *fakeEnricher) AnalyzeAndStore(_ context.Context, _ int64, _ anomaly.Finding) (repository.AlertAnalysis, error) {
+	f.calls++
+	return repository.AlertAnalysis{}, f.err
+}
+func (f *fakeEnricher) LatestText(_ context.Context, _ int64) string { return f.text }
+
+// fakeAttributionStore captures every Upsert call so tests can pin
+// the bucketing output and verify failures do not block sends.
+type fakeAttributionStore struct {
+	mu     sync.Mutex
+	rows   []repository.StrategyDimensions
+	err    error
+	called int
+}
+
+func (f *fakeAttributionStore) Upsert(_ context.Context, d repository.StrategyDimensions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.called++
+	if f.err != nil {
+		return f.err
+	}
+	f.rows = append(f.rows, d)
+	return nil
+}
+
 // --- tests ---------------------------------------------------------------
+
+// TestAIEnricherStampsAnalystNote pins the v7 contract: the sender
+// calls the enricher before render and the resulting note appears
+// in the Telegram body inside an "Analyst note" block.
+func TestAIEnricherStampsAnalystNote(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAIEnricher(&fakeEnricher{text: "Watchlist candidate. External context not checked."})
+
+	w.Drain(context.Background())
+
+	if bot.count.Load() != 1 {
+		t.Fatalf("expected 1 send, got %d", bot.count.Load())
+	}
+	body := bot.calls[0].Text
+	if !strings.Contains(body, "<b>Analyst note</b>") {
+		t.Errorf("missing Analyst note block in:\n%s", body)
+	}
+	if !strings.Contains(body, "Watchlist candidate.") {
+		t.Errorf("note text not stamped:\n%s", body)
+	}
+}
+
+// TestAIEnricherFailureDoesNotBlockSend pins that an enricher
+// failure is logged and the alert still ships (with no Analyst-note
+// block).
+func TestAIEnricherFailureDoesNotBlockSend(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAIEnricher(&fakeEnricher{err: errors.New("upstream down")})
+
+	w.Drain(context.Background())
+
+	if bot.count.Load() != 1 {
+		t.Fatalf("send must still fire on enricher failure: %d", bot.count.Load())
+	}
+	if strings.Contains(bot.calls[0].Text, "<b>Analyst note</b>") {
+		t.Errorf("Analyst note block must be elided on enricher failure:\n%s", bot.calls[0].Text)
+	}
+}
+
+// TestAIEnricherEmptyTextElidesBlock pins the contract for a
+// successful enricher that returns empty text (skip/error status):
+// the Analyst block is NOT rendered.
+func TestAIEnricherEmptyTextElidesBlock(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAIEnricher(&fakeEnricher{text: ""})
+
+	w.Drain(context.Background())
+
+	if strings.Contains(bot.calls[0].Text, "<b>Analyst note</b>") {
+		t.Errorf("empty note must not render the block")
+	}
+}
+
+// TestAttributionWriteHappyPath pins that every claimed alert produces
+// exactly one attribution row, populated with the Finding-derived
+// buckets. This is the join column the "which-setups-actually-win"
+// dashboards depend on.
+func TestAttributionWriteHappyPath(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	attr := &fakeAttributionStore{}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAttributionStore(attr)
+
+	w.Drain(context.Background())
+
+	if attr.called != 1 {
+		t.Fatalf("expected 1 attribution write, got %d", attr.called)
+	}
+	row := attr.rows[0]
+	if row.AlertID != 1 {
+		t.Errorf("alert_id mismatch: %d", row.AlertID)
+	}
+	if row.StrategyFamily != "whale_flow" {
+		t.Errorf("family: %q", row.StrategyFamily)
+	}
+	if row.Category != "politics" {
+		t.Errorf("category lower-cased: %q", row.Category)
+	}
+}
+
+// TestAttributionFailureDoesNotBlockSend pins the safety contract:
+// an attribution-store DB error must never prevent Telegram delivery.
+// Attribution is research telemetry, not a hard gate.
+func TestAttributionFailureDoesNotBlockSend(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	attr := &fakeAttributionStore{err: errors.New("pg down")}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAttributionStore(attr)
+
+	w.Drain(context.Background())
+
+	if bot.count.Load() != 1 {
+		t.Fatalf("attribution failure must not block send: bot calls=%d", bot.count.Load())
+	}
+	if attr.called != 1 {
+		t.Errorf("attribution write must be attempted exactly once: %d", attr.called)
+	}
+}
+
+// TestAttributionCarriesAIVerdict pins the join between the AI
+// verdict and the attribution row. A non-zero AlertAnalysis.Verdict
+// returned by the enricher must land on the attribution row's
+// ai_verdict bucket so dashboards can group "alerts the AI flagged
+// as lean_yes" → resolved_correct rate.
+func TestAttributionCarriesAIVerdict(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	attr := &fakeAttributionStore{}
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, nopLogger())
+	w.SetAIEnricher(&fakeVerdictEnricher{verdict: "lean_yes", text: "Watchlist."})
+	w.SetAttributionStore(attr)
+
+	w.Drain(context.Background())
+
+	if attr.called != 1 || len(attr.rows) != 1 {
+		t.Fatalf("expected 1 attribution row, got called=%d rows=%d", attr.called, len(attr.rows))
+	}
+	if attr.rows[0].AIVerdict != "lean_yes" {
+		t.Errorf("ai_verdict: %q", attr.rows[0].AIVerdict)
+	}
+}
+
+// fakeVerdictEnricher is a separate fake because fakeEnricher returns
+// an empty AlertAnalysis. This one mimics a real enricher that
+// returns Verdict on its OK path.
+type fakeVerdictEnricher struct {
+	verdict string
+	text    string
+}
+
+func (f *fakeVerdictEnricher) AnalyzeAndStore(_ context.Context, _ int64, _ anomaly.Finding) (repository.AlertAnalysis, error) {
+	return repository.AlertAnalysis{Verdict: f.verdict}, nil
+}
+func (f *fakeVerdictEnricher) LatestText(_ context.Context, _ int64) string { return f.text }
 
 func TestSendsPendingAlertAndMarksSent(t *testing.T) {
 	st := newFakeStore(sampleAlert(t, 1, "info"))

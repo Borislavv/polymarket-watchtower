@@ -623,23 +623,29 @@ type StableFavoriteConfig struct {
 	// Remaining-return floor expressed as a percentage.
 	MinReturnPct float64 `env:"STABLE_FAVORITE_MIN_RETURN_PCT" envDefault:"20" validate:"gte=0"`
 
-	// Stability window.
-	StabilityWindow    time.Duration `env:"STABLE_FAVORITE_STABILITY_WINDOW" envDefault:"24h" validate:"gt=0"`
-	MaxPriceStddev     float64       `env:"STABLE_FAVORITE_MAX_PRICE_STDDEV" envDefault:"0.08" validate:"gt=0"`
-	MaxDrawdown        float64       `env:"STABLE_FAVORITE_MAX_DRAWDOWN" envDefault:"0.12" validate:"gt=0"`
-	MaxAdverseMove6h   float64       `env:"STABLE_FAVORITE_MAX_ADVERSE_MOVE_6H" envDefault:"0.08" validate:"gt=0"`
-	MaxNegativeDrift6h float64       `env:"STABLE_FAVORITE_MAX_NEGATIVE_DRIFT_6H" envDefault:"0.05" validate:"gte=0"`
+	// Stability window. v7 relaxation: shortened to 6h (was 24h) so
+	// the stability read reflects the most-recent regime, and the
+	// stddev / drawdown / adverse-move caps loosened to admit markets
+	// that breathe a little without flapping. Cross-market is NOT a
+	// hard gate (see pickSeverity in the detector).
+	StabilityWindow    time.Duration `env:"STABLE_FAVORITE_STABILITY_WINDOW" envDefault:"6h" validate:"gt=0"`
+	MaxPriceStddev     float64       `env:"STABLE_FAVORITE_MAX_PRICE_STDDEV" envDefault:"0.10" validate:"gt=0"`
+	MaxDrawdown        float64       `env:"STABLE_FAVORITE_MAX_DRAWDOWN" envDefault:"0.25" validate:"gt=0"`
+	MaxAdverseMove6h   float64       `env:"STABLE_FAVORITE_MAX_ADVERSE_MOVE_6H" envDefault:"0.15" validate:"gt=0"`
+	MaxNegativeDrift6h float64       `env:"STABLE_FAVORITE_MAX_NEGATIVE_DRIFT_6H" envDefault:"0.10" validate:"gte=0"`
 
 	// Liquidity gates.
 	MinMarketVolumeUSD float64 `env:"STABLE_FAVORITE_MIN_MARKET_VOLUME_USD" envDefault:"25000" validate:"gte=0"`
 	MinRecentTrades    int     `env:"STABLE_FAVORITE_MIN_RECENT_TRADES" envDefault:"20" validate:"gte=0"`
 
-	// Cross-market (optional; no upstream wired in v6).
+	// Cross-market (optional; no upstream wired in v6). Effect is
+	// confidence-only — see detector.pickSeverity.
 	CrossMarketEnabled         bool    `env:"STABLE_FAVORITE_CROSS_MARKET_ENABLED" envDefault:"true"`
 	MaxCrossMarketDisagreement float64 `env:"STABLE_FAVORITE_MAX_CROSS_MARKET_DISAGREEMENT" envDefault:"0.15" validate:"gte=0,lt=1"`
 
-	// Worker cadence.
-	Interval       time.Duration `env:"STABLE_FAVORITE_INTERVAL" envDefault:"5m" validate:"gt=0"`
+	// Worker cadence. 15m (was 5m) tracks the slower-moving state
+	// view appropriate for the relaxed stability window.
+	Interval       time.Duration `env:"STABLE_FAVORITE_INTERVAL" envDefault:"15m" validate:"gt=0"`
 	CandidateLimit int           `env:"STABLE_FAVORITE_CANDIDATE_LIMIT" envDefault:"200" validate:"gte=1,lte=10000"`
 }
 

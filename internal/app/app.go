@@ -30,6 +30,8 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
@@ -80,6 +82,8 @@ type App struct {
 	detection      *detection.Worker
 	stableFavorite *stablefavorite.Worker
 	aiAnalysis     *aianalysis.Service
+	outcomeAI      *outcomeai.Worker
+	marketIntel    *marketintel.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -643,6 +647,91 @@ func New() (*App, error) {
 			LifecycleRefreshDeltaPct: cfg.AIAnalysis.LifecycleRefreshDeltaPct,
 			CLVMaterialChange:        cfg.AIAnalysis.CLVMaterialChange,
 		}, analyzer, alertAnalysisRepo, met, logger)
+
+		// Wire the AI enricher into the sender so every claimed alert
+		// generates / refreshes its analyst note BEFORE Telegram render.
+		// The sender already handles enricher==nil; this is the prod
+		// hookup. When AlertsEnabled=false the service short-circuits
+		// to a no-op call.
+		if senderWorker != nil {
+			senderWorker.SetAIEnricher(aiSvc)
+		}
+	}
+
+	// Strategy attribution writer: every alert that reaches the
+	// sender lands a bucketed row on polymarket_alert_strategy_dimensions
+	// so the "which-setups-actually-win" dashboards can group by
+	// strategy_family / lifecycle / odds / notional / category without
+	// recomputing buckets from raw payloads. Postgres-only (the table
+	// lives there); failures degrade silently inside the sender.
+	if cfg.Postgres.Enabled() && senderWorker != nil {
+		senderWorker.SetAttributionStore(repository.NewStrategyDimensionsRepository(pgPool))
+	}
+
+	// Outcome-learning worker: scans resolved alerts, calls AI for
+	// postmortems, edits original Telegram message + applies the
+	// success/failure reaction. Runs only when Postgres + Telegram
+	// + the alerts repo are wired; the AI key is OPTIONAL — without
+	// it the NoopAnalyzer returns StatusSkipped and the worker
+	// still applies reactions + sends a "Resolution" follow-up so
+	// the operator sees the result.
+	var outcomeAIWorker *outcomeai.Worker
+	if cfg.Postgres.Enabled() && alertsRepo != nil && bot != nil && cfg.AIAnalysis.Enabled {
+		var analyzerForOutcome analysis.Analyzer = analysis.NoopAnalyzer{}
+		if cfg.AIAnalysis.APIKey != "" {
+			analyzerForOutcome = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.AIAnalysis.Timeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		outcomeAIWorker = outcomeai.New(outcomeai.Config{
+			Enabled:         cfg.AIAnalysis.ReportsEnabled,
+			Interval:        10 * time.Minute,
+			ClaimLimit:      16,
+			ChatID:          cfg.Alerting.TelegramChatID,
+			SuccessReaction: cfg.TelegramReactions.SuccessEmoji,
+			FailureReaction: cfg.TelegramReactions.FailureEmoji,
+		}, alertsRepo, repository.NewAlertOutcomeAnalysisRepository(pgPool), analyzerForOutcome, bot, logger)
+	}
+
+	// 2h market intelligence report worker. Same gating: Postgres
+	// + Telegram wired AND AIMarketIntelligenceEnabled=true. The
+	// candidate selection works even without the AI key — the
+	// worker stores a "skipped" row and posts the candidate list
+	// unranked. With the key, the AI summary lands inline.
+	var marketIntelWorker *marketintel.Worker
+	if cfg.Postgres.Enabled() && bot != nil && cfg.AIAnalysis.MarketIntelligenceEnabled {
+		var analyzerForReport analysis.Analyzer = analysis.NoopAnalyzer{}
+		if cfg.AIAnalysis.APIKey != "" {
+			analyzerForReport = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.AIAnalysis.Timeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
+		marketIntelWorker = marketintel.New(marketintel.Config{
+			Enabled:        true,
+			Interval:       cfg.AIAnalysis.MarketIntelligenceInterval,
+			MaxMarkets:     cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
+			MaxOutputChars: cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
+			ChatID:         cfg.Alerting.TelegramChatID,
+		}, intelRepo, intelRepo, analyzerForReport, bot, logger)
 	}
 
 	return &App{
@@ -664,6 +753,8 @@ func New() (*App, error) {
 		detection:      detectionWorker,
 		stableFavorite: stableFavWorker,
 		aiAnalysis:     aiSvc,
+		outcomeAI:      outcomeAIWorker,
+		marketIntel:    marketIntelWorker,
 		pgPool:         pgPool,
 	}, nil
 }
@@ -856,6 +947,18 @@ func (a *App) Run() error {
 	if a.stableFavorite != nil {
 		execs = append(execs, shutdown2.Exec{Name: "stablefavorite", Fn: func(ctx context.Context) error {
 			a.stableFavorite.Run(ctx)
+			return nil
+		}})
+	}
+	if a.outcomeAI != nil {
+		execs = append(execs, shutdown2.Exec{Name: "outcomeai", Fn: func(ctx context.Context) error {
+			a.outcomeAI.Run(ctx)
+			return nil
+		}})
+	}
+	if a.marketIntel != nil {
+		execs = append(execs, shutdown2.Exec{Name: "marketintel", Fn: func(ctx context.Context) error {
+			a.marketIntel.Run(ctx)
 			return nil
 		}})
 	}

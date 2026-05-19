@@ -200,3 +200,26 @@ WHERE market_id     = sqlc.arg(market_id)::bigint
   AND traded_at     >= sqlc.arg(at_or_after)::timestamptz
 ORDER BY traded_at ASC
 LIMIT 1;
+
+-- name: GetAlertByID :one
+-- Single-row fetch used by the outcome-learning worker to reload
+-- the full row (payload, telegram_message_id, outcome_status, etc.)
+-- before invoking the AI postmortem path.
+SELECT * FROM polymarket_alerts WHERE id = $1;
+
+-- name: ListResolvedAlertsForPostmortem :many
+-- Returns sent alerts whose outcome is terminal AND which do NOT
+-- yet have an outcome-analysis row. The LEFT JOIN keeps the query
+-- a single roundtrip per claim cycle.
+--
+-- We process newest-first so a resolution burst (e.g. an event
+-- night) gets postmortems for the most-recent settlements first.
+SELECT a.*
+FROM polymarket_alerts a
+LEFT JOIN polymarket_alert_outcome_analyses o ON o.alert_id = a.id
+WHERE a.status         = 'sent'
+  AND a.outcome_status IN ('resolved_correct', 'resolved_wrong')
+  AND a.resolved_at   IS NOT NULL
+  AND o.id            IS NULL
+ORDER BY a.resolved_at DESC NULLS LAST, a.id DESC
+LIMIT sqlc.arg(limit_count)::integer;

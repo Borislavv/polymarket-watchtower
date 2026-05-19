@@ -303,6 +303,12 @@ type StableFavoriteRef struct {
 	Score      float64
 	Confidence float64
 
+	// RiskAdjustedReturn is RemainingReturnPct / (price stddev × 100)
+	// — the favourite's payout per unit of recent price noise.
+	// Higher = better edge for the stability the market exhibits.
+	// Zero when stddev is zero or undefined.
+	RiskAdjustedReturn float64
+
 	// CrossMarketStatus is one of:
 	//   "" / "unavailable" — no related-market data wired
 	//   "confirmed"        — related market within MaxDisagreement of this price

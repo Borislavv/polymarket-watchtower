@@ -101,3 +101,91 @@ RETURNING *;
 -- name: GetAlertOutcomeAnalysis :one
 SELECT * FROM polymarket_alert_outcome_analyses
 WHERE alert_id = sqlc.arg(alert_id)::bigint;
+
+-- name: ListMarketIntelligenceCandidates :many
+-- Top-N candidate markets for the 2h intelligence report. Selection
+-- philosophy: deep into lifecycle + recent activity + non-trivial
+-- liquidity. The query is intentionally simple — the AI does the
+-- ranking; we provide a generous shortlist.
+SELECT
+    m.condition_id,
+    m.question,
+    c.name AS category,
+    (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+            NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct,
+    -- last 24h aggregates over polymarket_trades for this market
+    COALESCE(
+      (SELECT COUNT(*) FROM polymarket_trades t
+       WHERE t.market_id = m.id AND t.traded_at >= NOW() - INTERVAL '24 hours'),
+      0)::bigint AS trades_24h,
+    COALESCE(
+      (SELECT SUM(t.notional_usd) FROM polymarket_trades t
+       WHERE t.market_id = m.id AND t.traded_at >= NOW() - INTERVAL '24 hours'),
+      0)::double precision AS volume_24h_usd,
+    -- last observed price on the first outcome token (proxy probability)
+    COALESCE(
+      (SELECT t.price FROM polymarket_trades t
+       WHERE t.market_id = m.id
+       ORDER BY t.traded_at DESC LIMIT 1),
+      0)::double precision AS last_price,
+    -- alerts emitted on this market in the last 24h
+    COALESCE(
+      (SELECT COUNT(*) FROM polymarket_alerts a
+       WHERE a.market_id = m.id AND a.created_at >= NOW() - INTERVAL '24 hours'),
+      0)::bigint AS alerts_24h
+FROM polymarket_markets m
+LEFT JOIN polymarket_market_categories mc ON mc.market_id = m.id
+LEFT JOIN polymarket_categories c ON c.id = mc.category_id
+WHERE m.active = TRUE
+  AND m.deleted_at IS NULL
+  AND m.purged_at  IS NULL
+  AND m.start_date IS NOT NULL
+  AND m.end_date   IS NOT NULL
+  AND m.end_date    > NOW()
+ORDER BY (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+                NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision DESC NULLS LAST,
+         volume_24h_usd DESC
+LIMIT sqlc.arg(limit_count)::integer;
+
+-- name: UpsertAlertStrategyDimensions :exec
+-- One row per alert; idempotent. Called by the alertsender worker
+-- BEFORE Telegram delivery so the attribution row exists by the
+-- time the operator sees the alert. Overwrites any prior bucketing
+-- (so a re-run after schema fix doesn't accumulate ghosts).
+INSERT INTO polymarket_alert_strategy_dimensions (
+    alert_id, strategy_family, lifecycle_bucket, odds_bucket,
+    notional_bucket, return_bucket, category, accumulation_window,
+    ownership_share_bucket, volatility_regime, new_wallet,
+    quiet_market, dormant_wallet, drift_regime, ai_verdict
+) VALUES (
+    sqlc.arg(alert_id)::bigint,
+    sqlc.arg(strategy_family)::text,
+    sqlc.arg(lifecycle_bucket)::text,
+    sqlc.narg(odds_bucket)::text,
+    sqlc.narg(notional_bucket)::text,
+    sqlc.narg(return_bucket)::text,
+    sqlc.narg(category)::text,
+    sqlc.narg(accumulation_window)::text,
+    sqlc.narg(ownership_share_bucket)::text,
+    sqlc.narg(volatility_regime)::text,
+    sqlc.arg(new_wallet)::bool,
+    sqlc.arg(quiet_market)::bool,
+    sqlc.arg(dormant_wallet)::bool,
+    sqlc.narg(drift_regime)::text,
+    sqlc.narg(ai_verdict)::text
+)
+ON CONFLICT (alert_id) DO UPDATE SET
+    strategy_family       = EXCLUDED.strategy_family,
+    lifecycle_bucket      = EXCLUDED.lifecycle_bucket,
+    odds_bucket           = EXCLUDED.odds_bucket,
+    notional_bucket       = EXCLUDED.notional_bucket,
+    return_bucket         = EXCLUDED.return_bucket,
+    category              = EXCLUDED.category,
+    accumulation_window   = EXCLUDED.accumulation_window,
+    ownership_share_bucket = EXCLUDED.ownership_share_bucket,
+    volatility_regime     = EXCLUDED.volatility_regime,
+    new_wallet            = EXCLUDED.new_wallet,
+    quiet_market          = EXCLUDED.quiet_market,
+    dormant_wallet        = EXCLUDED.dormant_wallet,
+    drift_regime          = EXCLUDED.drift_regime,
+    ai_verdict            = EXCLUDED.ai_verdict;

@@ -115,6 +115,84 @@ func (b *Bot) SendHTML(ctx context.Context, chatID, text string) (SendResult, er
 	return SendResult{MessageID: parsed.Result.MessageID}, nil
 }
 
+// ErrEditUnsupported is returned by EditMessageText when Telegram
+// explicitly rejects the edit (message too old per Bot API rules,
+// "message is not modified", bot kicked, etc.). Callers persist
+// this as terminal so a follow-up reply path can run instead.
+var ErrEditUnsupported = errors.New("telegram: editMessageText unsupported on target")
+
+// EditMessageText replaces the body of a previously-sent message
+// identified by (chatID, messageID). Used by the outcome-learning
+// worker to append a "Why WON / Why LOST" block to a resolved
+// alert's original Telegram message.
+//
+// Telegram's `editMessageText` only succeeds when:
+//   - the bot is the original sender
+//   - the message is < 48h old (per Bot API current rules)
+//   - the new text differs from the old text
+//   - the bot still has rights in the chat
+//
+// Permission/capability rejections map to ErrEditUnsupported so the
+// caller can fall back to a linked follow-up message. Generic
+// transport errors are returned as ordinary errors.
+//
+// Telegram API reference:
+//
+//	POST https://api.telegram.org/bot<token>/editMessageText
+//	  chat_id    int64 | "@channelusername"
+//	  message_id int
+//	  text       string
+//	  parse_mode "HTML"
+//	  disable_web_page_preview bool
+func (b *Bot) EditMessageText(ctx context.Context, chatID string, messageID int64, text string) error {
+	if strings.TrimSpace(chatID) == "" {
+		return errors.New("telegram: chat id required")
+	}
+	if messageID <= 0 {
+		return errors.New("telegram: message id required")
+	}
+	body := map[string]any{
+		"message_id":               messageID,
+		"text":                     text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
+	}
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil {
+		body["chat_id"] = id
+	} else {
+		body["chat_id"] = chatID
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("telegram: marshal: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/editMessageText",
+		strings.TrimRight(b.cfg.BaseURL, "/"), b.cfg.BotToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram: editMessageText: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	// 400 = parameter problem (message too old, not modified, parse
+	// error, etc.) → terminal; map to ErrEditUnsupported so the
+	// caller takes the follow-up-reply path. 403 = bot kicked /
+	// channel rights revoked → also terminal. Everything else (429,
+	// 5xx, network) is retryable.
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%w: %d: %s", ErrEditUnsupported, resp.StatusCode, string(snippet))
+	}
+	return fmt.Errorf("telegram: editMessageText chat %s -> %d: %s", chatID, resp.StatusCode, string(snippet))
+}
+
 // ErrReactionUnsupported is returned by SetMessageReaction when the
 // Telegram API explicitly rejects the call because of capability /
 // permission / target-type limits. Callers persist this as a terminal

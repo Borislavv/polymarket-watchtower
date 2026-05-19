@@ -103,6 +103,54 @@ func (q *Queries) ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([
 	return items, nil
 }
 
+const getAlertByID = `-- name: GetAlertByID :one
+SELECT id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at, next_retry_at, last_attempt_at, outcome_status, outcome_checked_at, resolved_at, winning_outcome_token, winning_outcome_label, drift_status, drift_checked_at, clv_15m, clv_1h, clv_6h, clv_24h, telegram_reaction_status, telegram_reaction_emoji, last_reaction_at FROM polymarket_alerts WHERE id = $1
+`
+
+// Single-row fetch used by the outcome-learning worker to reload
+// the full row (payload, telegram_message_id, outcome_status, etc.)
+// before invoking the AI postmortem path.
+func (q *Queries) GetAlertByID(ctx context.Context, id int64) (PolymarketAlerts, error) {
+	row := q.db.QueryRow(ctx, getAlertByID, id)
+	var i PolymarketAlerts
+	err := row.Scan(
+		&i.ID,
+		&i.DedupKey,
+		&i.StrategyVersion,
+		&i.Kind,
+		&i.Reason,
+		&i.Severity,
+		&i.MarketID,
+		&i.TraderID,
+		&i.TradeID,
+		&i.Payload,
+		&i.Status,
+		&i.TelegramMessageID,
+		&i.SendAttempts,
+		&i.LastSendError,
+		&i.SentAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.NextRetryAt,
+		&i.LastAttemptAt,
+		&i.OutcomeStatus,
+		&i.OutcomeCheckedAt,
+		&i.ResolvedAt,
+		&i.WinningOutcomeToken,
+		&i.WinningOutcomeLabel,
+		&i.DriftStatus,
+		&i.DriftCheckedAt,
+		&i.Clv15m,
+		&i.Clv1h,
+		&i.Clv6h,
+		&i.Clv24h,
+		&i.TelegramReactionStatus,
+		&i.TelegramReactionEmoji,
+		&i.LastReactionAt,
+	)
+	return i, err
+}
+
 const latestClusterAlertForCategory = `-- name: LatestClusterAlertForCategory :one
 SELECT id, dedup_key, strategy_version, kind, reason, severity, market_id, trader_id, trade_id, payload, status, telegram_message_id, send_attempts, last_send_error, sent_at, created_at, updated_at, next_retry_at, last_attempt_at, outcome_status, outcome_checked_at, resolved_at, winning_outcome_token, winning_outcome_label, drift_status, drift_checked_at, clv_15m, clv_1h, clv_6h, clv_24h, telegram_reaction_status, telegram_reaction_emoji, last_reaction_at FROM polymarket_alerts
 WHERE kind             = 'category_watch'
@@ -178,6 +226,78 @@ LIMIT $1::integer
 // recent reactions appear before historical backfill.
 func (q *Queries) ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error) {
 	rows, err := q.db.Query(ctx, listAlertsForReaction, claimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PolymarketAlerts
+	for rows.Next() {
+		var i PolymarketAlerts
+		if err := rows.Scan(
+			&i.ID,
+			&i.DedupKey,
+			&i.StrategyVersion,
+			&i.Kind,
+			&i.Reason,
+			&i.Severity,
+			&i.MarketID,
+			&i.TraderID,
+			&i.TradeID,
+			&i.Payload,
+			&i.Status,
+			&i.TelegramMessageID,
+			&i.SendAttempts,
+			&i.LastSendError,
+			&i.SentAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.NextRetryAt,
+			&i.LastAttemptAt,
+			&i.OutcomeStatus,
+			&i.OutcomeCheckedAt,
+			&i.ResolvedAt,
+			&i.WinningOutcomeToken,
+			&i.WinningOutcomeLabel,
+			&i.DriftStatus,
+			&i.DriftCheckedAt,
+			&i.Clv15m,
+			&i.Clv1h,
+			&i.Clv6h,
+			&i.Clv24h,
+			&i.TelegramReactionStatus,
+			&i.TelegramReactionEmoji,
+			&i.LastReactionAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listResolvedAlertsForPostmortem = `-- name: ListResolvedAlertsForPostmortem :many
+SELECT a.id, a.dedup_key, a.strategy_version, a.kind, a.reason, a.severity, a.market_id, a.trader_id, a.trade_id, a.payload, a.status, a.telegram_message_id, a.send_attempts, a.last_send_error, a.sent_at, a.created_at, a.updated_at, a.next_retry_at, a.last_attempt_at, a.outcome_status, a.outcome_checked_at, a.resolved_at, a.winning_outcome_token, a.winning_outcome_label, a.drift_status, a.drift_checked_at, a.clv_15m, a.clv_1h, a.clv_6h, a.clv_24h, a.telegram_reaction_status, a.telegram_reaction_emoji, a.last_reaction_at
+FROM polymarket_alerts a
+LEFT JOIN polymarket_alert_outcome_analyses o ON o.alert_id = a.id
+WHERE a.status         = 'sent'
+  AND a.outcome_status IN ('resolved_correct', 'resolved_wrong')
+  AND a.resolved_at   IS NOT NULL
+  AND o.id            IS NULL
+ORDER BY a.resolved_at DESC NULLS LAST, a.id DESC
+LIMIT $1::integer
+`
+
+// Returns sent alerts whose outcome is terminal AND which do NOT
+// yet have an outcome-analysis row. The LEFT JOIN keeps the query
+// a single roundtrip per claim cycle.
+//
+// We process newest-first so a resolution burst (e.g. an event
+// night) gets postmortems for the most-recent settlements first.
+func (q *Queries) ListResolvedAlertsForPostmortem(ctx context.Context, limitCount int32) ([]PolymarketAlerts, error) {
+	rows, err := q.db.Query(ctx, listResolvedAlertsForPostmortem, limitCount)
 	if err != nil {
 		return nil, err
 	}

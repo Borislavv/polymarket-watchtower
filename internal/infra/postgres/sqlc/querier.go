@@ -64,6 +64,10 @@ type Querier interface {
 	// reported as 'pending'.
 	DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error)
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
+	// Single-row fetch used by the outcome-learning worker to reload
+	// the full row (payload, telegram_message_id, outcome_status, etc.)
+	// before invoking the AI postmortem path.
+	GetAlertByID(ctx context.Context, id int64) (PolymarketAlerts, error)
 	GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (PolymarketAlertOutcomeAnalyses, error)
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
@@ -154,6 +158,18 @@ type Querier interface {
 	// "late-market" means.
 	ListLateMarketCandidates(ctx context.Context, arg ListLateMarketCandidatesParams) ([]ListLateMarketCandidatesRow, error)
 	ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]int64, error)
+	// Top-N candidate markets for the 2h intelligence report. Selection
+	// philosophy: deep into lifecycle + recent activity + non-trivial
+	// liquidity. The query is intentionally simple — the AI does the
+	// ranking; we provide a generous shortlist.
+	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
+	// Returns sent alerts whose outcome is terminal AND which do NOT
+	// yet have an outcome-analysis row. The LEFT JOIN keeps the query
+	// a single roundtrip per claim cycle.
+	//
+	// We process newest-first so a resolution burst (e.g. an event
+	// night) gets postmortems for the most-recent settlements first.
+	ListResolvedAlertsForPostmortem(ctx context.Context, limitCount int32) ([]PolymarketAlerts, error)
 	// Used by the drift worker. Returns sent alerts whose drift is still
 	// pending AND whose oldest reference window (15m by convention) has
 	// already elapsed. Bounded by claim_limit per tick.
@@ -351,6 +367,11 @@ type Querier interface {
 	// against the same trade batch is a no-op. Called by persist.Sink
 	// after collect's UpsertBatch; backfill never calls this.
 	UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error
+	// One row per alert; idempotent. Called by the alertsender worker
+	// BEFORE Telegram delivery so the attribution row exists by the
+	// time the operator sees the alert. Overwrites any prior bucketing
+	// (so a re-run after schema fix doesn't accumulate ghosts).
+	UpsertAlertStrategyDimensions(ctx context.Context, arg UpsertAlertStrategyDimensionsParams) error
 	// Insert-or-update a Polymarket category. `enabled` is preserved on update
 	// (it's a local setting driven by CATEGORY_WHITELIST, not Polymarket data).
 	UpsertCategory(ctx context.Context, arg UpsertCategoryParams) (PolymarketCategories, error)

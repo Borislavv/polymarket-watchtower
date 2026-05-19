@@ -366,3 +366,172 @@ func (q *Queries) LatestMarketIntelligenceReport(ctx context.Context) (Polymarke
 	)
 	return i, err
 }
+
+const listMarketIntelligenceCandidates = `-- name: ListMarketIntelligenceCandidates :many
+SELECT
+    m.condition_id,
+    m.question,
+    c.name AS category,
+    (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+            NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct,
+    -- last 24h aggregates over polymarket_trades for this market
+    COALESCE(
+      (SELECT COUNT(*) FROM polymarket_trades t
+       WHERE t.market_id = m.id AND t.traded_at >= NOW() - INTERVAL '24 hours'),
+      0)::bigint AS trades_24h,
+    COALESCE(
+      (SELECT SUM(t.notional_usd) FROM polymarket_trades t
+       WHERE t.market_id = m.id AND t.traded_at >= NOW() - INTERVAL '24 hours'),
+      0)::double precision AS volume_24h_usd,
+    -- last observed price on the first outcome token (proxy probability)
+    COALESCE(
+      (SELECT t.price FROM polymarket_trades t
+       WHERE t.market_id = m.id
+       ORDER BY t.traded_at DESC LIMIT 1),
+      0)::double precision AS last_price,
+    -- alerts emitted on this market in the last 24h
+    COALESCE(
+      (SELECT COUNT(*) FROM polymarket_alerts a
+       WHERE a.market_id = m.id AND a.created_at >= NOW() - INTERVAL '24 hours'),
+      0)::bigint AS alerts_24h
+FROM polymarket_markets m
+LEFT JOIN polymarket_market_categories mc ON mc.market_id = m.id
+LEFT JOIN polymarket_categories c ON c.id = mc.category_id
+WHERE m.active = TRUE
+  AND m.deleted_at IS NULL
+  AND m.purged_at  IS NULL
+  AND m.start_date IS NOT NULL
+  AND m.end_date   IS NOT NULL
+  AND m.end_date    > NOW()
+ORDER BY (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+                NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision DESC NULLS LAST,
+         volume_24h_usd DESC
+LIMIT $1::integer
+`
+
+type ListMarketIntelligenceCandidatesRow struct {
+	ConditionID  string
+	Question     string
+	Category     *string
+	LifecyclePct float64
+	Trades24h    int64
+	Volume24hUsd float64
+	LastPrice    float64
+	Alerts24h    int64
+}
+
+// Top-N candidate markets for the 2h intelligence report. Selection
+// philosophy: deep into lifecycle + recent activity + non-trivial
+// liquidity. The query is intentionally simple — the AI does the
+// ranking; we provide a generous shortlist.
+func (q *Queries) ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listMarketIntelligenceCandidates, limitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMarketIntelligenceCandidatesRow
+	for rows.Next() {
+		var i ListMarketIntelligenceCandidatesRow
+		if err := rows.Scan(
+			&i.ConditionID,
+			&i.Question,
+			&i.Category,
+			&i.LifecyclePct,
+			&i.Trades24h,
+			&i.Volume24hUsd,
+			&i.LastPrice,
+			&i.Alerts24h,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const upsertAlertStrategyDimensions = `-- name: UpsertAlertStrategyDimensions :exec
+INSERT INTO polymarket_alert_strategy_dimensions (
+    alert_id, strategy_family, lifecycle_bucket, odds_bucket,
+    notional_bucket, return_bucket, category, accumulation_window,
+    ownership_share_bucket, volatility_regime, new_wallet,
+    quiet_market, dormant_wallet, drift_regime, ai_verdict
+) VALUES (
+    $1::bigint,
+    $2::text,
+    $3::text,
+    $4::text,
+    $5::text,
+    $6::text,
+    $7::text,
+    $8::text,
+    $9::text,
+    $10::text,
+    $11::bool,
+    $12::bool,
+    $13::bool,
+    $14::text,
+    $15::text
+)
+ON CONFLICT (alert_id) DO UPDATE SET
+    strategy_family       = EXCLUDED.strategy_family,
+    lifecycle_bucket      = EXCLUDED.lifecycle_bucket,
+    odds_bucket           = EXCLUDED.odds_bucket,
+    notional_bucket       = EXCLUDED.notional_bucket,
+    return_bucket         = EXCLUDED.return_bucket,
+    category              = EXCLUDED.category,
+    accumulation_window   = EXCLUDED.accumulation_window,
+    ownership_share_bucket = EXCLUDED.ownership_share_bucket,
+    volatility_regime     = EXCLUDED.volatility_regime,
+    new_wallet            = EXCLUDED.new_wallet,
+    quiet_market          = EXCLUDED.quiet_market,
+    dormant_wallet        = EXCLUDED.dormant_wallet,
+    drift_regime          = EXCLUDED.drift_regime,
+    ai_verdict            = EXCLUDED.ai_verdict
+`
+
+type UpsertAlertStrategyDimensionsParams struct {
+	AlertID              int64
+	StrategyFamily       string
+	LifecycleBucket      string
+	OddsBucket           *string
+	NotionalBucket       *string
+	ReturnBucket         *string
+	Category             *string
+	AccumulationWindow   *string
+	OwnershipShareBucket *string
+	VolatilityRegime     *string
+	NewWallet            bool
+	QuietMarket          bool
+	DormantWallet        bool
+	DriftRegime          *string
+	AiVerdict            *string
+}
+
+// One row per alert; idempotent. Called by the alertsender worker
+// BEFORE Telegram delivery so the attribution row exists by the
+// time the operator sees the alert. Overwrites any prior bucketing
+// (so a re-run after schema fix doesn't accumulate ghosts).
+func (q *Queries) UpsertAlertStrategyDimensions(ctx context.Context, arg UpsertAlertStrategyDimensionsParams) error {
+	_, err := q.db.Exec(ctx, upsertAlertStrategyDimensions,
+		arg.AlertID,
+		arg.StrategyFamily,
+		arg.LifecycleBucket,
+		arg.OddsBucket,
+		arg.NotionalBucket,
+		arg.ReturnBucket,
+		arg.Category,
+		arg.AccumulationWindow,
+		arg.OwnershipShareBucket,
+		arg.VolatilityRegime,
+		arg.NewWallet,
+		arg.QuietMarket,
+		arg.DormantWallet,
+		arg.DriftRegime,
+		arg.AiVerdict,
+	)
+	return err
+}

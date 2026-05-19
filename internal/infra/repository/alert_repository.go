@@ -308,6 +308,33 @@ func (r *AlertRepository) ListAlertsForReaction(ctx context.Context, claimLimit 
 	return out, nil
 }
 
+// GetByID returns a single alert row. Used by the outcome-learning
+// worker to reload the full payload + telegram metadata before
+// running the AI postmortem path.
+func (r *AlertRepository) GetByID(ctx context.Context, id int64) (Alert, error) {
+	row, err := r.q.GetAlertByID(ctx, id)
+	if err != nil {
+		return Alert{}, fmt.Errorf("get alert by id %d: %w", id, err)
+	}
+	return alertFromSQLC(row), nil
+}
+
+// ListResolvedForPostmortem returns sent alerts whose outcome is
+// terminal AND which do not yet have a postmortem row. The query
+// LEFT JOINs polymarket_alert_outcome_analyses so the read is one
+// roundtrip per claim cycle.
+func (r *AlertRepository) ListResolvedForPostmortem(ctx context.Context, limit int32) ([]Alert, error) {
+	rows, err := r.q.ListResolvedAlertsForPostmortem(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list resolved alerts for postmortem: %w", err)
+	}
+	out := make([]Alert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, alertFromSQLC(row))
+	}
+	return out, nil
+}
+
 // MarkReaction stamps the setMessageReaction outcome on the alert row.
 // status MUST be one of the constants above. emoji is persisted as-is
 // when status=ReactionApplied; for other statuses it is informational.

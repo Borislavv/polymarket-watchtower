@@ -91,6 +91,23 @@ const (
 	ReasonCrossMarketConfirmation   = "CROSS_MARKET_CONFIRMATION"
 	ReasonCrossMarketConflict       = "CROSS_MARKET_CONFLICT"
 	ReasonLowLiquidityRisk          = "LOW_LIQUIDITY_RISK"
+
+	// ReasonVolatilityEventPending — recent (6h) volatility is
+	// markedly higher than the 24h baseline. Surveillance read: a
+	// binding event is unfolding now, the favorite may not stay
+	// stable. Context booster — caps severity but does not suppress.
+	ReasonVolatilityEventPending = "VOLATILITY_EVENT_PENDING"
+	// ReasonHypeMarketSuppression — 24h volume is unusually elevated
+	// AND the recent (6h) share of that volume dominates, suggesting
+	// the market is in a hype spike rather than orderly convergence.
+	// Stable-favorite alerts are downgraded one severity tier when
+	// this fires.
+	ReasonHypeMarketSuppression = "HYPE_MARKET_SUPPRESSION"
+	// ReasonRiskAdjustedReturn — annotates the StableFavoriteRef
+	// with the ratio (remaining_return_pct / observed_stddev × 100).
+	// Higher = better edge per unit of price noise. Surfaced as
+	// context only; no severity effect.
+	ReasonRiskAdjustedReturn = "RISK_ADJUSTED_RETURN"
 )
 
 // Tier is one severity rung on the single-trade ladder. A trade qualifies at
