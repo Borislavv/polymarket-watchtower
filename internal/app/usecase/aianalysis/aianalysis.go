@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -34,11 +35,12 @@ import (
 
 // Service is the usecase facade.
 type Service struct {
-	cfg      Config
-	analyzer analysis.Analyzer
-	repo     AnalysisStore
-	metrics  *metrics.Metrics
-	log      *zerolog.Logger
+	cfg        Config
+	analyzer   analysis.Analyzer
+	repo       AnalysisStore
+	requestLog RequestLogStore
+	metrics    *metrics.Metrics
+	log        *zerolog.Logger
 }
 
 // Config tunes refresh behavior + master switches.
@@ -59,16 +61,25 @@ type Config struct {
 }
 
 // AnalysisStore is the persistence seam. *repository.AlertAnalysisRepository
-// satisfies it.
+// satisfies it. Stores SUCCESSFUL AI answers only — failures land in
+// RequestLogStore.
 type AnalysisStore interface {
 	LatestVersion(ctx context.Context, alertID int64) (int32, error)
 	Latest(ctx context.Context, alertID int64) (repository.AlertAnalysis, error)
 	Insert(ctx context.Context, a repository.NewAlertAnalysis) (repository.AlertAnalysis, bool, error)
 }
 
-// New constructs a Service.
-func New(cfg Config, analyzer analysis.Analyzer, repo AnalysisStore, met *metrics.Metrics, log *zerolog.Logger) *Service {
-	return &Service{cfg: cfg, analyzer: analyzer, repo: repo, metrics: met, log: log}
+// RequestLogStore is the operational-telemetry seam for AI calls.
+// *repository.AIRequestLogRepository satisfies it. Optional — nil
+// keeps the service usable without the new table (dev mode, tests).
+type RequestLogStore interface {
+	Insert(ctx context.Context, l repository.AIRequestLog) error
+}
+
+// New constructs a Service. requestLog may be nil — without it the
+// service still works, but operational failures land in logs only.
+func New(cfg Config, analyzer analysis.Analyzer, repo AnalysisStore, requestLog RequestLogStore, met *metrics.Metrics, log *zerolog.Logger) *Service {
+	return &Service{cfg: cfg, analyzer: analyzer, repo: repo, requestLog: requestLog, metrics: met, log: log}
 }
 
 // Canonical skip/failure reason strings. Stable identifiers — the
@@ -88,21 +99,28 @@ const (
 	ReasonLatestTextNotOK     = "latest_text_status_not_ok"
 	ReasonLatestTextNotFound  = "latest_text_not_found"
 	ReasonLatestTextRepoError = "latest_text_repo_error"
+	ReasonValidationFailed    = "validation_failed"
 )
 
-// AnalyzeAndStore is the per-alert entry point. The caller (detect
-// emitter or a follow-up worker) has already persisted the alert
-// row; we look at the latest analysis for it, decide whether a
-// refresh is warranted, optionally call the Analyzer, and persist
-// the new version.
+// AnalyzeAndStore is the per-alert entry point. v8 data-correctness
+// semantics:
 //
-// Returns the analysis row regardless of outcome — Status tells the
-// caller whether to render it.
+//   - SUCCESSFUL AI answers are stored in polymarket_alert_analyses.
+//   - Provider failures and skips land in polymarket_ai_request_logs
+//     (when wired). They are NEVER stored as analysis rows — the
+//     production incident was OpenAI 429 quota JSON ending up in
+//     alert_analyses.last_error, making the analytical table
+//     unusable for dashboards.
+//   - Output validation runs before persistence: a returned text
+//     must contain the structured Thesis/Follow?/Verdict markers
+//     (see validateAlertOutput) — otherwise the response is treated
+//     as a failed call, request-logged, no analysis row written.
+//
+// Returns the analysis row when one exists for this alert (success
+// path or earlier successful version); otherwise an empty row with
+// Status carrying the canonical reason so the alertsender can log it.
 func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.Finding) (repository.AlertAnalysis, error) {
 	if !s.cfg.AlertsEnabled {
-		// Stamp the row so the caller can distinguish "disabled" from
-		// "wasn't asked". No DB write here — a global-disabled write
-		// would spam polymarket_alert_analyses with a row per alert.
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusSkipped),
@@ -122,39 +140,134 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 	switch {
 	case err == nil:
 		if !shouldRefresh(prev, f, s.cfg) {
-			// Mirror the prev row's status — if a previous analysis
-			// succeeded we render that; if it skipped/errored, the
-			// caller sees that status and logs accordingly.
 			return prev, nil
 		}
 	case errors.Is(err, repository.ErrAnalysisNotFound):
 		// First-time analysis — fall through.
 	default:
+		// A repo read failure is operational, not analytical. Log
+		// telemetry; return a skip-shaped result so the alert ships.
+		s.recordRequestLog(ctx, repository.AIRequestLog{
+			TargetKind:    "alert",
+			TargetID:      &alertID,
+			Provider:      "openai",
+			Model:         "",
+			RequestKind:   "alert_analysis",
+			Status:        "failed_terminal",
+			ErrorCategory: ReasonRepoLatestError,
+			ErrorMessage:  err.Error(),
+		})
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusError),
-			LastError: ReasonRepoLatestError + ": " + err.Error(),
+			LastError: ReasonRepoLatestError,
 		}, fmt.Errorf("latest alert analysis: %w", err)
 	}
 
 	req := BuildAlertRequest(f, time.Now())
 	startedAt := time.Now()
-	res, err := s.analyzer.AnalyzeAlert(ctx, req)
+	res, analyzerErr := s.analyzer.AnalyzeAlert(ctx, req)
 	latency := time.Since(startedAt)
-	if err != nil {
-		// Analyzer never returns Go errors — it surfaces Status.
-		// A non-nil error here means a serious internal issue;
-		// record an error row so the alert still emits.
-		s.log.Err(err).Int64("alert_id", alertID).Msg("aianalysis: analyzer error")
-		res = analysis.AlertAnalysis{Status: analysis.StatusError, Model: "unknown", LastError: err.Error()}
+
+	// Whatever the analyzer returned, write a request_log row. This
+	// is the load-bearing operational telemetry.
+	logRow := repository.AIRequestLog{
+		TargetKind:       "alert",
+		TargetID:         &alertID,
+		Provider:         "openai",
+		Model:            res.Model,
+		RequestKind:      "alert_analysis",
+		PromptChars:      int32(res.PromptChars),
+		OutputChars:      int32(res.OutputChars),
+		PromptTokens:     int32(res.PromptTokens),
+		CompletionTokens: int32(res.CompletionTokens),
+		EstimatedCostUSD: res.EstimatedCostUSD,
+		LatencyMS:        latency.Milliseconds(),
 	}
 
-	nextVersion, err := s.repo.LatestVersion(ctx, alertID)
-	if err != nil {
+	switch {
+	case analyzerErr != nil:
+		// Typed provider error.
+		logRow.Status, logRow.ErrorCategory, logRow.ErrorMessage = classifyAnalyzerError(analyzerErr, res)
+		s.log.Warn().Err(analyzerErr).
+			Int64("alert_id", alertID).
+			Str("category", logRow.ErrorCategory).
+			Msg("ai request failed")
+		s.recordRequestLog(ctx, logRow)
+		s.observe(res)
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusError),
-			LastError: ReasonRepoVersionError + ": " + err.Error(),
+			LastError: logRow.ErrorCategory,
+		}, nil
+
+	case res.Status == analysis.StatusSkipped:
+		// Analyzer signalled skip without an HTTP failure — usually
+		// budget/rate/no_key. Don't pollute the analysis table.
+		logRow.Status = "skipped_" + sanitizeReason(res.LastError)
+		logRow.ErrorCategory = res.LastError
+		s.log.Info().
+			Int64("alert_id", alertID).
+			Str("reason", res.LastError).
+			Msg("ai request skipped")
+		s.recordRequestLog(ctx, logRow)
+		s.observe(res)
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusSkipped),
+			LastError: res.LastError,
+		}, nil
+
+	case res.Status != analysis.StatusOK:
+		// Defence in depth — any other non-OK status is treated as a
+		// failure and request-logged.
+		logRow.Status = "failed_terminal"
+		logRow.ErrorCategory = res.LastError
+		s.recordRequestLog(ctx, logRow)
+		s.observe(res)
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(res.Status),
+			LastError: res.LastError,
+		}, nil
+	}
+
+	// Validation: a "success" with malformed/empty text is NOT a
+	// successful analysis. Reject and request-log.
+	if reason := validateAlertOutput(res.AnalysisText); reason != "" {
+		logRow.Status = "failed_terminal"
+		logRow.ErrorCategory = ReasonValidationFailed + ":" + reason
+		logRow.ErrorMessage = sanitizeAndCap(res.AnalysisText, 500)
+		s.log.Warn().
+			Int64("alert_id", alertID).
+			Str("category", logRow.ErrorCategory).
+			Msg("ai output failed validation; not persisting as analysis")
+		s.recordRequestLog(ctx, logRow)
+		s.observe(analysis.AlertAnalysis{Status: analysis.StatusError, Model: res.Model, LastError: logRow.ErrorCategory})
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusError),
+			LastError: logRow.ErrorCategory,
+		}, nil
+	}
+
+	// Real success path — persist the analysis.
+	nextVersion, err := s.repo.LatestVersion(ctx, alertID)
+	if err != nil {
+		s.recordRequestLog(ctx, repository.AIRequestLog{
+			TargetKind:    "alert",
+			TargetID:      &alertID,
+			Provider:      "openai",
+			Model:         res.Model,
+			RequestKind:   "alert_analysis",
+			Status:        "failed_terminal",
+			ErrorCategory: ReasonRepoVersionError,
+			ErrorMessage:  err.Error(),
+		})
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusError),
+			LastError: ReasonRepoVersionError,
 		}, fmt.Errorf("latest version: %w", err)
 	}
 	nextVersion++
@@ -171,24 +284,144 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 		EstimatedCostUSD: res.EstimatedCostUSD,
 		AnalysisText:     res.AnalysisText,
 		Verdict:          res.Verdict,
-		Status:           string(res.Status),
-		LastError:        res.LastError,
+		Status:           string(analysis.StatusOK),
+		LastError:        "",
 	})
 	if err != nil {
+		s.recordRequestLog(ctx, repository.AIRequestLog{
+			TargetKind:    "alert",
+			TargetID:      &alertID,
+			Provider:      "openai",
+			Model:         res.Model,
+			RequestKind:   "alert_analysis",
+			Status:        "failed_terminal",
+			ErrorCategory: ReasonRepoInsertError,
+			ErrorMessage:  err.Error(),
+		})
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusError),
-			LastError: ReasonRepoInsertError + ": " + err.Error(),
+			LastError: ReasonRepoInsertError,
 		}, fmt.Errorf("insert: %w", err)
 	}
+
+	// Success request_log + metrics.
+	logRow.Status = "success"
+	s.recordRequestLog(ctx, logRow)
 	s.observe(res)
-	// Attach the actual latency on the returned row so the caller
-	// can log it without re-measuring. We piggy-back on a struct
-	// field that exists on res (not row); the alertsender only
-	// looks at status/verdict/text, so this is informational and
-	// kept out-of-band via the dedicated AnalyzeAndStoreResult helper.
-	_ = latency
+	s.log.Info().
+		Int64("alert_id", alertID).
+		Str("model", res.Model).
+		Int64("latency_ms", latency.Milliseconds()).
+		Int("prompt_tokens", res.PromptTokens).
+		Int("completion_tokens", res.CompletionTokens).
+		Int("text_len", len(res.AnalysisText)).
+		Msg("ai request completed")
 	return row, nil
+}
+
+// recordRequestLog is a fail-open helper — telemetry MUST NEVER block
+// the AI path. If the store write fails (DB down, table missing),
+// log it and move on.
+func (s *Service) recordRequestLog(ctx context.Context, l repository.AIRequestLog) {
+	if s.requestLog == nil {
+		return
+	}
+	if err := s.requestLog.Insert(ctx, l); err != nil {
+		s.log.Err(err).Str("target_kind", l.TargetKind).Msg("aianalysis: request_log write failed")
+	}
+}
+
+// sanitizeReason converts a free-form reason string into a
+// snake_case identifier safe for status enums. Empty → "unknown".
+func sanitizeReason(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	r := strings.ToLower(s)
+	r = strings.ReplaceAll(r, " ", "_")
+	r = strings.ReplaceAll(r, "-", "_")
+	// Drop colon-suffix payload to keep cardinality bounded.
+	if i := strings.Index(r, ":"); i > 0 {
+		r = r[:i]
+	}
+	return r
+}
+
+// classifyAnalyzerError maps an analyzer error + result into the
+// request_log status / category / message triple. Falls back to
+// unknown when the error isn't a typed ProviderError.
+func classifyAnalyzerError(err error, res analysis.AlertAnalysis) (status, category, message string) {
+	// Try to use the typed openai ProviderError. We don't import
+	// the package to avoid a cycle — instead we parse the LastError
+	// field which the openai client already sets to the canonical
+	// category string. See openai.AnalyzeAlert.
+	cat := res.LastError
+	if cat == "" {
+		cat = "unknown"
+	}
+	switch cat {
+	case "quota_exceeded":
+		return "skipped_quota", cat, sanitizeAndCap(err.Error(), 500)
+	case "rate_limited":
+		return "failed_retryable", cat, sanitizeAndCap(err.Error(), 500)
+	case "timeout":
+		return "failed_retryable", cat, sanitizeAndCap(err.Error(), 500)
+	case "provider_5xx":
+		return "failed_retryable", cat, sanitizeAndCap(err.Error(), 500)
+	case "bad_request", "invalid_model", "prompt_rejected":
+		return "failed_terminal", cat, sanitizeAndCap(err.Error(), 500)
+	default:
+		return "failed_terminal", cat, sanitizeAndCap(err.Error(), 500)
+	}
+}
+
+// sanitizeAndCap is a local copy of the openai package helper so we
+// don't introduce an import cycle (aianalysis → repository → ?
+// → openai → ?). The dedupe is tolerable; the rule is "short and
+// boring", and both copies enforce that.
+func sanitizeAndCap(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.TrimSpace(s)
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+// validateAlertOutput enforces the v8 prompt contract: the model
+// must produce a structured note with at least Thesis / Follow? /
+// Verdict markers. A response missing any of them is treated as
+// malformed — it would render as a wall of text that doesn't
+// answer the operator's decision question, so we reject it and
+// fall back to "no Analyst note attached".
+//
+// Returns empty string when valid; otherwise a short reason code
+// the caller can store in the request log.
+func validateAlertOutput(text string) string {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return "empty_text"
+	}
+	// Reject outputs that look like raw provider errors — belt and
+	// braces over the openai client error path.
+	low := strings.ToLower(t)
+	for _, marker := range []string{"insufficient_quota", "rate_limit_exceeded", "\"error\":{"} {
+		if strings.Contains(low, marker) {
+			return "provider_error_text"
+		}
+	}
+	if !strings.Contains(t, "Thesis:") {
+		return "missing_thesis"
+	}
+	if !strings.Contains(t, "Follow?:") {
+		return "missing_follow"
+	}
+	if !strings.Contains(t, "Verdict:") {
+		return "missing_verdict"
+	}
+	return ""
 }
 
 // LatestText returns the rendered text for the most recent analysis

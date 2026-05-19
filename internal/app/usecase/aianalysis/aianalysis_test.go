@@ -3,6 +3,8 @@ package aianalysis
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,15 +18,18 @@ import (
 )
 
 // fakeAnalyzer returns a canned AlertAnalysis on every call. Tests
-// assert what the Service does with it.
+// assert what the Service does with it. err lets tests simulate a
+// typed-provider-error path (the openai client returns Go err +
+// non-OK Status on quota/rate/5xx).
 type fakeAnalyzer struct {
 	result analysis.AlertAnalysis
+	err    error
 	calls  int
 }
 
 func (f *fakeAnalyzer) AnalyzeAlert(_ context.Context, _ analysis.AlertAnalysisRequest) (analysis.AlertAnalysis, error) {
 	f.calls++
-	return f.result, nil
+	return f.result, f.err
 }
 func (f *fakeAnalyzer) AnalyzeMarketReport(_ context.Context, _ analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
 	return analysis.MarketReportAnalysis{}, nil
@@ -74,7 +79,44 @@ func nopLogger() *zerolog.Logger {
 
 func newSvc(an analysis.Analyzer, st AnalysisStore) *Service {
 	return New(Config{AlertsEnabled: true, LifecycleRefreshDeltaPct: 1, CLVMaterialChange: 0.02},
-		an, st, metrics.New(), nopLogger())
+		an, st, nil /* request_log */, metrics.New(), nopLogger())
+}
+
+// newSvcWithRequestLog wires a fake request-log store so tests can
+// assert v8 telemetry without standing up Postgres.
+func newSvcWithRequestLog(an analysis.Analyzer, st AnalysisStore, rl RequestLogStore) *Service {
+	return New(Config{AlertsEnabled: true, LifecycleRefreshDeltaPct: 1, CLVMaterialChange: 0.02},
+		an, st, rl, metrics.New(), nopLogger())
+}
+
+// validAnalysisText returns a model-output string that passes
+// validateAlertOutput. Centralised so updating the validation contract
+// doesn't require touching every test literal.
+func validAnalysisText(verdictWord string) string {
+	return "Thesis: stable late-cycle favorite.\n" +
+		"Follow?: " + verdictWord + ".\n" +
+		"Why: low stddev + meaningful remaining return.\n" +
+		"Risk: late news may flip the favorite.\n" +
+		"Next: watch close-time + final polls.\n" +
+		"Verdict: " + verdictWord + "."
+}
+
+// fakeRequestLog captures every Insert call so tests can assert the
+// status/category routing without a real DB.
+type fakeRequestLog struct {
+	mu   sync.Mutex
+	rows []repository.AIRequestLog
+	err  error
+}
+
+func (f *fakeRequestLog) Insert(_ context.Context, l repository.AIRequestLog) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.rows = append(f.rows, l)
+	return nil
 }
 
 func sampleFinding() anomaly.Finding {
@@ -101,7 +143,7 @@ func sampleFinding() anomaly.Finding {
 func TestFirstTimeAnalysisInsertsVersion1(t *testing.T) {
 	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
 		Status: analysis.StatusOK, Model: "test-model",
-		AnalysisText: "This looks like an actionable trade.",
+		AnalysisText: validAnalysisText("watchlist"),
 		Verdict:      "actionable",
 		PromptTokens: 150, CompletionTokens: 60, EstimatedCostUSD: 0.0001,
 	}}
@@ -127,7 +169,7 @@ func TestFirstTimeAnalysisInsertsVersion1(t *testing.T) {
 // re-running the service for the same alert with the same finding
 // must NOT call the analyzer.
 func TestRefreshSkippedWhenNothingMoved(t *testing.T) {
-	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusOK, AnalysisText: "x"}}
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusOK, AnalysisText: validAnalysisText("watch")}}
 	st := newFakeStore()
 	st.latest[42] = repository.AlertAnalysis{
 		AlertID: 42, Version: 1, Status: string(analysis.StatusOK),
@@ -148,7 +190,7 @@ func TestRefreshSkippedWhenNothingMoved(t *testing.T) {
 // TestRefreshTriggersOnSeverityUpgrade pins that a severity bump
 // forces a re-analysis even within the refresh window.
 func TestRefreshTriggersOnSeverityUpgrade(t *testing.T) {
-	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusOK, AnalysisText: "upgraded view"}}
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusOK, AnalysisText: validAnalysisText("watchlist")}}
 	st := newFakeStore()
 	st.latest[42] = repository.AlertAnalysis{
 		AlertID: 42, Version: 1, Status: string(analysis.StatusOK),
@@ -175,7 +217,7 @@ func TestRefreshTriggersOnSeverityUpgrade(t *testing.T) {
 func TestServiceDisabledShortCircuits(t *testing.T) {
 	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusOK}}
 	st := newFakeStore()
-	svc := New(Config{AlertsEnabled: false}, an, st, metrics.New(), nopLogger())
+	svc := New(Config{AlertsEnabled: false}, an, st, nil, metrics.New(), nopLogger())
 	if _, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -237,14 +279,128 @@ func (erroringAnalyzer) AnalyzeOutcome(_ context.Context, _ analysis.OutcomeAnal
 	return analysis.OutcomeAnalysis{}, nil
 }
 
-func TestAnalyzerErrorBecomesStatusError(t *testing.T) {
+// TestAnalyzerErrorWritesRequestLogNotAnalysis pins v8 semantics:
+// an analyzer Go error must NOT land in polymarket_alert_analyses.
+// It is recorded in polymarket_ai_request_logs only. The returned
+// AlertAnalysis carries Status=error so the caller skips the
+// Analyst-note block, but no row is persisted in the analytical table.
+func TestAnalyzerErrorWritesRequestLogNotAnalysis(t *testing.T) {
 	st := newFakeStore()
-	svc := newSvc(erroringAnalyzer{}, st)
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(erroringAnalyzer{}, st, rl)
+
 	row, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding())
 	if err != nil {
 		t.Fatalf("must not propagate analyzer error: %v", err)
 	}
 	if row.Status != string(analysis.StatusError) {
 		t.Errorf("status: got %q want error", row.Status)
+	}
+	if len(st.latest) != 0 {
+		t.Errorf("v8: failed analyses must NOT touch polymarket_alert_analyses; got %d rows", len(st.latest))
+	}
+	if len(rl.rows) != 1 {
+		t.Fatalf("expected 1 ai_request_logs row, got %d", len(rl.rows))
+	}
+	if rl.rows[0].TargetKind != "alert" {
+		t.Errorf("target_kind: %q", rl.rows[0].TargetKind)
+	}
+	if !strings.HasPrefix(rl.rows[0].Status, "failed") {
+		t.Errorf("status: %q (must start with failed_)", rl.rows[0].Status)
+	}
+}
+
+// TestProviderQuotaExceededIsNotStoredAsAnalysis is the canonical
+// regression for the production incident: a 429 quota error must
+// land in ai_request_logs with category=quota_exceeded, NEVER in
+// polymarket_alert_analyses with raw JSON in last_error.
+func TestProviderQuotaExceededIsNotStoredAsAnalysis(t *testing.T) {
+	// fakeAnalyzer returns Status=skipped + LastError=quota_exceeded
+	// — exactly what the openai client surfaces after the typed
+	// classifier categorises a 429 quota response.
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
+		Status:    analysis.StatusSkipped,
+		Model:     "gpt-4o-mini",
+		LastError: "quota_exceeded",
+	}}
+	st := newFakeStore()
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	_, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(st.latest) != 0 {
+		t.Errorf("v8: quota_exceeded must NOT write to alert_analyses; got %d rows", len(st.latest))
+	}
+	if len(rl.rows) != 1 {
+		t.Fatalf("expected 1 ai_request_logs row, got %d", len(rl.rows))
+	}
+	if got := rl.rows[0].ErrorCategory; got != "quota_exceeded" {
+		t.Errorf("error_category: %q want quota_exceeded", got)
+	}
+	if !strings.HasPrefix(rl.rows[0].Status, "skipped_") {
+		t.Errorf("status: %q (must start with skipped_)", rl.rows[0].Status)
+	}
+}
+
+// TestBadOutputFailsValidationAndIsRequestLogged pins the v8 output-
+// validation contract: a successful HTTP response whose text doesn't
+// match the structured format is rejected — request_log only, no
+// analysis row.
+func TestBadOutputFailsValidationAndIsRequestLogged(t *testing.T) {
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
+		Status:       analysis.StatusOK,
+		Model:        "gpt-4o-mini",
+		AnalysisText: "This is just free text without the required structure.",
+	}}
+	st := newFakeStore()
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	_, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(st.latest) != 0 {
+		t.Errorf("malformed output must NOT be stored as analysis; got %d rows", len(st.latest))
+	}
+	if len(rl.rows) != 1 {
+		t.Fatalf("expected 1 ai_request_logs row, got %d", len(rl.rows))
+	}
+	if !strings.HasPrefix(rl.rows[0].ErrorCategory, "validation_failed") {
+		t.Errorf("category: %q (must start with validation_failed)", rl.rows[0].ErrorCategory)
+	}
+}
+
+// TestErrorMessageIsCappedAt500 pins that a provider error message
+// — say the raw 429 JSON body — never lands at full length in the
+// DB. The repo wrapper caps at 500 chars before write.
+func TestErrorMessageIsCappedAt500(t *testing.T) {
+	huge := strings.Repeat("x", 1500)
+	rl := &fakeRequestLog{}
+	// Insert through the cap path by hand (the repo wrapper's logic).
+	_ = rl // smoke seam: the real repo wrapper handles capping; the
+	// fake records what's passed in. Exercise the cap via the
+	// service's classifyAnalyzerError path:
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{Status: analysis.StatusError, Model: "x", LastError: "rate_limited"}, err: errors.New(huge)}
+	st := newFakeStore()
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	if _, err := svc.AnalyzeAndStore(context.Background(), 1, sampleFinding()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rl.rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rl.rows))
+	}
+	// 500 char soft cap + the multi-byte ellipsis rune appended on
+	// truncation = up to ~503 bytes. The load-bearing contract is
+	// "no 1500-byte error JSON in the DB", and 503 satisfies it.
+	if got := len(rl.rows[0].ErrorMessage); got > 510 {
+		t.Errorf("error_message must be capped near 500 chars; got %d", got)
+	}
+	if got := len(rl.rows[0].ErrorMessage); got < 100 {
+		t.Errorf("error_message must retain useful prefix; got %d chars", got)
 	}
 }

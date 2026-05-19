@@ -170,15 +170,41 @@ func (w *Worker) tick(ctx context.Context) {
 		}
 		w.observeAIError("analyzer_error")
 	}
-	body, marketsJSON := composeReport(req, res)
-	hash := bodyHash(body)
+
+	// v8: when the AI is unavailable, do NOT ship a fake "AI summary
+	// unavailable" message as if it were a normal report. The
+	// periodic 2h intelligence report is an AI scout — without the
+	// AI it is, by definition, not an intelligence report.
+	//
+	// Operators see this state through:
+	//   - the structured log line below ("ai_unavailable: <category>")
+	//   - watchtower_market_intelligence_skipped_total{reason="ai_unavailable"}
+	//   - the polymarket_ai_request_logs row (separate operational
+	//     telemetry table — see aianalysis.Service)
+	if res.Status != analysis.StatusOK || strings.TrimSpace(res.ReportText) == "" {
+		w.log.Warn().
+			Str("period_key", periodKey).
+			Str("ai_status", string(res.Status)).
+			Str("ai_category", res.LastError).
+			Msg("market intelligence skipped: ai_unavailable")
+		w.observeSkip("ai_unavailable")
+		return
+	}
+
+	// Persist ONLY the AI's analysis text — never the rendered
+	// Telegram body. Rendering happens at send time below; storing
+	// the rendered version would pollute the analytical table with
+	// boilerplate (header / period: / Markets to watch / etc.).
+	analysisText := strings.TrimSpace(res.ReportText)
+	marketsJSON := marketsJSONSnapshot(req)
+	hash := bodyHash(analysisText + "|" + periodKey)
 
 	stored, fresh, err := w.store.Insert(ctx, repository.NewMarketIntelligenceReport{
 		PeriodKey:        periodKey,
 		PeriodStart:      periodStart,
 		PeriodEnd:        periodEnd,
 		SummaryHash:      hash,
-		ReportText:       body,
+		ReportText:       analysisText, // AI answer only — v8 contract.
 		MarketsJSON:      marketsJSON,
 		Model:            res.Model,
 		PromptTokens:     int32(res.PromptTokens),
@@ -192,10 +218,6 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 	if !fresh {
-		// Same-period dedup — the canonical "we already sent the 2h
-		// report for this window" path. Common on app restart and
-		// expected on fast ticks; logged at debug to keep the noise
-		// level low.
 		w.log.Debug().
 			Str("period_key", periodKey).
 			Msg("marketintel: dedup hit on period_key, skipping send")
@@ -208,10 +230,30 @@ func (w *Worker) tick(ctx context.Context) {
 		w.log.Warn().Msg("marketintel: bot or chat id not configured; report persisted but not delivered")
 		return
 	}
-	if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, body); err != nil {
+
+	// Render the Telegram body AT SEND TIME from the request + the
+	// AI text. The rendered string is NOT persisted.
+	telegramBody := renderTelegramBody(req, res)
+	if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, telegramBody); err != nil {
 		w.log.Err(err).Str("period_key", periodKey).Msg("marketintel: telegram send failed")
 		return
 	}
+}
+
+// marketsJSONSnapshot returns the compact candidate dataset for
+// dashboards. Distinct from the rendered Telegram body so the
+// analytical column stays small and queryable.
+func marketsJSONSnapshot(req analysis.MarketReportRequest) []byte {
+	out, _ := json.Marshal(req.Markets)
+	return out
+}
+
+// renderTelegramBody builds the Telegram HTML at send time from the
+// request snapshot + the AI's analysis text. The result is NEVER
+// persisted — this is purely a presentation layer.
+func renderTelegramBody(req analysis.MarketReportRequest, res analysis.MarketReportAnalysis) string {
+	body, _ := composeReport(req, res)
+	return body
 }
 
 // bucketedPeriod aligns `now` to the nearest interval boundary so a

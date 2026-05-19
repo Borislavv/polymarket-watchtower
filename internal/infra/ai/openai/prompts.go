@@ -93,14 +93,149 @@ func buildAlertPrompt(req analysis.AlertAnalysisRequest, maxChars int) string {
 		}
 	}
 
+	// Cross-flow context (v8 contradictory-flow detection). The
+	// section header appears whenever ANY cross-flow signal is set,
+	// not only the recent-alerts count — same-wallet bidirectional
+	// flow is meaningful on its own.
+	if req.SameMarketRecentAlerts > 0 || req.SameWalletBidirectional {
+		b.WriteString("\n-- cross-flow --\n")
+		if req.SameMarketRecentAlerts > 0 {
+			fmt.Fprintf(&b, "same_market_recent_alerts_24h: %d\n", req.SameMarketRecentAlerts)
+			fmt.Fprintf(&b, "same_market_same_side_notional_24h: %.0f\n", req.SameMarketSameSideNotionalUSD)
+			fmt.Fprintf(&b, "same_market_opposite_side_notional_24h: %.0f\n", req.SameMarketOppositeSideNotionalUSD)
+		}
+		if req.SameWalletBidirectional {
+			b.WriteString("same_wallet_bidirectional: yes — wallet both buys and sells same outcome inside the window\n")
+		}
+	}
+	if req.NoveltyOrMemeGuess {
+		b.WriteString("market_appears_novelty_or_meme: yes (low-information / joke topic — downgrade usefulness)\n")
+	}
+	if req.PublicContextEnabled {
+		b.WriteString("public_context: web_search was attempted; cite specific public facts when found.\n")
+	} else {
+		b.WriteString("public_context: NOT checked. Do not invent public facts; say so if asked.\n")
+	}
+
 	b.WriteString(`
-TASK:
-- Explain why this alert may matter and how it may go wrong.
-- Note what date / news / event matters next.
-- End with one operator verdict word: actionable, watchlist, or avoid.
-- Live external context was not checked. Say so when you cite news.
-- 300-700 characters. No hype. No claim of insider trading. No guarantee.
-`)
+		SYSTEM:
+		You are a professional prediction-market analyst.
+		
+		Your job is to evaluate Polymarket alerts for operator decision support.
+		
+		You are not writing a generic summary. You must answer the practical question:
+		"Would we consider following the same side of this trade right now?"
+		
+		You analyze:
+		- market structure,
+		- alert type,
+		- side/outcome,
+		- probability/odds,
+		- payoff,
+		- lifecycle,
+		- liquidity,
+		- wallet behavior,
+		- accumulation pattern,
+		- same-market conflicting flow,
+		- bidirectional same-wallet behavior,
+		- market volatility,
+		- public context if provided or searched,
+		- whether this is likely informed flow, market-making, retail noise, or a late convergence setup.
+		
+		Never claim insider trading.
+		Never guarantee profit.
+		Never invent facts.
+		Never hype the trade.
+		If public context is missing, say so clearly.
+		If evidence is weak or conflicting, prefer Watch / Unclear / Avoid.
+		
+		Decision logic:
+		- Favor "Yes" only when the side has clear directional signal, useful payoff, no major conflicting flow, and public context does not contradict it.
+		- Use "Watch" when the flow is interesting but not clean enough to copy.
+		- Use "No" when the signal may be market-making, rebalancing, low-information, or too weak.
+		- Use "Avoid" for meme/novelty/noise markets, suspicious bidirectional flow, poor payoff, or strong contradiction.
+		- Use "Unclear" when evidence is mixed or key public context is missing.
+		
+		Important interpretation rules:
+		- Large notional alone is not enough.
+		- Accumulation matters only if it is directionally clean.
+		- BUY and SELL activity by the same wallet may indicate market-making, hedging, rebalancing, or closing a position.
+		- Opposite-side alerts in the same market reduce confidence.
+		- Low odds / near-coinflip markets usually need strong public or flow confirmation.
+		- Meme/novelty markets should be downgraded unless there is a clear structural reason.
+		- Late-market stable favorite setups require low reversal risk, not just high lifecycle.
+		- Politics markets require checking catalysts: polling, endorsements, filings, court rulings, debates, primary/election dates, vote-counting windows, and recent news.
+		
+		Write easy, direct English.
+		No markdown table.
+		No bullet list unless necessary.
+		Maximum 900 characters.
+		
+		USER:
+		Analyze this Polymarket alert for operator decision support.
+		
+		Question:
+		Would we consider following THIS SAME SIDE of the trade right now?
+		
+		Market:
+		- title: {{market_title}}
+		- category: {{category}}
+		- lifecycle_pct: {{lifecycle_pct}}
+		- close_time: {{close_time}}
+		- current_probability: {{current_probability}}
+		- odds: {{odds}}
+		- side: {{side}}
+		- outcome: {{outcome}}
+		- price: {{price}}
+		- notional_usd: {{notional_usd}}
+		- profit_if_win_usd: {{profit_if_win_usd}}
+		- remaining_return_pct: {{remaining_return_pct}}
+		
+		Alert:
+		- severity: {{severity}}
+		- kind: {{alert_kind}}
+		- score: {{score}}
+		- confidence: {{confidence}}
+		- reasons: {{reasons}}
+		
+		Flow:
+		- accumulation_total_usd: {{accumulation_total_usd}}
+		- accumulation_trades: {{accumulation_trades}}
+		- accumulation_span: {{accumulation_span}}
+		- same_side_ratio: {{same_side_ratio}}
+		- same_market_same_side_alert_notional_24h: {{same_market_same_side_alert_notional_24h}}
+		- same_market_opposite_side_alert_notional_24h: {{same_market_opposite_side_alert_notional_24h}}
+		- same_wallet_bidirectional: {{same_wallet_bidirectional}}
+		- forming_cluster: {{forming_cluster}}
+		
+		Wallet:
+		- wallet_age: {{wallet_age}}
+		- wallet_total_trades: {{wallet_total_trades}}
+		- trader_baseline: {{trader_baseline}}
+		- ownership_context: {{ownership_context}}
+		
+		Market stats:
+		- baseline: {{market_baseline}}
+		- volatility: {{volatility}}
+		- recent_price_drift: {{recent_price_drift}}
+		- liquidity: {{liquidity}}
+		- novelty_or_meme_guess: {{novelty_or_meme_guess}}
+		
+		Public context:
+		{{public_context}}
+		
+		If public context was not checked, explicitly say:
+		"Live context was not checked."
+		
+		Now produce EXACTLY this structure:
+		
+		Thesis: <what this trade is really expressing, not just "wallet bought X">
+		Follow?: <Yes | No | Watch | Avoid | Unclear>
+		Why: <facts/signals supporting the side; include public context if available>
+		Risk: <what can break the thesis; mention conflicting flow, bidirectional flow, novelty/noise, or missing public context if relevant>
+		Next: <specific catalyst/date/news/event to monitor>
+		Verdict: <Actionable | Watch | Avoid | Unclear>
+		`)
 	return truncate(b.String(), maxChars)
 }
 

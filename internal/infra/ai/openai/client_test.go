@@ -13,6 +13,32 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 )
 
+// newFakeOpenAIRaw mounts an httptest server that returns the
+// supplied raw body + status. Used by tests that need to exercise
+// the typed-error classifier on a specific provider JSON shape
+// (quota_exceeded, rate_limit_exceeded, model_not_found, etc.).
+func newFakeOpenAIRaw(t *testing.T, body string, status int) (Config, func()) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	cfg := Config{
+		APIKey:                 "test-key",
+		BaseURL:                srv.URL,
+		Model:                  "test-model",
+		Timeout:                2 * time.Second,
+		MaxPromptChars:         2500,
+		MaxOutputChars:         700,
+		RatePerMin:             100,
+		DailyBudget:            5,
+		PromptCostPer1kUSD:     0.00015,
+		CompletionCostPer1kUSD: 0.0006,
+	}
+	return cfg, srv.Close
+}
+
 // newFakeOpenAI returns a Config + cleanup func wired to an
 // httptest server that mimics the Chat Completions API. Tests use
 // this to exercise the full client path WITHOUT hitting the real
@@ -132,22 +158,86 @@ func TestAnalyzeAlert_RateLimited(t *testing.T) {
 	}
 }
 
-// TestAnalyzeAlert_Non2xxIsErrorStatus pins the failure path: an
-// upstream 500 is recorded as StatusError, never propagated as a Go
-// error (the caller still emits the underlying alert).
-func TestAnalyzeAlert_Non2xxIsErrorStatus(t *testing.T) {
+// TestAnalyzeAlert_Non2xxReturnsTypedProviderError pins the v8 data-
+// correctness contract: a non-2xx response surfaces a typed
+// *ProviderError to the caller so it can be routed into
+// polymarket_ai_request_logs. LastError is the SHORT canonical
+// category (e.g. "provider_5xx") — never the raw provider body.
+// The analysis.AlertAnalysis result still carries StatusError so
+// the alert ships without an Analyst note.
+func TestAnalyzeAlert_Non2xxReturnsTypedProviderError(t *testing.T) {
 	cfg, cleanup := newFakeOpenAI(t, "", 500)
 	defer cleanup()
 	c := New(cfg)
 	out, err := c.AnalyzeAlert(context.Background(), analysis.AlertAnalysisRequest{})
-	if err != nil {
-		t.Fatalf("must not return Go error on upstream 500: %v", err)
+	if err == nil {
+		t.Fatalf("expected typed ProviderError on upstream 500")
+	}
+	pe, ok := AsProviderError(err)
+	if !ok {
+		t.Fatalf("error must be *ProviderError: %T", err)
+	}
+	if pe.Category != CategoryProvider5xx {
+		t.Errorf("category: got %q want provider_5xx", pe.Category)
+	}
+	if !pe.Retryable {
+		t.Error("provider_5xx must be retryable")
 	}
 	if out.Status != analysis.StatusError {
 		t.Errorf("status: got %q want error", out.Status)
 	}
-	if !strings.Contains(out.LastError, "500") {
-		t.Errorf("LastError must include the upstream status: %q", out.LastError)
+	if out.LastError != string(CategoryProvider5xx) {
+		t.Errorf("LastError must be the canonical category, not the raw body: %q", out.LastError)
+	}
+}
+
+// TestAnalyzeAlert_429QuotaExceeded pins the load-bearing
+// classification: the production incident was OpenAI 429 with
+// `{"error":{"code":"insufficient_quota"}}` being stored as a fake
+// analysis row. Now it MUST surface as CategoryQuotaExceeded with
+// Retryable=false — quota is a billing/operator action, not a
+// transient slow-down.
+func TestAnalyzeAlert_429QuotaExceeded(t *testing.T) {
+	body := `{"error":{"message":"You exceeded your quota","type":"insufficient_quota","code":"insufficient_quota"}}`
+	cfg, cleanup := newFakeOpenAIRaw(t, body, 429)
+	defer cleanup()
+	c := New(cfg)
+	out, err := c.AnalyzeAlert(context.Background(), analysis.AlertAnalysisRequest{})
+	if err == nil {
+		t.Fatalf("expected ProviderError for 429 quota")
+	}
+	pe, _ := AsProviderError(err)
+	if pe == nil || pe.Category != CategoryQuotaExceeded {
+		t.Fatalf("category: got %v want quota_exceeded", pe)
+	}
+	if pe.Retryable {
+		t.Error("quota_exceeded must NOT be retryable")
+	}
+	if strings.Contains(pe.Message, "{") {
+		t.Errorf("ProviderError.Message must be sanitized (no raw JSON): %q", pe.Message)
+	}
+	if out.LastError != string(CategoryQuotaExceeded) {
+		t.Errorf("LastError must be canonical category: %q", out.LastError)
+	}
+	if out.AnalysisText != "" {
+		t.Errorf("StatusError/Skipped row must have empty analysis text: %q", out.AnalysisText)
+	}
+}
+
+// TestAnalyzeAlert_429PerMinuteRateLimit pins the OTHER 429 path:
+// generic per-minute rate-limit, not quota. Must be retryable.
+func TestAnalyzeAlert_429PerMinuteRateLimit(t *testing.T) {
+	body := `{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}`
+	cfg, cleanup := newFakeOpenAIRaw(t, body, 429)
+	defer cleanup()
+	c := New(cfg)
+	_, err := c.AnalyzeAlert(context.Background(), analysis.AlertAnalysisRequest{})
+	pe, _ := AsProviderError(err)
+	if pe == nil || pe.Category != CategoryRateLimited {
+		t.Fatalf("category: got %v want rate_limited", pe)
+	}
+	if !pe.Retryable {
+		t.Error("rate_limited must be retryable")
 	}
 }
 
@@ -168,11 +258,77 @@ func TestPromptBuilder_TitleAndReasonsAppear(t *testing.T) {
 		"market_title: Will Massie win KY-04?",
 		"category: Politics",
 		"reasons: STABLE_PRICE, LOW_VOLATILITY",
-		"300-700 characters",
+		// v8 structured-output contract: prompt mandates the
+		// Thesis/Follow?/Verdict shape so output can be validated.
+		"Thesis:",
+		"Follow?:",
+		"Verdict:",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
 		}
+	}
+}
+
+// TestPromptBuilder_CrossFlowContradictoryAlerts pins v8: when the
+// detector reports same-market opposite-side notional, the prompt
+// must surface it so the model can name conflicting flow and
+// downgrade Follow? accordingly.
+func TestPromptBuilder_CrossFlowContradictoryAlerts(t *testing.T) {
+	req := analysis.AlertAnalysisRequest{
+		Kind: "accumulation", Severity: "warning",
+		SameMarketRecentAlerts:            4,
+		SameMarketSameSideNotionalUSD:     12_000,
+		SameMarketOppositeSideNotionalUSD: 18_000,
+	}
+	p := buildAlertPrompt(req, 5000)
+	for _, want := range []string{
+		"same_market_recent_alerts_24h: 4",
+		"same_market_same_side_notional_24h: 12000",
+		"same_market_opposite_side_notional_24h: 18000",
+		"conflicting flow",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
+		}
+	}
+}
+
+// TestPromptBuilder_BidirectionalWalletWarning pins that the
+// same-wallet-bidirectional signal lands in the prompt and the
+// market-making warning is included.
+func TestPromptBuilder_BidirectionalWalletWarning(t *testing.T) {
+	p := buildAlertPrompt(analysis.AlertAnalysisRequest{SameWalletBidirectional: true}, 5000)
+	if !strings.Contains(p, "same_wallet_bidirectional: yes") {
+		t.Errorf("prompt missing bidirectional flag:\n%s", p)
+	}
+	if !strings.Contains(p, "market-making") {
+		t.Errorf("prompt missing market-making warning:\n%s", p)
+	}
+}
+
+// TestPromptBuilder_NoveltyMemeDowngrade pins the novelty-bias clause.
+func TestPromptBuilder_NoveltyMemeDowngrade(t *testing.T) {
+	p := buildAlertPrompt(analysis.AlertAnalysisRequest{NoveltyOrMemeGuess: true}, 5000)
+	if !strings.Contains(p, "novelty") {
+		t.Errorf("prompt missing novelty marker:\n%s", p)
+	}
+}
+
+// TestPromptBuilder_PublicContextDisclosure pins both branches of
+// the web_search disclosure clause — the model must always know
+// whether it has live context or not.
+func TestPromptBuilder_PublicContextDisclosure(t *testing.T) {
+	enabled := buildAlertPrompt(analysis.AlertAnalysisRequest{PublicContextEnabled: true}, 5000)
+	if !strings.Contains(enabled, "web_search was attempted") {
+		t.Errorf("enabled disclosure missing:\n%s", enabled)
+	}
+	disabled := buildAlertPrompt(analysis.AlertAnalysisRequest{PublicContextEnabled: false}, 5000)
+	if !strings.Contains(disabled, "NOT checked") {
+		t.Errorf("disabled disclosure missing:\n%s", disabled)
+	}
+	if !strings.Contains(disabled, "Live context was not checked.") {
+		t.Errorf("expected the 'Live context was not checked.' rule in:\n%s", disabled)
 	}
 }
 

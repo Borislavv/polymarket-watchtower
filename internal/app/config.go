@@ -581,11 +581,22 @@ type AIAnalysisConfig struct {
 	CompletionCostPer1kUSD float64 `env:"AI_ANALYSIS_COMPLETION_COST_PER_1K_USD" envDefault:"0.0006" validate:"gte=0"`
 
 	// Feature toggles.
-	AlertsEnabled         bool   `env:"AI_ANALYSIS_TELEGRAM_ALERTS_ENABLED" envDefault:"true"`
-	LogAlertsEnabled      bool   `env:"AI_ANALYSIS_LOG_ALERTS_ENABLED" envDefault:"true"`
-	ReportsEnabled        bool   `env:"AI_ANALYSIS_REPORTS_ENABLED" envDefault:"true"`
-	WebContextEnabled     bool   `env:"AI_ANALYSIS_WEB_CONTEXT_ENABLED" envDefault:"false"`
-	WebContextMinSeverity string `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
+	AlertsEnabled    bool `env:"AI_ANALYSIS_TELEGRAM_ALERTS_ENABLED" envDefault:"true"`
+	LogAlertsEnabled bool `env:"AI_ANALYSIS_LOG_ALERTS_ENABLED" envDefault:"true"`
+	ReportsEnabled   bool `env:"AI_ANALYSIS_REPORTS_ENABLED" envDefault:"true"`
+
+	// Web context (OpenAI Responses API + web_search tool). Scaffolded
+	// in v8 — config knobs are wired, the openai client carries a
+	// gate behind `web_context=true` requests, but the full Responses
+	// API HTTP shape needs live-API verification before production
+	// enable. Keep WebContextEnabled=false until verified.
+	WebContextEnabled           bool          `env:"AI_ANALYSIS_WEB_CONTEXT_ENABLED" envDefault:"false"`
+	WebContextMinSeverity       string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
+	WebContextForHotInfo        bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
+	WebContextForStableFavorite bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_STABLE_FAVORITE" envDefault:"true"`
+	WebContextForPolitics       bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_POLITICS" envDefault:"true"`
+	WebContextMaxResults        int           `env:"AI_ANALYSIS_WEB_CONTEXT_MAX_RESULTS" envDefault:"5" validate:"gte=1,lte=20"`
+	WebContextTimeout           time.Duration `env:"AI_ANALYSIS_WEB_CONTEXT_TIMEOUT" envDefault:"12s" validate:"gt=0"`
 
 	// Refresh policy.
 	LifecycleRefreshDeltaPct float64 `env:"AI_ANALYSIS_LIFECYCLE_REFRESH_DELTA_PCT" envDefault:"1" validate:"gte=0"`

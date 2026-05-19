@@ -40,6 +40,78 @@ func (q *Queries) GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (P
 	return i, err
 }
 
+const insertAIRequestLog = `-- name: InsertAIRequestLog :exec
+INSERT INTO polymarket_ai_request_logs (
+    target_kind, target_id, provider, model, request_kind,
+    status, error_category, error_code, error_message, http_status,
+    prompt_chars, output_chars, prompt_tokens, completion_tokens,
+    estimated_cost_usd, latency_ms
+) VALUES (
+    $1::text,
+    $2::bigint,
+    $3::text,
+    $4::text,
+    $5::text,
+    $6::text,
+    $7::text,
+    $8::text,
+    $9::text,
+    $10::int,
+    $11::int,
+    $12::int,
+    $13::int,
+    $14::int,
+    $15::double precision,
+    $16::bigint
+)
+`
+
+type InsertAIRequestLogParams struct {
+	TargetKind       string
+	TargetID         *int64
+	Provider         string
+	Model            string
+	RequestKind      string
+	Status           string
+	ErrorCategory    *string
+	ErrorCode        *string
+	ErrorMessage     *string
+	HttpStatus       *int32
+	PromptChars      int32
+	OutputChars      int32
+	PromptTokens     int32
+	CompletionTokens int32
+	EstimatedCostUsd float64
+	LatencyMs        int64
+}
+
+// Operational log of one AI provider interaction. Idempotency is
+// intentionally NOT enforced — a transient blip producing two
+// log rows is fine; double-counting in dashboards is preferable to
+// silently dropping a failed call. The application caps
+// error_message at 500 chars before write.
+func (q *Queries) InsertAIRequestLog(ctx context.Context, arg InsertAIRequestLogParams) error {
+	_, err := q.db.Exec(ctx, insertAIRequestLog,
+		arg.TargetKind,
+		arg.TargetID,
+		arg.Provider,
+		arg.Model,
+		arg.RequestKind,
+		arg.Status,
+		arg.ErrorCategory,
+		arg.ErrorCode,
+		arg.ErrorMessage,
+		arg.HttpStatus,
+		arg.PromptChars,
+		arg.OutputChars,
+		arg.PromptTokens,
+		arg.CompletionTokens,
+		arg.EstimatedCostUsd,
+		arg.LatencyMs,
+	)
+	return err
+}
+
 const insertAlertAnalysis = `-- name: InsertAlertAnalysis :one
 INSERT INTO polymarket_alert_analyses (
     alert_id, version, trigger_kind, trigger_detail, model,
@@ -62,7 +134,7 @@ INSERT INTO polymarket_alert_analyses (
     $14::text
 )
 ON CONFLICT (alert_id, version) DO NOTHING
-RETURNING id, alert_id, version, trigger_kind, trigger_detail, model, prompt_chars, output_chars, prompt_tokens, completion_tokens, estimated_cost_usd, analysis_text, verdict, status, last_error, created_at
+RETURNING id, alert_id, version, trigger_kind, trigger_detail, model, prompt_chars, output_chars, prompt_tokens, completion_tokens, estimated_cost_usd, analysis_text, verdict, status, last_error, created_at, legacy_provider_failure
 `
 
 type InsertAlertAnalysisParams struct {
@@ -121,6 +193,7 @@ func (q *Queries) InsertAlertAnalysis(ctx context.Context, arg InsertAlertAnalys
 		&i.Status,
 		&i.LastError,
 		&i.CreatedAt,
+		&i.LegacyProviderFailure,
 	)
 	return i, err
 }
@@ -297,7 +370,7 @@ func (q *Queries) InsertMarketIntelligenceReport(ctx context.Context, arg Insert
 }
 
 const latestAlertAnalysis = `-- name: LatestAlertAnalysis :one
-SELECT id, alert_id, version, trigger_kind, trigger_detail, model, prompt_chars, output_chars, prompt_tokens, completion_tokens, estimated_cost_usd, analysis_text, verdict, status, last_error, created_at FROM polymarket_alert_analyses
+SELECT id, alert_id, version, trigger_kind, trigger_detail, model, prompt_chars, output_chars, prompt_tokens, completion_tokens, estimated_cost_usd, analysis_text, verdict, status, last_error, created_at, legacy_provider_failure FROM polymarket_alert_analyses
 WHERE alert_id = $1::bigint
 ORDER BY version DESC
 LIMIT 1
@@ -325,6 +398,7 @@ func (q *Queries) LatestAlertAnalysis(ctx context.Context, alertID int64) (Polym
 		&i.Status,
 		&i.LastError,
 		&i.CreatedAt,
+		&i.LegacyProviderFailure,
 	)
 	return i, err
 }

@@ -452,6 +452,71 @@ func (r *StrategyDimensionsRepository) Upsert(ctx context.Context, d StrategyDim
 	return nil
 }
 
+// --- AIRequestLogRepository -----------------------------------------------
+
+// AIRequestLog is the operational telemetry row written for every AI
+// provider interaction. Distinct from AlertAnalysis (which holds
+// successful AI answers ONLY) — see migration 00015 for the
+// motivation. Short, queryable, capped error_message.
+type AIRequestLog struct {
+	TargetKind       string // alert | market_intelligence | outcome
+	TargetID         *int64
+	Provider         string
+	Model            string
+	RequestKind      string // alert_analysis | market_report | outcome_postmortem
+	Status           string // success | failed_* | skipped_*
+	ErrorCategory    string
+	ErrorCode        string
+	ErrorMessage     string // capped to 500 chars
+	HTTPStatus       *int32
+	PromptChars      int32
+	OutputChars      int32
+	PromptTokens     int32
+	CompletionTokens int32
+	EstimatedCostUSD float64
+	LatencyMS        int64
+}
+
+// AIRequestLogRepository wraps polymarket_ai_request_logs.
+type AIRequestLogRepository struct {
+	q *sqlc.Queries
+}
+
+func NewAIRequestLogRepository(pool *pgxpool.Pool) *AIRequestLogRepository {
+	return &AIRequestLogRepository{q: sqlc.New(pool)}
+}
+
+// Insert persists one request-log row. Best-effort — telemetry MUST
+// NOT block the AI path; the caller logs the inner failure and moves
+// on. error_message is capped at 500 chars before write.
+func (r *AIRequestLogRepository) Insert(ctx context.Context, l AIRequestLog) error {
+	msg := l.ErrorMessage
+	if len(msg) > 500 {
+		msg = msg[:499] + "…"
+	}
+	if err := r.q.InsertAIRequestLog(ctx, sqlc.InsertAIRequestLogParams{
+		TargetKind:       l.TargetKind,
+		TargetID:         l.TargetID,
+		Provider:         l.Provider,
+		Model:            l.Model,
+		RequestKind:      l.RequestKind,
+		Status:           l.Status,
+		ErrorCategory:    strPtr(l.ErrorCategory),
+		ErrorCode:        strPtr(l.ErrorCode),
+		ErrorMessage:     strPtr(msg),
+		HttpStatus:       l.HTTPStatus,
+		PromptChars:      l.PromptChars,
+		OutputChars:      l.OutputChars,
+		PromptTokens:     l.PromptTokens,
+		CompletionTokens: l.CompletionTokens,
+		EstimatedCostUsd: l.EstimatedCostUSD,
+		LatencyMs:        l.LatencyMS,
+	}); err != nil {
+		return fmt.Errorf("insert ai request log: %w", err)
+	}
+	return nil
+}
+
 func alertOutcomeFromSQLC(row sqlc.PolymarketAlertOutcomeAnalyses) AlertOutcomeAnalysis {
 	out := AlertOutcomeAnalysis{
 		ID:               row.ID,

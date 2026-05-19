@@ -212,10 +212,12 @@ func TestBucketedPeriod(t *testing.T) {
 	}
 }
 
-// TestTick_AnalyzerErrorStillProducesReport pins that an analyzer
-// failure does NOT block the report. The body explains the AI
-// summary is unavailable and the candidate list still ships.
-func TestTick_AnalyzerErrorStillProducesReport(t *testing.T) {
+// TestTick_AnalyzerErrorSkipsReport pins the v8 contract: when the
+// AI is unavailable, the 2h intelligence report is NOT sent — a
+// scout report without the scout is not a real report. The previous
+// behaviour (ship "AI summary unavailable" as if it were a deliberate
+// note) was rejected after the production incident.
+func TestTick_AnalyzerErrorSkipsReport(t *testing.T) {
 	cand := &fakeCandidates{rows: sampleCandidates()}
 	st := &fakeStore{}
 	an := &fakeAnalyzer{err: errors.New("upstream down")}
@@ -225,11 +227,55 @@ func TestTick_AnalyzerErrorStillProducesReport(t *testing.T) {
 
 	w.Tick(context.Background())
 
-	if len(bot.sends) != 1 {
-		t.Fatalf("must still send report on analyzer error: %d", len(bot.sends))
+	if len(bot.sends) != 0 {
+		t.Errorf("AI failure must skip Telegram; got %d sends", len(bot.sends))
 	}
-	if !strings.Contains(bot.sends[0].Text, "AI summary unavailable") {
-		t.Errorf("body must explain AI failure:\n%s", bot.sends[0].Text)
+	if len(st.inserted) != 0 {
+		t.Errorf("AI failure must not persist a row; got %d", len(st.inserted))
+	}
+}
+
+// TestTick_PersistsAnalysisTextNotRenderedBody pins the v8 data-
+// correctness contract: report_text holds the AI answer ONLY, never
+// the rendered Telegram body (which contains header / period: /
+// markets list boilerplate that's analytically useless).
+func TestTick_PersistsAnalysisTextNotRenderedBody(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	aiText := "Stable favorites dominate. Watchlist KY-04. Next: primary results."
+	an := &fakeAnalyzer{out: analysis.MarketReportAnalysis{
+		Status: analysis.StatusOK, Model: "test", ReportText: aiText,
+	}}
+	bot := &fakeBot{}
+	w := New(Config{Enabled: true, MaxMarkets: 50, ChatID: "42", Interval: time.Hour},
+		cand, st, an, bot, nopLogger())
+
+	w.Tick(context.Background())
+
+	if len(st.inserted) != 1 {
+		t.Fatalf("expected 1 persisted row, got %d", len(st.inserted))
+	}
+	stored := st.inserted[0].ReportText
+	if stored != aiText {
+		t.Errorf("report_text must equal AI analysis text verbatim.\n got: %q\nwant: %q", stored, aiText)
+	}
+	for _, banned := range []string{
+		"<b>Market intelligence",
+		"<b>Overview</b>",
+		"<b>Markets to watch</b>",
+		"<b>Analyst summary</b>",
+	} {
+		if strings.Contains(stored, banned) {
+			t.Errorf("report_text MUST NOT contain rendered Telegram boilerplate %q:\n%s", banned, stored)
+		}
+	}
+	// Telegram body, on the other hand, MUST still render the full
+	// structured message at send time.
+	if len(bot.sends) != 1 {
+		t.Fatalf("expected 1 Telegram send, got %d", len(bot.sends))
+	}
+	if !strings.Contains(bot.sends[0].Text, "<b>Market intelligence") {
+		t.Errorf("Telegram body should render header at send time:\n%s", bot.sends[0].Text)
 	}
 }
 

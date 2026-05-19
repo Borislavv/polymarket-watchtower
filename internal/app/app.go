@@ -696,7 +696,9 @@ func New() (*App, error) {
 			AlertsEnabled:            cfg.AIAnalysis.Enabled && cfg.AIAnalysis.AlertsEnabled,
 			LifecycleRefreshDeltaPct: cfg.AIAnalysis.LifecycleRefreshDeltaPct,
 			CLVMaterialChange:        cfg.AIAnalysis.CLVMaterialChange,
-		}, analyzer, alertAnalysisRepo, met, logger)
+		}, analyzer, alertAnalysisRepo,
+			repository.NewAIRequestLogRepository(pgPool),
+			met, logger)
 
 		// Wire the AI enricher into the sender so every claimed alert
 		// generates / refreshes its analyst note BEFORE Telegram render.

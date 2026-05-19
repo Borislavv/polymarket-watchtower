@@ -72,6 +72,26 @@ type AlertAnalysisRequest struct {
 	QuietMarketNote  string
 	NewWalletNote    string
 	OutcomeStatus    string
+
+	// v8 cross-flow context: when the same market has had multiple
+	// alerts in the last 24h, the model needs to distinguish a
+	// clean one-sided whale signal from conflicting flow. The
+	// detector populates these from recent rows in polymarket_alerts.
+	SameMarketRecentAlerts            int     // count last 24h
+	SameMarketSameSideNotionalUSD     float64 // notional summed on this side
+	SameMarketOppositeSideNotionalUSD float64 // notional summed on opposite side
+	SameWalletBidirectional           bool    // wallet bought AND sold same outcome inside window
+
+	// NoveltyOrMemeGuess flags markets the detector or operator
+	// classified as joke/novelty (low informational value). When
+	// true the prompt asks the model to bias toward Avoid/Watch.
+	NoveltyOrMemeGuess bool
+
+	// PublicContextEnabled tells the model whether web_search was
+	// run for this request. When false the model must include a
+	// "Live context was not checked." sentence in Risk or Next so
+	// the operator never confuses an offline note with a researched one.
+	PublicContextEnabled bool
 }
 
 // AlertAnalysis is what the analyzer returns.

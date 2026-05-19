@@ -77,6 +77,12 @@ type Querier interface {
 	// trade.Trade from polymarket_trades.
 	GetTraderByID(ctx context.Context, id int64) (PolymarketTraders, error)
 	GetTraderByWallet(ctx context.Context, walletAddress string) (PolymarketTraders, error)
+	// Operational log of one AI provider interaction. Idempotency is
+	// intentionally NOT enforced — a transient blip producing two
+	// log rows is fine; double-counting in dashboards is preferable to
+	// silently dropping a failed call. The application caps
+	// error_message at 500 chars before write.
+	InsertAIRequestLog(ctx context.Context, arg InsertAIRequestLogParams) error
 	// Persist one AI alert-analysis row. Versions are append-only; the
 	// usecase layer chooses the version number (latest+1 on refresh,
 	// else 1). The trigger fields record WHY this version was generated

@@ -192,3 +192,33 @@ ON CONFLICT (alert_id) DO UPDATE SET
     dormant_wallet        = EXCLUDED.dormant_wallet,
     drift_regime          = EXCLUDED.drift_regime,
     ai_verdict            = EXCLUDED.ai_verdict;
+
+-- name: InsertAIRequestLog :exec
+-- Operational log of one AI provider interaction. Idempotency is
+-- intentionally NOT enforced — a transient blip producing two
+-- log rows is fine; double-counting in dashboards is preferable to
+-- silently dropping a failed call. The application caps
+-- error_message at 500 chars before write.
+INSERT INTO polymarket_ai_request_logs (
+    target_kind, target_id, provider, model, request_kind,
+    status, error_category, error_code, error_message, http_status,
+    prompt_chars, output_chars, prompt_tokens, completion_tokens,
+    estimated_cost_usd, latency_ms
+) VALUES (
+    sqlc.arg(target_kind)::text,
+    sqlc.narg(target_id)::bigint,
+    sqlc.arg(provider)::text,
+    sqlc.arg(model)::text,
+    sqlc.arg(request_kind)::text,
+    sqlc.arg(status)::text,
+    sqlc.narg(error_category)::text,
+    sqlc.narg(error_code)::text,
+    sqlc.narg(error_message)::text,
+    sqlc.narg(http_status)::int,
+    sqlc.arg(prompt_chars)::int,
+    sqlc.arg(output_chars)::int,
+    sqlc.arg(prompt_tokens)::int,
+    sqlc.arg(completion_tokens)::int,
+    sqlc.arg(estimated_cost_usd)::double precision,
+    sqlc.arg(latency_ms)::bigint
+);

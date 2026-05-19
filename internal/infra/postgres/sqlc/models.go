@@ -8,23 +8,45 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type PolymarketAlertAnalyses struct {
+type PolymarketAiRequestLogs struct {
 	ID               int64
-	AlertID          int64
-	Version          int32
-	TriggerKind      string
-	TriggerDetail    *string
+	TargetKind       string
+	TargetID         *int64
+	Provider         string
 	Model            string
+	RequestKind      string
+	Status           string
+	ErrorCategory    *string
+	ErrorCode        *string
+	ErrorMessage     *string
+	HttpStatus       *int32
 	PromptChars      int32
 	OutputChars      int32
 	PromptTokens     int32
 	CompletionTokens int32
 	EstimatedCostUsd float64
-	AnalysisText     string
-	Verdict          *string
-	Status           string
-	LastError        *string
+	LatencyMs        int64
 	CreatedAt        pgtype.Timestamptz
+}
+
+type PolymarketAlertAnalyses struct {
+	ID                    int64
+	AlertID               int64
+	Version               int32
+	TriggerKind           string
+	TriggerDetail         *string
+	Model                 string
+	PromptChars           int32
+	OutputChars           int32
+	PromptTokens          int32
+	CompletionTokens      int32
+	EstimatedCostUsd      float64
+	AnalysisText          string
+	Verdict               *string
+	Status                string
+	LastError             *string
+	CreatedAt             pgtype.Timestamptz
+	LegacyProviderFailure bool
 }
 
 type PolymarketAlertOutcomeAnalyses struct {

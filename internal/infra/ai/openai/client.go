@@ -159,7 +159,18 @@ func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisReq
 	}
 	resp, err := c.callChat(ctx, prompt, c.cfg.MaxOutputChars)
 	if err != nil {
-		return analysis.AlertAnalysis{Status: analysis.StatusError, Model: c.cfg.Model, LastError: err.Error()}, nil
+		// Surface a short canonical category in LastError (never the
+		// raw provider body). The aianalysis layer routes the full
+		// typed error into polymarket_ai_request_logs.
+		pe, ok := AsProviderError(err)
+		if !ok {
+			pe = &ProviderError{Category: CategoryUnknown, Message: err.Error()}
+		}
+		return analysis.AlertAnalysis{
+			Status:    statusForCategory(pe.Category),
+			Model:     c.cfg.Model,
+			LastError: string(pe.Category),
+		}, err
 	}
 	cost := c.estimateCost(resp.PromptTokens, resp.CompletionTokens)
 	c.ledger.consume(cost)
@@ -176,6 +187,19 @@ func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisReq
 		CompletionTokens: resp.CompletionTokens,
 		EstimatedCostUSD: cost,
 	}, nil
+}
+
+// statusForCategory maps the typed provider category back to the
+// legacy analysis.Status enum the wrapper still returns for
+// backward-compat. quota/budget/disabled → skipped (no retry);
+// everything else → error.
+func statusForCategory(cat ErrorCategory) analysis.Status {
+	switch cat {
+	case CategoryQuotaExceeded:
+		return analysis.StatusSkipped
+	default:
+		return analysis.StatusError
+	}
 }
 
 // AnalyzeMarketReport is implemented but the orchestrating worker
@@ -195,7 +219,15 @@ func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketRep
 	}
 	resp, err := c.callChat(ctx, prompt, 2000)
 	if err != nil {
-		return analysis.MarketReportAnalysis{Status: analysis.StatusError, Model: c.cfg.Model, LastError: err.Error()}, nil
+		pe, ok := AsProviderError(err)
+		if !ok {
+			pe = &ProviderError{Category: CategoryUnknown, Message: err.Error()}
+		}
+		return analysis.MarketReportAnalysis{
+			Status:    statusForCategory(pe.Category),
+			Model:     c.cfg.Model,
+			LastError: string(pe.Category),
+		}, err
 	}
 	cost := c.estimateCost(resp.PromptTokens, resp.CompletionTokens)
 	c.ledger.consume(cost)
@@ -223,7 +255,15 @@ func (c *Client) AnalyzeOutcome(ctx context.Context, req analysis.OutcomeAnalysi
 	}
 	resp, err := c.callChat(ctx, prompt, c.cfg.MaxOutputChars)
 	if err != nil {
-		return analysis.OutcomeAnalysis{Status: analysis.StatusError, Model: c.cfg.Model, LastError: err.Error()}, nil
+		pe, ok := AsProviderError(err)
+		if !ok {
+			pe = &ProviderError{Category: CategoryUnknown, Message: err.Error()}
+		}
+		return analysis.OutcomeAnalysis{
+			Status:    statusForCategory(pe.Category),
+			Model:     c.cfg.Model,
+			LastError: string(pe.Category),
+		}, err
 	}
 	cost := c.estimateCost(resp.PromptTokens, resp.CompletionTokens)
 	c.ledger.consume(cost)
@@ -274,15 +314,32 @@ func (c *Client) callChat(ctx context.Context, userMsg string, maxChars int) (ch
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return chatResp{}, fmt.Errorf("do: %w", err)
+		// Network-class failure. Context-deadline maps to timeout
+		// so the caller can route it through the retry policy.
+		cat := CategoryNetwork
+		if errors.Is(err, context.DeadlineExceeded) {
+			cat = CategoryTimeout
+		}
+		return chatResp{}, &ProviderError{
+			Category:  cat,
+			Message:   sanitizeAndCap(err.Error(), 200),
+			Retryable: true,
+		}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return chatResp{}, fmt.Errorf("read: %w", err)
+		return chatResp{}, &ProviderError{
+			Category:  CategoryNetwork,
+			Message:   sanitizeAndCap(err.Error(), 200),
+			Retryable: true,
+		}
 	}
 	if resp.StatusCode/100 != 2 {
-		return chatResp{}, fmt.Errorf("openai status %d: %s", resp.StatusCode, string(raw))
+		// Typed, structured failure — the upstream service routes
+		// this into polymarket_ai_request_logs and metrics, NEVER
+		// into polymarket_alert_analyses.
+		return chatResp{}, classifyHTTPError(resp.StatusCode, raw)
 	}
 	var parsed struct {
 		Choices []struct {
@@ -296,10 +353,18 @@ func (c *Client) callChat(ctx context.Context, userMsg string, maxChars int) (ch
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return chatResp{}, fmt.Errorf("unmarshal: %w", err)
+		return chatResp{}, &ProviderError{
+			Category:  CategoryUnknown,
+			Message:   sanitizeAndCap("unmarshal: "+err.Error(), 200),
+			Retryable: false,
+		}
 	}
 	if len(parsed.Choices) == 0 {
-		return chatResp{}, errors.New("no choices in response")
+		return chatResp{}, &ProviderError{
+			Category:  CategoryEmptyResponse,
+			Message:   "no choices in response",
+			Retryable: true,
+		}
 	}
 	return chatResp{
 		Text:             strings.TrimSpace(parsed.Choices[0].Message.Content),
