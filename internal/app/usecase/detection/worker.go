@@ -198,7 +198,7 @@ func (w *Worker) tick(ctx context.Context) {
 		w.log.Debug().Msg("detection: idle tick, queue empty")
 		return
 	}
-	w.log.Info().
+	w.log.Debug().
 		Int64("claimed", counters.claimed.Load()).
 		Int64("analyzed", counters.analyzed.Load()).
 		Int64("skipped_too_old", counters.skippedTooOld.Load()).

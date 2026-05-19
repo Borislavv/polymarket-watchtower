@@ -80,9 +80,6 @@ about this; do not deploy.
    - stale-trade gate (`StaleThreshold = LIVE_ALERT_MAX_LAG`) →
      `mark_skipped('too_old_for_live_alert')`.
    - success → `mark_analyzed`.
-4. **Per-tick summary log**: `"detection: tick summary"` with
-   claimed/analyzed/skipped_too_old/skipped_market_unknown/
-   failed_panic/failed_mark counts.
 
 Failure-class table:
 
