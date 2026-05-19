@@ -282,6 +282,16 @@ type AnomalyConfig struct {
 	LifecycleHotFromPct   float64       `env:"LIFECYCLE_HOT_FROM_PCT" envDefault:"90" validate:"gte=0,lte=100"`
 	MarketMinAge          time.Duration `env:"MARKET_MIN_AGE" envDefault:"24h" validate:"gte=0"`
 
+	// LiveAlertMaxLag — defence against detect.Observe accidentally
+	// firing on a backfilled trade. When trade.traded_at is older
+	// than now() − this lag at Observe time, the detector skips
+	// scoring and increments
+	// watchtower_trades_skipped_detection_total{reason="too_old_for_live_alert"}.
+	// 0 disables the gate (legacy behaviour). Default 1h matches
+	// the collect tick budget — anything older is almost certainly
+	// a replay.
+	LiveAlertMaxLag time.Duration `env:"LIVE_ALERT_MAX_LAG" envDefault:"1h" validate:"gte=0"`
+
 	// Trader-history multiplier (v2). Scoring adds a second multiplier:
 	// notional / wallet's median historical trade. A trade fires when it
 	// is anomalous on EITHER the market axis or the trader axis (the

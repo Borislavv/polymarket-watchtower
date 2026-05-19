@@ -89,6 +89,9 @@ func (q *Queries) ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([
 			&i.Clv1h,
 			&i.Clv6h,
 			&i.Clv24h,
+			&i.TelegramReactionStatus,
+			&i.TelegramReactionEmoji,
+			&i.LastReactionAt,
 		); err != nil {
 			return nil, err
 		}
@@ -216,6 +219,9 @@ func (q *Queries) ListSentAlertsForDrift(ctx context.Context, arg ListSentAlerts
 			&i.Clv1h,
 			&i.Clv6h,
 			&i.Clv24h,
+			&i.TelegramReactionStatus,
+			&i.TelegramReactionEmoji,
+			&i.LastReactionAt,
 		); err != nil {
 			return nil, err
 		}
@@ -284,6 +290,9 @@ func (q *Queries) ListSentAlertsForOutcomeCheck(ctx context.Context, claimLimit 
 			&i.Clv1h,
 			&i.Clv6h,
 			&i.Clv24h,
+			&i.TelegramReactionStatus,
+			&i.TelegramReactionEmoji,
+			&i.LastReactionAt,
 		); err != nil {
 			return nil, err
 		}

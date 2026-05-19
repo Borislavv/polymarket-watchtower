@@ -227,6 +227,33 @@ func (r *MarketRepository) GetByID(ctx context.Context, marketID int64) (Market,
 	return marketFromSQLC(row), nil
 }
 
+// UpdateCollectCursor advances polymarket_markets.last_collect_traded_at
+// for the given market to `tradedAt`. The update is monotonic at the
+// SQL layer (no-op when the supplied timestamp is older than the
+// persisted one), so concurrent callers cannot regress the cursor.
+// Called only by persist.Sink on the collect path — backfill must NOT
+// invoke this method or the collect/backfill decoupling breaks.
+func (r *MarketRepository) UpdateCollectCursor(ctx context.Context, marketID int64, tradedAt time.Time) error {
+	if tradedAt.IsZero() {
+		return nil
+	}
+	return r.q.UpdateMarketCollectCursor(ctx, sqlc.UpdateMarketCollectCursorParams{
+		MarketID: marketID,
+		TradedAt: tsFromTime(tradedAt),
+	})
+}
+
+// CollectCursor returns the per-market collect cursor. Zero time
+// means "never touched by collect" (first-sight or backfill-only) —
+// the caller falls through to its BootstrapLookback default.
+func (r *MarketRepository) CollectCursor(ctx context.Context, marketID int64) (time.Time, error) {
+	ts, err := r.q.MarketCollectCursor(ctx, marketID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("collect cursor for market %d: %w", marketID, err)
+	}
+	return tsTime(ts), nil
+}
+
 // UpsertOutcome links a market outcome (Yes/No/etc.) to its CLOB token id.
 func (r *MarketRepository) UpsertOutcome(ctx context.Context, marketID int64, tokenID, label string) error {
 	return r.q.UpsertMarketOutcome(ctx, sqlc.UpsertMarketOutcomeParams{

@@ -49,8 +49,26 @@ migrate: ## apply DB migrations
 	go run ./cmd/cli migrate -dsn "$(POSTGRES_DSN)"
 
 .PHONY: sqlc
-sqlc: ## regenerate db/sqlc Go code (requires sqlc binary on PATH)
+sqlc: ## regenerate db/sqlc Go code (requires sqlc binary on PATH; see make sqlc-docker for no-install fallback)
 	sqlc generate
+
+.PHONY: sqlc-docker
+sqlc-docker: ## regenerate db/sqlc via the official sqlc Docker image (no local install needed)
+	docker run --rm -v "$(CURDIR):/src" -w /src sqlc/sqlc:latest generate
+
+.PHONY: sqlc-check
+sqlc-check: ## CI guard: run sqlc generate and fail if anything changed (i.e. someone hand-patched the generated code)
+	@if command -v sqlc >/dev/null 2>&1; then \
+		sqlc generate; \
+	else \
+		echo "sqlc not on PATH; falling back to docker"; \
+		docker run --rm -v "$(CURDIR):/src" -w /src sqlc/sqlc:latest generate; \
+	fi
+	@if ! git diff --quiet -- internal/infra/postgres/sqlc db/queries db/migrations; then \
+		echo "sqlc generated code is out of sync with db/queries — run 'make sqlc' and commit"; \
+		git --no-pager diff --stat -- internal/infra/postgres/sqlc db/queries db/migrations; \
+		exit 1; \
+	fi
 
 .PHONY: pg-test
 pg-test: ## run repository integration tests against the local Postgres

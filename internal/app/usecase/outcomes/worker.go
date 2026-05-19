@@ -114,8 +114,19 @@ type ReactionMetrics interface {
 // OutcomeMetrics is the shim for the alert-outcome counter. Stamped
 // once per classified alert so Grafana can graph signal-quality
 // without re-running the aggregate SQL on every dashboard refresh.
+//
+// The interface is intentionally narrow: ObserveOutcome counts the
+// verdict; ObservePAL emits the proof-of-alert-value family (edge,
+// weighted success, calibration bucket). Two methods so the
+// implementation can fan out to different Prometheus collectors
+// without forcing the caller to know about the labels.
 type OutcomeMetrics interface {
 	ObserveOutcome(status, severity, kind string)
+	// ObservePAL records one classified alert against the PAL metric
+	// family. snap.EdgeValid=false means edge/weighted metrics are
+	// skipped (still a calibration counter contribution). Implementers
+	// must tolerate nil-safe calls when the metrics handle is nil.
+	ObservePAL(snap PALSnapshot)
 }
 
 func (c Config) applyDefaults() Config {
@@ -312,13 +323,37 @@ func (w *Worker) processOne(ctx context.Context, a repository.Alert) {
 		return
 	}
 
-	verdict := w.classify(a, res)
+	verdict, price, side := w.classifyWithTrade(a, res)
 	if err := w.alerts.MarkOutcome(ctx, verdict); err != nil {
 		w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomes: mark outcome failed")
 	}
 	if w.cfg.OutcomeMetrics != nil {
 		w.cfg.OutcomeMetrics.ObserveOutcome(string(verdict.Status), a.Severity, string(a.Kind))
+		// PAL: emit only when we recovered the trade-level price+side
+		// from the Finding payload AND the verdict is in a state that
+		// admits an edge calculation (or contributes a calibration
+		// bucket count). The snapshot builder handles the gating.
+		if price > 0 {
+			snap := BuildSnapshot(verdict.Status, a.Severity, string(a.Kind), price, side)
+			w.cfg.OutcomeMetrics.ObservePAL(snap)
+		}
 	}
+}
+
+// classifyWithTrade is the PAL-enriched wrapper around classify. It
+// decodes the Finding twice (once internally in classify, once here
+// for the trade details). The cost is a sub-microsecond JSON unmarshal
+// per resolved alert — vastly cheaper than restructuring the payload
+// to avoid the second pass.
+func (w *Worker) classifyWithTrade(a repository.Alert, res gamma.MarketResolution) (repository.OutcomeUpdate, float64, trade.Side) {
+	verdict := w.classify(a, res)
+	// Best-effort price/side recovery for PAL. A payload that won't
+	// parse is rare (the alertsender wrote it) but tolerated.
+	var f anomaly.Finding
+	if err := json.Unmarshal(a.Payload, &f); err != nil || f.Trade == nil {
+		return verdict, 0, ""
+	}
+	return verdict, f.Trade.Price, f.Trade.Side
 }
 
 // classify decodes the alert's persisted Finding and compares its trade

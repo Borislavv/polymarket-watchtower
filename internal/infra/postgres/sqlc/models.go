@@ -107,6 +107,9 @@ type PolymarketMarkets struct {
 	UpdatedAt               pgtype.Timestamptz
 	DeletedAt               pgtype.Timestamptz
 	PurgedAt                pgtype.Timestamptz
+	// Added by migration 00009. NULL when the market has never been
+	// touched by the collect path (first-sight or backfill-only).
+	LastCollectTradedAt pgtype.Timestamptz
 }
 
 type PolymarketTraders struct {

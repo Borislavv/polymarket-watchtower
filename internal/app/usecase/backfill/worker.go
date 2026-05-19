@@ -318,6 +318,12 @@ func (w *Worker) persistPage(ctx context.Context, marketID int64, page []trade.T
 		if dup := res.Requested - res.Inserted; dup > 0 {
 			w.metrics.TradesDuplicatesSkipped.Add(float64(dup))
 		}
+		// Label every backfilled trade as `source=backfill` so the
+		// operator can see the firehose in Grafana and tell it apart
+		// from collect's live tail.
+		if w.metrics.TradesImported != nil {
+			w.metrics.TradesImported.WithLabelValues("backfill").Add(float64(res.Requested))
+		}
 	}
 	return oldest, newest, nil
 }

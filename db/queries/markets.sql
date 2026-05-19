@@ -179,3 +179,23 @@ SET active          = TRUE,
     backfill_status = 'pending',
     updated_at      = NOW()
 WHERE id = $1;
+
+-- name: UpdateMarketCollectCursor :exec
+-- Advances polymarket_markets.last_collect_traded_at to the supplied
+-- timestamp, but only when it is strictly greater than the current
+-- value (or the current value is NULL). Idempotent — re-running
+-- against the same trade batch is a no-op. Called by persist.Sink
+-- after collect's UpsertBatch; backfill never calls this.
+UPDATE polymarket_markets
+SET last_collect_traded_at = sqlc.arg(traded_at)::timestamptz,
+    updated_at             = NOW()
+WHERE id = sqlc.arg(market_id)::bigint
+  AND (last_collect_traded_at IS NULL OR last_collect_traded_at < sqlc.arg(traded_at)::timestamptz);
+
+-- name: MarketCollectCursor :one
+-- Reads the per-market collect cursor. Returns NULL when the market
+-- has never been touched by collect (first-sight or backfill-only),
+-- which the caller maps to the BootstrapLookback default.
+SELECT last_collect_traded_at
+FROM polymarket_markets
+WHERE id = $1;

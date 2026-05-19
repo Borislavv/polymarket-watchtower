@@ -96,7 +96,7 @@ func TestTick_SendsRenderedMessageToChat(t *testing.T) {
 		"• purged: 7",
 		"<b>Trades</b>",
 		"• total: 1500000",
-		"• last 2h: 8500",
+		"• last 2h (by traded_at): 8500",
 		"• traders seen: 100000",
 		"<b>Alerts</b>",
 		"• sent: 18",

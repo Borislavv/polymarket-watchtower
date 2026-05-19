@@ -143,7 +143,24 @@ type Config struct {
 	// oldest sample) to clear this floor before alerts can fire. 0 disables.
 	// Distinct from BaselineWindow, which is the *maximum* lookback.
 	BaselineMinReadySpan time.Duration
-	Clock                func() time.Time
+
+	// LiveAlertMaxLag is the maximum acceptable distance between a
+	// trade's traded_at and now() at the moment detect.Observe runs.
+	// Trades older than this lag are NOT scored for live alerts —
+	// the metric watchtower_trades_skipped_detection_total
+	// {reason="too_old_for_live_alert"} increments and Observe
+	// returns early. Baselines are NOT updated either (the trade
+	// already lives in polymarket_trades and will be picked up by
+	// the DB-backed baseline reader on the next legitimately-live
+	// trade).
+	//
+	// This is the safety belt against an Observe call accidentally
+	// firing on backfilled history. Default 0 disables the gate
+	// (every trade is scored) — production should set this to a
+	// duration matching the collect tick budget, e.g. 1h.
+	LiveAlertMaxLag time.Duration
+
+	Clock func() time.Time
 
 	// Baseliner is the Postgres-backed baseline fetcher. Wired in
 	// production whenever POSTGRES_DSN is set. Leave nil only in the
@@ -320,7 +337,30 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	if notional <= 0 {
 		return
 	}
+	// LIVE_ALERT_MAX_LAG safety belt. A trade reaching detect.Observe
+	// with a traded_at older than the configured lag is almost
+	// certainly being replayed from polymarket_trades — either
+	// backfill leaked into the Observe path (architectural bug) or
+	// the operator restarted the binary after long downtime and the
+	// collector's bootstrap window swept up stale history. Either
+	// way we must not send a Telegram alert: the public market has
+	// long since priced this trade in.
+	//
+	// We still record the trade size on the histogram so dashboards
+	// stay consistent; baseline updates happen via persist.Sink on
+	// the way in, not here.
 	l.metrics.TradeSizeUSD.Observe(notional)
+	if l.cfg.LiveAlertMaxLag > 0 && !trade.Timestamp.IsZero() {
+		if l.now().Sub(trade.Timestamp) > l.cfg.LiveAlertMaxLag {
+			if l.metrics.TradesSkippedDetection != nil {
+				l.metrics.TradesSkippedDetection.WithLabelValues("too_old_for_live_alert").Inc()
+			}
+			return
+		}
+	}
+	if l.metrics.TradesAnalyzed != nil {
+		l.metrics.TradesAnalyzed.Inc()
+	}
 
 	// Alert-eligibility gates. These do NOT block baseline updates — we want
 	// the reservoir to warm continuously so it's ready the moment the market

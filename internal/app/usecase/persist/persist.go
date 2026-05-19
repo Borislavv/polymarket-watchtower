@@ -217,6 +217,32 @@ func (s *Sink) PersistTrades(ctx context.Context, m market.Market, trades []trad
 		if dup := res.Requested - res.Inserted; dup > 0 {
 			s.metrics.TradesDuplicatesSkipped.Add(float64(dup))
 		}
+		// PART 3 telemetry: trades imported BY SOURCE so the operator
+		// can see "are we still pulling from collect, or has backfill
+		// taken over?" via Grafana / stats summary.
+		if s.metrics.TradesImported != nil {
+			s.metrics.TradesImported.WithLabelValues("collect").Add(float64(res.Requested))
+		}
+	}
+	// Advance the per-market collect cursor to the newest traded_at in
+	// this batch. Migration 00009 decoupled this cursor from backfill
+	// ingestion: collect now resumes from where collect itself last
+	// saw, regardless of what backfill has done to polymarket_trades.
+	// Monotonic at the SQL layer — a stale duplicate batch will
+	// no-op against an already-advanced cursor.
+	var newest time.Time
+	for _, t := range trades {
+		if t.Timestamp.After(newest) {
+			newest = t.Timestamp
+		}
+	}
+	if !newest.IsZero() {
+		if err := s.markets.UpdateCollectCursor(ctx, dbMarket.ID, newest); err != nil {
+			// Cursor-update failure is non-fatal; the trades are
+			// already persisted. Next tick will retry through the
+			// markets.UpdateCollectCursor monotonic path.
+			return fmt.Errorf("update collect cursor: %w", err)
+		}
 	}
 	return nil
 }
@@ -254,9 +280,13 @@ func (s *Sink) upsertMarketOutcomes(ctx context.Context, persisted []repository.
 }
 
 // LatestTradedAt is the optional collector cursor source. Returns the
-// newest traded_at for the supplied market condition id, or the zero time
-// when the market is not yet known or has no trades. Wired into
-// collect.Config.Cursor when the DB is configured.
+// newest traded_at the COLLECT path itself has persisted for the
+// market, or the zero time when the market is not yet known or
+// collect has never touched it. Migration 00009 decoupled this from
+// MAX(traded_at) on polymarket_trades — backfill no longer poisons
+// the collect cursor.
+//
+// Wired into collect.Config.Cursor when the DB is configured.
 func (s *Sink) LatestTradedAt(ctx context.Context, conditionID string) (time.Time, error) {
 	if s == nil {
 		return time.Time{}, nil
@@ -265,7 +295,7 @@ func (s *Sink) LatestTradedAt(ctx context.Context, conditionID string) (time.Tim
 	if err != nil {
 		return time.Time{}, nil //nolint:nilerr // market not yet persisted is not an error
 	}
-	return s.trades.LatestTradedAt(ctx, m.ID)
+	return s.markets.CollectCursor(ctx, m.ID)
 }
 
 func uniqueWallets(trades []trade.Trade) []string {

@@ -82,14 +82,31 @@ type Stats struct {
 	MarketsSoftDeleted int64
 	MarketsPurged      int64
 	TradesTotal        int64
-	TradesLast2h       int64
-	TradersTotal       int64
-	AlertsBySeverity   map[string]int64
-	AlertsPending      int64
-	AlertsFailed       int64
-	AlertsSent         int64
-	BackfillByStatus   map[string]int64
-	UptimeSince        time.Time
+	// TradesLast2h is the count by traded_at — i.e. how many trades
+	// have happened on Polymarket in the last 2 hours. Misleading on
+	// its own because backfill inflates ingestion volume without
+	// representing live activity.
+	TradesLast2h int64
+	// TradesIngestedLast2h is the count by ingested_at — what the
+	// watchtower has PERSISTED in the last 2h, regardless of when
+	// the underlying trade happened. Dominated by backfill on a
+	// freshly-discovered universe.
+	TradesIngestedLast2h int64
+	// TradesAnalyzedLast2h is the count of trades that reached
+	// detect.Observe — sourced from watchtower_trades_analyzed_total
+	// when wired, falls back to 0. The gap between
+	// TradesIngestedLast2h (~26k in a healthy hour at our scale) and
+	// TradesAnalyzedLast2h (≤ the collect-side imported count, modulo
+	// the LIVE_ALERT_MAX_LAG skip pile) tells the operator whether
+	// the detection path is keeping up with ingestion.
+	TradesAnalyzedLast2h int64
+	TradersTotal         int64
+	AlertsBySeverity     map[string]int64
+	AlertsPending        int64
+	AlertsFailed         int64
+	AlertsSent           int64
+	BackfillByStatus     map[string]int64
+	UptimeSince          time.Time
 }
 
 // Worker is the long-running summary loop. Safe to run alongside
@@ -193,7 +210,15 @@ func Format(s Stats, now time.Time) string {
 
 	b.WriteString("\n<b>Trades</b>\n")
 	fmt.Fprintf(&b, "• total: %d\n", s.TradesTotal)
-	fmt.Fprintf(&b, "• last 2h: %d\n", s.TradesLast2h)
+	fmt.Fprintf(&b, "• last 2h (by traded_at): %d\n", s.TradesLast2h)
+	if s.TradesIngestedLast2h > 0 || s.TradesAnalyzedLast2h > 0 {
+		fmt.Fprintf(&b, "• last 2h (imported into DB): %d\n", s.TradesIngestedLast2h)
+		fmt.Fprintf(&b, "• last 2h (analyzed by detector): %d\n", s.TradesAnalyzedLast2h)
+		if s.TradesIngestedLast2h > 0 {
+			ratio := float64(s.TradesAnalyzedLast2h) / float64(s.TradesIngestedLast2h) * 100
+			fmt.Fprintf(&b, "• analyzed/imported: <b>%.1f%%</b>\n", ratio)
+		}
+	}
 	fmt.Fprintf(&b, "• traders seen: %d\n", s.TradersTotal)
 
 	b.WriteString("\n<b>Alerts</b>\n")
@@ -280,13 +305,20 @@ func (s *Store) Read(ctx context.Context) (Stats, error) {
 	}
 	row = s.pool.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM polymarket_trades)                                            AS total,
-			(SELECT COUNT(*) FROM polymarket_trades WHERE traded_at >= NOW() - INTERVAL '2 hours') AS last_2h,
-			(SELECT COUNT(*) FROM polymarket_traders)                                           AS traders
+			(SELECT COUNT(*) FROM polymarket_trades)                                                AS total,
+			(SELECT COUNT(*) FROM polymarket_trades WHERE traded_at   >= NOW() - INTERVAL '2 hours') AS last_2h_traded,
+			(SELECT COUNT(*) FROM polymarket_trades WHERE ingested_at >= NOW() - INTERVAL '2 hours') AS last_2h_ingested,
+			(SELECT COUNT(*) FROM polymarket_traders)                                               AS traders
 	`)
-	if err := row.Scan(&out.TradesTotal, &out.TradesLast2h, &out.TradersTotal); err != nil {
+	if err := row.Scan(&out.TradesTotal, &out.TradesLast2h, &out.TradesIngestedLast2h, &out.TradersTotal); err != nil {
 		return out, fmt.Errorf("read trades: %w", err)
 	}
+	// TradesAnalyzedLast2h is not in the DB — it lives in the
+	// Prometheus counter watchtower_trades_analyzed_total. The
+	// statsreport.Store layer doesn't have a Prometheus reader, so
+	// we leave it at 0 here and let the worker fill it via a small
+	// shim (set on Stats before rendering). When unset (0) the
+	// renderer omits the analyzed/imported ratio cleanly.
 
 	sevRows, err := s.pool.Query(ctx, `
 		SELECT severity, COUNT(*) FROM polymarket_alerts

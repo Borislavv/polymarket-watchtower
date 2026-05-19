@@ -474,6 +474,136 @@
         "expr": "sum(increase(watchtower_signal_reports_sent_total{status=\"failed\"}[24h]))",
         "refId": "A"
       }]
+    },
+    {
+      "id": 80,
+      "type": "row",
+      "title": "PAL · Proof of Alert Value",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 116, "w": 24, "h": 1}
+    },
+    {
+      "id": 81,
+      "type": "timeseries",
+      "title": "PAL · cumulative realized edge",
+      "description": "Cumulative sum of (success_binary − implied_probability_at_alert) over resolved alerts. A green line that trends UP is the proof-of-value signal: our alerts on average beat what the market itself priced. A flat or descending line means alerts are not adding value over the market's own probability.",
+      "gridPos": {"x": 0, "y": 117, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_alert_realized_edge_sum[$__range]))",
+        "legendFormat": "cumulative edge",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 82,
+      "type": "timeseries",
+      "title": "PAL · avg realized edge by severity (24h rolling)",
+      "description": "Average edge per resolved alert, broken down by severity. Critical/Hard should out-edge Info if the severity ladder is meaningful.",
+      "gridPos": {"x": 12, "y": 117, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (severity) (rate(watchtower_alert_realized_edge_sum[24h])) / clamp_min(sum by (severity) (rate(watchtower_alert_realized_edge_count[24h])), 0.00001)",
+        "legendFormat": "{{severity}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 83,
+      "type": "timeseries",
+      "title": "PAL · avg realized edge by alert kind (24h rolling)",
+      "description": "Edge per kind: trade_anomaly vs accumulation vs category_watch vs ownership_concentration. If one kind contributes most of the positive edge, weight your operator attention there.",
+      "gridPos": {"x": 0, "y": 125, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (kind) (rate(watchtower_alert_realized_edge_sum[24h])) / clamp_min(sum by (kind) (rate(watchtower_alert_realized_edge_count[24h])), 0.00001)",
+        "legendFormat": "{{kind}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 84,
+      "type": "timeseries",
+      "title": "PAL · weighted success rate (24h rolling)",
+      "description": "Severity-weighted success rate: sum(weight × success) / sum(weight). Weights: Info=1 Warning=3 Critical=10 Hard=25. A flat rate while raw Info volume rises means we're adding noise without adding edge.",
+      "gridPos": {"x": 12, "y": 125, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(rate(watchtower_alert_weighted_success_total[24h])) / clamp_min(sum(rate(watchtower_alert_weighted_resolved_total[24h])), 0.00001)",
+        "legendFormat": "weighted success",
+        "refId": "A"
+      }],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 85,
+      "type": "table",
+      "title": "PAL · calibration by implied-probability bucket (24h)",
+      "description": "For each implied-probability bucket, the share of resolved alerts that turned out correct. The market thinks the 10-20% bucket should win 10-20% of the time; if it wins MORE than that, we have signal in the long-shot region. The most informative buckets are 0-10 / 10-20 / 20-30.",
+      "gridPos": {"x": 0, "y": 133, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "valueLabel": "metric",
+            "mode": "columns"
+          }
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum by (bucket) (increase(watchtower_alert_calibration_total{status=\"resolved_correct\"}[24h]))",
+          "legendFormat": "success",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "expr": "sum by (bucket) (increase(watchtower_alert_calibration_total{status=~\"resolved_correct|resolved_wrong\"}[24h]))",
+          "legendFormat": "resolved",
+          "refId": "B",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 86,
+      "type": "timeseries",
+      "title": "PAL · CLV-lite avg favourable drift",
+      "description": "Average post-trade price drift in the alert's direction over four reference windows. A positive curve at 15m → 6h means the market moved our way after the alert fired — informative even before final resolution.",
+      "gridPos": {"x": 0, "y": 142, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "avg(rate(watchtower_alert_realized_edge_sum[24h])) / clamp_min(avg(rate(watchtower_alert_realized_edge_count[24h])), 0.00001)",
+        "legendFormat": "avg edge (proxy)",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 87,
+      "type": "stat",
+      "title": "PAL · resolved sample size (7d)",
+      "description": "Count of resolved alerts in the last 7 days. Below 30 the dashboard numbers are dominated by noise — treat as directional only. The PAL doc gives binomial CIs.",
+      "gridPos": {"x": 12, "y": 142, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_alert_realized_edge_count[7d]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 88,
+      "type": "stat",
+      "title": "PAL · pending outcomes (count)",
+      "description": "Alerts whose market hasn't resolved yet. A pile of pending means the dashboard is lagging — the latest week of alerts is invisible to the edge calculation. Wait for resolution before re-tuning.",
+      "gridPos": {"x": 18, "y": 142, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(watchtower_alert_calibration_total{status=\"pending\"}) - sum(watchtower_alert_calibration_total{status=~\"resolved_correct|resolved_wrong|unknown|unavailable\"})",
+        "refId": "A"
+      }]
     }
   ]
 }

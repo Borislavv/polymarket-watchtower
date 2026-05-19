@@ -445,6 +445,7 @@ func New() (*App, error) {
 		LifecycleHotFromPct:   cfg.Anomaly.LifecycleHotFromPct,
 		MarketMinAge:          cfg.Anomaly.MarketMinAge,
 		BaselineMinReadySpan:  cfg.Anomaly.BaselineMinReadySpan,
+		LiveAlertMaxLag:       cfg.Anomaly.LiveAlertMaxLag,
 		StrategyVersion:       anomaly.StrategyIdentity,
 	}
 	// Production: DB baseline + DB-backed alert dedup. The detector only
@@ -577,8 +578,10 @@ func (r reactionMetricsAdapter) ObserveReaction(status, reaction string) {
 	r.m.TelegramReactions.WithLabelValues(status, reaction).Inc()
 }
 
-// outcomeMetricsAdapter shims metrics.AlertOutcomes over the
-// outcomes.OutcomeMetrics shape.
+// outcomeMetricsAdapter shims metrics.AlertOutcomes + the PAL family
+// (realized edge / weighted success / calibration) over the
+// outcomes.OutcomeMetrics interface. Methods tolerate nil receivers
+// to keep tests cheap.
 type outcomeMetricsAdapter struct{ m *metrics.Metrics }
 
 func (o outcomeMetricsAdapter) ObserveOutcome(status, severity, kind string) {
@@ -586,6 +589,35 @@ func (o outcomeMetricsAdapter) ObserveOutcome(status, severity, kind string) {
 		return
 	}
 	o.m.AlertOutcomes.WithLabelValues(status, severity, kind).Inc()
+}
+
+func (o outcomeMetricsAdapter) ObservePAL(snap outcomes.PALSnapshot) {
+	if o.m == nil {
+		return
+	}
+	// Calibration counter fires for every classified alert (including
+	// pending — useful for "of all alerts in the 0-10% bucket, how
+	// many resolved?"). The status label distinguishes contributions.
+	if o.m.AlertCalibrationTotal != nil {
+		o.m.AlertCalibrationTotal.
+			WithLabelValues(snap.Bucket, string(snap.Status), snap.Severity, snap.Kind).
+			Inc()
+	}
+	// Edge + weighted only when the verdict is resolved_correct or
+	// resolved_wrong (snap.EdgeValid). Pending / unknown / unavailable
+	// contribute only the calibration counter.
+	if !snap.EdgeValid {
+		return
+	}
+	if o.m.AlertRealizedEdge != nil {
+		o.m.AlertRealizedEdge.WithLabelValues(snap.Severity, snap.Kind).Observe(snap.Edge)
+	}
+	if o.m.AlertWeightedResolvedTotal != nil && snap.Weight > 0 {
+		o.m.AlertWeightedResolvedTotal.WithLabelValues(snap.Severity, snap.Kind).Add(snap.Weight)
+	}
+	if o.m.AlertWeightedSuccessTotal != nil && snap.Weight > 0 {
+		o.m.AlertWeightedSuccessTotal.WithLabelValues(snap.Severity, snap.Kind).Add(snap.Weight * snap.SuccessBinary)
+	}
 }
 
 // signalReportMetricsAdapter shims metrics.SignalReportsSent over the

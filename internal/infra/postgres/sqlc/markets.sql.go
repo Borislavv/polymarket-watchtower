@@ -76,7 +76,7 @@ func (q *Queries) FailMarketBackfill(ctx context.Context, arg FailMarketBackfill
 }
 
 const getMarketByConditionID = `-- name: GetMarketByConditionID :one
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets WHERE condition_id = $1
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at FROM polymarket_markets WHERE condition_id = $1
 `
 
 func (q *Queries) GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error) {
@@ -105,12 +105,13 @@ func (q *Queries) GetMarketByConditionID(ctx context.Context, conditionID string
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.PurgedAt,
+		&i.LastCollectTradedAt,
 	)
 	return i, err
 }
 
 const getMarketByID = `-- name: GetMarketByID :one
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets WHERE id = $1
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at FROM polymarket_markets WHERE id = $1
 `
 
 func (q *Queries) GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error) {
@@ -139,6 +140,7 @@ func (q *Queries) GetMarketByID(ctx context.Context, id int64) (PolymarketMarket
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.PurgedAt,
+		&i.LastCollectTradedAt,
 	)
 	return i, err
 }
@@ -160,7 +162,7 @@ func (q *Queries) LinkMarketCategory(ctx context.Context, arg LinkMarketCategory
 }
 
 const listActiveMarketsForBackfill = `-- name: ListActiveMarketsForBackfill :many
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at FROM polymarket_markets
 WHERE active = TRUE
   AND deleted_at IS NULL
   AND purged_at IS NULL
@@ -205,6 +207,7 @@ func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32)
 			&i.UpdatedAt,
 			&i.DeletedAt,
 			&i.PurgedAt,
+			&i.LastCollectTradedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -217,7 +220,7 @@ func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32)
 }
 
 const listActiveMarketsForCollection = `-- name: ListActiveMarketsForCollection :many
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at FROM polymarket_markets
 WHERE active = TRUE
   AND deleted_at IS NULL
   AND purged_at IS NULL
@@ -260,6 +263,7 @@ func (q *Queries) ListActiveMarketsForCollection(ctx context.Context) ([]Polymar
 			&i.UpdatedAt,
 			&i.DeletedAt,
 			&i.PurgedAt,
+			&i.LastCollectTradedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -296,7 +300,7 @@ func (q *Queries) ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]
 }
 
 const listSoftDeletedForPurge = `-- name: ListSoftDeletedForPurge :many
-SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at FROM polymarket_markets
+SELECT id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at FROM polymarket_markets
 WHERE deleted_at IS NOT NULL
   AND deleted_at <= $1::timestamptz
   AND purged_at IS NULL
@@ -350,6 +354,7 @@ func (q *Queries) ListSoftDeletedForPurge(ctx context.Context, arg ListSoftDelet
 			&i.UpdatedAt,
 			&i.DeletedAt,
 			&i.PurgedAt,
+			&i.LastCollectTradedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -485,7 +490,7 @@ ON CONFLICT (condition_id) DO UPDATE SET
     last_seen_at = NOW(),
     deleted_at   = NULL,
     updated_at   = NOW()
-RETURNING id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at
+RETURNING id, condition_id, slug, question, event_slug, event_title, start_date, end_date, active, closed, last_seen_at, backfill_status, backfill_oldest_fetched_at, backfill_newest_fetched_at, backfill_attempts, backfill_last_error, backfill_started_at, backfill_completed_at, created_at, updated_at, deleted_at, purged_at, last_collect_traded_at
 `
 
 type UpsertMarketParams struct {
@@ -545,6 +550,7 @@ func (q *Queries) UpsertMarket(ctx context.Context, arg UpsertMarketParams) (Pol
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.PurgedAt,
+		&i.LastCollectTradedAt,
 	)
 	return i, err
 }
@@ -565,4 +571,39 @@ type UpsertMarketOutcomeParams struct {
 func (q *Queries) UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error {
 	_, err := q.db.Exec(ctx, upsertMarketOutcome, arg.MarketID, arg.TokenID, arg.Label)
 	return err
+}
+
+const updateMarketCollectCursor = `-- name: UpdateMarketCollectCursor :exec
+UPDATE polymarket_markets
+SET last_collect_traded_at = $2::timestamptz,
+    updated_at             = NOW()
+WHERE id = $1::bigint
+  AND (last_collect_traded_at IS NULL OR last_collect_traded_at < $2::timestamptz)
+`
+
+type UpdateMarketCollectCursorParams struct {
+	MarketID int64
+	TradedAt pgtype.Timestamptz
+}
+
+// Advances the per-market collect cursor monotonically. No-op when
+// the supplied timestamp is older than the persisted one.
+func (q *Queries) UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error {
+	_, err := q.db.Exec(ctx, updateMarketCollectCursor, arg.MarketID, arg.TradedAt)
+	return err
+}
+
+const marketCollectCursor = `-- name: MarketCollectCursor :one
+SELECT last_collect_traded_at
+FROM polymarket_markets
+WHERE id = $1
+`
+
+// Returns NULL when the market has never been touched by the collect
+// path. Caller maps NULL to "use BootstrapLookback".
+func (q *Queries) MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, marketCollectCursor, id)
+	var ts pgtype.Timestamptz
+	err := row.Scan(&ts)
+	return ts, err
 }

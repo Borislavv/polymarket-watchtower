@@ -162,6 +162,10 @@ type Querier interface {
 	// analytics — the FK from polymarket_trades.market_id does not CASCADE
 	// on the trade side, so a row delete would orphan trades.
 	MarkMarketPurged(ctx context.Context, id int64) error
+	// Per-market collect cursor (migration 00009). Updated only by
+	// persist.Sink on the collect path; backfill never touches it.
+	UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error
+	MarketCollectCursor(ctx context.Context, id int64) (pgtype.Timestamptz, error)
 	// Mark active markets inactive AND stamp deleted_at when they did not
 	// appear in the latest whitelisted-categories discovery sweep. Scoped by
 	// category so markets in non-whitelisted categories are untouched.

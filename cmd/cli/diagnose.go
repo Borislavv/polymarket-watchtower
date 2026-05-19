@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,8 @@ func runDiagnoseAlerts(args []string) {
 	fs := flag.NewFlagSet("diagnose-alerts", flag.ExitOnError)
 	dsn := fs.String("dsn", os.Getenv("POSTGRES_DSN"), "Postgres DSN (defaults to $POSTGRES_DSN)")
 	lookbackFlag := fs.Duration("lookback", 24*time.Hour, "trade-lookback window used when projecting candidate volume")
+	presetFlag := fs.String("preset", "", "load gates from presets/<name>.env (overrides env+flags below; valid: aggressive | balanced | conservative)")
+	presetsDir := fs.String("presets-dir", "presets", "directory containing <preset>.env files; default 'presets' (resolved relative to cwd)")
 
 	// Gate-override flags. Each defaults to NaN/-1/empty so we can tell
 	// "operator did not set" apart from "operator explicitly set 0".
@@ -61,6 +64,21 @@ func runDiagnoseAlerts(args []string) {
 	}
 
 	gates := readGatesFromEnv()
+	// --preset overlays a presets/<name>.env file on top of the env
+	// (without spawning a subshell). Useful for comparing all three
+	// presets against the same DB snapshot in one operator session:
+	//     cli diagnose-alerts --preset aggressive
+	//     cli diagnose-alerts --preset balanced
+	//     cli diagnose-alerts --preset conservative
+	// Per-flag overrides below still beat the preset — explicit wins.
+	if strings.TrimSpace(*presetFlag) != "" {
+		overlay, err := readGatesFromPresetFile(*presetsDir, *presetFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "diagnose-alerts: --preset %s: %v\n", *presetFlag, err)
+			os.Exit(2)
+		}
+		gates = overlay
+	}
 	if *bnTrades >= 0 {
 		gates.minBaselineTrades = *bnTrades
 	}
@@ -405,6 +423,140 @@ func readGatesFromEnv() gateConfig {
 		critMinOdds:            envFloat("ALERT_CRITICAL_MIN_ODDS", 8),
 		critMinMultiplier:      envFloat("ALERT_CRITICAL_MIN_MULTIPLIER", 10000),
 	}
+}
+
+// readGatesFromPresetFile parses presets/<name>.env directly and
+// returns the gateConfig it implies. Lookup rule:
+//
+//  1. presets/<name>.env (verbatim, ignoring comments and blank lines)
+//  2. each `KEY=VALUE` line is treated as if it had been exported in
+//     the environment, but applied to a tiny isolated map — we never
+//     mutate os.Environ so a follow-up `--preset balanced` doesn't
+//     leak `--preset aggressive`'s state.
+//  3. unknown keys are tolerated (presets carry knobs the diagnose
+//     tool doesn't read — e.g. cluster + accumulation config).
+//
+// Defaults the diagnose tool already uses are preserved for keys the
+// preset file does not set.
+func readGatesFromPresetFile(presetsDir, name string) (gateConfig, error) {
+	// Friendly normalisation: accept "aggressive", "aggressive.env",
+	// or an absolute path.
+	candidate := strings.TrimSpace(name)
+	if candidate == "" {
+		return gateConfig{}, fmt.Errorf("empty preset name")
+	}
+	if !strings.HasSuffix(candidate, ".env") {
+		candidate += ".env"
+	}
+	path := candidate
+	if !filepath.IsAbs(candidate) {
+		path = filepath.Join(presetsDir, candidate)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return gateConfig{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	values := parseDotEnv(body)
+	// Start from the diagnose defaults; the preset overrides whatever
+	// keys it carries.
+	g := readGatesFromEnv()
+	if v, ok := values["LIFECYCLE_ALERT_FROM_PCT"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.lifecycleFromPct = f
+		}
+	}
+	if v, ok := values["MARKET_MIN_AGE"]; ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			g.marketMinAge = d
+		}
+	}
+	if v, ok := values["SINGLE_MIN_BASELINE_TRADES"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			g.minBaselineTrades = n
+		}
+	}
+	if v, ok := values["SINGLE_MIN_BASELINE_NOTIONAL_USD"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.minBaselineNotionalUSD = f
+		}
+	}
+	if v, ok := values["BASELINE_MIN_READY_WINDOW"]; ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			g.minReadyWindow = d
+		}
+	}
+	if v, ok := values["ALERT_INFO_MIN_NOTIONAL_USD"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.infoMinNotionalUSD = f
+		}
+	}
+	if v, ok := values["ALERT_INFO_MIN_ODDS"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.infoMinOdds = f
+		}
+	}
+	if v, ok := values["ALERT_INFO_MIN_MULTIPLIER"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.infoMinMultiplier = f
+		}
+	}
+	if v, ok := values["ALERT_WARNING_MIN_NOTIONAL_USD"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.warnMinNotionalUSD = f
+		}
+	}
+	if v, ok := values["ALERT_WARNING_MIN_ODDS"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.warnMinOdds = f
+		}
+	}
+	if v, ok := values["ALERT_WARNING_MIN_MULTIPLIER"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.warnMinMultiplier = f
+		}
+	}
+	if v, ok := values["ALERT_CRITICAL_MIN_NOTIONAL_USD"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.critMinNotionalUSD = f
+		}
+	}
+	if v, ok := values["ALERT_CRITICAL_MIN_ODDS"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.critMinOdds = f
+		}
+	}
+	if v, ok := values["ALERT_CRITICAL_MIN_MULTIPLIER"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			g.critMinMultiplier = f
+		}
+	}
+	return g, nil
+}
+
+// parseDotEnv is a tiny KEY=VALUE parser tolerating shell comments,
+// blank lines, and surrounding whitespace. Anything that doesn't look
+// like KEY=VALUE is silently skipped — the diagnose tool only cares
+// about the gate-relevant keys.
+func parseDotEnv(body []byte) map[string]string {
+	out := map[string]string{}
+	for _, raw := range strings.Split(string(body), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:eq])
+		v := strings.TrimSpace(line[eq+1:])
+		// Strip surrounding quotes ("foo" or 'foo').
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func envFloat(k string, dflt float64) float64 {

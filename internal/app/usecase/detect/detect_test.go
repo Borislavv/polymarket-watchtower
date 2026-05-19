@@ -17,6 +17,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 )
 
@@ -885,4 +886,101 @@ func TestObserveConcurrencySafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestObserve_TooOldTradeSkippedForLiveAlerts pins the
+// LIVE_ALERT_MAX_LAG safety belt: a trade whose traded_at is older
+// than now() − lag must NOT fire (Telegram-spam prevention against
+// backfill / replay paths), and the skip counter must increment so
+// operators can prove the gate is doing its job in production.
+//
+// Setup: build a loop with LiveAlertMaxLag=1h, then feed a trade
+// that would otherwise fire (warm baseline + large notional +
+// long-odds). Expect: zero emissions, exactly one
+// trades_skipped_detection_total{reason="too_old_for_live_alert"}.
+func TestObserve_TooOldTradeSkippedForLiveAlerts(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := marketcache.New()
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
+			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
+			Categories: []vo.CategoryID{42}, Active: true,
+			StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
+		}},
+		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
+	)
+	emit := &capturingEmitter{}
+	met := metrics.New()
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds:      defaultThresholds(),
+		Baseline:        baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:         cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:           func() time.Time { return now },
+		LiveAlertMaxLag: time.Hour, // anything older than 1h is "replay"
+	}, reg, emit, met, &log)
+	m, _ := reg.Get("0xa")
+
+	// Warm the baseline at NOW so the gate's bookkeeping path doesn't
+	// no-op on an empty bucket. (warm() bypasses LiveAlertMaxLag via
+	// repeated calls at `at == now`; we measure the SKIP path only
+	// for the one trade that's intentionally stale below.)
+	warm(loop, m, 10, 100, 0.10, now)
+
+	// Stale trade: traded_at 3h ago, lag = 1h → must skip.
+	stale := bet(50_000, 0.10, "0xstale", now.Add(-3*time.Hour))
+	loop.Observe(context.Background(), m, stale)
+
+	if got := len(emit.all()); got != 0 {
+		t.Fatalf("stale trade must not emit any Finding, got %d: %+v", got, emit.all())
+	}
+	skipped := getCounter(t, met.TradesSkippedDetection, "too_old_for_live_alert")
+	if skipped < 1 {
+		t.Fatalf("trades_skipped_detection_total{too_old_for_live_alert} should be ≥1, got %v", skipped)
+	}
+}
+
+// TestObserve_RecentTradePassesLiveAlertGate is the complementary
+// positive case: a trade younger than LIVE_ALERT_MAX_LAG flows
+// through the gate (TradesAnalyzed increments; the skip counter
+// stays where it was).
+func TestObserve_RecentTradePassesLiveAlertGate(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	reg := marketcache.New()
+	reg.Replace(
+		[]market.Market{{
+			ID: "0xa", Slug: "us-pres", Question: "Who wins?",
+			TokenIDs: []vo.TokenID{"tok-yes", "tok-no"}, Outcomes: []string{"Yes", "No"},
+			Categories: []vo.CategoryID{42}, Active: true,
+			StartDate: now.Add(-95 * 24 * time.Hour), EndDate: now.Add(5 * 24 * time.Hour),
+		}},
+		[]market.Category{{ID: 42, Slug: "politics", Label: "Politics"}},
+	)
+	emit := &capturingEmitter{}
+	met := metrics.New()
+	log := zerolog.Nop()
+	loop := New(Config{
+		Thresholds:      defaultThresholds(),
+		Baseline:        baseline.Config{Window: 7 * 24 * time.Hour},
+		Cluster:         cluster.Config{Window: time.Hour, MinTrades: 99, MinUniqueWallets: 99},
+		Clock:           func() time.Time { return now },
+		LiveAlertMaxLag: time.Hour,
+	}, reg, emit, met, &log)
+	m, _ := reg.Get("0xa")
+
+	// A fresh trade (5 minutes ago) — comfortably inside the 1h lag.
+	fresh := bet(100, 0.50, "0xfresh", now.Add(-5*time.Minute))
+	loop.Observe(context.Background(), m, fresh)
+
+	skipped := getCounter(t, met.TradesSkippedDetection, "too_old_for_live_alert")
+	if skipped > 0 {
+		t.Errorf("fresh trade must not increment skip counter, got %v", skipped)
+	}
+	// metrics.New() returns counter-vecs; TradesAnalyzed is a plain
+	// Counter. Use prometheus testutil to read its value without
+	// importing client_model directly.
+	if v := testutil.ToFloat64(met.TradesAnalyzed); v < 1 {
+		t.Errorf("trades_analyzed_total should be ≥1 after a fresh Observe, got %v", v)
+	}
 }

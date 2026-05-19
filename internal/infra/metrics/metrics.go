@@ -66,6 +66,27 @@ type Metrics struct {
 	// Counters increment exactly once per row inserted / updated. Operators
 	// graph rate(...) over these to see whether the ingest path is keeping
 	// up with the discover/collect/backfill cadence.
+	// TradesImported counts the raw INGESTION rate per source
+	// (collect | backfill). Distinct from TradesUpserted which only
+	// counts FRESH inserts — TradesImported includes duplicates so
+	// the operator can see "collect is still pulling, backfill is
+	// double-counting" patterns. The diagnostic that motivates this:
+	// for 24h of data, ingested_at counted 897k rows while traded_at
+	// counted 109k — 8× firehose from backfill.
+	TradesImported *prometheus.CounterVec // source = collect|backfill
+
+	// TradesAnalyzed counts the trades that reached detect.Observe.
+	// In a healthy pipeline this should track TradesImported{source=collect}
+	// modulo a small skip pile (too_old_for_live_alert, etc.).
+	// Divergence between imported and analyzed is the structural
+	// signal that the collect cursor is poisoned.
+	TradesAnalyzed prometheus.Counter
+
+	// TradesSkippedDetection records every trade detect.Observe
+	// declined to score. The reason label is the typed string from
+	// detect.SkipReason* (currently: too_old_for_live_alert).
+	TradesSkippedDetection *prometheus.CounterVec // reason
+
 	MarketsUpserted         prometheus.Counter     // every successful UpsertMarket call (incl. ON CONFLICT)
 	MarketOutcomesUpserted  prometheus.Counter     // every UpsertOutcome call (per token row)
 	MarketsSoftDeleted      prometheus.Counter     // sweep-driven `active=false, deleted_at=NOW()` flips
@@ -94,6 +115,28 @@ type Metrics struct {
 	SignalReportsSent *prometheus.CounterVec // period_type, status
 	TelegramReactions *prometheus.CounterVec // status, reaction
 	AlertOutcomes     *prometheus.CounterVec // status, severity, kind
+
+	// --- PAL · Proof of Alert Value ---
+	// AlertRealizedEdge is a HistogramVec — the only Prometheus type
+	// whose _sum field admits negative observations. Buckets are
+	// chosen so the [-1, +1] range any single edge can take is
+	// covered with informative resolution at the centre.
+	AlertRealizedEdge *prometheus.HistogramVec // severity, kind
+
+	// AlertWeightedSuccessTotal accumulates severity_weight ×
+	// success_binary per resolved alert. Denominator is
+	// AlertWeightedResolvedTotal (severity_weight per resolved
+	// alert). Their ratio is the weighted success rate; the
+	// Grafana panel computes it as
+	//   sum(rate(success)) / sum(rate(resolved))
+	AlertWeightedSuccessTotal  *prometheus.CounterVec // severity, kind
+	AlertWeightedResolvedTotal *prometheus.CounterVec // severity, kind
+
+	// AlertCalibrationTotal counts every classified alert by its
+	// implied-probability bucket. The 4 labels add up to bounded
+	// cardinality: 7 buckets × 4 statuses × 4 severities × ~5 kinds
+	// = 560 series cap. Cheap.
+	AlertCalibrationTotal *prometheus.CounterVec // bucket, status, severity, kind
 }
 
 func New() *Metrics {
@@ -231,6 +274,19 @@ func New() *Metrics {
 		Help: "Telegram alert delivery failures, by severity.",
 	}, []string{"severity"})
 
+	m.TradesImported = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trades", Name: "imported_total",
+		Help: "Trades persisted into polymarket_trades, by source (collect|backfill). Counts EVERY attempt including duplicates — divergence from trades_analyzed_total tells you the collect cursor isn't keeping up with the live tail.",
+	}, []string{"source"})
+	m.TradesAnalyzed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trades", Name: "analyzed_total",
+		Help: "Trades that reached detect.Observe and were scored against the strategy gates. A growing gap between this counter and trades_imported_total{source=collect} is the canonical signal that backfill is consuming the live tail.",
+	})
+	m.TradesSkippedDetection = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trades", Name: "skipped_detection_total",
+		Help: "Trades that reached detect.Observe but were not scored, by reason. Currently the only reason emitted is `too_old_for_live_alert` (LIVE_ALERT_MAX_LAG); the metric exists with a label vector so future skip paths are loud.",
+	}, []string{"reason"})
+
 	m.MarketsUpserted = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "persist", Name: "markets_upserted_total",
 		Help: "Successful UpsertMarket calls. Includes both fresh inserts and updates to existing rows (ON CONFLICT path).",
@@ -287,6 +343,27 @@ func New() *Metrics {
 		Help: "Resolved alert verdicts, by status (resolved_correct / resolved_wrong / unknown / unavailable), severity, and alert kind. Drives the Grafana signal-quality panels.",
 	}, []string{"status", "severity", "kind"})
 
+	// PAL · Proof of Alert Value
+	// HistogramVec admits negative observations on _sum (unlike Counter).
+	// Buckets span the legal range [-1, +1] of realized edge.
+	m.AlertRealizedEdge = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "realized_edge",
+		Help:    "PAL · realized edge per resolved alert: success_binary − implied_probability_at_alert. Sum over resolved alerts (PromQL: rate(sum) / rate(count)) is the average edge. Positive average means alerts beat the market's implied probability — the load-bearing proof-of-value metric.",
+		Buckets: []float64{-1.0, -0.75, -0.5, -0.25, -0.10, 0, 0.10, 0.25, 0.50, 0.75, 1.0},
+	}, []string{"severity", "kind"})
+	m.AlertWeightedSuccessTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "weighted_success_total",
+		Help: "PAL · severity-weighted successes: sum of severity_weight × 1{resolved_correct}. Weights: Info=1 Warning=3 Critical=10 Hard=25. Divide by alert_weighted_resolved_total for the weighted success rate.",
+	}, []string{"severity", "kind"})
+	m.AlertWeightedResolvedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "weighted_resolved_total",
+		Help: "PAL · denominator for weighted success: sum of severity_weight per RESOLVED alert (pending/ambiguous/unavailable excluded).",
+	}, []string{"severity", "kind"})
+	m.AlertCalibrationTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "calibration_total",
+		Help: "PAL · calibration: count of alerts by implied-probability bucket (0-10 / 10-20 / 20-30 / 30-40 / 40-50 / 50-70 / 70+), outcome status, severity, and kind. Low-bucket success rates above their implied probability is the signal-quality smoking gun.",
+	}, []string{"bucket", "status", "severity", "kind"})
+
 	m.StatsSummariesSent = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "stats", Name: "summaries_sent_total",
 		Help: "Periodic Telegram stats summaries delivered (one per interval when the worker is enabled).",
@@ -310,12 +387,16 @@ func New() *Metrics {
 		m.BaselineBuckets,
 		m.CategoryFilterSkipped, m.AlertMMSuppressed, m.LifecycleUnknownSkipped,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
+		m.TradesImported, m.TradesAnalyzed, m.TradesSkippedDetection,
 		m.MarketsUpserted, m.MarketOutcomesUpserted,
 		m.MarketsSoftDeleted, m.MarketsPurged, m.MarketsResumed,
 		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,
 		m.BackfillPagesFetched, m.BackfillRunsTotal,
 		m.StatsSummariesSent, m.StatsSummaryErrors,
 		m.SignalReportsSent, m.TelegramReactions, m.AlertOutcomes,
+		m.AlertRealizedEdge,
+		m.AlertWeightedSuccessTotal, m.AlertWeightedResolvedTotal,
+		m.AlertCalibrationTotal,
 	)
 	return m
 }
