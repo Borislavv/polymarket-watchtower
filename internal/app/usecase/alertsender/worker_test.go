@@ -1,6 +1,7 @@
 package alertsender
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -133,7 +134,12 @@ func (f *fakeEnricher) AnalyzeAndStore(_ context.Context, _ int64, _ anomaly.Fin
 	f.calls++
 	return repository.AlertAnalysis{}, f.err
 }
-func (f *fakeEnricher) LatestText(_ context.Context, _ int64) string { return f.text }
+func (f *fakeEnricher) LatestText(_ context.Context, _ int64) (string, string) {
+	if f.text == "" {
+		return "", "analyzer_skipped"
+	}
+	return f.text, ""
+}
 
 // fakeAttributionStore captures every Upsert call so tests can pin
 // the bucketing output and verify failures do not block sends.
@@ -216,6 +222,155 @@ func TestAIEnricherEmptyTextElidesBlock(t *testing.T) {
 	if strings.Contains(bot.calls[0].Text, "<b>Analyst note</b>") {
 		t.Errorf("empty note must not render the block")
 	}
+}
+
+// TestAIEnricherNotWiredLogsReason pins TASK 2 / TASK 3: when no
+// enricher is wired into the sender, every alert emits a structured
+// "no note attached" event so the operator never sees a silent skip.
+func TestAIEnricherNotWiredLogsReason(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	var buf bytes.Buffer
+	log := zerolog.New(&buf)
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, &log)
+	// Deliberately do NOT call w.SetAIEnricher.
+
+	w.Drain(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, `"ai alert analysis: no note attached"`) {
+		t.Errorf("missing no-note-attached log:\n%s", out)
+	}
+	if !strings.Contains(out, `"reason":"enricher_not_wired"`) {
+		t.Errorf("missing reason=enricher_not_wired in:\n%s", out)
+	}
+}
+
+// TestAIEnricherSkippedStatusLogsReason pins the canonical
+// "ai alert analysis: skipped" path. The enricher returns Status=skipped
+// with LastError carrying the reason (e.g. "no_api_key", "rate_limited").
+// That reason MUST land in the log so an operator can fix configuration.
+func TestAIEnricherSkippedStatusLogsReason(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	var buf bytes.Buffer
+	log := zerolog.New(&buf)
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, &log)
+	w.SetAIEnricher(&fakeStatusEnricher{
+		status: "skipped", reason: "no_api_key", model: "noop",
+	})
+
+	w.Drain(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, `"ai alert analysis: skipped"`) {
+		t.Errorf("missing skipped log:\n%s", out)
+	}
+	if !strings.Contains(out, `"reason":"no_api_key"`) {
+		t.Errorf("missing reason in:\n%s", out)
+	}
+	if bot.count.Load() != 1 {
+		t.Errorf("alert must still ship when AI is skipped: %d", bot.count.Load())
+	}
+}
+
+// TestAIEnricherErrorStatusLogsReason pins "ai alert analysis: failed"
+// for Status=error (vs. Status=skipped). Both still ship the alert.
+func TestAIEnricherErrorStatusLogsReason(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	var buf bytes.Buffer
+	log := zerolog.New(&buf)
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, &log)
+	w.SetAIEnricher(&fakeStatusEnricher{
+		status: "error", reason: "rate_limited", model: "gpt-4o-mini",
+	})
+
+	w.Drain(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, `"ai alert analysis: failed"`) {
+		t.Errorf("missing failed log:\n%s", out)
+	}
+	if !strings.Contains(out, `"error":"rate_limited"`) {
+		t.Errorf("missing error in:\n%s", out)
+	}
+	if bot.count.Load() != 1 {
+		t.Errorf("alert must still ship when AI errors: %d", bot.count.Load())
+	}
+}
+
+// TestAIEnricherCompletedLogsAttached pins the happy-path log shape.
+// On success the worker emits both "completed" and "attached to
+// telegram alert" so a grep can confirm the AI text actually reached
+// the operator's chat.
+func TestAIEnricherCompletedLogsAttached(t *testing.T) {
+	st := newFakeStore(sampleAlert(t, 1, "info"))
+	bot := &fakeBot{}
+	var buf bytes.Buffer
+	log := zerolog.New(&buf)
+	w := New(Config{ChatID: "42", ClaimLimit: 16, Workers: 1, Interval: time.Hour},
+		st, bot, nil, &log)
+	w.SetAIEnricher(&fakeStatusEnricher{
+		status: "ok", verdict: "lean_yes", text: "Watchlist candidate.",
+		model: "gpt-4o-mini",
+	})
+
+	w.Drain(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, `"ai alert analysis: completed"`) {
+		t.Errorf("missing completed log:\n%s", out)
+	}
+	if !strings.Contains(out, `"ai alert analysis: attached to telegram alert"`) {
+		t.Errorf("missing attached log:\n%s", out)
+	}
+	if !strings.Contains(bot.calls[0].Text, "Analyst note") {
+		t.Errorf("Telegram body missing Analyst note block:\n%s", bot.calls[0].Text)
+	}
+	if !strings.Contains(bot.calls[0].Text, "Watchlist candidate.") {
+		t.Errorf("Telegram body missing note text:\n%s", bot.calls[0].Text)
+	}
+}
+
+// fakeStatusEnricher is the modern fake that mirrors the new
+// AnalyzeAndStore contract: explicit Status + LastError fields so
+// tests can drive every branch of stampAnalystNote.
+type fakeStatusEnricher struct {
+	status  string // "ok" | "skipped" | "error"
+	reason  string // populated into LastError
+	verdict string
+	text    string
+	model   string
+	err     error
+}
+
+func (f *fakeStatusEnricher) AnalyzeAndStore(_ context.Context, alertID int64, _ anomaly.Finding) (repository.AlertAnalysis, error) {
+	if f.err != nil {
+		return repository.AlertAnalysis{}, f.err
+	}
+	return repository.AlertAnalysis{
+		AlertID:      alertID,
+		Status:       f.status,
+		Verdict:      f.verdict,
+		AnalysisText: f.text,
+		Model:        f.model,
+		LastError:    f.reason,
+	}, nil
+}
+
+func (f *fakeStatusEnricher) LatestText(_ context.Context, _ int64) (string, string) {
+	if f.status != "ok" || f.text == "" {
+		r := f.reason
+		if r == "" {
+			r = "latest_text_status_not_ok:" + f.status
+		}
+		return "", r
+	}
+	return f.text, ""
 }
 
 // TestAttributionWriteHappyPath pins that every claimed alert produces
@@ -303,7 +458,12 @@ type fakeVerdictEnricher struct {
 func (f *fakeVerdictEnricher) AnalyzeAndStore(_ context.Context, _ int64, _ anomaly.Finding) (repository.AlertAnalysis, error) {
 	return repository.AlertAnalysis{Verdict: f.verdict}, nil
 }
-func (f *fakeVerdictEnricher) LatestText(_ context.Context, _ int64) string { return f.text }
+func (f *fakeVerdictEnricher) LatestText(_ context.Context, _ int64) (string, string) {
+	if f.text == "" {
+		return "", "analyzer_skipped"
+	}
+	return f.text, ""
+}
 
 func TestSendsPendingAlertAndMarksSent(t *testing.T) {
 	st := newFakeStore(sampleAlert(t, 1, "info"))

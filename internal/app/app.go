@@ -654,7 +654,21 @@ func New() (*App, error) {
 	var aiSvc *aianalysis.Service
 	if alertAnalysisRepo != nil {
 		var analyzer analysis.Analyzer = analysis.NoopAnalyzer{}
-		if cfg.AIAnalysis.Enabled && cfg.AIAnalysis.APIKey != "" {
+		// Startup classification — answers the operator's first
+		// question after a deploy ("is AI on or off, and why?").
+		switch {
+		case !cfg.AIAnalysis.Enabled:
+			logger.Info().
+				Str("reason", "AI_ANALYSIS_ENABLED=false").
+				Bool("telegram_alerts_enabled", cfg.AIAnalysis.AlertsEnabled).
+				Bool("reports_enabled", cfg.AIAnalysis.ReportsEnabled).
+				Msg("ai analysis disabled")
+		case cfg.AIAnalysis.APIKey == "":
+			logger.Warn().
+				Str("model", cfg.AIAnalysis.Model).
+				Bool("telegram_alerts_enabled", cfg.AIAnalysis.AlertsEnabled).
+				Msg("ai analysis configured but api key missing — falling back to NoopAnalyzer")
+		default:
 			analyzer = openai.New(openai.Config{
 				APIKey:                 cfg.AIAnalysis.APIKey,
 				BaseURL:                cfg.AIAnalysis.BaseURL,
@@ -667,9 +681,16 @@ func New() (*App, error) {
 				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
 				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
 			})
-			logger.Info().Str("model", cfg.AIAnalysis.Model).Msg("ai analysis enabled")
-		} else {
-			logger.Info().Msg("ai analysis disabled (no key or AI_ANALYSIS_ENABLED=false)")
+			logger.Info().
+				Str("provider", "openai").
+				Str("model", cfg.AIAnalysis.Model).
+				Dur("timeout", cfg.AIAnalysis.Timeout).
+				Float64("daily_budget_usd", cfg.AIAnalysis.DailyBudgetUSD).
+				Int("rate_limit_per_min", cfg.AIAnalysis.RateLimitPerMin).
+				Bool("telegram_alerts_enabled", cfg.AIAnalysis.AlertsEnabled).
+				Bool("reports_enabled", cfg.AIAnalysis.ReportsEnabled).
+				Bool("market_intelligence_enabled", cfg.AIAnalysis.MarketIntelligenceEnabled).
+				Msg("ai analysis enabled")
 		}
 		aiSvc = aianalysis.New(aianalysis.Config{
 			AlertsEnabled:            cfg.AIAnalysis.Enabled && cfg.AIAnalysis.AlertsEnabled,
@@ -681,10 +702,15 @@ func New() (*App, error) {
 		// generates / refreshes its analyst note BEFORE Telegram render.
 		// The sender already handles enricher==nil; this is the prod
 		// hookup. When AlertsEnabled=false the service short-circuits
-		// to a no-op call.
+		// with a Status=skipped row so the alertsender logs `reason=disabled`.
 		if senderWorker != nil {
 			senderWorker.SetAIEnricher(aiSvc)
+			logger.Info().
+				Bool("ai_telegram_alerts_enabled", cfg.AIAnalysis.Enabled && cfg.AIAnalysis.AlertsEnabled).
+				Msg("alertsender: ai enricher wired")
 		}
+	} else {
+		logger.Warn().Msg("ai analysis disabled (postgres not configured — alert analyses cannot be persisted)")
 	}
 
 	// Strategy attribution writer: every alert that reaches the

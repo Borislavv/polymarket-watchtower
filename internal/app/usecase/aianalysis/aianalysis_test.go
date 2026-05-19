@@ -194,8 +194,12 @@ func TestLatestTextReturnsEmptyOnSkipped(t *testing.T) {
 	if _, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := svc.LatestText(context.Background(), 42); got != "" {
+	got, reason := svc.LatestText(context.Background(), 42)
+	if got != "" {
 		t.Errorf("LatestText should be empty for non-OK status; got %q", got)
+	}
+	if reason == "" {
+		t.Errorf("LatestText must surface a non-empty reason for empty result")
 	}
 }
 

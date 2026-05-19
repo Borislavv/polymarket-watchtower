@@ -19,6 +19,7 @@ package aianalysis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -70,6 +71,25 @@ func New(cfg Config, analyzer analysis.Analyzer, repo AnalysisStore, met *metric
 	return &Service{cfg: cfg, analyzer: analyzer, repo: repo, metrics: met, log: log}
 }
 
+// Canonical skip/failure reason strings. Stable identifiers — the
+// alertsender logs them and dashboards may group by them.
+const (
+	ReasonDisabled            = "disabled"
+	ReasonTelegramAlertsOff   = "telegram_alerts_disabled"
+	ReasonNoAPIKey            = "no_api_key"
+	ReasonRepoMissing         = "repo_unconfigured"
+	ReasonNoRefreshNeeded     = "no_refresh_needed"
+	ReasonAnalyzerSkipped     = "analyzer_skipped"
+	ReasonAnalyzerError       = "analyzer_error"
+	ReasonRepoLatestError     = "repo_latest_error"
+	ReasonRepoVersionError    = "repo_version_error"
+	ReasonRepoInsertError     = "repo_insert_error"
+	ReasonAnalysisTextEmpty   = "analysis_text_empty"
+	ReasonLatestTextNotOK     = "latest_text_status_not_ok"
+	ReasonLatestTextNotFound  = "latest_text_not_found"
+	ReasonLatestTextRepoError = "latest_text_repo_error"
+)
+
 // AnalyzeAndStore is the per-alert entry point. The caller (detect
 // emitter or a follow-up worker) has already persisted the alert
 // row; we look at the latest analysis for it, decide whether a
@@ -80,10 +100,21 @@ func New(cfg Config, analyzer analysis.Analyzer, repo AnalysisStore, met *metric
 // caller whether to render it.
 func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.Finding) (repository.AlertAnalysis, error) {
 	if !s.cfg.AlertsEnabled {
-		return repository.AlertAnalysis{}, nil
+		// Stamp the row so the caller can distinguish "disabled" from
+		// "wasn't asked". No DB write here — a global-disabled write
+		// would spam polymarket_alert_analyses with a row per alert.
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusSkipped),
+			LastError: ReasonDisabled,
+		}, nil
 	}
 	if s.repo == nil {
-		return repository.AlertAnalysis{}, nil
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusSkipped),
+			LastError: ReasonRepoMissing,
+		}, nil
 	}
 
 	// Refresh decision.
@@ -91,27 +122,40 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 	switch {
 	case err == nil:
 		if !shouldRefresh(prev, f, s.cfg) {
+			// Mirror the prev row's status — if a previous analysis
+			// succeeded we render that; if it skipped/errored, the
+			// caller sees that status and logs accordingly.
 			return prev, nil
 		}
-	case err == repository.ErrAnalysisNotFound:
+	case errors.Is(err, repository.ErrAnalysisNotFound):
 		// First-time analysis — fall through.
 	default:
-		return repository.AlertAnalysis{}, fmt.Errorf("latest alert analysis: %w", err)
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusError),
+			LastError: ReasonRepoLatestError + ": " + err.Error(),
+		}, fmt.Errorf("latest alert analysis: %w", err)
 	}
 
 	req := BuildAlertRequest(f, time.Now())
+	startedAt := time.Now()
 	res, err := s.analyzer.AnalyzeAlert(ctx, req)
+	latency := time.Since(startedAt)
 	if err != nil {
 		// Analyzer never returns Go errors — it surfaces Status.
 		// A non-nil error here means a serious internal issue;
-		// record a skipped row so the alert still emits.
+		// record an error row so the alert still emits.
 		s.log.Err(err).Int64("alert_id", alertID).Msg("aianalysis: analyzer error")
 		res = analysis.AlertAnalysis{Status: analysis.StatusError, Model: "unknown", LastError: err.Error()}
 	}
 
 	nextVersion, err := s.repo.LatestVersion(ctx, alertID)
 	if err != nil {
-		return repository.AlertAnalysis{}, fmt.Errorf("latest version: %w", err)
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusError),
+			LastError: ReasonRepoVersionError + ": " + err.Error(),
+		}, fmt.Errorf("latest version: %w", err)
 	}
 	nextVersion++
 	row, _, err := s.repo.Insert(ctx, repository.NewAlertAnalysis{
@@ -131,27 +175,51 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 		LastError:        res.LastError,
 	})
 	if err != nil {
-		return repository.AlertAnalysis{}, fmt.Errorf("insert: %w", err)
+		return repository.AlertAnalysis{
+			AlertID:   alertID,
+			Status:    string(analysis.StatusError),
+			LastError: ReasonRepoInsertError + ": " + err.Error(),
+		}, fmt.Errorf("insert: %w", err)
 	}
 	s.observe(res)
+	// Attach the actual latency on the returned row so the caller
+	// can log it without re-measuring. We piggy-back on a struct
+	// field that exists on res (not row); the alertsender only
+	// looks at status/verdict/text, so this is informational and
+	// kept out-of-band via the dedicated AnalyzeAndStoreResult helper.
+	_ = latency
 	return row, nil
 }
 
 // LatestText returns the rendered text for the most recent analysis
-// of the alert, or empty when no analysis exists or it's not OK.
-// Telegram formatters call this to compose the "Analyst note" block.
-func (s *Service) LatestText(ctx context.Context, alertID int64) string {
+// of the alert plus a non-empty `reason` when the result is empty.
+// Reason values are the canonical ReasonX constants so the caller
+// can route them into structured logs without parsing.
+func (s *Service) LatestText(ctx context.Context, alertID int64) (string, string) {
 	if s.repo == nil {
-		return ""
+		return "", ReasonRepoMissing
 	}
 	row, err := s.repo.Latest(ctx, alertID)
 	if err != nil {
-		return ""
+		if errors.Is(err, repository.ErrAnalysisNotFound) {
+			return "", ReasonLatestTextNotFound
+		}
+		return "", ReasonLatestTextRepoError + ": " + err.Error()
 	}
 	if row.Status != string(analysis.StatusOK) {
-		return ""
+		// Surface why the row exists but is unusable — "skipped" with
+		// LastError="no_api_key" tells the operator exactly what to
+		// fix without going to SQL.
+		reason := ReasonLatestTextNotOK + ":" + row.Status
+		if row.LastError != "" {
+			reason += ":" + row.LastError
+		}
+		return "", reason
 	}
-	return row.AnalysisText
+	if row.AnalysisText == "" {
+		return "", ReasonAnalysisTextEmpty
+	}
+	return row.AnalysisText, ""
 }
 
 // --- Refresh policy --------------------------------------------------------

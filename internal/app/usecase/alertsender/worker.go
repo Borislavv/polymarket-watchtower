@@ -110,10 +110,17 @@ type AIEnricher interface {
 	// degrade gracefully on its own — never blocks the send path,
 	// never returns a Go error on AI failure (AI failures are
 	// persisted as Status=skipped/error and rendered as "no note").
+	//
+	// The returned row carries Status (ok / skipped / error) and
+	// LastError so the caller can log WHY a note is empty without
+	// re-querying the repo. A non-nil Go error indicates a serious
+	// internal failure (e.g. repo down).
 	AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.Finding) (repository.AlertAnalysis, error)
-	// LatestText returns the most recent OK analysis text for this
-	// alert, or empty string when none.
-	LatestText(ctx context.Context, alertID int64) string
+	// LatestText returns (text, reason). text is the most recent OK
+	// analysis; reason is a canonical aianalysis.Reason* string
+	// explaining why text is empty (Status not OK / NotFound / repo
+	// error / disabled). Both empty = should not happen.
+	LatestText(ctx context.Context, alertID int64) (string, string)
 }
 
 // AttributionStore persists the bucketed strategy-attribution row that
@@ -385,32 +392,111 @@ func unmarshalFinding(a repository.Alert) (anomaly.Finding, error) {
 }
 
 // stampAnalystNote calls the optional AI enricher and stamps the
-// resulting note text on the Finding before render. All failures
-// degrade silently: the enricher is allowed to return Status=skipped
-// or Status=error, and we simply leave AnalystNote empty so the
-// formatter elides the Analyst-note block.
+// resulting note text on the Finding before render. AI failures
+// never block the send — the alert still ships, just without an
+// Analyst-note block — but every outcome is logged so an operator
+// can see WHY a note is or isn't attached without going to SQL.
 //
-// Returns the AI verdict (best-effort, "" when unavailable) so the
-// caller can carry it into strategy-attribution writes.
+// Log event names are canonical:
+//   - "ai alert analysis: started"      (begin)
+//   - "ai alert analysis: completed"    (Status=ok, text non-empty)
+//   - "ai alert analysis: skipped"      (Status=skipped, e.g. disabled / no key)
+//   - "ai alert analysis: failed"       (Go error from the service)
+//   - "ai alert analysis: attached to telegram alert"   (rendered)
+//   - "ai alert analysis: no note attached"             (not rendered + why)
+//
+// Returns the AI verdict so the caller can carry it into the
+// strategy-attribution write.
 //
 // Cost-control safety: the enricher MUST honour the per-minute rate
 // limit and daily budget inside its own implementation. The sender
 // trusts that contract and does not double-gate.
 func (w *Worker) stampAnalystNote(ctx context.Context, f *anomaly.Finding, alertID int64) string {
 	if w.enricher == nil {
+		w.log.Info().
+			Int64("alert_id", alertID).
+			Str("reason", "enricher_not_wired").
+			Msg("ai alert analysis: no note attached")
 		return ""
 	}
+
+	w.log.Info().
+		Int64("alert_id", alertID).
+		Str("kind", string(f.Kind)).
+		Str("severity", string(f.Severity)).
+		Msg("ai alert analysis: started")
+
+	startedAt := w.now()
 	res, err := w.enricher.AnalyzeAndStore(ctx, alertID, *f)
+	latencyMs := w.now().Sub(startedAt).Milliseconds()
+
 	if err != nil {
-		// Logged but non-fatal — the alert still ships.
-		w.log.Err(err).Int64("alert_id", alertID).Msg("alertsender: AI enrich failed")
+		w.log.Err(err).
+			Int64("alert_id", alertID).
+			Str("category", "service_error").
+			Int64("latency_ms", latencyMs).
+			Msg("ai alert analysis: failed")
+		w.log.Info().
+			Int64("alert_id", alertID).
+			Str("reason", "service_error").
+			Msg("ai alert analysis: no note attached")
 		return ""
 	}
-	note := w.enricher.LatestText(ctx, alertID)
-	if note != "" {
-		f.AnalystNote = note
+
+	// Service surfaced a Status — log it. "ok" → continue to LatestText
+	// and render. "skipped" / "error" → log reason and return.
+	switch res.Status {
+	case "ok":
+		w.log.Info().
+			Int64("alert_id", alertID).
+			Str("status", res.Status).
+			Str("verdict", res.Verdict).
+			Int32("text_len", int32(len(res.AnalysisText))).
+			Str("model", res.Model).
+			Int64("latency_ms", latencyMs).
+			Msg("ai alert analysis: completed")
+	case "skipped":
+		w.log.Info().
+			Int64("alert_id", alertID).
+			Str("reason", reasonOrUnknown(res.LastError)).
+			Str("model", res.Model).
+			Int64("latency_ms", latencyMs).
+			Msg("ai alert analysis: skipped")
+	case "error":
+		w.log.Warn().
+			Int64("alert_id", alertID).
+			Str("error", reasonOrUnknown(res.LastError)).
+			Str("model", res.Model).
+			Int64("latency_ms", latencyMs).
+			Msg("ai alert analysis: failed")
+	default:
+		w.log.Warn().
+			Int64("alert_id", alertID).
+			Str("status", res.Status).
+			Msg("ai alert analysis: unrecognised status")
 	}
+
+	note, reason := w.enricher.LatestText(ctx, alertID)
+	if note == "" {
+		w.log.Info().
+			Int64("alert_id", alertID).
+			Str("reason", reasonOrUnknown(reason)).
+			Msg("ai alert analysis: no note attached")
+		return res.Verdict
+	}
+	f.AnalystNote = note
+	w.log.Info().
+		Int64("alert_id", alertID).
+		Int32("text_len", int32(len(note))).
+		Msg("ai alert analysis: attached to telegram alert")
 	return res.Verdict
+}
+
+func reasonOrUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 // writeAttribution persists the bucketed strategy-attribution row for

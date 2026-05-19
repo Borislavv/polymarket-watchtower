@@ -34,6 +34,13 @@ func main() {
 		// they want the old multiplier-ladder breakdown. Will be
 		// removed after the v6 path proves out.
 		runDiagnoseAlerts(os.Args[2:])
+	case "diagnose-ai":
+		// Quick "is AI working?" smoke: prints the latest 20 alert
+		// rows + the latest 20 alert-analysis rows (status, verdict,
+		// truncated text, error). The two queries together tell an
+		// operator whether alerts are being created and whether the
+		// AI enricher is producing usable output.
+		runDiagnoseAI(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -41,9 +48,10 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cli <migrate|diagnose-alerts> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cli <migrate|diagnose-alerts|diagnose-ai> [flags]")
 	fmt.Fprintln(os.Stderr, "  migrate          -dsn postgres://…")
 	fmt.Fprintln(os.Stderr, "  diagnose-alerts  -dsn postgres://… [--lookback 24h]")
+	fmt.Fprintln(os.Stderr, "  diagnose-ai      -dsn postgres://… [--limit 20]")
 }
 
 func runMigrate(args []string) {
