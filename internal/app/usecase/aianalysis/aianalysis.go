@@ -195,6 +195,11 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 			Msg("ai request failed")
 		s.recordRequestLog(ctx, logRow)
 		s.observe(res)
+		// Quota-exceeded is a separate counter — operator-actionable
+		// (billing), not a transient slow-down.
+		if logRow.ErrorCategory == "quota_exceeded" && s.metrics != nil && s.metrics.AIQuotaExceeded != nil {
+			s.metrics.AIQuotaExceeded.WithLabelValues("openai", res.Model).Inc()
+		}
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusError),
@@ -244,6 +249,9 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 			Msg("ai output failed validation; not persisting as analysis")
 		s.recordRequestLog(ctx, logRow)
 		s.observe(analysis.AlertAnalysis{Status: analysis.StatusError, Model: res.Model, LastError: logRow.ErrorCategory})
+		if s.metrics != nil && s.metrics.AIAnalysisRejected != nil {
+			s.metrics.AIAnalysisRejected.WithLabelValues("alert", reason).Inc()
+		}
 		return repository.AlertAnalysis{
 			AlertID:   alertID,
 			Status:    string(analysis.StatusError),
@@ -309,6 +317,9 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 	logRow.Status = "success"
 	s.recordRequestLog(ctx, logRow)
 	s.observe(res)
+	if s.metrics != nil && s.metrics.AIAnalysisPersisted != nil {
+		s.metrics.AIAnalysisPersisted.WithLabelValues("alert").Inc()
+	}
 	s.log.Info().
 		Int64("alert_id", alertID).
 		Str("model", res.Model).
@@ -362,6 +373,9 @@ func classifyAnalyzerError(err error, res analysis.AlertAnalysis) (status, categ
 	}
 	switch cat {
 	case "quota_exceeded":
+		// Note: AIQuotaExceeded metric is emitted at the openai
+		// client layer where the typed error is classified — this
+		// branch is the routing decision, not the counter bump.
 		return "skipped_quota", cat, sanitizeAndCap(err.Error(), 500)
 	case "rate_limited":
 		return "failed_retryable", cat, sanitizeAndCap(err.Error(), 500)

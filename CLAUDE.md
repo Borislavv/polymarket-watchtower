@@ -3,6 +3,16 @@
 Accepted decisions for polymarket-watchtower. Update when changing alerting
 strategy or terminology. For usage see README.md and presets/README.md.
 
+**Knowledge base (start here for new contributors):**
+- `doc/project/overview.md` — what Watchtower is / is not, philosophy.
+- `doc/project/architecture-map.md` — package + DB + flow map.
+- `doc/project/runtime-flow.md` — startup → ingest → detect → alert → outcome.
+- `doc/project/operator-guide.md` — SQL health checks, metrics, runbook.
+- `doc/project/tuning-methodology.md` — how to build `.env.prod` from DB evidence.
+- `doc/strategies/current-strategy-map.md` — per-strategy gates + interaction matrix.
+- `doc/observability/ai-metrics.md` — AI metric inventory + log events.
+- `doc/observability/dashboards.md` — Grafana panel reference.
+
 ## Alerting strategy
 
 Goal: surface large risky bets and suspicious wallet clusters near the end

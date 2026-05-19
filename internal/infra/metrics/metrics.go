@@ -147,6 +147,19 @@ type Metrics struct {
 	// outcome_postmortem) and reason (analyzer_error, budget_exhausted,
 	// rate_limited, timeout). The single AI-failure visibility metric.
 	AIRequestErrors *prometheus.CounterVec
+	// AIAnalysisPersisted: incremented for every successful row landed
+	// in polymarket_alert_analyses or polymarket_market_intelligence_reports.
+	// Labelled by target_kind (alert | market_intelligence | outcome).
+	AIAnalysisPersisted *prometheus.CounterVec
+	// AIAnalysisRejected: incremented when AI output is rejected by
+	// sanity checks (empty / provider-error-JSON). The v8.1 relaxation
+	// removed structural validation, so this counter should stay near
+	// zero in normal operation — a sudden rise means a provider
+	// regression or a prompt shift.
+	AIAnalysisRejected *prometheus.CounterVec
+	// AIQuotaExceeded: 429 with insufficient_quota. Operator action
+	// (billing) required; retry never helps.
+	AIQuotaExceeded *prometheus.CounterVec
 
 	// --- Signal-quality reports + reactions (Strategy reporting) ---
 	// SignalReportsSent: labelled by period_type (daily / weekly /
@@ -469,6 +482,21 @@ func New() *Metrics {
 		Help: "AI requests that failed before producing usable output, by kind (alert_note, market_intelligence, outcome_postmortem) and reason.",
 	}, []string{"kind", "reason"})
 
+	m.AIAnalysisPersisted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "analysis_persisted_total",
+		Help: "AI answers landed in polymarket_alert_analyses / polymarket_market_intelligence_reports. target_kind: alert | market_intelligence | outcome.",
+	}, []string{"target_kind"})
+
+	m.AIAnalysisRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "analysis_rejected_total",
+		Help: "AI output rejected by sanity checks (empty_text | provider_error_text). v8.1 removed structural validation; a non-zero rate here means a provider regression.",
+	}, []string{"target_kind", "reason"})
+
+	m.AIQuotaExceeded = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "quota_exceeded_total",
+		Help: "Provider returned HTTP 429 with insufficient_quota. Operator action required; retry is useless.",
+	}, []string{"provider", "model"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -493,6 +521,7 @@ func New() *Metrics {
 		m.BackfillPagesFetched, m.BackfillRunsTotal,
 		m.StatsSummariesSent, m.StatsSummaryErrors,
 		m.MarketIntelligenceSkipped, m.AIRequestErrors,
+		m.AIAnalysisPersisted, m.AIAnalysisRejected, m.AIQuotaExceeded,
 		m.SignalReportsSent, m.TelegramReactions, m.AlertOutcomes,
 		m.AlertRealizedEdge,
 		m.AlertWeightedSuccessTotal, m.AlertWeightedResolvedTotal,
