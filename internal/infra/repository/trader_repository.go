@@ -85,6 +85,20 @@ func (r *TraderRepository) UpsertSeen(ctx context.Context, wallets []string) ([]
 	return out, nil
 }
 
+// WalletByID returns the wallet address for the given trader id, or
+// empty string on miss. Used by the detection worker to rebuild
+// trade.Trade.Taker when draining the pending queue.
+func (r *TraderRepository) WalletByID(ctx context.Context, traderID int64) (string, error) {
+	row, err := r.q.GetTraderByID(ctx, traderID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get trader by id %d: %w", traderID, err)
+	}
+	return row.WalletAddress, nil
+}
+
 // GetByWallet resolves a wallet address to a Trader, returning
 // ErrTraderNotFound when the wallet has never been seen.
 func (r *TraderRepository) GetByWallet(ctx context.Context, wallet string) (Trader, error) {

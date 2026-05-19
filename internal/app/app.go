@@ -24,6 +24,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detection"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
@@ -71,6 +72,7 @@ type App struct {
 	drift        *drift.Worker
 	stats        *statsreport.Worker
 	signalReport *signalreport.Worker
+	detection    *detection.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -438,8 +440,11 @@ func New() (*App, error) {
 				MinTraderP99Ratio: cfg.Anomaly.CriticalMinTraderP99Ratio,
 				MinMultiplier:     cfg.Anomaly.CriticalMinMultiplier,
 			},
-			MinBaselineTrades:      cfg.Anomaly.SingleMinBaselineTrades,
-			MinBaselineNotionalUSD: cfg.Anomaly.SingleMinBaselineNotionalUSD,
+			MinBaselineTrades:                cfg.Anomaly.SingleMinBaselineTrades,
+			MinBaselineNotionalUSD:           cfg.Anomaly.SingleMinBaselineNotionalUSD,
+			LowBaselineCapEnabled:            cfg.Anomaly.LowBaselineCapEnabled,
+			LowBaselineSingleMaxSeverity:     anomaly.Severity(cfg.Anomaly.LowBaselineSingleMaxSeverity),
+			LowBaselineAllowCriticalAbsolute: cfg.Anomaly.LowBaselineAllowCriticalAbsolute,
 		},
 		Baseline: baseline.Config{
 			Window: cfg.Anomaly.BaselineWindow,
@@ -522,8 +527,35 @@ func New() (*App, error) {
 			MaxAge:           cfg.Anomaly.NewWalletMaxAge,
 			MaxHistoryTrades: cfg.Anomaly.NewWalletMaxHistoryTrades,
 		}
+		// Dormant-wallet booster (v6) — context only, never standalone.
+		detectCfg.DormantWallet = detect.DormantWalletConfig{
+			Enabled:        cfg.Anomaly.DormantWalletEnabled,
+			MinIdle:        cfg.Anomaly.DormantWalletMinIdle,
+			MinNotionalUSD: cfg.Anomaly.DormantWalletMinNotionalUSD,
+		}
+		detectCfg.TraderActivity = tradesRepo
 	}
 	detectLoop := detect.New(detectCfg, cache, emitter, met, logger)
+
+	// Detection worker — v6 architecture. When Postgres is wired, every
+	// persisted trade lands as 'pending' and the worker drains it
+	// through detectLoop.Observe. The collect loop no longer calls
+	// Observe inline; that path lives only in the memory-only dev mode
+	// where there's no queue to drain.
+	var detectionWorker *detection.Worker
+	collectObserver := detectLoop // memory-mode default
+	var _ = collectObserver       // referenced below in collect.New
+	if cfg.Postgres.Enabled() {
+		dw := detection.New(detection.Config{
+			Workers:        cfg.Detection.Workers,
+			ClaimLimit:     int32(cfg.Detection.ClaimLimit),
+			Interval:       cfg.Detection.Interval,
+			StaleThreshold: cfg.Anomaly.LiveAlertMaxLag,
+		}, tradesRepo, cache, detectLoop, walletResolver(tradersRepo), met, logger)
+		detectionWorker = dw
+		// Collect no longer drives detection in production.
+		collectObserver = nil
+	}
 
 	collectCfg := collect.Config{
 		Interval:          cfg.Pipeline.CollectInterval,
@@ -534,7 +566,7 @@ func New() (*App, error) {
 		collectCfg.Persist = persistSink.PersistTrades
 		collectCfg.Cursor = persistSink.LatestTradedAt
 	}
-	collectLoop := collect.New(collectCfg, dataClient, cache, detectLoop, met, logger)
+	collectLoop := collect.New(collectCfg, dataClient, cache, collectObserver, met, logger)
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
@@ -554,8 +586,30 @@ func New() (*App, error) {
 		drift:        driftWorker,
 		stats:        statsWorker,
 		signalReport: signalReportWorker,
+		detection:    detectionWorker,
 		pgPool:       pgPool,
 	}, nil
+}
+
+// walletResolver returns a wallet-resolution callback for the
+// detection worker. The worker has a trader_id but Observe expects
+// trade.Taker to be a wallet address — this closure does the lookup.
+//
+// Failures map to empty string, which the worker reads as "trader
+// axis disabled for this trade" — exactly like a wallet we've never
+// seen. The repository call is a single indexed PK lookup so cost is
+// negligible per trade.
+func walletResolver(traders *repository.TraderRepository) detection.WalletResolver {
+	if traders == nil {
+		return nil
+	}
+	return func(ctx context.Context, traderID int64) string {
+		wallet, err := traders.WalletByID(ctx, traderID)
+		if err != nil {
+			return ""
+		}
+		return wallet
+	}
 }
 
 // telegramSenderAdapter narrows *telegram.Bot to statsreport.Sender by
@@ -697,6 +751,12 @@ func (a *App) Run() error {
 	}
 	if a.signalReport != nil {
 		execs = append(execs, shutdown2.Exec{Name: "signalreport", Fn: a.signalReport.Run})
+	}
+	if a.detection != nil {
+		execs = append(execs, shutdown2.Exec{Name: "detection", Fn: func(ctx context.Context) error {
+			a.detection.Run(ctx)
+			return nil
+		}})
 	}
 
 	return shutdown2.Graceful(

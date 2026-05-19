@@ -96,6 +96,14 @@ type OwnershipSharesFetcher interface {
 	OwnershipShares(ctx context.Context, q repository.OwnershipSharesQuery) (repository.OwnershipShares, error)
 }
 
+// TraderActivityFetcher returns the wallet's most-recent traded_at
+// strictly before the supplied cutoff. Used by the dormant-wallet
+// booster to compute idle duration. Satisfied by
+// *repository.TradeRepository.TraderLastSeenBefore.
+type TraderActivityFetcher interface {
+	TraderLastSeenBefore(ctx context.Context, traderID int64, before time.Time) (time.Time, error)
+}
+
 // AlertCreator is the dedup primitive. TryCreatePending must:
 //   - return created=true with a fresh Alert when the dedup_key is new;
 //   - return created=false (no error) when the dedup_key already exists.
@@ -236,6 +244,23 @@ type Config struct {
 	// Findings as reason codes — never as a standalone alert. Disabled
 	// when NewWallet.Enabled is false OR cfg.Traders is nil.
 	NewWallet NewWalletConfig
+
+	// DormantWallet gates the dormant-wallet revival booster. A
+	// non-new wallet that has been idle for ≥ MinIdle and just placed
+	// a trade ≥ MinNotionalUSD gets DORMANT_WALLET_REVIVAL stamped.
+	// Disabled when Enabled=false or TraderActivity is nil.
+	DormantWallet DormantWalletConfig
+
+	// TraderActivity backs the dormant-wallet booster's idle-gap
+	// computation. Production: *repository.TradeRepository.
+	TraderActivity TraderActivityFetcher
+}
+
+// DormantWalletConfig tunes the dormant-wallet revival booster.
+type DormantWalletConfig struct {
+	Enabled        bool
+	MinIdle        time.Duration
+	MinNotionalUSD float64
 }
 
 // NewWalletConfig tunes the new-wallet context booster (Strategy B).
@@ -605,22 +630,25 @@ func (l *Loop) emitTradeAnomaly(
 			Span:      stats.SpanActual,
 			WindowMax: l.cfg.Baseline.Window,
 		},
-		GrossPayoutIfWinUSD: sr.GrossPayoutIfWinUSD,
-		ProfitIfWinUSD:      sr.ProfitIfWinUSD,
-		MarketP95Ratio:      sr.MarketP95Ratio,
-		MarketP99Ratio:      sr.MarketP99Ratio,
-		TraderP95Ratio:      sr.TraderP95Ratio,
-		TraderP99Ratio:      sr.TraderP99Ratio,
-		PayoffGatePassed:    sr.PayoffGatePassed,
-		TailGatePassed:      sr.TailGatePassed,
-		LifecyclePct:        lifecyclePct,
-		Hot:                 hot,
-		InCluster:           peerCount >= 2,
-		ClusterPeerCount:    peerCount,
-		MarketURL:           l.marketURL(m),
-		CategoryURL:         l.categoryURL(catRef),
-		TraderURL:           l.traderURL(ref.Wallet),
-		GrafanaURL:          l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
+		GrossPayoutIfWinUSD:         sr.GrossPayoutIfWinUSD,
+		ProfitIfWinUSD:              sr.ProfitIfWinUSD,
+		MarketP95Ratio:              sr.MarketP95Ratio,
+		MarketP99Ratio:              sr.MarketP99Ratio,
+		TraderP95Ratio:              sr.TraderP95Ratio,
+		TraderP99Ratio:              sr.TraderP99Ratio,
+		PayoffGatePassed:            sr.PayoffGatePassed,
+		TailGatePassed:              sr.TailGatePassed,
+		LowMarketBaselineConfidence: sr.LowMarketBaselineConfidence,
+		LowTraderBaselineConfidence: sr.LowTraderBaselineConfidence,
+		SeverityCapped:              sr.SeverityCapped,
+		LifecyclePct:                lifecyclePct,
+		Hot:                         hot,
+		InCluster:                   peerCount >= 2,
+		ClusterPeerCount:            peerCount,
+		MarketURL:                   l.marketURL(m),
+		CategoryURL:                 l.categoryURL(catRef),
+		TraderURL:                   l.traderURL(ref.Wallet),
+		GrafanaURL:                  l.grafanaURL(catRef, m, t.Timestamp, sr.Severity),
 	}
 	// Trader-history context (when available) — operators want to see "this
 	// wallet's typical trade is $X" alongside the market-side baseline.
@@ -653,6 +681,39 @@ func (l *Loop) emitTradeAnomaly(
 		if l.metrics != nil && l.metrics.NewWalletReasons != nil {
 			l.metrics.NewWalletReasons.WithLabelValues(string(anomaly.KindTradeAnomaly), string(sr.Severity)).Inc()
 		}
+	}
+
+	// Dormant-wallet context booster: non-new wallet that has been
+	// idle for ≥ DORMANT_WALLET_MIN_IDLE and just placed a sized
+	// trade. Context only — never escalates severity.
+	if dw := l.dormantWalletRef(ctx, ref.Wallet, ref.NotionalUSD, t.Timestamp, f.NewWallet); dw != nil {
+		f.DormantWallet = dw
+		f.Reasons = append(f.Reasons, anomaly.ReasonDormantWalletRevival)
+	}
+
+	// Ownership fusion: when the same (wallet, market, outcome) has
+	// trade-flow concentration, stamp the ownership context on this
+	// single-trade Finding so an operator sees "this trade ALSO sits
+	// on top of a 12%-of-flow position". Never promotes severity.
+	if or := l.ownershipFusionRef(ctx, ref.Wallet, m.ID, t.Token, t.Price); or != nil {
+		f.Ownership = or
+		f.Reasons = append(f.Reasons, anomaly.ReasonOwnershipFusion, anomaly.ReasonMarketOwnershipConcentration)
+		if or.Approximate {
+			f.Reasons = append(f.Reasons, "APPROXIMATE_OWNERSHIP")
+		}
+	}
+
+	// Surface v6 low-baseline reasons on the alert payload so the
+	// operator sees the uncertainty even if Telegram rendering hasn't
+	// surfaced the dedicated row yet.
+	if sr.LowMarketBaselineConfidence {
+		f.Reasons = append(f.Reasons, anomaly.ReasonLowMarketBaselineConfidence)
+	}
+	if sr.LowTraderBaselineConfidence {
+		f.Reasons = append(f.Reasons, anomaly.ReasonLowTraderBaselineConfidence)
+	}
+	if sr.SeverityCapped {
+		f.Reasons = append(f.Reasons, anomaly.ReasonSeverityCappedLowBaseline)
 	}
 
 	l.metrics.TradeAnomalies.WithLabelValues(string(sr.Severity), categoryLabel(catRef), anomaly.ReasonSingle).Inc()
@@ -1358,6 +1419,87 @@ func (l *Loop) newWalletRef(ctx context.Context, wallet string, historyTrades in
 		AgeAtTrade:    age,
 		HistoryTrades: int64(historyTrades),
 		IsNew:         true,
+	}
+}
+
+// dormantWalletRef returns the dormant-wallet booster payload when:
+//
+//   - DormantWallet config is Enabled and TraderActivity is wired,
+//   - wallet has a non-nil trader_id in the DB,
+//   - the wallet is NOT new (the new-wallet booster takes priority),
+//   - the wallet's last trade before this one is older than MinIdle,
+//   - the current trade clears MinNotionalUSD.
+//
+// Returns nil otherwise — never errors. Context booster only.
+func (l *Loop) dormantWalletRef(ctx context.Context, wallet string, notionalUSD float64, tradedAt time.Time, nw *anomaly.NewWalletRef) *anomaly.DormantWalletRef {
+	if !l.cfg.DormantWallet.Enabled || l.cfg.TraderActivity == nil || wallet == "" {
+		return nil
+	}
+	if nw != nil && nw.IsNew {
+		// Don't double-stamp; new-wallet booster already covers this.
+		return nil
+	}
+	if l.cfg.DormantWallet.MinNotionalUSD > 0 && notionalUSD < l.cfg.DormantWallet.MinNotionalUSD {
+		return nil
+	}
+	tid := l.resolveTraderID(ctx, wallet)
+	if tid == nil {
+		return nil
+	}
+	last, err := l.cfg.TraderActivity.TraderLastSeenBefore(ctx, *tid, tradedAt)
+	if err != nil || last.IsZero() {
+		return nil
+	}
+	idle := tradedAt.Sub(last)
+	if l.cfg.DormantWallet.MinIdle > 0 && idle < l.cfg.DormantWallet.MinIdle {
+		return nil
+	}
+	return &anomaly.DormantWalletRef{LastSeenAt: last, IdleDuration: idle}
+}
+
+// ownershipFusionRef computes the trade-flow ownership snapshot for
+// the same (wallet, market, outcome) and returns an OwnershipRef when
+// the wallet's net BUY-share count is non-trivial. Unlike the
+// standalone KindOwnership emission path, fusion always renders — it
+// is context attached to a primary alert, not a gating decision.
+// Returns nil when the lookup is unwired or returns zero state.
+func (l *Loop) ownershipFusionRef(ctx context.Context, wallet string, mid vo.MarketID, token vo.TokenID, priceHint float64) *anomaly.OwnershipRef {
+	if l.cfg.OwnershipShares == nil || wallet == "" {
+		return nil
+	}
+	tid := l.resolveTraderID(ctx, wallet)
+	if tid == nil {
+		return nil
+	}
+	dbMID := l.resolveMarketID(ctx, mid)
+	if dbMID == nil {
+		return nil
+	}
+	row, err := l.cfg.OwnershipShares.OwnershipShares(ctx, repository.OwnershipSharesQuery{
+		TraderID:     *tid,
+		MarketID:     *dbMID,
+		OutcomeToken: string(token),
+	})
+	if err != nil {
+		return nil
+	}
+	net := row.WalletBuyShares - row.WalletSellShares
+	if net <= 0 || row.MarketBuyShares <= 0 {
+		return nil
+	}
+	pct := 100 * net / row.MarketBuyShares
+	if pct <= 0 {
+		return nil
+	}
+	return &anomaly.OwnershipRef{
+		Wallet:            wallet,
+		MarketID:          string(mid),
+		OutcomeToken:      string(token),
+		SharePct:          pct,
+		WalletNetShares:   net,
+		MarketTotalShares: row.MarketBuyShares,
+		NotionalUSD:       net * priceHint,
+		Approximate:       true,
 	}
 }
 

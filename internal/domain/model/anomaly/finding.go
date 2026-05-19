@@ -164,6 +164,21 @@ type AccumulationRef struct {
 	Window string
 }
 
+// DormantWalletRef is the context-booster payload attached to single-
+// trade and accumulation Findings when the firing wallet has been
+// idle for at least DORMANT_WALLET_MIN_IDLE before the firing trade
+// and the trade clears DORMANT_WALLET_MIN_NOTIONAL_USD. Surveillance
+// read: a wallet that built positions a year ago, sat dormant, then
+// woke up the week of a binding event is qualitatively suspicious.
+type DormantWalletRef struct {
+	// LastSeenAt is the wallet's most recent trade timestamp STRICTLY
+	// before the firing trade.
+	LastSeenAt time.Time
+	// IdleDuration is firingAt − LastSeenAt; zero when LastSeenAt is
+	// zero (wallet has no prior history).
+	IdleDuration time.Duration
+}
+
 // NewWalletRef is the context-booster payload attached to single-trade
 // and accumulation Findings when the firing wallet is new (first seen
 // recently, or thin history). Populated by the detector — empty wallet
@@ -267,6 +282,16 @@ type Finding struct {
 	PayoffGatePassed bool
 	TailGatePassed   bool
 
+	// Baseline confidence flags (v6). True when the corresponding
+	// baseline was unready at scoring time; surfaced in the Telegram
+	// payload as warning lines so the operator can see the
+	// uncertainty without re-deriving it. SeverityCapped is true when
+	// the original tier was lowered because LowBaselineCapEnabled
+	// kicked in.
+	LowMarketBaselineConfidence bool
+	LowTraderBaselineConfidence bool
+	SeverityCapped              bool
+
 	// Cluster fields.
 	Category *CategoryRef
 	Cluster  *ClusterStats
@@ -280,6 +305,12 @@ type Finding struct {
 	// "new wallet" gates. Nil when the wallet has substantial history
 	// or when the booster is disabled.
 	NewWallet *NewWalletRef
+
+	// DormantWallet is the dormant-wallet context booster, attached
+	// when the firing wallet has been idle long enough AND the
+	// current trade is meaningfully sized. Nil when not dormant or
+	// when the booster is disabled.
+	DormantWallet *DormantWalletRef
 
 	// Ownership is populated on KindOwnership Findings — never on
 	// trade_anomaly / accumulation / category_watch.

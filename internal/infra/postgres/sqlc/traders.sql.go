@@ -11,6 +11,25 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getTraderByID = `-- name: GetTraderByID :one
+SELECT id, wallet_address, first_seen_at, last_seen_at FROM polymarket_traders WHERE id = $1
+`
+
+// Reverse of GetTraderByWallet — used by the detection worker to
+// resolve a trader_id back to its wallet string when rebuilding a
+// trade.Trade from polymarket_trades.
+func (q *Queries) GetTraderByID(ctx context.Context, id int64) (PolymarketTraders, error) {
+	row := q.db.QueryRow(ctx, getTraderByID, id)
+	var i PolymarketTraders
+	err := row.Scan(
+		&i.ID,
+		&i.WalletAddress,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+	)
+	return i, err
+}
+
 const getTraderByWallet = `-- name: GetTraderByWallet :one
 SELECT id, wallet_address, first_seen_at, last_seen_at FROM polymarket_traders WHERE wallet_address = $1
 `

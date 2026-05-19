@@ -382,6 +382,25 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 	if !f.TailGatePassed {
 		b.WriteString("• tail gate: unenforced (no baseline was ready)\n")
 	}
+	if f.LowMarketBaselineConfidence {
+		b.WriteString("• ⚠ market baseline thin — rarity ranking unenforced\n")
+	}
+	if f.LowTraderBaselineConfidence {
+		b.WriteString("• ⚠ trader history thin — wallet-tail ranking unenforced\n")
+	}
+	if f.SeverityCapped {
+		fmt.Fprintf(b, "• severity reduced to <b>%s</b> due to thin baseline\n", string(f.Severity))
+	}
+	if f.DormantWallet != nil && f.DormantWallet.IdleDuration > 0 {
+		fmt.Fprintf(b, "• <b>dormant-wallet revival</b>: idle %s before this trade\n",
+			humanDuration(f.DormantWallet.IdleDuration))
+	}
+	if f.Ownership != nil && f.Kind != anomaly.KindOwnership {
+		// Fusion context — distinct from a standalone ownership_concentration
+		// alert. The percentage is approximate (trade-flow proxy).
+		fmt.Fprintf(b, "• <b>ownership context</b>: ~%.1f%% of recorded BUY flow (approx.)\n",
+			f.Ownership.SharePct)
+	}
 	if f.LifecyclePct > 0 {
 		hot := ""
 		if f.Hot {

@@ -250,6 +250,157 @@ func (r *TradeRepository) OldestTradedAt(ctx context.Context, marketID int64) (t
 	return tsTime(row), nil
 }
 
+// PendingDetectionTrade is the unscored trade row returned by
+// ClaimUndetectedTrades. Holds enough context for the detection worker
+// to rebuild a trade.Trade + market lookup without re-querying.
+type PendingDetectionTrade struct {
+	ID                int64
+	MarketID          int64
+	MarketConditionID string
+	TraderID          *int64
+	OutcomeToken      string
+	Side              string
+	Price             float64
+	SizeShares        float64
+	NotionalUSD       float64
+	TradedAt          time.Time
+	IngestedAt        time.Time
+	ExternalID        string // empty when NULL
+	TxHash            string // empty when NULL
+	DedupKey          string
+	DetectionAttempts int32
+}
+
+// ClaimUndetectedTrades pulls up to `limit` trades that have never been
+// through the detection worker, locking them FOR UPDATE SKIP LOCKED so
+// concurrent workers see disjoint batches. The caller MUST mark each
+// returned row via MarkDetectionAnalyzed / MarkDetectionSkipped /
+// MarkDetectionFailed before its transaction ends — otherwise the rows
+// stay pending and the next claim re-picks them.
+func (r *TradeRepository) ClaimUndetectedTrades(ctx context.Context, limit int32) ([]PendingDetectionTrade, error) {
+	rows, err := r.q.ClaimUndetectedTrades(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim undetected trades: %w", err)
+	}
+	out := make([]PendingDetectionTrade, 0, len(rows))
+	for _, row := range rows {
+		var traderID *int64
+		if row.TraderID != nil {
+			id := *row.TraderID
+			traderID = &id
+		}
+		ext := ""
+		if row.ExternalID != nil {
+			ext = *row.ExternalID
+		}
+		tx := ""
+		if row.TxHash != nil {
+			tx = *row.TxHash
+		}
+		out = append(out, PendingDetectionTrade{
+			ID:                row.ID,
+			MarketID:          row.MarketID,
+			MarketConditionID: row.MarketConditionID,
+			TraderID:          traderID,
+			OutcomeToken:      row.OutcomeToken,
+			Side:              row.Side,
+			Price:             row.Price,
+			SizeShares:        row.SizeShares,
+			NotionalUSD:       row.NotionalUsd,
+			TradedAt:          tsTime(row.TradedAt),
+			IngestedAt:        tsTime(row.IngestedAt),
+			ExternalID:        ext,
+			TxHash:            tx,
+			DedupKey:          row.DedupKey,
+			DetectionAttempts: row.DetectionAttempts,
+		})
+	}
+	return out, nil
+}
+
+// MarkDetectionAnalyzed stamps a trade as having flowed through the
+// scorer (may or may not have produced an alert).
+func (r *TradeRepository) MarkDetectionAnalyzed(ctx context.Context, tradeID int64) error {
+	return r.q.MarkTradeDetectionResult(ctx, sqlc.MarkTradeDetectionResultParams{
+		TradeID:      tradeID,
+		Status:       "analyzed",
+		SkipReason:   nil,
+		ErrorMessage: nil,
+	})
+}
+
+// MarkDetectionSkipped stamps a trade as deliberately skipped (e.g.
+// too_old_for_live_alert, market_unknown, mm_suppressed). The reason
+// string is the canonical skip code.
+func (r *TradeRepository) MarkDetectionSkipped(ctx context.Context, tradeID int64, reason string) error {
+	reasonPtr := &reason
+	return r.q.MarkTradeDetectionResult(ctx, sqlc.MarkTradeDetectionResultParams{
+		TradeID:      tradeID,
+		Status:       "skipped",
+		SkipReason:   reasonPtr,
+		ErrorMessage: nil,
+	})
+}
+
+// MarkDetectionFailed stamps a transient or terminal failure. The
+// worker may decide to keep retrying (the row is re-pending after a
+// row-level reset is not implemented here — failures stay 'failed'
+// and require operator intervention).
+func (r *TradeRepository) MarkDetectionFailed(ctx context.Context, tradeID int64, errMsg string) error {
+	errPtr := &errMsg
+	return r.q.MarkTradeDetectionResult(ctx, sqlc.MarkTradeDetectionResultParams{
+		TradeID:      tradeID,
+		Status:       "failed",
+		SkipReason:   nil,
+		ErrorMessage: errPtr,
+	})
+}
+
+// PendingDetectionCount returns the number of trades whose detection
+// state is NULL ("pending"). Used by stats/Grafana to show backlog.
+func (r *TradeRepository) PendingDetectionCount(ctx context.Context) (int64, error) {
+	return r.q.PendingDetectionCount(ctx)
+}
+
+// DetectionStatusBreakdown returns counts of trades grouped by their
+// terminal detection_status (NULL → "pending"). Used by stats reports.
+func (r *TradeRepository) DetectionStatusBreakdown(ctx context.Context) (map[string]int64, error) {
+	rows, err := r.q.DetectionStatusBreakdown(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("detection status breakdown: %w", err)
+	}
+	out := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		out[row.Status] = row.Count
+	}
+	return out, nil
+}
+
+// TraderFirstSeenAt returns the earliest persisted trade timestamp for
+// the given trader id, or the zero time when the trader has never
+// been observed. Used by the new-wallet / dormant-wallet boosters.
+func (r *TradeRepository) TraderFirstSeenAt(ctx context.Context, traderID int64) (time.Time, error) {
+	ts, err := r.q.TraderFirstSeenAt(ctx, traderID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("trader first seen: %w", err)
+	}
+	return tsTime(ts), nil
+}
+
+// TraderLastSeenBefore returns the most recent traded_at for the given
+// trader strictly before the supplied cutoff. Used by the
+// dormant-wallet booster: "how long was this wallet idle?".
+func (r *TradeRepository) TraderLastSeenBefore(ctx context.Context, traderID int64, before time.Time) (time.Time, error) {
+	ts, err := r.q.TraderLastSeenBefore(ctx, sqlc.TraderLastSeenBeforeParams{
+		TraderID: traderID,
+		Before:   tsFromTime(before),
+	})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("trader last seen before: %w", err)
+	}
+	return tsTime(ts), nil
+}
+
 // LastTradedAtBefore returns the most recent traded_at strictly before the
 // supplied timestamp on the given (market, outcome). Returns the zero
 // time when no prior trade exists. Used by the quiet-market wake-up

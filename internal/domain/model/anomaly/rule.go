@@ -51,6 +51,33 @@ const (
 	// ReasonWalletDominatesOutcome — wallet's share crossed the
 	// highest (Critical) ownership tier.
 	ReasonWalletDominatesOutcome = "WALLET_DOMINATES_OUTCOME"
+
+	// ReasonDormantWalletRevival — non-new wallet that was idle ≥
+	// DORMANT_WALLET_MIN_IDLE before placing a sized trade.
+	// Surveillance read: long-lived account that woke up around a
+	// binding event. Context booster only — never fires standalone.
+	ReasonDormantWalletRevival = "DORMANT_WALLET_REVIVAL"
+
+	// ReasonOwnershipFusion — single-trade or accumulation Finding
+	// emitted alongside a non-trivial ownership share for the same
+	// (wallet, market, outcome). Stamped by detect.Loop after the
+	// primary scorer fires; never standalone (the standalone path
+	// keeps emitting KindOwnership Findings).
+	ReasonOwnershipFusion = "OWNERSHIP_FUSION"
+
+	// ReasonLowMarketBaselineConfidence — single-trade fired with an
+	// unenforced market tail gate. The alert payload renders a
+	// "thin baseline" warning so the operator can discount rarity
+	// claims.
+	ReasonLowMarketBaselineConfidence = "LOW_MARKET_BASELINE_CONFIDENCE"
+	// ReasonLowTraderBaselineConfidence — single-trade fired with an
+	// unenforced trader tail gate.
+	ReasonLowTraderBaselineConfidence = "LOW_TRADER_BASELINE_CONFIDENCE"
+	// ReasonSeverityCappedLowBaseline — severity was lowered because
+	// of LowBaselineCapEnabled. Helps an operator distinguish "tier
+	// X by gates" from "would have been tier X+1 but baseline was
+	// thin so we capped it".
+	ReasonSeverityCappedLowBaseline = "SEVERITY_CAPPED_LOW_BASELINE"
 )
 
 // Tier is one severity rung on the single-trade ladder. A trade qualifies at
@@ -119,6 +146,17 @@ type Thresholds struct {
 	// trusted. Does not apply to the trader axis — a small wallet's
 	// p95 is meaningful at low total USD as long as the count clears.
 	MinBaselineNotionalUSD float64
+
+	// LowBaselineCapEnabled controls the v6 severity-cap behaviour:
+	// when a tail gate is unenforced (baseline not ready), the
+	// scorer caps severity at LowBaselineSingleMaxSeverity unless the
+	// trade clears the Critical absolute floor and
+	// LowBaselineAllowCriticalAbsolute is true. This prevents thin
+	// markets / new wallets from producing pager-grade alerts on
+	// fundamentally uncertain rarity.
+	LowBaselineCapEnabled            bool
+	LowBaselineSingleMaxSeverity     Severity // typically SeverityInfo
+	LowBaselineAllowCriticalAbsolute bool
 }
 
 // AbsoluteTier returns the highest rung where notional AND odds both clear

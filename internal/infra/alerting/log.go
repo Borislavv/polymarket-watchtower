@@ -98,7 +98,15 @@ func (s *LogSink) Notify(_ context.Context, f anomaly.Finding) error {
 	}
 	evt = evt.
 		Bool("payoff_gate_passed", f.PayoffGatePassed).
-		Bool("tail_gate_passed", f.TailGatePassed)
+		Bool("tail_gate_passed", f.TailGatePassed).
+		Bool("low_market_baseline_confidence", f.LowMarketBaselineConfidence).
+		Bool("low_trader_baseline_confidence", f.LowTraderBaselineConfidence).
+		Bool("severity_capped", f.SeverityCapped)
+	if f.DormantWallet != nil {
+		evt = evt.
+			Time("dormant_wallet_last_seen_at", f.DormantWallet.LastSeenAt).
+			Dur("dormant_wallet_idle_duration", f.DormantWallet.IdleDuration)
+	}
 	if f.Trade != nil && f.Trade.Odds > 0 {
 		evt = evt.Float64("odds", f.Trade.Odds)
 	}

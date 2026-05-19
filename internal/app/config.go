@@ -293,6 +293,29 @@ type AnomalyConfig struct {
 	WarningMinMultiplier  float64 `env:"ALERT_WARNING_MIN_MULTIPLIER" envDefault:"1000" validate:"gte=0"`
 	CriticalMinMultiplier float64 `env:"ALERT_CRITICAL_MIN_MULTIPLIER" envDefault:"10000" validate:"gte=0"`
 
+	// v6 low-baseline confidence behaviour. When a single-trade fires
+	// through an unenforced market tail gate (baseline not ready), cap
+	// severity at LowBaselineSingleMaxSeverity unless the trade clears
+	// the Critical absolute floor AND LowBaselineAllowCriticalAbsolute
+	// is true. Prevents thin-market noise reaching pager band.
+	LowBaselineCapEnabled            bool   `env:"LOW_BASELINE_CAP_ENABLED" envDefault:"true"`
+	LowBaselineSingleMaxSeverity     string `env:"LOW_BASELINE_SINGLE_MAX_SEVERITY" envDefault:"info"`
+	LowBaselineAllowCriticalAbsolute bool   `env:"LOW_BASELINE_ALLOW_CRITICAL_ABSOLUTE" envDefault:"true"`
+
+	// Dormant-wallet booster: a non-new wallet that has been idle for
+	// at least MinIdle and now places a trade ≥ MinNotional gets
+	// DORMANT_WALLET_REVIVAL stamped on the Finding. Context only;
+	// never fires standalone.
+	DormantWalletEnabled        bool          `env:"DORMANT_WALLET_ENABLED" envDefault:"true"`
+	DormantWalletMinIdle        time.Duration `env:"DORMANT_WALLET_MIN_IDLE" envDefault:"720h" validate:"gte=0"`
+	DormantWalletMinNotionalUSD float64       `env:"DORMANT_WALLET_MIN_NOTIONAL_USD" envDefault:"5000" validate:"gte=0"`
+
+	// New-wallet booster size floors (existing booster, just new env
+	// keys per the v6 spec — single-trade and accumulation entry
+	// points).
+	NewWalletMinSingleNotionalUSD float64 `env:"NEW_WALLET_MIN_SINGLE_NOTIONAL_USD" envDefault:"3000" validate:"gte=0"`
+	NewWalletMinLineTotalUSD      float64 `env:"NEW_WALLET_MIN_LINE_TOTAL_USD" envDefault:"10000" validate:"gte=0"`
+
 	// Baseline shape. Every valid trade enters the reservoir — there is no
 	// per-trade size filter. Readiness gates below protect against thin or
 	// all-dust baselines.
@@ -517,6 +540,17 @@ type Config struct {
 	CategoryFilter    CategoryFilterConfig
 	Alerting          AlertingConfig
 	StatsReport       StatsReportConfig
+	Detection         DetectionConfig
+}
+
+// DetectionConfig tunes the v6 detection worker that drains
+// polymarket_trades.detected_at IS NULL through detect.Loop.Observe.
+// The worker only runs when Postgres is wired; memory-only dev mode
+// keeps the v4 inline-from-collect behaviour.
+type DetectionConfig struct {
+	Workers    int           `env:"DETECTION_WORKERS" envDefault:"16" validate:"gte=1,lte=128"`
+	ClaimLimit int           `env:"DETECTION_CLAIM_LIMIT" envDefault:"500" validate:"gte=1,lte=10000"`
+	Interval   time.Duration `env:"DETECTION_INTERVAL" envDefault:"5s" validate:"gt=0"`
 }
 
 func LoadConfig() (*Config, error) {

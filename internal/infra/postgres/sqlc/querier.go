@@ -51,11 +51,28 @@ type Querier interface {
 	// failed rows (status='failed' AND next_retry_at <= now()). The retry
 	// worker is the same alertsender; there is no separate retry path.
 	ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([]PolymarketAlerts, error)
+	// Claim a batch of trades that have never been through the detection
+	// worker. SKIP LOCKED keeps concurrent workers from contending on the
+	// same rows; the partial index on (traded_at DESC) WHERE detected_at
+	// IS NULL keeps this cheap.
+	//
+	// The claimer does NOT mutate the rows — it just locks them. A second
+	// statement (MarkTradeDetectionResult) records the terminal state once
+	// the worker finishes processing. If the worker crashes mid-trade the
+	// row stays pending and the next claimer picks it up.
+	ClaimUndetectedTrades(ctx context.Context, claimLimit int32) ([]ClaimUndetectedTradesRow, error)
 	CompleteMarketBackfill(ctx context.Context, arg CompleteMarketBackfillParams) error
+	// /stats break-down: rows by terminal detection state. NULL status is
+	// reported as 'pending'.
+	DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error)
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
+	// Reverse of GetTraderByWallet — used by the detection worker to
+	// resolve a trader_id back to its wallet string when rebuilding a
+	// trade.Trade from polymarket_trades.
+	GetTraderByID(ctx context.Context, id int64) (PolymarketTraders, error)
 	GetTraderByWallet(ctx context.Context, walletAddress string) (PolymarketTraders, error)
 	// Insert a single trade. ON CONFLICT (dedup_key) DO NOTHING is the dedup
 	// primitive — concurrent inserters of the same trade race to the unique
@@ -184,6 +201,11 @@ type Querier interface {
 	// cleared on success so a row that recovered after a transient failure
 	// doesn't keep its stale error text.
 	MarkSignalReportSent(ctx context.Context, arg MarkSignalReportSentParams) error
+	// Stamp the terminal state for one trade. detected_at = NOW() always.
+	// detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
+	// CHECK constraint enforces this). detection_skip_reason is set only
+	// when status='skipped'; last_detection_error only when status='failed'.
+	MarkTradeDetectionResult(ctx context.Context, arg MarkTradeDetectionResultParams) error
 	// Reads the per-market collect cursor. Returns NULL when the market
 	// has never been touched by collect (first-sight or backfill-only),
 	// which the caller maps to the BootstrapLookback default.
@@ -200,6 +222,10 @@ type Querier interface {
 	// counterparty whose trade we didn't observe is invisible to this
 	// query. Treat the percentage as directional, not authoritative.
 	OwnershipShares(ctx context.Context, arg OwnershipSharesParams) (OwnershipSharesRow, error)
+	// Diagnostic: how many trades are still pending detection. Used by
+	// /stats and Grafana so operators can see whether the worker is
+	// keeping up.
+	PendingDetectionCount(ctx context.Context) (int64, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending
 	// so the BackfillWorker picks up missing history on the next tick.
@@ -228,6 +254,14 @@ type Querier interface {
 	// after the supplied timestamp. NULL when no later trade exists yet.
 	// Powers the CLV-lite drift worker's per-window reference price lookup.
 	TradePriceAtOrAfter(ctx context.Context, arg TradePriceAtOrAfterParams) (float64, error)
+	// Earliest persisted trade timestamp for a wallet's full history.
+	// Used by the new-wallet / dormant-wallet context boosters; the
+	// detection worker calls this when stamping context on a Finding.
+	TraderFirstSeenAt(ctx context.Context, traderID int64) (pgtype.Timestamptz, error)
+	// Most-recent trade timestamp STRICTLY before the supplied cutoff.
+	// Used by the dormant-wallet booster to ask "how long has this wallet
+	// been idle just before this trade?".
+	TraderLastSeenBefore(ctx context.Context, arg TraderLastSeenBeforeParams) (pgtype.Timestamptz, error)
 	// Per-(trader, market, outcome) two-sided activity over the supplied
 	// lookback. Powers the MM/arbitrage suppression filter: a wallet that
 	// has been hitting BUY and SELL on the same outcome in roughly balanced

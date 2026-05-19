@@ -10,9 +10,27 @@ import (
 
 func thresholds() anomaly.Thresholds {
 	return anomaly.Thresholds{
-		Info:                   anomaly.Tier{MinNotionalUSD: 5_000, MinOdds: 3, MinMultiplier: 100},
-		Warning:                anomaly.Tier{MinNotionalUSD: 25_000, MinOdds: 5, MinMultiplier: 1_000},
-		Critical:               anomaly.Tier{MinNotionalUSD: 100_000, MinOdds: 8, MinMultiplier: 10_000},
+		Info: anomaly.Tier{
+			MinNotionalUSD: 5_000, MinOdds: 3,
+			MinProfitUSD:      5_000,
+			MinMarketP95Ratio: 1,
+			MinTraderP95Ratio: 1,
+			MinMultiplier:     100, // accumulation-legacy field — ignored by v6 gates
+		},
+		Warning: anomaly.Tier{
+			MinNotionalUSD: 25_000, MinOdds: 5,
+			MinProfitUSD:      15_000,
+			MinMarketP95Ratio: 2,
+			MinTraderP95Ratio: 1.5,
+			MinMultiplier:     1_000,
+		},
+		Critical: anomaly.Tier{
+			MinNotionalUSD: 100_000, MinOdds: 8,
+			MinProfitUSD:      50_000,
+			MinMarketP95Ratio: 4,
+			MinTraderP95Ratio: 2,
+			MinMultiplier:     10_000,
+		},
 		MinBaselineTrades:      20,
 		MinBaselineNotionalUSD: 1_000,
 	}
@@ -204,38 +222,99 @@ func TestDecide_OddsGateBlocksLowOdds(t *testing.T) {
 	}
 }
 
-// TestDecide_MarketMultiplierGate pins the rarity-vs-market check. Line
-// looks impressive on its own but the market is busy enough that the line
-// is normal background.
-func TestDecide_MarketMultiplierGate(t *testing.T) {
+// TestDecide_MarketP95GateBlocksLowRatio pins the v6 tail gate: a line
+// whose total is below the market p95 ratio fails the tail gate, even
+// when the size paths qualify.
+func TestDecide_MarketP95GateBlocksLowRatio(t *testing.T) {
 	d := New(cfg(), thresholds())
 	l := baseLine()
 	l.TradeCount = 5
 	l.TotalNotionalUSD = 25_000
 	l.MeanNotionalUSD = 5_000
 	l.MedianNotionalUSD = 5_000
-	l.MarketMedianUSD = 1_000 // 25000/1000 = 25× → below Info=100
+	l.MaxNotionalUSD = 6_000
+	// market p95 $30k → ratio 0.83 < Info 1.0× → blocked.
+	l.MarketP95USD = 30_000
+	l.TraderP95USD = 10_000 // trader p95 ratio 2.5 ≥ Info 1.0×, so trader axis passes
 	l.AvgOdds = 5
 	if v := d.Decide(l); v.Fired {
-		t.Fatalf("expected no fire on a busy market: %+v", v)
+		t.Fatalf("expected no fire below market p95 ratio: %+v", v)
 	}
 }
 
-// TestDecide_MarketBaselineUnreadyBlocksWhenMultiplierRequired pins the
-// fail-closed contract: when the market baseline isn't ready (MedianUSD=0)
-// and the tier requires a multiplier, the line cannot rank rarity and
-// must not fire.
-func TestDecide_MarketBaselineUnreadyBlocks(t *testing.T) {
+// TestDecide_TraderP95GateBlocksRoutineWhale pins the v6 trader-tail
+// gate: a wallet whose own p95 dwarfs the line total fails the trader
+// gate (line is routine for this wallet), regardless of market tail.
+func TestDecide_TraderP95GateBlocksRoutineWhale(t *testing.T) {
 	d := New(cfg(), thresholds())
 	l := baseLine()
-	l.TradeCount = 4
-	l.TotalNotionalUSD = 20_000
+	l.TradeCount = 5
+	l.TotalNotionalUSD = 25_000
 	l.MeanNotionalUSD = 5_000
 	l.MedianNotionalUSD = 5_000
-	l.MarketMedianUSD = 0 // unready
-	l.AvgOdds = 4
+	l.MarketP95USD = 100 // market tail comfortable (ratio 250×)
+	// trader p95 $100k → ratio 0.25 < Info 1.0× → blocked.
+	l.TraderP95USD = 100_000
+	l.AvgOdds = 5
 	if v := d.Decide(l); v.Fired {
-		t.Fatalf("expected no fire when market baseline unready: %+v", v)
+		t.Fatalf("expected no fire when line is routine for this wallet: %+v", v)
+	}
+}
+
+// TestDecide_BaselinesUnreadyFireWithLowConfidence pins the v6
+// philosophy: when neither baseline is ready the line CAN still fire
+// (size + payoff + odds + min trades), but it carries the
+// LowBaselineConfidence reason code so an operator can see the
+// uncertainty.
+func TestDecide_BaselinesUnreadyFireWithLowConfidence(t *testing.T) {
+	d := New(cfg(), thresholds())
+	l := baseLine()
+	l.TradeCount = 5
+	l.TotalNotionalUSD = 25_000
+	l.MeanNotionalUSD = 5_000
+	l.MedianNotionalUSD = 5_000
+	l.MarketP95USD = 0 // unready
+	l.TraderP95USD = 0 // unready
+	l.MarketMedianUSD = 0
+	l.TraderMedianUSD = 0
+	l.AvgOdds = 5
+	v := d.Decide(l)
+	if !v.Fired {
+		t.Fatalf("expected fire on absolute+payoff alone when no baseline ready: %+v", v)
+	}
+	sawLowConfidence := false
+	for _, r := range v.Reasons {
+		if r == ReasonLowBaselineConfidence {
+			sawLowConfidence = true
+		}
+	}
+	if !sawLowConfidence {
+		t.Errorf("LowBaselineConfidence reason must be attached when baselines unready: %v", v.Reasons)
+	}
+}
+
+// TestDecide_PayoffGateBlocksLowOdds pins the v6 payoff gate: the
+// line might clear notional + tail, but if profit-if-win is below
+// tier.MinProfitUSD it must not fire. Choose odds just above the
+// MinOdds floor so the odds gate doesn't bite first.
+func TestDecide_PayoffGateBlocksLowOdds(t *testing.T) {
+	_ = New(cfg(), thresholds()) // confirm constructor still works
+	l := baseLine()
+	l.TradeCount = 5
+	l.TotalNotionalUSD = 12_000 // ≥ Info 2× notional $5k=$10k
+	l.MeanNotionalUSD = 2_400
+	l.MedianNotionalUSD = 2_400
+	l.MaxNotionalUSD = 3_000
+	l.MarketP95USD = 200 // ratio 60 ≥ 1
+	l.TraderP95USD = 200 // ratio 60 ≥ 1
+	l.AvgOdds = 3.1      // profit = 12000 × 2.1 = $25,200… too high. Lower to 1.3.
+	l.AvgOdds = 3.05     // profit = 12000 × 2.05 = $24,600 — still above Info $5k
+	// Actually $5k profit floor is generous. Set Info MinProfitUSD higher.
+	th := thresholds()
+	th.Info.MinProfitUSD = 50_000 // force payoff gate above $24,600
+	d2 := New(cfg(), th)
+	if v := d2.Decide(l); v.Fired {
+		t.Fatalf("expected no fire below payoff floor: profit=%v ; verdict=%+v", l.LineProfitIfWinUSD(), v)
 	}
 }
 

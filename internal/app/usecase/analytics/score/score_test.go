@@ -289,6 +289,76 @@ func TestPriceAtOrAboveOneRejected(t *testing.T) {
 	}
 }
 
+// --- Low-baseline confidence cap (v6) -------------------------------------
+
+// TestLowBaselineCap_FiringDowngradedToInfo pins the v6 contract: when
+// the market baseline is unready and LowBaselineCapEnabled=true, the
+// firing severity is capped at LowBaselineSingleMaxSeverity even if
+// the absolute+payoff floors would have qualified a higher tier.
+func TestLowBaselineCap_FiringDowngradedToInfo(t *testing.T) {
+	th := defaults()
+	th.LowBaselineCapEnabled = true
+	th.LowBaselineSingleMaxSeverity = anomaly.SeverityInfo
+	th.LowBaselineAllowCriticalAbsolute = true
+
+	// $30k @ odds 6 — would fire at Warning under defaults if market
+	// were ready. Market unready (noMarket) → cap to Info.
+	r := Score(30_000, 1.0/6, noMarket, trader(60, 300, 3_000, 8_000), th)
+	if !r.Fired {
+		t.Fatalf("expected fire: %+v", r)
+	}
+	if r.Severity != anomaly.SeverityInfo {
+		t.Fatalf("severity must be capped to Info, got %s", r.Severity)
+	}
+	if !r.SeverityCapped || !r.LowMarketBaselineConfidence {
+		t.Errorf("expected SeverityCapped + LowMarketBaselineConfidence: %+v", r)
+	}
+}
+
+// TestLowBaselineCap_CriticalAbsoluteExceptionAllowed pins the
+// LowBaselineAllowCriticalAbsolute=true escape hatch: a trade that
+// clears the Critical absolute floor is NOT capped even when the
+// market baseline is unready.
+func TestLowBaselineCap_CriticalAbsoluteExceptionAllowed(t *testing.T) {
+	th := defaults()
+	th.LowBaselineCapEnabled = true
+	th.LowBaselineSingleMaxSeverity = anomaly.SeverityInfo
+	th.LowBaselineAllowCriticalAbsolute = true
+
+	r := Score(500_000, 1.0/10, noMarket, trader(60, 300, 3_000, 8_000), th)
+	if !r.Fired {
+		t.Fatalf("expected fire: %+v", r)
+	}
+	if r.Severity != anomaly.SeverityCritical {
+		t.Fatalf("Critical absolute should bypass cap, got %s", r.Severity)
+	}
+	if r.SeverityCapped {
+		t.Errorf("SeverityCapped should be false when exception applies: %+v", r)
+	}
+}
+
+// TestLowBaselineCap_DisabledIsNoop pins that LowBaselineCapEnabled=false
+// preserves the original severity (the confidence flags still fire,
+// but severity is not adjusted).
+func TestLowBaselineCap_DisabledIsNoop(t *testing.T) {
+	th := defaults()
+	th.LowBaselineCapEnabled = false
+
+	r := Score(30_000, 1.0/6, noMarket, trader(60, 300, 3_000, 8_000), th)
+	if !r.Fired {
+		t.Fatalf("expected fire: %+v", r)
+	}
+	if r.Severity != anomaly.SeverityWarning {
+		t.Errorf("severity should not be capped when feature off, got %s", r.Severity)
+	}
+	if !r.LowMarketBaselineConfidence {
+		t.Error("LowMarketBaselineConfidence flag should still be set")
+	}
+	if r.SeverityCapped {
+		t.Errorf("SeverityCapped should be false when feature off")
+	}
+}
+
 // TestP99OnlyGateEnforced verifies that a tier with only p99 configured
 // still gates correctly when the market baseline is ready.
 func TestP99OnlyGateEnforced(t *testing.T) {

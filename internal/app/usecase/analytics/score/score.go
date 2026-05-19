@@ -78,6 +78,20 @@ type Result struct {
 	// unenforceable and TailGatePassed=false even on a firing trade.
 	TailGatePassed bool
 
+	// LowMarketBaselineConfidence is true when the market baseline was
+	// not ready (Count/TotalUSD/P95 readiness floor failed). The
+	// firing decision still respected the gate (left unenforced), but
+	// the alert payload should warn the operator that the per-bucket
+	// rarity dimension is missing.
+	LowMarketBaselineConfidence bool
+	// LowTraderBaselineConfidence is the analogous flag for the wallet
+	// distribution.
+	LowTraderBaselineConfidence bool
+	// SeverityCapped is true when the firing severity was lowered
+	// because of LowMarketBaselineConfidence. The Telegram formatter
+	// surfaces this as a "severity reduced — thin baseline" line.
+	SeverityCapped bool
+
 	// SuppressedReason names the first blocking gate when Fired=false.
 	// Empty when Fired=true or when the input was invalid.
 	SuppressedReason string
@@ -116,6 +130,9 @@ func Score(notionalUSD, price float64, market, trader baseline.Stats, t anomaly.
 	// MinTraderHistoryTrades upstream of Score.
 	traderReady := trader.Count >= t.MinBaselineTrades && trader.P95USD > 0
 
+	base.LowMarketBaselineConfidence = !marketReady
+	base.LowTraderBaselineConfidence = !traderReady
+
 	for _, tier := range []struct {
 		sev  anomaly.Severity
 		spec anomaly.Tier
@@ -134,6 +151,7 @@ func Score(notionalUSD, price float64, market, trader baseline.Stats, t anomaly.
 			r.Severity = tier.sev
 			r.PayoffGatePassed = v.payoffPassed
 			r.TailGatePassed = v.tailPassed
+			applyLowBaselineCap(&r, tier.sev, notionalUSD, odds, t)
 			return r
 		}
 	}
@@ -209,6 +227,58 @@ func evaluateTier(
 	}
 
 	return tierVerdict{passed: true, payoffPassed: payoffPassed, tailPassed: enforcedTail > 0}
+}
+
+// applyLowBaselineCap implements the v6 severity-cap rule: when the
+// market baseline is not ready the trade fired through an unenforced
+// market tail gate, so its severity must be capped at
+// Thresholds.LowBaselineSingleMaxSeverity (typically Info) unless the
+// trade clears the Critical absolute floor AND
+// Thresholds.LowBaselineAllowCriticalAbsolute is true.
+//
+// The trader baseline doesn't trigger a cap on its own — a wallet we
+// don't know is fine to alert on if the market tail is solid. A cap
+// flag is still set on the Result for the alert payload.
+func applyLowBaselineCap(r *Result, fired anomaly.Severity, notional, odds float64, t anomaly.Thresholds) {
+	if !t.LowBaselineCapEnabled {
+		return
+	}
+	if !r.LowMarketBaselineConfidence {
+		return
+	}
+	cap := t.LowBaselineSingleMaxSeverity
+	if cap == "" {
+		cap = anomaly.SeverityInfo
+	}
+	// Allowed Critical-absolute exception: notional and odds clear the
+	// Critical absolute floors (already gated by the tier evaluator —
+	// if we fired at Critical the trade passed).
+	if t.LowBaselineAllowCriticalAbsolute &&
+		notional >= t.Critical.MinNotionalUSD &&
+		(t.Critical.MinOdds <= 0 || odds >= t.Critical.MinOdds) {
+		return
+	}
+	// Only cap downward — never escalate.
+	if severityRank(fired) > severityRank(cap) {
+		r.Severity = cap
+		r.SeverityCapped = true
+	}
+}
+
+// severityRank is the same ordering anomaly.rank uses; copied here to
+// avoid importing private helpers. Hard > Critical > Warning > Info.
+func severityRank(s anomaly.Severity) int {
+	switch s {
+	case anomaly.SeverityHard:
+		return 4
+	case anomaly.SeverityCritical:
+		return 3
+	case anomaly.SeverityWarning:
+		return 2
+	case anomaly.SeverityInfo:
+		return 1
+	}
+	return 0
 }
 
 // safeRatio guards against division by zero. Returns 0 when the divisor is

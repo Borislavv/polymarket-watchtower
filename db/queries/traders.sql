@@ -52,3 +52,9 @@ WHERE trader_id     = sqlc.arg(trader_id)::bigint
   AND market_id     = sqlc.arg(market_id)::bigint
   AND outcome_token = sqlc.arg(outcome_token)::text
   AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);
+
+-- name: GetTraderByID :one
+-- Reverse of GetTraderByWallet — used by the detection worker to
+-- resolve a trader_id back to its wallet string when rebuilding a
+-- trade.Trade from polymarket_trades.
+SELECT * FROM polymarket_traders WHERE id = $1;

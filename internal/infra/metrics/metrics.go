@@ -82,10 +82,31 @@ type Metrics struct {
 	// signal that the collect cursor is poisoned.
 	TradesAnalyzed prometheus.Counter
 
+	// TradesAnalyzedTotal is the v6 detection-queue counter: per
+	// trade, the worker stamps one of {analyzed | skipped | failed}
+	// with an optional reason. status = {analyzed,skipped,failed}.
+	// reason is the skip/failure cause (empty for status=analyzed).
+	TradesAnalyzedTotal *prometheus.CounterVec // status, reason
+
 	// TradesSkippedDetection records every trade detect.Observe
 	// declined to score. The reason label is the typed string from
 	// detect.SkipReason* (currently: too_old_for_live_alert).
 	TradesSkippedDetection *prometheus.CounterVec // reason
+
+	// DetectionClaimed counts trades the detection worker pulled out
+	// of the queue. Useful for sanity-checking the worker is actually
+	// running.
+	DetectionClaimed prometheus.Counter
+
+	// DetectionFailed counts terminal failures during detection
+	// (claim errors, mark errors, panics). reason: claim_error |
+	// panic | mark_analyzed.
+	DetectionFailed *prometheus.CounterVec // reason
+
+	// DetectionLagSeconds is the histogram of (now − traded_at) at
+	// the moment the worker dequeues a trade. The right tail tells
+	// operators how stale the backlog gets.
+	DetectionLagSeconds prometheus.Histogram
 
 	MarketsUpserted         prometheus.Counter     // every successful UpsertMarket call (incl. ON CONFLICT)
 	MarketOutcomesUpserted  prometheus.Counter     // every UpsertOutcome call (per token row)
@@ -287,6 +308,23 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "trades", Name: "skipped_detection_total",
 		Help: "Trades that reached detect.Observe but were not scored, by reason. Currently the only reason emitted is `too_old_for_live_alert` (LIVE_ALERT_MAX_LAG); the metric exists with a label vector so future skip paths are loud.",
 	}, []string{"reason"})
+	m.TradesAnalyzedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "trades", Name: "analyzed_status_total",
+		Help: "v6 detection-queue terminal state per trade. status=analyzed|skipped|failed; reason carries the skip/failure cause (empty when status=analyzed).",
+	}, []string{"status", "reason"})
+	m.DetectionClaimed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "detection", Name: "claimed_total",
+		Help: "Trades the detection worker pulled out of the pending queue. Health check — should track imports modulo lag.",
+	})
+	m.DetectionFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "detection", Name: "failed_total",
+		Help: "Detection failures. reason: claim_error | panic | mark_analyzed.",
+	}, []string{"reason"})
+	m.DetectionLagSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "detection", Name: "lag_seconds",
+		Help:    "now() − traded_at when the worker dequeues a trade. Right-tail tells operators how stale the backlog is getting.",
+		Buckets: []float64{1, 5, 15, 60, 300, 900, 3600, 7200, 21600, 86400},
+	})
 
 	m.MarketsUpserted = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "persist", Name: "markets_upserted_total",
@@ -390,6 +428,7 @@ func New() *Metrics {
 		m.CategoryFilterSkipped, m.AlertMMSuppressed, m.LifecycleUnknownSkipped,
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
 		m.TradesImported, m.TradesAnalyzed, m.TradesSkippedDetection,
+		m.TradesAnalyzedTotal, m.DetectionClaimed, m.DetectionFailed, m.DetectionLagSeconds,
 		m.MarketsUpserted, m.MarketOutcomesUpserted,
 		m.MarketsSoftDeleted, m.MarketsPurged, m.MarketsResumed,
 		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,

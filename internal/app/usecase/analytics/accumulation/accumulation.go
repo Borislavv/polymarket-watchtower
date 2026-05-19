@@ -46,14 +46,24 @@ import (
 type ReasonCode string
 
 const (
-	ReasonRepeatedSameOutcome    ReasonCode = "REPEATED_SAME_OUTCOME_ACCUMULATION"
-	ReasonLineTotalHigh          ReasonCode = "LINE_TOTAL_NOTIONAL_HIGH"
-	ReasonManySmallSameSide      ReasonCode = "MANY_SMALL_TRADES_SAME_SIDE"
-	ReasonLineLargeVsMarket      ReasonCode = "LINE_LARGE_VS_MARKET"
-	ReasonLineLargeVsSelf        ReasonCode = "LINE_LARGE_VS_SELF"
+	// Surveillance shape codes — v6 vocabulary.
+	ReasonSameTraderAccumulation ReasonCode = "SAME_TRADER_ACCUMULATION"
+	ReasonLinePayoffHigh         ReasonCode = "LINE_PAYOFF_HIGH"
+	ReasonLineMarketTail         ReasonCode = "LINE_MARKET_TAIL"
+	ReasonLineTraderTail         ReasonCode = "LINE_TRADER_TAIL"
+	ReasonManySmallsSameSide     ReasonCode = "MANY_SMALLS_SAME_SIDE"
+	ReasonLowBaselineConfidence  ReasonCode = "LOW_BASELINE_CONFIDENCE"
 	ReasonLateMarketAccumulation ReasonCode = "LATE_MARKET_ACCUMULATION"
 	ReasonHotMarketAccumulation  ReasonCode = "HOT_MARKET_ACCUMULATION"
 	ReasonLowSampleSize          ReasonCode = "LOW_SAMPLE_SIZE"
+
+	// Aliases retained for places that still reference the v4 names.
+	// They map onto the v6 vocabulary verbatim.
+	ReasonRepeatedSameOutcome ReasonCode = "SAME_TRADER_ACCUMULATION"
+	ReasonLineTotalHigh       ReasonCode = "LINE_PAYOFF_HIGH"
+	ReasonManySmallSameSide   ReasonCode = "MANY_SMALLS_SAME_SIDE"
+	ReasonLineLargeVsMarket   ReasonCode = "LINE_MARKET_TAIL"
+	ReasonLineLargeVsSelf     ReasonCode = "LINE_TRADER_TAIL"
 )
 
 // POSSIBLE_MARKET_MAKER lives in package mmfilter (the semantic owner —
@@ -296,19 +306,54 @@ func (d *Detector) Decide(line Line) Verdict {
 	return v
 }
 
-// passesNonSize checks the gates that don't involve the line total:
-// avg_odds ≥ tier_odds AND line_market_multiplier ≥ tier_multiplier.
-// Returns false if the market baseline isn't ready and the tier requires
-// a multiplier > 0 (a line cannot rank rarity without a baseline).
+// LineProfitIfWinUSD is the line's profit-if-win using the line's
+// AVERAGE odds: total × (avgOdds − 1). The line median odds is a
+// reasonable approximation for "if this whole position resolves
+// favourably, what does the wallet make?".
+func (l Line) LineProfitIfWinUSD() float64 {
+	if l.AvgOdds <= 1 || l.TotalNotionalUSD <= 0 {
+		return 0
+	}
+	return l.TotalNotionalUSD * (l.AvgOdds - 1)
+}
+
+// passesNonSize evaluates the v6 tail+payoff gates for one tier. The
+// median-multiplier gate (line_total / market_median ≥ tier.MinMultiplier)
+// has been removed — it was the v4/v5 false-positive source for thin
+// markets. Replaced with:
+//
+//   - odds floor (unchanged)
+//   - payoff floor: lineProfit ≥ tier.MinProfitUSD
+//   - market tail: max(lineTotal/marketP95, lineMax/marketP95) ≥
+//     tier.MinMarketP95Ratio (only when market baseline ready)
+//   - trader tail: lineTotal/traderP95 ≥ tier.MinTraderP95Ratio
+//     (only when trader baseline ready)
+//
+// Gates with zero floors are disabled (operator turned them off);
+// gates whose baseline is unready are unenforced (returning true for
+// that specific gate). The detector exposes the readiness state to
+// reasons() so the alert payload can carry LowBaselineConfidence.
 func (d *Detector) passesNonSize(line Line, t anomaly.Tier) bool {
 	if t.MinOdds > 0 && line.AvgOdds < t.MinOdds {
 		return false
 	}
-	if t.MinMultiplier > 0 {
-		if line.MarketMedianUSD <= 0 {
+	if t.MinProfitUSD > 0 && line.LineProfitIfWinUSD() < t.MinProfitUSD {
+		return false
+	}
+	if t.MinMarketP95Ratio > 0 && line.MarketP95USD > 0 {
+		// Tail can be tripped by either the cumulative line total or
+		// any one of its trades being large. Single-large-trade-in-a-
+		// line is a stronger informed signal than slow drip, but slow
+		// drip is the *exclusive* shape catched by accumulation, so
+		// we accept either.
+		lineRatio := line.TotalNotionalUSD / line.MarketP95USD
+		maxRatio := line.MaxNotionalUSD / line.MarketP95USD
+		if lineRatio < t.MinMarketP95Ratio && maxRatio < t.MinMarketP95Ratio {
 			return false
 		}
-		if line.MarketMultiplier() < t.MinMultiplier {
+	}
+	if t.MinTraderP95Ratio > 0 && line.TraderP95USD > 0 {
+		if line.TotalNotionalUSD/line.TraderP95USD < t.MinTraderP95Ratio {
 			return false
 		}
 	}
@@ -344,21 +389,32 @@ func (d *Detector) passesSize(line Line, t anomaly.Tier) string {
 }
 
 // reasons compiles the structured tags for the alert payload. Always
-// includes the canonical REPEATED_SAME_OUTCOME marker; the others reflect
-// which gates lit up.
+// includes SAME_TRADER_ACCUMULATION; the others reflect which gates
+// lit up under the v6 tail+payoff model.
 func (d *Detector) reasons(line Line, t anomaly.Tier, sizePath string) []ReasonCode {
-	out := []ReasonCode{ReasonRepeatedSameOutcome}
-	if line.TotalNotionalUSD >= 2*d.cfg.TotalMultiplier*t.MinNotionalUSD {
-		out = append(out, ReasonLineTotalHigh)
+	out := []ReasonCode{ReasonSameTraderAccumulation}
+	if t.MinProfitUSD > 0 && line.LineProfitIfWinUSD() >= 2*t.MinProfitUSD {
+		out = append(out, ReasonLinePayoffHigh)
 	}
 	if sizePath == "many-smalls" {
-		out = append(out, ReasonManySmallSameSide)
+		out = append(out, ReasonManySmallsSameSide)
 	}
-	if t.MinMultiplier > 0 && line.MarketMultiplier() >= 2*t.MinMultiplier {
-		out = append(out, ReasonLineLargeVsMarket)
+	if line.MarketP95USD > 0 {
+		ratio := line.TotalNotionalUSD / line.MarketP95USD
+		if line.MaxNotionalUSD/line.MarketP95USD > ratio {
+			ratio = line.MaxNotionalUSD / line.MarketP95USD
+		}
+		if t.MinMarketP95Ratio > 0 && ratio >= 2*t.MinMarketP95Ratio {
+			out = append(out, ReasonLineMarketTail)
+		}
 	}
-	if line.TraderMultiplier() >= 10 {
-		out = append(out, ReasonLineLargeVsSelf)
+	if line.TraderP95USD > 0 && t.MinTraderP95Ratio > 0 {
+		if line.TotalNotionalUSD/line.TraderP95USD >= 2*t.MinTraderP95Ratio {
+			out = append(out, ReasonLineTraderTail)
+		}
+	}
+	if line.MarketP95USD <= 0 || line.TraderP95USD <= 0 {
+		out = append(out, ReasonLowBaselineConfidence)
 	}
 	if line.LifecyclePct >= 75 {
 		out = append(out, ReasonLateMarketAccumulation)
@@ -400,11 +456,13 @@ func (d *Detector) score(line Line, t anomaly.Tier, sev anomaly.Severity) int {
 		totalRatio := line.TotalNotionalUSD / (d.cfg.TotalMultiplier * t.MinNotionalUSD)
 		s += saturate(totalRatio, 4) * 20
 	}
-	if t.MinMultiplier > 0 {
-		s += saturate(line.MarketMultiplier()/t.MinMultiplier, 4) * 10
+	// v6 tail bonus replaces the median-multiplier bonus. Bigger weight
+	// when both axes confirm than when only one does.
+	if line.MarketP95USD > 0 && t.MinMarketP95Ratio > 0 {
+		s += saturate(line.TotalNotionalUSD/line.MarketP95USD/t.MinMarketP95Ratio, 4) * 10
 	}
-	if line.TraderMedianUSD > 0 {
-		s += saturate(line.TraderMultiplier()/10, 4) * 5
+	if line.TraderP95USD > 0 && t.MinTraderP95Ratio > 0 {
+		s += saturate(line.TotalNotionalUSD/line.TraderP95USD/t.MinTraderP95Ratio, 4) * 5
 	}
 	s += math.Min(line.LifecyclePct/20, 5)
 	if s > 100 {
@@ -428,9 +486,9 @@ func (d *Detector) score(line Line, t anomaly.Tier, sev anomaly.Severity) int {
 func (d *Detector) confidence(line Line) float64 {
 	var c float64
 	switch {
-	case line.MarketMedianUSD > 0 && line.TraderMedianUSD > 0:
+	case line.MarketP95USD > 0 && line.TraderP95USD > 0:
 		c = 0.4
-	case line.MarketMedianUSD > 0:
+	case line.MarketP95USD > 0:
 		c = 0.3
 	default:
 		c = 0.2

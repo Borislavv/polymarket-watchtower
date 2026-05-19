@@ -183,6 +183,118 @@ func (q *Queries) BaselineSpan(ctx context.Context, arg BaselineSpanParams) (Bas
 	return i, err
 }
 
+const claimUndetectedTrades = `-- name: ClaimUndetectedTrades :many
+SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
+       t.size_shares, t.notional_usd, t.traded_at, t.external_id,
+       t.tx_hash, t.ingested_at, t.dedup_key,
+       t.detection_attempts,
+       m.condition_id AS market_condition_id
+FROM polymarket_trades t
+JOIN polymarket_markets m ON m.id = t.market_id
+WHERE t.detected_at IS NULL
+ORDER BY t.traded_at DESC, t.id DESC
+LIMIT $1::integer
+FOR UPDATE OF t SKIP LOCKED
+`
+
+type ClaimUndetectedTradesRow struct {
+	ID                int64
+	MarketID          int64
+	TraderID          *int64
+	OutcomeToken      string
+	Side              string
+	Price             float64
+	SizeShares        float64
+	NotionalUsd       float64
+	TradedAt          pgtype.Timestamptz
+	ExternalID        *string
+	TxHash            *string
+	IngestedAt        pgtype.Timestamptz
+	DedupKey          string
+	DetectionAttempts int32
+	MarketConditionID string
+}
+
+// Claim a batch of trades that have never been through the detection
+// worker. SKIP LOCKED keeps concurrent workers from contending on the
+// same rows; the partial index on (traded_at DESC) WHERE detected_at
+// IS NULL keeps this cheap.
+//
+// The claimer does NOT mutate the rows — it just locks them. A second
+// statement (MarkTradeDetectionResult) records the terminal state once
+// the worker finishes processing. If the worker crashes mid-trade the
+// row stays pending and the next claimer picks it up.
+func (q *Queries) ClaimUndetectedTrades(ctx context.Context, claimLimit int32) ([]ClaimUndetectedTradesRow, error) {
+	rows, err := q.db.Query(ctx, claimUndetectedTrades, claimLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimUndetectedTradesRow
+	for rows.Next() {
+		var i ClaimUndetectedTradesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.MarketID,
+			&i.TraderID,
+			&i.OutcomeToken,
+			&i.Side,
+			&i.Price,
+			&i.SizeShares,
+			&i.NotionalUsd,
+			&i.TradedAt,
+			&i.ExternalID,
+			&i.TxHash,
+			&i.IngestedAt,
+			&i.DedupKey,
+			&i.DetectionAttempts,
+			&i.MarketConditionID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const detectionStatusBreakdown = `-- name: DetectionStatusBreakdown :many
+SELECT COALESCE(detection_status, 'pending')::text AS status,
+       COUNT(*)::bigint                            AS count
+FROM polymarket_trades
+GROUP BY 1
+ORDER BY 1
+`
+
+type DetectionStatusBreakdownRow struct {
+	Status string
+	Count  int64
+}
+
+// /stats break-down: rows by terminal detection state. NULL status is
+// reported as 'pending'.
+func (q *Queries) DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error) {
+	rows, err := q.db.Query(ctx, detectionStatusBreakdown)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DetectionStatusBreakdownRow
+	for rows.Next() {
+		var i DetectionStatusBreakdownRow
+		if err := rows.Scan(&i.Status, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertTrade = `-- name: InsertTrade :one
 INSERT INTO polymarket_trades (
     market_id, trader_id, outcome_token, side,
@@ -195,7 +307,7 @@ VALUES (
     $8, $9, $10, $11
 )
 ON CONFLICT (dedup_key) DO NOTHING
-RETURNING id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key
+RETURNING id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error
 `
 
 type InsertTradeParams struct {
@@ -245,6 +357,11 @@ func (q *Queries) InsertTrade(ctx context.Context, arg InsertTradeParams) (Polym
 		&i.TxHash,
 		&i.IngestedAt,
 		&i.DedupKey,
+		&i.DetectedAt,
+		&i.DetectionStatus,
+		&i.DetectionSkipReason,
+		&i.DetectionAttempts,
+		&i.LastDetectionError,
 	)
 	return i, err
 }
@@ -291,7 +408,7 @@ func (q *Queries) LatestTradeAt(ctx context.Context, marketID int64) (pgtype.Tim
 }
 
 const listBaselineTrades = `-- name: ListBaselineTrades :many
-SELECT id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key FROM polymarket_trades
+SELECT id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error FROM polymarket_trades
 WHERE market_id = $1
   AND outcome_token = $2
   AND traded_at >= $3
@@ -338,6 +455,11 @@ func (q *Queries) ListBaselineTrades(ctx context.Context, arg ListBaselineTrades
 			&i.TxHash,
 			&i.IngestedAt,
 			&i.DedupKey,
+			&i.DetectedAt,
+			&i.DetectionStatus,
+			&i.DetectionSkipReason,
+			&i.DetectionAttempts,
+			&i.LastDetectionError,
 		); err != nil {
 			return nil, err
 		}
@@ -350,7 +472,7 @@ func (q *Queries) ListBaselineTrades(ctx context.Context, arg ListBaselineTrades
 }
 
 const listClusterWindowTrades = `-- name: ListClusterWindowTrades :many
-SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price, t.size_shares, t.notional_usd, t.traded_at, t.external_id, t.tx_hash, t.ingested_at, t.dedup_key, m.condition_id AS market_condition_id
+SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price, t.size_shares, t.notional_usd, t.traded_at, t.external_id, t.tx_hash, t.ingested_at, t.dedup_key, t.detected_at, t.detection_status, t.detection_skip_reason, t.detection_attempts, t.last_detection_error, m.condition_id AS market_condition_id
 FROM polymarket_trades t
 JOIN polymarket_markets m ON m.id = t.market_id
 WHERE t.market_id = $1
@@ -364,20 +486,25 @@ type ListClusterWindowTradesParams struct {
 }
 
 type ListClusterWindowTradesRow struct {
-	ID                int64
-	MarketID          int64
-	TraderID          *int64
-	OutcomeToken      string
-	Side              string
-	Price             float64
-	SizeShares        float64
-	NotionalUsd       float64
-	TradedAt          pgtype.Timestamptz
-	ExternalID        *string
-	TxHash            *string
-	IngestedAt        pgtype.Timestamptz
-	DedupKey          string
-	MarketConditionID string
+	ID                  int64
+	MarketID            int64
+	TraderID            *int64
+	OutcomeToken        string
+	Side                string
+	Price               float64
+	SizeShares          float64
+	NotionalUsd         float64
+	TradedAt            pgtype.Timestamptz
+	ExternalID          *string
+	TxHash              *string
+	IngestedAt          pgtype.Timestamptz
+	DedupKey            string
+	DetectedAt          pgtype.Timestamptz
+	DetectionStatus     *string
+	DetectionSkipReason *string
+	DetectionAttempts   int32
+	LastDetectionError  *string
+	MarketConditionID   string
 }
 
 // All trades in the per-category cluster window. Used by the cluster
@@ -405,6 +532,11 @@ func (q *Queries) ListClusterWindowTrades(ctx context.Context, arg ListClusterWi
 			&i.TxHash,
 			&i.IngestedAt,
 			&i.DedupKey,
+			&i.DetectedAt,
+			&i.DetectionStatus,
+			&i.DetectionSkipReason,
+			&i.DetectionAttempts,
+			&i.LastDetectionError,
 			&i.MarketConditionID,
 		); err != nil {
 			return nil, err
@@ -449,6 +581,37 @@ func (q *Queries) ListTradesForBackfillPage(ctx context.Context, arg ListTradesF
 		return nil, err
 	}
 	return items, nil
+}
+
+const markTradeDetectionResult = `-- name: MarkTradeDetectionResult :exec
+UPDATE polymarket_trades
+SET detected_at           = NOW(),
+    detection_status      = $1::text,
+    detection_skip_reason = $2::text,
+    last_detection_error  = $3::text,
+    detection_attempts    = detection_attempts + 1
+WHERE id = $4::bigint
+`
+
+type MarkTradeDetectionResultParams struct {
+	Status       string
+	SkipReason   *string
+	ErrorMessage *string
+	TradeID      int64
+}
+
+// Stamp the terminal state for one trade. detected_at = NOW() always.
+// detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
+// CHECK constraint enforces this). detection_skip_reason is set only
+// when status='skipped'; last_detection_error only when status='failed'.
+func (q *Queries) MarkTradeDetectionResult(ctx context.Context, arg MarkTradeDetectionResultParams) error {
+	_, err := q.db.Exec(ctx, markTradeDetectionResult,
+		arg.Status,
+		arg.SkipReason,
+		arg.ErrorMessage,
+		arg.TradeID,
+	)
+	return err
 }
 
 const oldestTradeAt = `-- name: OldestTradeAt :one
@@ -501,4 +664,56 @@ func (q *Queries) OwnershipShares(ctx context.Context, arg OwnershipSharesParams
 	var i OwnershipSharesRow
 	err := row.Scan(&i.WalletBuyShares, &i.WalletSellShares, &i.MarketBuyShares)
 	return i, err
+}
+
+const pendingDetectionCount = `-- name: PendingDetectionCount :one
+SELECT COUNT(*)::bigint AS pending FROM polymarket_trades WHERE detected_at IS NULL
+`
+
+// Diagnostic: how many trades are still pending detection. Used by
+// /stats and Grafana so operators can see whether the worker is
+// keeping up.
+func (q *Queries) PendingDetectionCount(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, pendingDetectionCount)
+	var pending int64
+	err := row.Scan(&pending)
+	return pending, err
+}
+
+const traderFirstSeenAt = `-- name: TraderFirstSeenAt :one
+SELECT MIN(t.traded_at)::timestamptz AS first_seen_at
+FROM polymarket_trades t
+WHERE t.trader_id = $1::bigint
+`
+
+// Earliest persisted trade timestamp for a wallet's full history.
+// Used by the new-wallet / dormant-wallet context boosters; the
+// detection worker calls this when stamping context on a Finding.
+func (q *Queries) TraderFirstSeenAt(ctx context.Context, traderID int64) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, traderFirstSeenAt, traderID)
+	var first_seen_at pgtype.Timestamptz
+	err := row.Scan(&first_seen_at)
+	return first_seen_at, err
+}
+
+const traderLastSeenBefore = `-- name: TraderLastSeenBefore :one
+SELECT MAX(t.traded_at)::timestamptz AS last_at
+FROM polymarket_trades t
+WHERE t.trader_id = $1::bigint
+  AND t.traded_at < $2::timestamptz
+`
+
+type TraderLastSeenBeforeParams struct {
+	TraderID int64
+	Before   pgtype.Timestamptz
+}
+
+// Most-recent trade timestamp STRICTLY before the supplied cutoff.
+// Used by the dormant-wallet booster to ask "how long has this wallet
+// been idle just before this trade?".
+func (q *Queries) TraderLastSeenBefore(ctx context.Context, arg TraderLastSeenBeforeParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, traderLastSeenBefore, arg.TraderID, arg.Before)
+	var last_at pgtype.Timestamptz
+	err := row.Scan(&last_at)
+	return last_at, err
 }

@@ -118,17 +118,22 @@ type PolymarketTraders struct {
 }
 
 type PolymarketTrades struct {
-	ID           int64
-	MarketID     int64
-	TraderID     *int64
-	OutcomeToken string
-	Side         string
-	Price        float64
-	SizeShares   float64
-	NotionalUsd  float64
-	TradedAt     pgtype.Timestamptz
-	ExternalID   *string
-	TxHash       *string
-	IngestedAt   pgtype.Timestamptz
-	DedupKey     string
+	ID                  int64
+	MarketID            int64
+	TraderID            *int64
+	OutcomeToken        string
+	Side                string
+	Price               float64
+	SizeShares          float64
+	NotionalUsd         float64
+	TradedAt            pgtype.Timestamptz
+	ExternalID          *string
+	TxHash              *string
+	IngestedAt          pgtype.Timestamptz
+	DedupKey            string
+	DetectedAt          pgtype.Timestamptz
+	DetectionStatus     *string
+	DetectionSkipReason *string
+	DetectionAttempts   int32
+	LastDetectionError  *string
 }

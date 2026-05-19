@@ -154,3 +154,70 @@ WHERE trader_id     = sqlc.arg(trader_id)::bigint
   AND outcome_token = sqlc.arg(outcome_token)::text
   AND side          = sqlc.arg(side)::text
   AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);
+
+-- name: ClaimUndetectedTrades :many
+-- Claim a batch of trades that have never been through the detection
+-- worker. SKIP LOCKED keeps concurrent workers from contending on the
+-- same rows; the partial index on (traded_at DESC) WHERE detected_at
+-- IS NULL keeps this cheap.
+--
+-- The claimer does NOT mutate the rows — it just locks them. A second
+-- statement (MarkTradeDetectionResult) records the terminal state once
+-- the worker finishes processing. If the worker crashes mid-trade the
+-- row stays pending and the next claimer picks it up.
+SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
+       t.size_shares, t.notional_usd, t.traded_at, t.external_id,
+       t.tx_hash, t.ingested_at, t.dedup_key,
+       t.detection_attempts,
+       m.condition_id AS market_condition_id
+FROM polymarket_trades t
+JOIN polymarket_markets m ON m.id = t.market_id
+WHERE t.detected_at IS NULL
+ORDER BY t.traded_at DESC, t.id DESC
+LIMIT sqlc.arg(claim_limit)::integer
+FOR UPDATE OF t SKIP LOCKED;
+
+-- name: MarkTradeDetectionResult :exec
+-- Stamp the terminal state for one trade. detected_at = NOW() always.
+-- detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
+-- CHECK constraint enforces this). detection_skip_reason is set only
+-- when status='skipped'; last_detection_error only when status='failed'.
+UPDATE polymarket_trades
+SET detected_at           = NOW(),
+    detection_status      = sqlc.arg(status)::text,
+    detection_skip_reason = sqlc.narg(skip_reason)::text,
+    last_detection_error  = sqlc.narg(error_message)::text,
+    detection_attempts    = detection_attempts + 1
+WHERE id = sqlc.arg(trade_id)::bigint;
+
+-- name: PendingDetectionCount :one
+-- Diagnostic: how many trades are still pending detection. Used by
+-- /stats and Grafana so operators can see whether the worker is
+-- keeping up.
+SELECT COUNT(*)::bigint AS pending FROM polymarket_trades WHERE detected_at IS NULL;
+
+-- name: DetectionStatusBreakdown :many
+-- /stats break-down: rows by terminal detection state. NULL status is
+-- reported as 'pending'.
+SELECT COALESCE(detection_status, 'pending')::text AS status,
+       COUNT(*)::bigint                            AS count
+FROM polymarket_trades
+GROUP BY 1
+ORDER BY 1;
+
+-- name: TraderFirstSeenAt :one
+-- Earliest persisted trade timestamp for a wallet's full history.
+-- Used by the new-wallet / dormant-wallet context boosters; the
+-- detection worker calls this when stamping context on a Finding.
+SELECT MIN(t.traded_at)::timestamptz AS first_seen_at
+FROM polymarket_trades t
+WHERE t.trader_id = sqlc.arg(trader_id)::bigint;
+
+-- name: TraderLastSeenBefore :one
+-- Most-recent trade timestamp STRICTLY before the supplied cutoff.
+-- Used by the dormant-wallet booster to ask "how long has this wallet
+-- been idle just before this trade?".
+SELECT MAX(t.traded_at)::timestamptz AS last_at
+FROM polymarket_trades t
+WHERE t.trader_id = sqlc.arg(trader_id)::bigint
+  AND t.traded_at < sqlc.arg(before)::timestamptz;
