@@ -373,17 +373,21 @@ func (l *Loop) Observe(ctx context.Context, market market.Market, trade trade.Tr
 	//
 	// We still record the trade size on the histogram so dashboards
 	// stay consistent; baseline updates happen via persist.Sink on
-	// the way in, not here.
-	l.metrics.TradeSizeUSD.Observe(notional)
+	// the way in, not here. Nil-guarded — Loops constructed without
+	// metrics (some test paths, CLI subcommands) must not crash on
+	// the hot path.
+	if l.metrics != nil && l.metrics.TradeSizeUSD != nil {
+		l.metrics.TradeSizeUSD.Observe(notional)
+	}
 	if l.cfg.LiveAlertMaxLag > 0 && !trade.Timestamp.IsZero() {
 		if l.now().Sub(trade.Timestamp) > l.cfg.LiveAlertMaxLag {
-			if l.metrics.TradesSkippedDetection != nil {
+			if l.metrics != nil && l.metrics.TradesSkippedDetection != nil {
 				l.metrics.TradesSkippedDetection.WithLabelValues("too_old_for_live_alert").Inc()
 			}
 			return
 		}
 	}
-	if l.metrics.TradesAnalyzed != nil {
+	if l.metrics != nil && l.metrics.TradesAnalyzed != nil {
 		l.metrics.TradesAnalyzed.Inc()
 	}
 
