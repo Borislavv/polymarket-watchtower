@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -182,24 +183,49 @@ func (w *Worker) tick(ctx context.Context) {
 	} else if n > 0 {
 		w.log.Warn().Int64("reclaimed", n).Msg("detection: stale claims reclaimed")
 	}
+	var counters detectionTickCounters
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.drainLoop(ctx)
+			w.drainLoop(ctx, &counters)
 		}()
 	}
 	wg.Wait()
+
+	if counters.claimed.Load() == 0 {
+		w.log.Debug().Msg("detection: idle tick, queue empty")
+		return
+	}
+	w.log.Info().
+		Int64("claimed", counters.claimed.Load()).
+		Int64("analyzed", counters.analyzed.Load()).
+		Int64("skipped_too_old", counters.skippedTooOld.Load()).
+		Int64("skipped_market_unknown", counters.skippedMarketUnknown.Load()).
+		Int64("failed_panic", counters.failedPanic.Load()).
+		Int64("failed_mark", counters.failedMark.Load()).
+		Msg("detection: tick summary")
+}
+
+// detectionTickCounters tallies per-tick outcomes. atomic.Int64 lets
+// any worker goroutine update without coordination.
+type detectionTickCounters struct {
+	claimed              atomic.Int64
+	analyzed             atomic.Int64
+	skippedTooOld        atomic.Int64
+	skippedMarketUnknown atomic.Int64
+	failedPanic          atomic.Int64
+	failedMark           atomic.Int64
 }
 
 // drainLoop pulls until the queue is empty or ctx cancels.
-func (w *Worker) drainLoop(ctx context.Context) {
+func (w *Worker) drainLoop(ctx context.Context, counters *detectionTickCounters) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		n, err := w.processOne(ctx)
+		n, err := w.processOne(ctx, counters)
 		if err != nil {
 			w.log.Err(err).Msg("detection: claim failed")
 			return
@@ -210,7 +236,7 @@ func (w *Worker) drainLoop(ctx context.Context) {
 	}
 }
 
-func (w *Worker) processOne(ctx context.Context) (int, error) {
+func (w *Worker) processOne(ctx context.Context, counters *detectionTickCounters) (int, error) {
 	rows, err := w.claimer.ClaimUndetectedTrades(ctx, w.cfg.WorkerID, w.cfg.ClaimLimit, w.cfg.ClaimTTL)
 	if err != nil {
 		if w.metrics != nil && w.metrics.DetectionFailed != nil {
@@ -221,14 +247,17 @@ func (w *Worker) processOne(ctx context.Context) (int, error) {
 	if w.metrics != nil && w.metrics.DetectionClaimed != nil {
 		w.metrics.DetectionClaimed.Add(float64(len(rows)))
 	}
+	if counters != nil {
+		counters.claimed.Add(int64(len(rows)))
+	}
 	now := w.cfg.Clock()
 	for _, row := range rows {
-		w.handle(ctx, now, row)
+		w.handle(ctx, now, row, counters)
 	}
 	return len(rows), nil
 }
 
-func (w *Worker) handle(ctx context.Context, now time.Time, row repository.PendingDetectionTrade) {
+func (w *Worker) handle(ctx context.Context, now time.Time, row repository.PendingDetectionTrade, counters *detectionTickCounters) {
 	if w.metrics != nil && w.metrics.DetectionLagSeconds != nil && !row.TradedAt.IsZero() {
 		w.metrics.DetectionLagSeconds.Observe(now.Sub(row.TradedAt).Seconds())
 	}
@@ -244,6 +273,9 @@ func (w *Worker) handle(ctx context.Context, now time.Time, row repository.Pendi
 			w.log.Err(err).Int64("trade_id", row.ID).Msg("detection: mark skipped failed")
 		}
 		w.metric("skipped", SkipReasonMarketUnknown)
+		if counters != nil {
+			counters.skippedMarketUnknown.Add(1)
+		}
 		return
 	}
 
@@ -276,6 +308,9 @@ func (w *Worker) handle(ctx context.Context, now time.Time, row repository.Pendi
 		if w.metrics != nil && w.metrics.DetectionFailed != nil {
 			w.metrics.DetectionFailed.WithLabelValues("panic").Inc()
 		}
+		if counters != nil {
+			counters.failedPanic.Add(1)
+		}
 		return
 	}
 
@@ -286,6 +321,9 @@ func (w *Worker) handle(ctx context.Context, now time.Time, row repository.Pendi
 			w.log.Err(err).Int64("trade_id", row.ID).Msg("detection: mark skipped failed")
 		}
 		w.metric("skipped", SkipReasonTooOldForLiveAlert)
+		if counters != nil {
+			counters.skippedTooOld.Add(1)
+		}
 		return
 	}
 	if err := w.claimer.MarkDetectionAnalyzed(ctx, row.ID); err != nil {
@@ -293,9 +331,15 @@ func (w *Worker) handle(ctx context.Context, now time.Time, row repository.Pendi
 		if w.metrics != nil && w.metrics.DetectionFailed != nil {
 			w.metrics.DetectionFailed.WithLabelValues("mark_analyzed").Inc()
 		}
+		if counters != nil {
+			counters.failedMark.Add(1)
+		}
 		return
 	}
 	w.metric("analyzed", "")
+	if counters != nil {
+		counters.analyzed.Add(1)
+	}
 }
 
 func (w *Worker) safeObserve(ctx context.Context, m market.Market, t trade.Trade) (recovered error) {

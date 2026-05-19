@@ -353,15 +353,19 @@ func New() (*App, error) {
 	}
 	if cfg.Postgres.Enabled() {
 		backfillWorker = backfill.New(backfill.Config{
-			Interval:    cfg.Backfill.Interval,
-			BatchSize:   cfg.Backfill.Workers,
-			Concurrency: cfg.Backfill.Workers,
-			PageSize:    cfg.Backfill.PageLimit,
-			StaleAfter:  cfg.Backfill.StaleAfter,
+			Interval:          cfg.Backfill.Interval,
+			BatchSize:         cfg.Backfill.Workers,
+			Concurrency:       cfg.Backfill.Workers,
+			PageSize:          cfg.Backfill.PageLimit,
+			StaleAfter:        cfg.Backfill.StaleAfter,
+			PartialRetryAfter: cfg.Backfill.PartialRetryAfter,
 		}, marketsRepo, tradesRepo, tradersRepo, dataClient, met, logger)
 		logger.Info().
 			Int("workers", cfg.Backfill.Workers).
+			Int("page_limit", cfg.Backfill.PageLimit).
 			Dur("interval", cfg.Backfill.Interval).
+			Dur("stale_after", cfg.Backfill.StaleAfter).
+			Dur("partial_retry_after", cfg.Backfill.PartialRetryAfter).
 			Msg("backfill: enabled")
 
 		sanityWorker = sanity.New(sanity.Config{
@@ -584,8 +588,17 @@ func New() (*App, error) {
 		// collect.pull (`if l.observer != nil`) now skips correctly.
 		collectObserver = nil
 		detectMode = "db_queue"
+		logger.Info().
+			Str("detect_mode", detectMode).
+			Int("workers", cfg.Detection.Workers).
+			Int("claim_limit", cfg.Detection.ClaimLimit).
+			Dur("interval", cfg.Detection.Interval).
+			Dur("claim_ttl", cfg.Detection.ClaimTTL).
+			Dur("stale_threshold", cfg.Anomaly.LiveAlertMaxLag).
+			Msg("detection worker: enabled")
+	} else {
+		logger.Info().Str("detect_mode", detectMode).Msg("detection pipeline wired (memory mode)")
 	}
-	logger.Info().Str("detect_mode", detectMode).Msg("detection pipeline wired")
 
 	collectCfg := collect.Config{
 		Interval:          cfg.Pipeline.CollectInterval,

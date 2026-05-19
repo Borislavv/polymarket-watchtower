@@ -26,6 +26,14 @@ type fakeMarketStore struct {
 	beginIDs      []int64
 	completeCalls []completeCall
 	failCalls     []failCall
+	// listCalls captures every (limit, partialRetryAfter) the worker
+	// asked for so the cooldown plumbing can be pinned by test.
+	listCalls []listCall
+}
+
+type listCall struct {
+	Limit             int32
+	PartialRetryAfter time.Duration
 }
 
 type completeCall struct {
@@ -47,9 +55,10 @@ func (f *fakeMarketStore) ResetStaleRunning(_ context.Context, _ time.Time) erro
 	return nil
 }
 
-func (f *fakeMarketStore) ListActiveForBackfill(_ context.Context, _ int32) ([]repository.Market, error) {
+func (f *fakeMarketStore) ListActiveForBackfill(_ context.Context, limit int32, partialRetryAfter time.Duration) ([]repository.Market, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls = append(f.listCalls, listCall{Limit: limit, PartialRetryAfter: partialRetryAfter})
 	out := f.candidates
 	f.candidates = nil
 	return out, nil
@@ -265,6 +274,58 @@ func TestWorker_ResetsStaleRunningEveryTick(t *testing.T) {
 
 	if ms.resetCalls != 2 {
 		t.Errorf("reset calls: %d want 2", ms.resetCalls)
+	}
+}
+
+// TestWorker_PartialRetryAfterPropagatedToStore pins the cooldown
+// plumbing: the configured Config.PartialRetryAfter must reach the
+// SQL claim query as the partial_retry_after argument. Without this,
+// `partial_api_limit` markets would re-enter the claim pool every
+// tick and burn API quota — the operator-reported symptom that drove
+// migration 00014 + this knob.
+func TestWorker_PartialRetryAfterPropagatedToStore(t *testing.T) {
+	ms := &fakeMarketStore{}
+	tr := &fakeTrades{}
+	td := &fakeTraders{}
+	cl := &fakeClient{}
+	w := New(Config{
+		Concurrency:       1,
+		BatchSize:         4,
+		PageSize:          500,
+		PartialRetryAfter: 6 * time.Hour,
+	}, ms, tr, td, cl, nil, nopLogger())
+
+	w.Tick(context.Background())
+
+	if len(ms.listCalls) != 1 {
+		t.Fatalf("expected 1 list call, got %d", len(ms.listCalls))
+	}
+	if got := ms.listCalls[0].PartialRetryAfter; got != 6*time.Hour {
+		t.Errorf("partial_retry_after: got %v want 6h", got)
+	}
+	if got := ms.listCalls[0].Limit; got != 4 {
+		t.Errorf("limit: got %d want 4", got)
+	}
+}
+
+// TestWorker_PartialRetryAfterDefaults pins the applyDefaults
+// guarantee: zero/negative in the Config gets bumped to the
+// production default (6h), so any caller that forgets to set it
+// still gets cooldown.
+func TestWorker_PartialRetryAfterDefaults(t *testing.T) {
+	ms := &fakeMarketStore{}
+	tr := &fakeTrades{}
+	td := &fakeTraders{}
+	cl := &fakeClient{}
+	w := New(Config{}, ms, tr, td, cl, nil, nopLogger()) // zero cfg
+
+	w.Tick(context.Background())
+
+	if len(ms.listCalls) != 1 {
+		t.Fatalf("expected 1 list call, got %d", len(ms.listCalls))
+	}
+	if got := ms.listCalls[0].PartialRetryAfter; got != 6*time.Hour {
+		t.Errorf("default partial_retry_after: got %v want 6h", got)
 	}
 }
 

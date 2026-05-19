@@ -166,17 +166,38 @@ SELECT id, condition_id, slug, question, event_slug, event_title, start_date, en
 WHERE active = TRUE
   AND deleted_at IS NULL
   AND purged_at IS NULL
-  AND backfill_status IN ('pending','partial_api_limit')
+  AND (
+        backfill_status = 'pending'
+        OR (
+              backfill_status = 'partial_api_limit'
+              AND (
+                    backfill_completed_at IS NULL
+                    OR backfill_completed_at < NOW() - $1::interval
+                  )
+            )
+      )
 ORDER BY end_date ASC NULLS LAST
-LIMIT $1
+LIMIT $2::integer
 `
+
+type ListActiveMarketsForBackfillParams struct {
+	PartialRetryAfter pgtype.Interval
+	LimitCount        int32
+}
 
 // Pick the next batch of markets to backfill, prioritised by upcoming
 // end_date (markets nearer resolution have the most actionable history).
 // Excludes soft-deleted and purged markets — backfill never wastes API
 // pages on a market we have no intent to monitor.
-func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, limit int32) ([]PolymarketMarkets, error) {
-	rows, err := q.db.Query(ctx, listActiveMarketsForBackfill, limit)
+//
+// partial_api_limit cooldown: those markets have already hit the
+// documented Polymarket 3000-row offset cap. Re-running them within
+// minutes will hit the same cap and burn API quota for nothing, so
+// they only become re-claimable once their last completion is older
+// than $2 (BACKFILL_PARTIAL_RETRY_AFTER, default 6h). `pending`
+// markets bypass the cooldown — they have never been attempted.
+func (q *Queries) ListActiveMarketsForBackfill(ctx context.Context, arg ListActiveMarketsForBackfillParams) ([]PolymarketMarkets, error) {
+	rows, err := q.db.Query(ctx, listActiveMarketsForBackfill, arg.PartialRetryAfter, arg.LimitCount)
 	if err != nil {
 		return nil, err
 	}

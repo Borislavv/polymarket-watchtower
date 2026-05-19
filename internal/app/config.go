@@ -86,6 +86,15 @@ type BackfillConfig struct {
 	// StaleAfter requeues 'running' markets older than this — used to
 	// recover from a crashed previous process.
 	StaleAfter time.Duration `env:"BACKFILL_STALE_AFTER" envDefault:"15m" validate:"required"`
+	// PartialRetryAfter is the cooldown applied to markets stamped
+	// `partial_api_limit` before they become re-claimable. The 3000-
+	// row offset cap is a structural Polymarket limit: re-running a
+	// market within minutes will hit the same cap and burn API
+	// quota for nothing. Default 6h gives the upstream enough time
+	// for the documented cap to potentially shift (e.g. Polymarket
+	// raises the offset cap) without keeping the markets in an
+	// infinite tight retry loop.
+	PartialRetryAfter time.Duration `env:"BACKFILL_PARTIAL_RETRY_AFTER" envDefault:"6h" validate:"required"`
 }
 
 // MarketSanityConfig tunes the soft-delete reaper (sanity worker). The

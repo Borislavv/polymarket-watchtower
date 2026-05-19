@@ -73,13 +73,29 @@ WHERE m.active = TRUE
 -- end_date (markets nearer resolution have the most actionable history).
 -- Excludes soft-deleted and purged markets — backfill never wastes API
 -- pages on a market we have no intent to monitor.
+--
+-- partial_api_limit cooldown: those markets have already hit the
+-- documented Polymarket 3000-row offset cap. Re-running them within
+-- minutes will hit the same cap and burn API quota for nothing, so
+-- they only become re-claimable once their last completion is older
+-- than $2 (BACKFILL_PARTIAL_RETRY_AFTER, default 6h). `pending`
+-- markets bypass the cooldown — they have never been attempted.
 SELECT * FROM polymarket_markets
 WHERE active = TRUE
   AND deleted_at IS NULL
   AND purged_at IS NULL
-  AND backfill_status IN ('pending','partial_api_limit')
+  AND (
+        backfill_status = 'pending'
+        OR (
+              backfill_status = 'partial_api_limit'
+              AND (
+                    backfill_completed_at IS NULL
+                    OR backfill_completed_at < NOW() - sqlc.arg(partial_retry_after)::interval
+                  )
+            )
+      )
 ORDER BY end_date ASC NULLS LAST
-LIMIT $1;
+LIMIT sqlc.arg(limit_count)::integer;
 
 -- name: ListActiveMarketsForCollection :many
 -- Active markets that have at least started backfill — collection of

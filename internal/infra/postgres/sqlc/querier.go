@@ -129,7 +129,14 @@ type Querier interface {
 	// end_date (markets nearer resolution have the most actionable history).
 	// Excludes soft-deleted and purged markets — backfill never wastes API
 	// pages on a market we have no intent to monitor.
-	ListActiveMarketsForBackfill(ctx context.Context, limit int32) ([]PolymarketMarkets, error)
+	//
+	// partial_api_limit cooldown: those markets have already hit the
+	// documented Polymarket 3000-row offset cap. Re-running them within
+	// minutes will hit the same cap and burn API quota for nothing, so
+	// they only become re-claimable once their last completion is older
+	// than $2 (BACKFILL_PARTIAL_RETRY_AFTER, default 6h). `pending`
+	// markets bypass the cooldown — they have never been attempted.
+	ListActiveMarketsForBackfill(ctx context.Context, arg ListActiveMarketsForBackfillParams) ([]PolymarketMarkets, error)
 	// Active markets that have at least started backfill — collection of
 	// recent trades only makes sense once we know how far back history goes.
 	// Excludes soft-deleted and purged markets.

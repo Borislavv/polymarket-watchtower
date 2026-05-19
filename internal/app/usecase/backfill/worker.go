@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -46,7 +47,11 @@ type TradeClient interface {
 // MarketStore is the subset of *repository.MarketRepository the worker uses.
 type MarketStore interface {
 	ResetStaleRunning(ctx context.Context, cutoff time.Time) error
-	ListActiveForBackfill(ctx context.Context, limit int32) ([]repository.Market, error)
+	// ListActiveForBackfill returns the next batch. partialRetryAfter
+	// is the cooldown applied to `partial_api_limit` markets — they
+	// only become re-claimable after their last completion is older
+	// than this. Zero disables the cooldown (re-claim every tick).
+	ListActiveForBackfill(ctx context.Context, limit int32, partialRetryAfter time.Duration) ([]repository.Market, error)
 	BeginBackfill(ctx context.Context, marketID int64) error
 	CompleteBackfill(ctx context.Context, marketID int64, status repository.BackfillStatus, oldestFetched, newestFetched time.Time) error
 	FailBackfill(ctx context.Context, marketID int64, errMsg string) error
@@ -80,6 +85,11 @@ type Config struct {
 	// this — usually means the previous process crashed mid-backfill.
 	// Default 15m.
 	StaleAfter time.Duration
+	// PartialRetryAfter is the cooldown applied to partial_api_limit
+	// markets before they become re-claimable. The 3000-row offset cap
+	// is structural in the Data API, so re-running these within minutes
+	// just burns quota. Default 6h.
+	PartialRetryAfter time.Duration
 	// Clock is the time source; defaults to time.Now.
 	Clock func() time.Time
 }
@@ -125,6 +135,9 @@ func New(
 	if cfg.StaleAfter <= 0 {
 		cfg.StaleAfter = 15 * time.Minute
 	}
+	if cfg.PartialRetryAfter <= 0 {
+		cfg.PartialRetryAfter = 6 * time.Hour
+	}
 	now := cfg.Clock
 	if now == nil {
 		now = time.Now
@@ -155,15 +168,20 @@ func (w *Worker) tick(ctx context.Context) {
 	if err := w.markets.ResetStaleRunning(ctx, w.now().Add(-w.cfg.StaleAfter)); err != nil {
 		w.log.Err(err).Msg("backfill: reset stale failed")
 	}
-	candidates, err := w.markets.ListActiveForBackfill(ctx, int32(w.cfg.BatchSize))
+	candidates, err := w.markets.ListActiveForBackfill(ctx, int32(w.cfg.BatchSize), w.cfg.PartialRetryAfter)
 	if err != nil {
 		w.log.Err(err).Msg("backfill: list candidates failed")
 		return
 	}
 	if len(candidates) == 0 {
+		w.log.Debug().Msg("backfill: idle tick, no candidates")
 		return
 	}
 
+	// Per-tick counters — recorded by backfillOne via atomic ops so the
+	// summary log captures the actual outcome distribution rather than
+	// just "we claimed N".
+	var counters tickCounters
 	sem := make(chan struct{}, w.cfg.Concurrency)
 	var wg sync.WaitGroup
 	for _, m := range candidates {
@@ -175,10 +193,27 @@ func (w *Worker) tick(ctx context.Context) {
 		go func(m repository.Market) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			w.backfillOne(ctx, m)
+			w.backfillOne(ctx, m, &counters)
 		}(m)
 	}
 	wg.Wait()
+
+	w.log.Info().
+		Int("claimed", len(candidates)).
+		Int64("completed", counters.completed.Load()).
+		Int64("partial", counters.partial.Load()).
+		Int64("failed", counters.failed.Load()).
+		Int64("skipped", counters.skipped.Load()).
+		Msg("backfill: tick summary")
+}
+
+// tickCounters is the per-tick result histogram. atomic.Int64 so
+// backfillOne can update from multiple goroutines without a mutex.
+type tickCounters struct {
+	completed atomic.Int64
+	partial   atomic.Int64
+	failed    atomic.Int64
+	skipped   atomic.Int64
 }
 
 // backfillOne runs the full backfill for a single market. The transition
@@ -186,9 +221,12 @@ func (w *Worker) tick(ctx context.Context) {
 // row is no longer in (`pending`, `partial_api_limit`) and BeginBackfill
 // is a no-op. The next steps still run because ListActiveForBackfill
 // already vetted the row.
-func (w *Worker) backfillOne(ctx context.Context, m repository.Market) {
+func (w *Worker) backfillOne(ctx context.Context, m repository.Market, counters *tickCounters) {
 	if err := w.markets.BeginBackfill(ctx, m.ID); err != nil {
 		w.log.Err(err).Int64("market_id", m.ID).Msg("backfill: begin failed")
+		if counters != nil {
+			counters.skipped.Add(1)
+		}
 		return
 	}
 	w.log.Info().
@@ -202,6 +240,9 @@ func (w *Worker) backfillOne(ctx context.Context, m repository.Market) {
 		// for ResetStaleRunning to recover. Anything else is a real error.
 		if errors.Is(finalErr, context.Canceled) || errors.Is(finalErr, context.DeadlineExceeded) {
 			w.log.Info().Int64("market_id", m.ID).Msg("backfill: cancelled mid-run")
+			if counters != nil {
+				counters.skipped.Add(1)
+			}
 			return
 		}
 		if err := w.markets.FailBackfill(ctx, m.ID, finalErr.Error()); err != nil {
@@ -211,14 +252,30 @@ func (w *Worker) backfillOne(ctx context.Context, m repository.Market) {
 			w.metrics.BackfillRunsTotal.WithLabelValues("failed").Inc()
 		}
 		w.log.Err(finalErr).Int64("market_id", m.ID).Msg("backfill: failed")
+		if counters != nil {
+			counters.failed.Add(1)
+		}
 		return
 	}
 	if err := w.markets.CompleteBackfill(ctx, m.ID, status, oldest, newest); err != nil {
 		w.log.Err(err).Int64("market_id", m.ID).Msg("backfill: complete update failed")
+		if counters != nil {
+			counters.failed.Add(1)
+		}
 		return
 	}
 	if w.metrics != nil {
 		w.metrics.BackfillRunsTotal.WithLabelValues(string(status)).Inc()
+	}
+	if counters != nil {
+		switch status {
+		case repository.BackfillCompleted:
+			counters.completed.Add(1)
+		case repository.BackfillPartialAPILimit:
+			counters.partial.Add(1)
+		default:
+			counters.skipped.Add(1)
+		}
 	}
 	w.log.Info().
 		Int64("market_id", m.ID).

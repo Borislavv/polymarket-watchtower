@@ -156,8 +156,15 @@ func (r *MarketRepository) MarkSeenInactive(ctx context.Context, seenConditionID
 
 // ListActiveForBackfill returns the next batch of markets to backfill,
 // ordered by upcoming end_date ASC (nearer-to-resolution first).
-func (r *MarketRepository) ListActiveForBackfill(ctx context.Context, limit int32) ([]Market, error) {
-	rows, err := r.q.ListActiveMarketsForBackfill(ctx, limit)
+//
+// partialRetryAfter is the cooldown applied to partial_api_limit markets
+// before they become re-claimable. Pass zero to disable the cooldown
+// (every tick re-claims partials — only useful in tests).
+func (r *MarketRepository) ListActiveForBackfill(ctx context.Context, limit int32, partialRetryAfter time.Duration) ([]Market, error) {
+	rows, err := r.q.ListActiveMarketsForBackfill(ctx, sqlc.ListActiveMarketsForBackfillParams{
+		PartialRetryAfter: intervalFromDuration(partialRetryAfter),
+		LimitCount:        limit,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list backfill candidates: %w", err)
 	}
