@@ -198,7 +198,7 @@ DSN set; CI integration tests opt in via `POSTGRES_TEST_DSN`.
 ### Strategy versioning decision (v4 cleanup)
 
 Strategy identity is **code-owned**. It lives at
-`anomaly.StrategyIdentity = "informed-flow-v4"` and is woven into every
+`anomaly.StrategyIdentity = "informed-flow-v6"` and is woven into every
 alert dedup key. The previous `STRATEGY_VERSION` env var was removed —
 an operator must not be able to flip the dedup namespace at runtime; a
 stray value would silently re-alert on trades already deduped.

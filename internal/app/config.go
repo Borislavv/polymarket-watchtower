@@ -541,6 +541,52 @@ type Config struct {
 	Alerting          AlertingConfig
 	StatsReport       StatsReportConfig
 	Detection         DetectionConfig
+	StableFavorite    StableFavoriteConfig
+	AIAnalysis        AIAnalysisConfig
+}
+
+// AIAnalysisConfig wires the AI market-intelligence layer. The
+// service operates fully without an OpenAI key — when OPENAI_API_KEY
+// is empty (or AIAnalysisEnabled=false), every analyzer call short-
+// circuits to StatusSkipped and the Telegram path elides the
+// Analyst-note block. No AI-related code path can ever block alert
+// emission.
+type AIAnalysisConfig struct {
+	Enabled  bool   `env:"AI_ANALYSIS_ENABLED" envDefault:"false"`
+	Provider string `env:"AI_ANALYSIS_PROVIDER" envDefault:"openai"`
+	Model    string `env:"AI_ANALYSIS_MODEL" envDefault:"gpt-4.1-mini"`
+	APIKey   string `env:"OPENAI_API_KEY"`
+	BaseURL  string `env:"OPENAI_BASE_URL" envDefault:"https://api.openai.com/v1"`
+
+	Timeout        time.Duration `env:"AI_ANALYSIS_TIMEOUT" envDefault:"8s" validate:"gt=0"`
+	MaxOutputChars int           `env:"AI_ANALYSIS_MAX_OUTPUT_CHARS" envDefault:"700" validate:"gte=100,lte=4000"`
+	MaxPromptChars int           `env:"AI_ANALYSIS_MAX_PROMPT_CHARS" envDefault:"2500" validate:"gte=200,lte=20000"`
+
+	// Cost control.
+	RateLimitPerMin int     `env:"AI_ANALYSIS_RATE_LIMIT_PER_MIN" envDefault:"10" validate:"gte=1"`
+	DailyBudgetUSD  float64 `env:"AI_ANALYSIS_DAILY_BUDGET_USD" envDefault:"5" validate:"gt=0"`
+
+	// Per-1k-token cost overrides — operator-tunable when model
+	// pricing changes.
+	PromptCostPer1kUSD     float64 `env:"AI_ANALYSIS_PROMPT_COST_PER_1K_USD" envDefault:"0.00015" validate:"gte=0"`
+	CompletionCostPer1kUSD float64 `env:"AI_ANALYSIS_COMPLETION_COST_PER_1K_USD" envDefault:"0.0006" validate:"gte=0"`
+
+	// Feature toggles.
+	AlertsEnabled         bool   `env:"AI_ANALYSIS_TELEGRAM_ALERTS_ENABLED" envDefault:"true"`
+	LogAlertsEnabled      bool   `env:"AI_ANALYSIS_LOG_ALERTS_ENABLED" envDefault:"true"`
+	ReportsEnabled        bool   `env:"AI_ANALYSIS_REPORTS_ENABLED" envDefault:"true"`
+	WebContextEnabled     bool   `env:"AI_ANALYSIS_WEB_CONTEXT_ENABLED" envDefault:"false"`
+	WebContextMinSeverity string `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
+
+	// Refresh policy.
+	LifecycleRefreshDeltaPct float64 `env:"AI_ANALYSIS_LIFECYCLE_REFRESH_DELTA_PCT" envDefault:"1" validate:"gte=0"`
+	CLVMaterialChange        float64 `env:"AI_ANALYSIS_CLV_MATERIAL_CHANGE" envDefault:"0.02" validate:"gte=0"`
+
+	// 2h market-intelligence schedule.
+	MarketIntelligenceEnabled        bool          `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
+	MarketIntelligenceInterval       time.Duration `env:"AI_MARKET_INTELLIGENCE_INTERVAL" envDefault:"2h" validate:"gt=0"`
+	MarketIntelligenceMaxMarkets     int           `env:"AI_MARKET_INTELLIGENCE_MAX_MARKETS" envDefault:"50" validate:"gte=1,lte=500"`
+	MarketIntelligenceMaxOutputChars int           `env:"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS" envDefault:"2000" validate:"gte=200,lte=8000"`
 }
 
 // DetectionConfig tunes the v6 detection worker that drains
@@ -551,6 +597,50 @@ type DetectionConfig struct {
 	Workers    int           `env:"DETECTION_WORKERS" envDefault:"16" validate:"gte=1,lte=128"`
 	ClaimLimit int           `env:"DETECTION_CLAIM_LIMIT" envDefault:"500" validate:"gte=1,lte=10000"`
 	Interval   time.Duration `env:"DETECTION_INTERVAL" envDefault:"5s" validate:"gt=0"`
+	// ClaimTTL is the lease duration on a claimed-but-not-yet-stamped
+	// row. After this elapses a worker can reclaim the row (crash
+	// recovery). Must exceed the per-row processing budget; default 5m.
+	ClaimTTL time.Duration `env:"DETECTION_CLAIM_TTL" envDefault:"5m" validate:"gt=0"`
+}
+
+// StableFavoriteConfig configures the late-market-stable-favorite
+// strategy. SEPARATE from whale-flow knobs — must be toggled
+// independently. The strategy looks for late-stage markets with a
+// stable favorite in a defined probability band; it never represents
+// itself as risk-free or guaranteed.
+type StableFavoriteConfig struct {
+	Enabled bool `env:"STABLE_FAVORITE_ENABLED" envDefault:"false"`
+
+	// Lifecycle gates.
+	MinLifecyclePct float64 `env:"STABLE_FAVORITE_MIN_LIFECYCLE_PCT" envDefault:"92" validate:"gte=0,lte=100"`
+	HotLifecyclePct float64 `env:"STABLE_FAVORITE_HOT_LIFECYCLE_PCT" envDefault:"97" validate:"gte=0,lte=100"`
+
+	// Favorite-probability band — we want neither a coinflip nor a
+	// near-certain side (no payout).
+	MinProbability float64 `env:"STABLE_FAVORITE_MIN_PROBABILITY" envDefault:"0.55" validate:"gt=0,lt=1"`
+	MaxProbability float64 `env:"STABLE_FAVORITE_MAX_PROBABILITY" envDefault:"0.85" validate:"gt=0,lt=1"`
+
+	// Remaining-return floor expressed as a percentage.
+	MinReturnPct float64 `env:"STABLE_FAVORITE_MIN_RETURN_PCT" envDefault:"20" validate:"gte=0"`
+
+	// Stability window.
+	StabilityWindow    time.Duration `env:"STABLE_FAVORITE_STABILITY_WINDOW" envDefault:"24h" validate:"gt=0"`
+	MaxPriceStddev     float64       `env:"STABLE_FAVORITE_MAX_PRICE_STDDEV" envDefault:"0.08" validate:"gt=0"`
+	MaxDrawdown        float64       `env:"STABLE_FAVORITE_MAX_DRAWDOWN" envDefault:"0.12" validate:"gt=0"`
+	MaxAdverseMove6h   float64       `env:"STABLE_FAVORITE_MAX_ADVERSE_MOVE_6H" envDefault:"0.08" validate:"gt=0"`
+	MaxNegativeDrift6h float64       `env:"STABLE_FAVORITE_MAX_NEGATIVE_DRIFT_6H" envDefault:"0.05" validate:"gte=0"`
+
+	// Liquidity gates.
+	MinMarketVolumeUSD float64 `env:"STABLE_FAVORITE_MIN_MARKET_VOLUME_USD" envDefault:"25000" validate:"gte=0"`
+	MinRecentTrades    int     `env:"STABLE_FAVORITE_MIN_RECENT_TRADES" envDefault:"20" validate:"gte=0"`
+
+	// Cross-market (optional; no upstream wired in v6).
+	CrossMarketEnabled         bool    `env:"STABLE_FAVORITE_CROSS_MARKET_ENABLED" envDefault:"true"`
+	MaxCrossMarketDisagreement float64 `env:"STABLE_FAVORITE_MAX_CROSS_MARKET_DISAGREEMENT" envDefault:"0.15" validate:"gte=0,lt=1"`
+
+	// Worker cadence.
+	Interval       time.Duration `env:"STABLE_FAVORITE_INTERVAL" envDefault:"5m" validate:"gt=0"`
+	CandidateLimit int           `env:"STABLE_FAVORITE_CANDIDATE_LIMIT" envDefault:"200" validate:"gte=1,lte=10000"`
 }
 
 func LoadConfig() (*Config, error) {

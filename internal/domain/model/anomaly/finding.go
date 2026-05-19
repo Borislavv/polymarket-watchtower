@@ -34,6 +34,16 @@ const (
 	// holders endpoint wired upstream, so the percentage is approximate.
 	// Detected alongside KindAccumulation in the same detect tick.
 	KindOwnership Kind = "ownership_concentration"
+	// KindStableFavorite is a SEPARATE strategy from whale-flow
+	// detection: a market is in its final 8% (default), a single
+	// outcome trades inside the favorite-probability band (default
+	// 55–85%), the price has been stable, no adverse drift, and
+	// liquidity is reasonable. Fires on slow-time market state, not
+	// per-trade — emitted by internal/app/usecase/stablefavorite.
+	//
+	// Surveillance read: "late-market convergence candidate with
+	// meaningful remaining payout". Never described as risk-free.
+	KindStableFavorite Kind = "stable_favorite"
 )
 
 // Severity is a coarse classification routed by sinks and dashboards.
@@ -236,6 +246,74 @@ type OwnershipRef struct {
 	Approximate bool
 }
 
+// StableFavoriteRef carries the structured payload of a
+// late-market-stable-favorite alert. This is a DISTINCT signal from
+// whale-flow detection — the favorite-probability band, stability
+// stats, remaining payout, and cross-market context are surfaced so
+// an operator can decide whether the alert is actionable without
+// re-querying the source.
+//
+// Important rendering invariant: NEVER described as "safe" or
+// "guaranteed" by any consumer of this struct. Political markets gap
+// on late news; the strategy quantifies stability but cannot remove
+// underlying event risk.
+type StableFavoriteRef struct {
+	MarketID     string // condition_id
+	OutcomeToken string
+	Outcome      string // "Yes" / "No" / label from market metadata
+
+	// Probability is the current price (= implied probability).
+	Probability float64
+	// RemainingReturnPct is (1 − price) / price expressed as a
+	// percentage. Example: 0.65 → 53.8%.
+	RemainingReturnPct float64
+
+	// StabilityWindow is the lookback over which the price-stability
+	// stats were computed (typically 24h, but the worker may use a
+	// shorter window for very-near-resolution markets).
+	StabilityWindow time.Duration
+
+	// 24h-window stats: mean / stddev / min / max / first / last
+	// price + observed sample count.
+	PriceMean    float64
+	PriceStddev  float64
+	PriceMin     float64
+	PriceMax     float64
+	PriceFirst   float64
+	PriceLast    float64
+	PriceSamples int
+
+	// Drawdown is (max − min) / max over the window — bounded in
+	// [0, 1].
+	Drawdown float64
+	// AdverseMove6h is the price drift over the most recent 6h:
+	// (price_now − price_6h_ago) for the favored side, so NEGATIVE
+	// values indicate adverse drift (favorite weakening).
+	AdverseMove6h float64
+
+	// Liquidity proxies.
+	RecentVolumeUSD  float64
+	RecentTradeCount int
+
+	LifecyclePct float64
+
+	// Score is the 0..100 ranking heuristic — not a probability.
+	// Confidence is the 0..1 adjustment driven by sample size and
+	// cross-market availability.
+	Score      float64
+	Confidence float64
+
+	// CrossMarketStatus is one of:
+	//   "" / "unavailable" — no related-market data wired
+	//   "confirmed"        — related market within MaxDisagreement of this price
+	//   "conflict"         — related market disagrees beyond MaxDisagreement
+	CrossMarketStatus string
+	// CrossMarketDelta is the absolute price-difference between this
+	// outcome and its cross-market match. Zero when CrossMarketStatus
+	// is "" or "unavailable".
+	CrossMarketDelta float64
+}
+
 // ClusterStats summarises a category-cluster alert.
 type ClusterStats struct {
 	Window          time.Duration
@@ -316,6 +394,11 @@ type Finding struct {
 	// trade_anomaly / accumulation / category_watch.
 	Ownership *OwnershipRef
 
+	// StableFavorite is populated on KindStableFavorite Findings.
+	// Distinct from trade-anomaly / accumulation — this is the
+	// late-market-convergence strategy.
+	StableFavorite *StableFavoriteRef
+
 	// QuietMarket is the context tag attached when the firing event landed
 	// on a historically quiet (market, outcome). Nil otherwise. Applies to
 	// single-trade and accumulation Findings; cluster Findings do not
@@ -350,4 +433,10 @@ type Finding struct {
 	// messages with database rows or with Grafana logs use this string
 	// as the primary join key.
 	DedupKey string
+
+	// AnalystNote is the AI-generated analysis text. Optional —
+	// empty when the AI layer is disabled, missing an API key,
+	// rate-limited, or otherwise unavailable. Telegram formatter
+	// renders an "Analyst note" block when this is non-empty.
+	AnalystNote string
 }

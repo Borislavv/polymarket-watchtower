@@ -51,21 +51,20 @@ type Querier interface {
 	// failed rows (status='failed' AND next_retry_at <= now()). The retry
 	// worker is the same alertsender; there is no separate retry path.
 	ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([]PolymarketAlerts, error)
-	// Claim a batch of trades that have never been through the detection
-	// worker. SKIP LOCKED keeps concurrent workers from contending on the
-	// same rows; the partial index on (traded_at DESC) WHERE detected_at
-	// IS NULL keeps this cheap.
-	//
-	// The claimer does NOT mutate the rows — it just locks them. A second
-	// statement (MarkTradeDetectionResult) records the terminal state once
-	// the worker finishes processing. If the worker crashes mid-trade the
-	// row stays pending and the next claimer picks it up.
-	ClaimUndetectedTrades(ctx context.Context, claimLimit int32) ([]ClaimUndetectedTradesRow, error)
+	// Atomically lease a batch of trades that need detection processing.
+	// The UPDATE flips detection_claimed_at to NOW() and stamps the
+	// worker id; the inner SELECT … FOR UPDATE SKIP LOCKED ensures
+	// concurrent workers see disjoint batches. A leased row stays in
+	// 'pending' (detected_at IS NULL) until the worker calls
+	// MarkTradeDetectionResult; if the worker crashes, ResetStaleDetectionClaims
+	// reclaims rows whose lease is older than the configured TTL.
+	ClaimUndetectedTrades(ctx context.Context, arg ClaimUndetectedTradesParams) ([]ClaimUndetectedTradesRow, error)
 	CompleteMarketBackfill(ctx context.Context, arg CompleteMarketBackfillParams) error
 	// /stats break-down: rows by terminal detection state. NULL status is
 	// reported as 'pending'.
 	DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error)
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
+	GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (PolymarketAlertOutcomeAnalyses, error)
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
@@ -74,6 +73,18 @@ type Querier interface {
 	// trade.Trade from polymarket_trades.
 	GetTraderByID(ctx context.Context, id int64) (PolymarketTraders, error)
 	GetTraderByWallet(ctx context.Context, walletAddress string) (PolymarketTraders, error)
+	// Persist one AI alert-analysis row. Versions are append-only; the
+	// usecase layer chooses the version number (latest+1 on refresh,
+	// else 1). The trigger fields record WHY this version was generated
+	// so the lessons dataset can be re-derived later.
+	InsertAlertAnalysis(ctx context.Context, arg InsertAlertAnalysisParams) (PolymarketAlertAnalyses, error)
+	// One row per alert; the outcomes worker calls this once per alert
+	// when the market resolves. Unique constraint on alert_id makes the
+	// write idempotent.
+	InsertAlertOutcomeAnalysis(ctx context.Context, arg InsertAlertOutcomeAnalysisParams) (PolymarketAlertOutcomeAnalyses, error)
+	// Persist one 2h report. summary_hash unique-conflict skips silently
+	// so the caller can decide whether to retry-with-fresh-content.
+	InsertMarketIntelligenceReport(ctx context.Context, arg InsertMarketIntelligenceReportParams) (PolymarketMarketIntelligenceReports, error)
 	// Insert a single trade. ON CONFLICT (dedup_key) DO NOTHING is the dedup
 	// primitive — concurrent inserters of the same trade race to the unique
 	// constraint and exactly one wins. The caller maps pgx.ErrNoRows to
@@ -85,9 +96,21 @@ type Querier interface {
 	// yields the gap to the previous historical trade so the detector can
 	// judge "idle for how long?" without re-listing rows.
 	LastTradeAtBefore(ctx context.Context, arg LastTradeAtBeforeParams) (pgtype.Timestamptz, error)
+	// Returns the most recent analysis row for the alert. Telegram
+	// formatter and operators reading the alert page consume this.
+	LatestAlertAnalysis(ctx context.Context, alertID int64) (PolymarketAlertAnalyses, error)
+	// Returns the highest version number recorded for the alert, or 0
+	// when none. Used by the refresh policy to compute next-version.
+	LatestAlertAnalysisVersion(ctx context.Context, alertID int64) (int32, error)
 	// Used by the cluster cooldown gate. Returns NULL when there's been no
 	// cluster alert for this market+outcome under the current strategy.
 	LatestClusterAlertForCategory(ctx context.Context, arg LatestClusterAlertForCategoryParams) (PolymarketAlerts, error)
+	LatestMarketIntelligenceReport(ctx context.Context) (PolymarketMarketIntelligenceReports, error)
+	// Most recent observed price for (market, outcome). Used by the
+	// stable-favorite worker as "current price" since there is no CLOB
+	// bid/ask wired upstream — the most recent trade is the best proxy
+	// we have for the implied probability.
+	LatestPriceForOutcome(ctx context.Context, arg LatestPriceForOutcomeParams) (float64, error)
 	// Returns the most recent signal report of the given period_type, or
 	// empty if none exists. Used at scheduler startup to decide whether
 	// we missed a tick.
@@ -121,6 +144,15 @@ type Querier interface {
 	// detector to count distinct wallets and total notional.
 	ListClusterWindowTrades(ctx context.Context, arg ListClusterWindowTradesParams) ([]ListClusterWindowTradesRow, error)
 	ListEnabledCategories(ctx context.Context) ([]PolymarketCategories, error)
+	// Active markets whose lifecycle progress has crossed the supplied
+	// threshold AND haven't been soft-deleted/purged. Returns enough
+	// context for the stable-favorite worker to build inputs without a
+	// second roundtrip per row.
+	//
+	// The lifecycle math mirrors the in-memory market.LifecyclePct used
+	// by the per-trade scorer so the two strategies agree on what
+	// "late-market" means.
+	ListLateMarketCandidates(ctx context.Context, arg ListLateMarketCandidatesParams) ([]ListLateMarketCandidatesRow, error)
 	ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]int64, error)
 	// Used by the drift worker. Returns sent alerts whose drift is still
 	// pending AND whose oldest reference window (15m by convention) has
@@ -205,6 +237,8 @@ type Querier interface {
 	// detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
 	// CHECK constraint enforces this). detection_skip_reason is set only
 	// when status='skipped'; last_detection_error only when status='failed'.
+	// The lease columns are cleared atomically so a row can never enter a
+	// "completed but still leased" state.
 	MarkTradeDetectionResult(ctx context.Context, arg MarkTradeDetectionResultParams) error
 	// Reads the per-market collect cursor. Returns NULL when the market
 	// has never been touched by collect (first-sight or backfill-only),
@@ -226,6 +260,15 @@ type Querier interface {
 	// /stats and Grafana so operators can see whether the worker is
 	// keeping up.
 	PendingDetectionCount(ctx context.Context) (int64, error)
+	// Per-(market, outcome) price/volume stats over a lookback window.
+	// Powers the late-market stable-favorite worker — stability,
+	// adverse-drift, and liquidity gates all read from this one row.
+	//
+	// first/last via array_agg(ORDER BY) so a single scan yields both.
+	// STDDEV_POP (not _SAMP) because we treat the window as the
+	// population for stability purposes; the worker enforces a minimum
+	// sample count upstream.
+	PriceWindowStats(ctx context.Context, arg PriceWindowStatsParams) (PriceWindowStatsRow, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending
 	// so the BackfillWorker picks up missing history on the next tick.
@@ -233,6 +276,10 @@ type Querier interface {
 	// query covers the path where the sanity worker confirms resumption via
 	// a fresh DB read.
 	RequeueResumedMarket(ctx context.Context, id int64) error
+	// Free leases held longer than the supplied interval, so the next
+	// claim picks the row back up. Returns the number of rows reset (the
+	// worker logs this so an operator can spot crash loops).
+	ResetStaleDetectionClaims(ctx context.Context, staleAfter pgtype.Interval) (int64, error)
 	// Recovery: a process that crashed mid-backfill leaves rows in 'running'.
 	// This resets any 'running' row whose backfill_started_at is older than
 	// the supplied threshold, so the next scheduler tick re-claims them.

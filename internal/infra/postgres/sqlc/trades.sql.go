@@ -184,18 +184,32 @@ func (q *Queries) BaselineSpan(ctx context.Context, arg BaselineSpanParams) (Bas
 }
 
 const claimUndetectedTrades = `-- name: ClaimUndetectedTrades :many
-SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
-       t.size_shares, t.notional_usd, t.traded_at, t.external_id,
-       t.tx_hash, t.ingested_at, t.dedup_key,
-       t.detection_attempts,
-       m.condition_id AS market_condition_id
-FROM polymarket_trades t
-JOIN polymarket_markets m ON m.id = t.market_id
-WHERE t.detected_at IS NULL
-ORDER BY t.traded_at DESC, t.id DESC
-LIMIT $1::integer
-FOR UPDATE OF t SKIP LOCKED
+UPDATE polymarket_trades t
+SET detection_claimed_at = NOW(),
+    detection_worker_id  = $1::text
+FROM (
+    SELECT id
+    FROM polymarket_trades
+    WHERE detected_at IS NULL
+      AND (detection_claimed_at IS NULL OR detection_claimed_at < NOW() - $2::interval)
+    ORDER BY traded_at DESC, id DESC
+    LIMIT $3::integer
+    FOR UPDATE SKIP LOCKED
+) AS picked
+JOIN polymarket_markets m ON TRUE
+WHERE t.id = picked.id AND m.id = t.market_id
+RETURNING t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
+          t.size_shares, t.notional_usd, t.traded_at, t.external_id,
+          t.tx_hash, t.ingested_at, t.dedup_key,
+          t.detection_attempts,
+          m.condition_id AS market_condition_id
 `
+
+type ClaimUndetectedTradesParams struct {
+	WorkerID   string
+	ClaimTtl   pgtype.Interval
+	ClaimLimit int32
+}
 
 type ClaimUndetectedTradesRow struct {
 	ID                int64
@@ -215,17 +229,15 @@ type ClaimUndetectedTradesRow struct {
 	MarketConditionID string
 }
 
-// Claim a batch of trades that have never been through the detection
-// worker. SKIP LOCKED keeps concurrent workers from contending on the
-// same rows; the partial index on (traded_at DESC) WHERE detected_at
-// IS NULL keeps this cheap.
-//
-// The claimer does NOT mutate the rows — it just locks them. A second
-// statement (MarkTradeDetectionResult) records the terminal state once
-// the worker finishes processing. If the worker crashes mid-trade the
-// row stays pending and the next claimer picks it up.
-func (q *Queries) ClaimUndetectedTrades(ctx context.Context, claimLimit int32) ([]ClaimUndetectedTradesRow, error) {
-	rows, err := q.db.Query(ctx, claimUndetectedTrades, claimLimit)
+// Atomically lease a batch of trades that need detection processing.
+// The UPDATE flips detection_claimed_at to NOW() and stamps the
+// worker id; the inner SELECT … FOR UPDATE SKIP LOCKED ensures
+// concurrent workers see disjoint batches. A leased row stays in
+// 'pending' (detected_at IS NULL) until the worker calls
+// MarkTradeDetectionResult; if the worker crashes, ResetStaleDetectionClaims
+// reclaims rows whose lease is older than the configured TTL.
+func (q *Queries) ClaimUndetectedTrades(ctx context.Context, arg ClaimUndetectedTradesParams) ([]ClaimUndetectedTradesRow, error) {
+	rows, err := q.db.Query(ctx, claimUndetectedTrades, arg.WorkerID, arg.ClaimTtl, arg.ClaimLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +319,7 @@ VALUES (
     $8, $9, $10, $11
 )
 ON CONFLICT (dedup_key) DO NOTHING
-RETURNING id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error
+RETURNING id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error, detection_claimed_at, detection_worker_id
 `
 
 type InsertTradeParams struct {
@@ -362,6 +374,8 @@ func (q *Queries) InsertTrade(ctx context.Context, arg InsertTradeParams) (Polym
 		&i.DetectionSkipReason,
 		&i.DetectionAttempts,
 		&i.LastDetectionError,
+		&i.DetectionClaimedAt,
+		&i.DetectionWorkerID,
 	)
 	return i, err
 }
@@ -392,6 +406,30 @@ func (q *Queries) LastTradeAtBefore(ctx context.Context, arg LastTradeAtBeforePa
 	return last_at, err
 }
 
+const latestPriceForOutcome = `-- name: LatestPriceForOutcome :one
+SELECT price FROM polymarket_trades
+WHERE market_id     = $1::bigint
+  AND outcome_token = $2::text
+ORDER BY traded_at DESC
+LIMIT 1
+`
+
+type LatestPriceForOutcomeParams struct {
+	MarketID     int64
+	OutcomeToken string
+}
+
+// Most recent observed price for (market, outcome). Used by the
+// stable-favorite worker as "current price" since there is no CLOB
+// bid/ask wired upstream — the most recent trade is the best proxy
+// we have for the implied probability.
+func (q *Queries) LatestPriceForOutcome(ctx context.Context, arg LatestPriceForOutcomeParams) (float64, error) {
+	row := q.db.QueryRow(ctx, latestPriceForOutcome, arg.MarketID, arg.OutcomeToken)
+	var price float64
+	err := row.Scan(&price)
+	return price, err
+}
+
 const latestTradeAt = `-- name: LatestTradeAt :one
 SELECT MAX(traded_at)::timestamptz AS latest_at
 FROM polymarket_trades
@@ -408,7 +446,7 @@ func (q *Queries) LatestTradeAt(ctx context.Context, marketID int64) (pgtype.Tim
 }
 
 const listBaselineTrades = `-- name: ListBaselineTrades :many
-SELECT id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error FROM polymarket_trades
+SELECT id, market_id, trader_id, outcome_token, side, price, size_shares, notional_usd, traded_at, external_id, tx_hash, ingested_at, dedup_key, detected_at, detection_status, detection_skip_reason, detection_attempts, last_detection_error, detection_claimed_at, detection_worker_id FROM polymarket_trades
 WHERE market_id = $1
   AND outcome_token = $2
   AND traded_at >= $3
@@ -460,6 +498,8 @@ func (q *Queries) ListBaselineTrades(ctx context.Context, arg ListBaselineTrades
 			&i.DetectionSkipReason,
 			&i.DetectionAttempts,
 			&i.LastDetectionError,
+			&i.DetectionClaimedAt,
+			&i.DetectionWorkerID,
 		); err != nil {
 			return nil, err
 		}
@@ -472,7 +512,7 @@ func (q *Queries) ListBaselineTrades(ctx context.Context, arg ListBaselineTrades
 }
 
 const listClusterWindowTrades = `-- name: ListClusterWindowTrades :many
-SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price, t.size_shares, t.notional_usd, t.traded_at, t.external_id, t.tx_hash, t.ingested_at, t.dedup_key, t.detected_at, t.detection_status, t.detection_skip_reason, t.detection_attempts, t.last_detection_error, m.condition_id AS market_condition_id
+SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price, t.size_shares, t.notional_usd, t.traded_at, t.external_id, t.tx_hash, t.ingested_at, t.dedup_key, t.detected_at, t.detection_status, t.detection_skip_reason, t.detection_attempts, t.last_detection_error, t.detection_claimed_at, t.detection_worker_id, m.condition_id AS market_condition_id
 FROM polymarket_trades t
 JOIN polymarket_markets m ON m.id = t.market_id
 WHERE t.market_id = $1
@@ -504,6 +544,8 @@ type ListClusterWindowTradesRow struct {
 	DetectionSkipReason *string
 	DetectionAttempts   int32
 	LastDetectionError  *string
+	DetectionClaimedAt  pgtype.Timestamptz
+	DetectionWorkerID   *string
 	MarketConditionID   string
 }
 
@@ -537,7 +579,79 @@ func (q *Queries) ListClusterWindowTrades(ctx context.Context, arg ListClusterWi
 			&i.DetectionSkipReason,
 			&i.DetectionAttempts,
 			&i.LastDetectionError,
+			&i.DetectionClaimedAt,
+			&i.DetectionWorkerID,
 			&i.MarketConditionID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLateMarketCandidates = `-- name: ListLateMarketCandidates :many
+SELECT m.id, m.condition_id, m.slug, m.question, m.event_slug, m.start_date, m.end_date,
+       (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+              NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct
+FROM polymarket_markets m
+WHERE m.active = TRUE
+  AND m.deleted_at IS NULL
+  AND m.purged_at  IS NULL
+  AND m.start_date IS NOT NULL
+  AND m.end_date   IS NOT NULL
+  AND m.end_date    > NOW()
+  AND (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+             NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision >= $1::double precision
+ORDER BY lifecycle_pct DESC
+LIMIT $2::integer
+`
+
+type ListLateMarketCandidatesParams struct {
+	MinLifecyclePct float64
+	LimitCount      int32
+}
+
+type ListLateMarketCandidatesRow struct {
+	ID           int64
+	ConditionID  string
+	Slug         string
+	Question     string
+	EventSlug    *string
+	StartDate    pgtype.Timestamptz
+	EndDate      pgtype.Timestamptz
+	LifecyclePct float64
+}
+
+// Active markets whose lifecycle progress has crossed the supplied
+// threshold AND haven't been soft-deleted/purged. Returns enough
+// context for the stable-favorite worker to build inputs without a
+// second roundtrip per row.
+//
+// The lifecycle math mirrors the in-memory market.LifecyclePct used
+// by the per-trade scorer so the two strategies agree on what
+// "late-market" means.
+func (q *Queries) ListLateMarketCandidates(ctx context.Context, arg ListLateMarketCandidatesParams) ([]ListLateMarketCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listLateMarketCandidates, arg.MinLifecyclePct, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLateMarketCandidatesRow
+	for rows.Next() {
+		var i ListLateMarketCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConditionID,
+			&i.Slug,
+			&i.Question,
+			&i.EventSlug,
+			&i.StartDate,
+			&i.EndDate,
+			&i.LifecyclePct,
 		); err != nil {
 			return nil, err
 		}
@@ -589,7 +703,9 @@ SET detected_at           = NOW(),
     detection_status      = $1::text,
     detection_skip_reason = $2::text,
     last_detection_error  = $3::text,
-    detection_attempts    = detection_attempts + 1
+    detection_attempts    = detection_attempts + 1,
+    detection_claimed_at  = NULL,
+    detection_worker_id   = NULL
 WHERE id = $4::bigint
 `
 
@@ -604,6 +720,8 @@ type MarkTradeDetectionResultParams struct {
 // detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
 // CHECK constraint enforces this). detection_skip_reason is set only
 // when status='skipped'; last_detection_error only when status='failed'.
+// The lease columns are cleared atomically so a row can never enter a
+// "completed but still leased" state.
 func (q *Queries) MarkTradeDetectionResult(ctx context.Context, arg MarkTradeDetectionResultParams) error {
 	_, err := q.db.Exec(ctx, markTradeDetectionResult,
 		arg.Status,
@@ -678,6 +796,89 @@ func (q *Queries) PendingDetectionCount(ctx context.Context) (int64, error) {
 	var pending int64
 	err := row.Scan(&pending)
 	return pending, err
+}
+
+const priceWindowStats = `-- name: PriceWindowStats :one
+SELECT
+    COUNT(*)::bigint                                            AS sample_count,
+    COALESCE(AVG(price), 0)::double precision                   AS mean_price,
+    COALESCE(STDDEV_POP(price), 0)::double precision            AS stddev_price,
+    COALESCE(MIN(price), 0)::double precision                   AS min_price,
+    COALESCE(MAX(price), 0)::double precision                   AS max_price,
+    COALESCE((array_agg(price ORDER BY traded_at ASC))[1],  0)::double precision AS first_price,
+    COALESCE((array_agg(price ORDER BY traded_at DESC))[1], 0)::double precision AS last_price,
+    COALESCE(SUM(notional_usd), 0)::double precision            AS volume_usd,
+    COALESCE(SUM(notional_usd) FILTER (WHERE side = 'BUY'),  0)::double precision AS buy_volume_usd,
+    COALESCE(SUM(notional_usd) FILTER (WHERE side = 'SELL'), 0)::double precision AS sell_volume_usd
+FROM polymarket_trades
+WHERE market_id     = $1::bigint
+  AND outcome_token = $2::text
+  AND traded_at    >= $3::timestamptz
+`
+
+type PriceWindowStatsParams struct {
+	MarketID     int64
+	OutcomeToken string
+	Since        pgtype.Timestamptz
+}
+
+type PriceWindowStatsRow struct {
+	SampleCount   int64
+	MeanPrice     float64
+	StddevPrice   float64
+	MinPrice      float64
+	MaxPrice      float64
+	FirstPrice    float64
+	LastPrice     float64
+	VolumeUsd     float64
+	BuyVolumeUsd  float64
+	SellVolumeUsd float64
+}
+
+// Per-(market, outcome) price/volume stats over a lookback window.
+// Powers the late-market stable-favorite worker — stability,
+// adverse-drift, and liquidity gates all read from this one row.
+//
+// first/last via array_agg(ORDER BY) so a single scan yields both.
+// STDDEV_POP (not _SAMP) because we treat the window as the
+// population for stability purposes; the worker enforces a minimum
+// sample count upstream.
+func (q *Queries) PriceWindowStats(ctx context.Context, arg PriceWindowStatsParams) (PriceWindowStatsRow, error) {
+	row := q.db.QueryRow(ctx, priceWindowStats, arg.MarketID, arg.OutcomeToken, arg.Since)
+	var i PriceWindowStatsRow
+	err := row.Scan(
+		&i.SampleCount,
+		&i.MeanPrice,
+		&i.StddevPrice,
+		&i.MinPrice,
+		&i.MaxPrice,
+		&i.FirstPrice,
+		&i.LastPrice,
+		&i.VolumeUsd,
+		&i.BuyVolumeUsd,
+		&i.SellVolumeUsd,
+	)
+	return i, err
+}
+
+const resetStaleDetectionClaims = `-- name: ResetStaleDetectionClaims :execrows
+UPDATE polymarket_trades
+SET detection_claimed_at = NULL,
+    detection_worker_id  = NULL
+WHERE detected_at IS NULL
+  AND detection_claimed_at IS NOT NULL
+  AND detection_claimed_at < NOW() - $1::interval
+`
+
+// Free leases held longer than the supplied interval, so the next
+// claim picks the row back up. Returns the number of rows reset (the
+// worker logs this so an operator can spot crash loops).
+func (q *Queries) ResetStaleDetectionClaims(ctx context.Context, staleAfter pgtype.Interval) (int64, error) {
+	result, err := q.db.Exec(ctx, resetStaleDetectionClaims, staleAfter)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const traderFirstSeenAt = `-- name: TraderFirstSeenAt :one

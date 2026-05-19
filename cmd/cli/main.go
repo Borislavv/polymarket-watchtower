@@ -24,6 +24,15 @@ func main() {
 	case "migrate":
 		runMigrate(os.Args[2:])
 	case "diagnose-alerts":
+		// v6 path uses the production scorer (analytics/score.Score)
+		// so the projected fire counts match exactly what the
+		// watchtower binary would emit. The legacy v4 multiplier-only
+		// diagnose has been removed — call runDiagnoseAlertsV6 only.
+		runDiagnoseAlertsV6(os.Args[2:])
+	case "diagnose-alerts-v4":
+		// Kept for one release as an operator escape hatch in case
+		// they want the old multiplier-ladder breakdown. Will be
+		// removed after the v6 path proves out.
 		runDiagnoseAlerts(os.Args[2:])
 	default:
 		usage()

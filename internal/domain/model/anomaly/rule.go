@@ -2,10 +2,11 @@ package anomaly
 
 // Canonical alert reasons rendered in the Telegram header and metric labels.
 const (
-	ReasonSingle       = "LargeRareBet"
-	ReasonCluster      = "WhaleClusterDetected"
-	ReasonAccumulation = "SameTraderAccumulationLine"
-	ReasonOwnership    = "MarketOwnershipConcentration"
+	ReasonSingle         = "LargeRareBet"
+	ReasonCluster        = "WhaleClusterDetected"
+	ReasonAccumulation   = "SameTraderAccumulationLine"
+	ReasonOwnership      = "MarketOwnershipConcentration"
+	ReasonStableFavorite = "LateMarketStableFavorite"
 )
 
 // Structured reason codes attached to Finding.Reasons (and to
@@ -78,6 +79,18 @@ const (
 	// X by gates" from "would have been tier X+1 but baseline was
 	// thin so we capped it".
 	ReasonSeverityCappedLowBaseline = "SEVERITY_CAPPED_LOW_BASELINE"
+
+	// --- Stable-favorite (late-market convergence) reason codes ----
+	// All of the following are emitted ONLY on KindStableFavorite
+	// Findings and never overlap with whale-flow detection.
+	ReasonLateMarketFavorite        = "LATE_MARKET_FAVORITE"
+	ReasonStablePrice               = "STABLE_PRICE"
+	ReasonLowVolatility             = "LOW_VOLATILITY"
+	ReasonNoReversalPressure        = "NO_REVERSAL_PRESSURE"
+	ReasonMeaningfulRemainingPayoff = "MEANINGFUL_REMAINING_PAYOFF"
+	ReasonCrossMarketConfirmation   = "CROSS_MARKET_CONFIRMATION"
+	ReasonCrossMarketConflict       = "CROSS_MARKET_CONFLICT"
+	ReasonLowLiquidityRisk          = "LOW_LIQUIDITY_RISK"
 )
 
 // Tier is one severity rung on the single-trade ladder. A trade qualifies at

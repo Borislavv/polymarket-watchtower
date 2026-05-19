@@ -33,6 +33,9 @@ const (
 	// approximated from trade-flow share counts. CHECK constraint added
 	// in migration 00006.
 	AlertKindOwnership AlertKind = "ownership_concentration"
+	// AlertKindStableFavorite is the late-market-convergence
+	// strategy. Emitted by internal/app/usecase/stablefavorite.
+	AlertKindStableFavorite AlertKind = "stable_favorite"
 )
 
 // OutcomeStatus is the typed string used by polymarket_alerts.outcome_status.

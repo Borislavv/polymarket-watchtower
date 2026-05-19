@@ -106,7 +106,15 @@ type Stats struct {
 	AlertsFailed         int64
 	AlertsSent           int64
 	BackfillByStatus     map[string]int64
-	UptimeSince          time.Time
+	// v6 detection-queue breakdown. DetectionByStatus maps
+	// detection_status ("analyzed" | "skipped" | "failed" | "pending"
+	// when null) to row count. DetectionPending is the count of rows
+	// the worker still has to process (i.e. detected_at IS NULL).
+	// These come from polymarket_trades, not the alerts table — they
+	// reflect ingest-pipeline health, not Telegram-delivery health.
+	DetectionByStatus map[string]int64
+	DetectionPending  int64
+	UptimeSince       time.Time
 }
 
 // Worker is the long-running summary loop. Safe to run alongside
@@ -247,6 +255,20 @@ func Format(s Stats, now time.Time) string {
 			fmt.Fprintf(&b, "• %s: %d\n", html.EscapeString(st), n)
 		}
 	}
+	if len(s.DetectionByStatus) > 0 || s.DetectionPending > 0 {
+		b.WriteString("\n<b>Detection</b>\n")
+		// Fixed order so two consecutive summaries are diff-friendly.
+		for _, st := range []string{"analyzed", "skipped", "failed"} {
+			n := s.DetectionByStatus[st]
+			if n == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "• %s: %d\n", html.EscapeString(st), n)
+		}
+		if s.DetectionPending > 0 {
+			fmt.Fprintf(&b, "• pending: %d\n", s.DetectionPending)
+		}
+	}
 	return b.String()
 }
 
@@ -359,6 +381,30 @@ func (s *Store) Read(ctx context.Context) (Stats, error) {
 	if sent != nil {
 		out.AlertsSent = *sent
 	}
+
+	detRows, err := s.pool.Query(ctx, `
+		SELECT COALESCE(detection_status, 'pending')::text, COUNT(*)
+		FROM polymarket_trades
+		GROUP BY 1
+	`)
+	if err != nil {
+		return out, fmt.Errorf("read detection breakdown: %w", err)
+	}
+	out.DetectionByStatus = make(map[string]int64, 4)
+	for detRows.Next() {
+		var st string
+		var n int64
+		if err := detRows.Scan(&st, &n); err != nil {
+			detRows.Close()
+			return out, fmt.Errorf("scan detection: %w", err)
+		}
+		if st == "pending" {
+			out.DetectionPending = n
+		} else {
+			out.DetectionByStatus[st] = n
+		}
+	}
+	detRows.Close()
 
 	bfRows, err := s.pool.Query(ctx, `
 		SELECT backfill_status, COUNT(*) FROM polymarket_markets

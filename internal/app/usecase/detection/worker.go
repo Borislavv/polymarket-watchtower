@@ -22,6 +22,7 @@ package detection
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -32,6 +33,12 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+)
+
+// osHostname / osPid are package-level vars so tests can override.
+var (
+	osHostname = func() (string, error) { return os.Hostname() }
+	osPid      = func() int { return os.Getpid() }
 )
 
 // Canonical skip reasons stamped on detection_skip_reason. Used by
@@ -50,10 +57,11 @@ type Observer interface {
 // TradeClaimer is the subset of repository.TradeRepository the worker
 // uses. *repository.TradeRepository satisfies it.
 type TradeClaimer interface {
-	ClaimUndetectedTrades(ctx context.Context, limit int32) ([]repository.PendingDetectionTrade, error)
+	ClaimUndetectedTrades(ctx context.Context, workerID string, limit int32, claimTTL time.Duration) ([]repository.PendingDetectionTrade, error)
 	MarkDetectionAnalyzed(ctx context.Context, tradeID int64) error
 	MarkDetectionSkipped(ctx context.Context, tradeID int64, reason string) error
 	MarkDetectionFailed(ctx context.Context, tradeID int64, errMsg string) error
+	ResetStaleDetectionClaims(ctx context.Context, staleAfter time.Duration) (int64, error)
 }
 
 // MarketCache resolves a market condition_id to the in-memory
@@ -81,6 +89,16 @@ type Config struct {
 	// too_old_for_live_alert even though Observe still ran (the
 	// scorer's internal gate ensures no alert was emitted).
 	StaleThreshold time.Duration
+	// ClaimTTL is the lease duration. A row claimed by a worker that
+	// then crashes is reclaimable by another worker after this
+	// timeout. Must be longer than the per-row processing budget
+	// (Observe + DB write); a too-short TTL causes double-processing,
+	// a too-long TTL slows crash recovery. Default 5m.
+	ClaimTTL time.Duration
+	// WorkerID is stamped on each leased row so an operator can see
+	// who's holding what during incident diagnosis. Defaults to a
+	// hostname-derived value.
+	WorkerID string
 	// Clock optionally overrides time.Now (tests).
 	Clock func() time.Time
 }
@@ -95,9 +113,16 @@ func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = 5 * time.Second
 	}
-	// StaleThreshold == 0 disables the stale-stamp (every analyzed
-	// trade is marked 'analyzed'; only Observer's internal lag gate
-	// suppresses Telegram). Production sets this to LiveAlertMaxLag.
+	if c.ClaimTTL <= 0 {
+		c.ClaimTTL = 5 * time.Minute
+	}
+	if c.WorkerID == "" {
+		// Hostname-derived default keeps logs interpretable on
+		// multi-replica deploys. PID-suffix to disambiguate when an
+		// operator restarts in place.
+		hn, _ := osHostname()
+		c.WorkerID = fmt.Sprintf("%s:%d", hn, osPid())
+	}
 	if c.Clock == nil {
 		c.Clock = time.Now
 	}
@@ -149,6 +174,14 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) Tick(ctx context.Context) { w.tick(ctx) }
 
 func (w *Worker) tick(ctx context.Context) {
+	// Reset stale leases first so rows abandoned by crashed siblings
+	// re-enter the claimable pool. Errors are logged but don't block
+	// the tick — the claim query handles the same predicate inline.
+	if n, err := w.claimer.ResetStaleDetectionClaims(ctx, w.cfg.ClaimTTL); err != nil {
+		w.log.Err(err).Msg("detection: reset stale claims failed")
+	} else if n > 0 {
+		w.log.Warn().Int64("reclaimed", n).Msg("detection: stale claims reclaimed")
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Workers; i++ {
 		wg.Add(1)
@@ -178,7 +211,7 @@ func (w *Worker) drainLoop(ctx context.Context) {
 }
 
 func (w *Worker) processOne(ctx context.Context) (int, error) {
-	rows, err := w.claimer.ClaimUndetectedTrades(ctx, w.cfg.ClaimLimit)
+	rows, err := w.claimer.ClaimUndetectedTrades(ctx, w.cfg.WorkerID, w.cfg.ClaimLimit, w.cfg.ClaimTTL)
 	if err != nil {
 		if w.metrics != nil && w.metrics.DetectionFailed != nil {
 			w.metrics.DetectionFailed.WithLabelValues("claim_error").Inc()

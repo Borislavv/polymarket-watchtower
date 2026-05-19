@@ -271,14 +271,19 @@ type PendingDetectionTrade struct {
 	DetectionAttempts int32
 }
 
-// ClaimUndetectedTrades pulls up to `limit` trades that have never been
-// through the detection worker, locking them FOR UPDATE SKIP LOCKED so
-// concurrent workers see disjoint batches. The caller MUST mark each
-// returned row via MarkDetectionAnalyzed / MarkDetectionSkipped /
-// MarkDetectionFailed before its transaction ends — otherwise the rows
-// stay pending and the next claim re-picks them.
-func (r *TradeRepository) ClaimUndetectedTrades(ctx context.Context, limit int32) ([]PendingDetectionTrade, error) {
-	rows, err := r.q.ClaimUndetectedTrades(ctx, limit)
+// ClaimUndetectedTrades atomically leases up to `limit` trades to a
+// detection worker. workerID is stamped on the row for diagnostic
+// queries; claimTTL is the lease duration — rows whose lease is older
+// than this are re-claimable by another worker (see
+// ResetStaleDetectionClaims). The caller MUST mark each returned row
+// via MarkDetectionAnalyzed / MarkDetectionSkipped /
+// MarkDetectionFailed before the lease expires.
+func (r *TradeRepository) ClaimUndetectedTrades(ctx context.Context, workerID string, limit int32, claimTTL time.Duration) ([]PendingDetectionTrade, error) {
+	rows, err := r.q.ClaimUndetectedTrades(ctx, sqlc.ClaimUndetectedTradesParams{
+		WorkerID:   workerID,
+		ClaimTtl:   intervalFromDuration(claimTTL),
+		ClaimLimit: limit,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("claim undetected trades: %w", err)
 	}
@@ -362,6 +367,18 @@ func (r *TradeRepository) PendingDetectionCount(ctx context.Context) (int64, err
 	return r.q.PendingDetectionCount(ctx)
 }
 
+// ResetStaleDetectionClaims clears the lease on rows whose
+// detection_claimed_at is older than `staleAfter`. Returns the row
+// count for diagnostic logging. The worker calls this once per tick
+// before the claim so crashed siblings' rows re-enter the pool.
+func (r *TradeRepository) ResetStaleDetectionClaims(ctx context.Context, staleAfter time.Duration) (int64, error) {
+	rows, err := r.q.ResetStaleDetectionClaims(ctx, intervalFromDuration(staleAfter))
+	if err != nil {
+		return 0, fmt.Errorf("reset stale detection claims: %w", err)
+	}
+	return rows, nil
+}
+
 // DetectionStatusBreakdown returns counts of trades grouped by their
 // terminal detection_status (NULL → "pending"). Used by stats reports.
 func (r *TradeRepository) DetectionStatusBreakdown(ctx context.Context) (map[string]int64, error) {
@@ -399,6 +416,111 @@ func (r *TradeRepository) TraderLastSeenBefore(ctx context.Context, traderID int
 		return time.Time{}, fmt.Errorf("trader last seen before: %w", err)
 	}
 	return tsTime(ts), nil
+}
+
+// PriceWindow is the per-(market, outcome) price/volume snapshot
+// used by the stable-favorite detector. Shape matches the SQL
+// PriceWindowStats query.
+type PriceWindow struct {
+	SampleCount   int64
+	MeanPrice     float64
+	StddevPrice   float64
+	MinPrice      float64
+	MaxPrice      float64
+	FirstPrice    float64 // oldest price in window
+	LastPrice     float64 // newest price in window
+	VolumeUSD     float64
+	BuyVolumeUSD  float64
+	SellVolumeUSD float64
+}
+
+// PriceWindowStats returns the price/volume snapshot for (market,
+// outcome) over the window [since, NOW()]. Empty window → zero
+// values; the caller treats SampleCount<2 as "no signal".
+func (r *TradeRepository) PriceWindowStats(ctx context.Context, marketID int64, outcomeToken string, since time.Time) (PriceWindow, error) {
+	row, err := r.q.PriceWindowStats(ctx, sqlc.PriceWindowStatsParams{
+		MarketID:     marketID,
+		OutcomeToken: outcomeToken,
+		Since:        tsFromTime(since),
+	})
+	if err != nil {
+		return PriceWindow{}, fmt.Errorf("price window stats: %w", err)
+	}
+	return PriceWindow{
+		SampleCount:   row.SampleCount,
+		MeanPrice:     row.MeanPrice,
+		StddevPrice:   row.StddevPrice,
+		MinPrice:      row.MinPrice,
+		MaxPrice:      row.MaxPrice,
+		FirstPrice:    row.FirstPrice,
+		LastPrice:     row.LastPrice,
+		VolumeUSD:     row.VolumeUsd,
+		BuyVolumeUSD:  row.BuyVolumeUsd,
+		SellVolumeUSD: row.SellVolumeUsd,
+	}, nil
+}
+
+// LateMarketCandidate is one market past the lifecycle threshold.
+type LateMarketCandidate struct {
+	ID           int64
+	ConditionID  string
+	Slug         string
+	Question     string
+	EventSlug    string
+	StartDate    time.Time
+	EndDate      time.Time
+	LifecyclePct float64
+}
+
+// ListLateMarketCandidates returns up to `limit` active markets
+// whose lifecycle progress has crossed `minLifecyclePct`. Used by
+// the stable-favorite worker as the input universe for its periodic
+// sweep — much cheaper than listing every market and filtering in
+// Go.
+func (r *TradeRepository) ListLateMarketCandidates(ctx context.Context, minLifecyclePct float64, limit int32) ([]LateMarketCandidate, error) {
+	rows, err := r.q.ListLateMarketCandidates(ctx, sqlc.ListLateMarketCandidatesParams{
+		MinLifecyclePct: minLifecyclePct,
+		LimitCount:      limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list late-market candidates: %w", err)
+	}
+	out := make([]LateMarketCandidate, 0, len(rows))
+	for _, row := range rows {
+		eventSlug := ""
+		if row.EventSlug != nil {
+			eventSlug = *row.EventSlug
+		}
+		out = append(out, LateMarketCandidate{
+			ID:           row.ID,
+			ConditionID:  row.ConditionID,
+			Slug:         row.Slug,
+			Question:     row.Question,
+			EventSlug:    eventSlug,
+			StartDate:    tsTime(row.StartDate),
+			EndDate:      tsTime(row.EndDate),
+			LifecyclePct: row.LifecyclePct,
+		})
+	}
+	return out, nil
+}
+
+// LatestPriceForOutcome returns the most-recent observed price for
+// the (market, outcome) pair. 0 when no trade exists yet. Used as a
+// proxy for "current implied probability" since CLOB best-bid/ask
+// isn't wired upstream.
+func (r *TradeRepository) LatestPriceForOutcome(ctx context.Context, marketID int64, outcomeToken string) (float64, error) {
+	p, err := r.q.LatestPriceForOutcome(ctx, sqlc.LatestPriceForOutcomeParams{
+		MarketID:     marketID,
+		OutcomeToken: outcomeToken,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("latest price for outcome: %w", err)
+	}
+	return p, nil
 }
 
 // LastTradedAtBefore returns the most recent traded_at strictly before the

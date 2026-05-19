@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/aianalysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/alertsender"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/accumulation"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/baseline"
@@ -19,6 +20,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/ownership"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
+	sfdet "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/stablefavorite"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
@@ -32,9 +34,12 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/stablefavorite"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/statsreport"
+	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	httpsrv "github.com/Borislavv/polymarket-watchtower/internal/infra/http"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/log"
@@ -65,14 +70,16 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill     *backfill.Worker
-	sender       *alertsender.Worker
-	sanity       *sanity.Worker
-	outcomes     *outcomes.Worker
-	drift        *drift.Worker
-	stats        *statsreport.Worker
-	signalReport *signalreport.Worker
-	detection    *detection.Worker
+	backfill       *backfill.Worker
+	sender         *alertsender.Worker
+	sanity         *sanity.Worker
+	outcomes       *outcomes.Worker
+	drift          *drift.Worker
+	stats          *statsreport.Worker
+	signalReport   *signalreport.Worker
+	detection      *detection.Worker
+	stableFavorite *stablefavorite.Worker
+	aiAnalysis     *aianalysis.Service
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -146,6 +153,7 @@ func New() (*App, error) {
 		pgPool             *pgxpool.Pool
 		persistSink        *persist.Sink
 		alertsRepo         *repository.AlertRepository
+		alertAnalysisRepo  *repository.AlertAnalysisRepository
 		marketsRepo        *repository.MarketRepository
 		tradesRepo         *repository.TradeRepository
 		tradersRepo        *repository.TraderRepository
@@ -180,6 +188,7 @@ func New() (*App, error) {
 		tradesRepo = repository.NewTradeRepository(pgPool)
 		tradersRepo = repository.NewTraderRepository(pgPool)
 		alertsRepo = repository.NewAlertRepository(pgPool)
+		alertAnalysisRepo = repository.NewAlertAnalysisRepository(pgPool)
 		persistSink = persist.NewSink(
 			repository.NewCategoryRepository(pgPool),
 			marketsRepo, tradesRepo, tradersRepo,
@@ -550,6 +559,7 @@ func New() (*App, error) {
 			Workers:        cfg.Detection.Workers,
 			ClaimLimit:     int32(cfg.Detection.ClaimLimit),
 			Interval:       cfg.Detection.Interval,
+			ClaimTTL:       cfg.Detection.ClaimTTL,
 			StaleThreshold: cfg.Anomaly.LiveAlertMaxLag,
 		}, tradesRepo, cache, detectLoop, walletResolver(tradersRepo), met, logger)
 		detectionWorker = dw
@@ -568,26 +578,93 @@ func New() (*App, error) {
 	}
 	collectLoop := collect.New(collectCfg, dataClient, cache, collectObserver, met, logger)
 
+	// Stable-favorite strategy — separate from whale-flow detection.
+	// Runs only when Postgres is wired (it reads from polymarket_*) AND
+	// the operator opts in via STABLE_FAVORITE_ENABLED=true.
+	var stableFavWorker *stablefavorite.Worker
+	if cfg.Postgres.Enabled() && cfg.StableFavorite.Enabled {
+		sfCfg := sfdet.Config{
+			Enabled:                    cfg.StableFavorite.Enabled,
+			MinLifecyclePct:            cfg.StableFavorite.MinLifecyclePct,
+			HotLifecyclePct:            cfg.StableFavorite.HotLifecyclePct,
+			MinProbability:             cfg.StableFavorite.MinProbability,
+			MaxProbability:             cfg.StableFavorite.MaxProbability,
+			MinReturnPct:               cfg.StableFavorite.MinReturnPct,
+			StabilityWindow:            cfg.StableFavorite.StabilityWindow,
+			MaxPriceStddev:             cfg.StableFavorite.MaxPriceStddev,
+			MaxDrawdown:                cfg.StableFavorite.MaxDrawdown,
+			MaxAdverseMove6h:           cfg.StableFavorite.MaxAdverseMove6h,
+			MaxNegativeDrift6h:         cfg.StableFavorite.MaxNegativeDrift6h,
+			MinMarketVolumeUSD:         cfg.StableFavorite.MinMarketVolumeUSD,
+			MinRecentTrades:            cfg.StableFavorite.MinRecentTrades,
+			CrossMarketEnabled:         cfg.StableFavorite.CrossMarketEnabled,
+			MaxCrossMarketDisagreement: cfg.StableFavorite.MaxCrossMarketDisagreement,
+		}
+		sfDet := sfdet.New(sfCfg)
+		sfCache := stableFavoriteCacheAdapter{cache: cache}
+		stableFavWorker = stablefavorite.New(stablefavorite.Config{
+			Enabled:         true,
+			Interval:        cfg.StableFavorite.Interval,
+			CandidateLimit:  int32(cfg.StableFavorite.CandidateLimit),
+			StrategyVersion: anomaly.StrategyIdentity,
+		}, sfDet, tradesRepo, tradesRepo, sfCache, nil, alertsRepo, emitter, met, logger)
+	}
+
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
+	// AI analysis service. The Analyzer is either:
+	//   - openai.Client when AIAnalysis.Enabled=true AND a key is set
+	//   - analysis.NoopAnalyzer otherwise (service works without AI).
+	// The aianalysis.Service wraps either Analyzer and adds the
+	// refresh/cost policy + persistence. Wiring stays inert when
+	// alertAnalysisRepo is nil (memory-only mode).
+	var aiSvc *aianalysis.Service
+	if alertAnalysisRepo != nil {
+		var analyzer analysis.Analyzer = analysis.NoopAnalyzer{}
+		if cfg.AIAnalysis.Enabled && cfg.AIAnalysis.APIKey != "" {
+			analyzer = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.AIAnalysis.Timeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+			logger.Info().Str("model", cfg.AIAnalysis.Model).Msg("ai analysis enabled")
+		} else {
+			logger.Info().Msg("ai analysis disabled (no key or AI_ANALYSIS_ENABLED=false)")
+		}
+		aiSvc = aianalysis.New(aianalysis.Config{
+			AlertsEnabled:            cfg.AIAnalysis.Enabled && cfg.AIAnalysis.AlertsEnabled,
+			LifecycleRefreshDeltaPct: cfg.AIAnalysis.LifecycleRefreshDeltaPct,
+			CLVMaterialChange:        cfg.AIAnalysis.CLVMaterialChange,
+		}, analyzer, alertAnalysisRepo, met, logger)
+	}
+
 	return &App{
-		cfg:          cfg,
-		logger:       logger,
-		metrics:      met,
-		cache:        cache,
-		discover:     discoverLoop,
-		collect:      collectLoop,
-		detectRun:    detectLoop.Run,
-		httpSrv:      httpSrv,
-		backfill:     backfillWorker,
-		sender:       senderWorker,
-		sanity:       sanityWorker,
-		outcomes:     outcomesWorker,
-		drift:        driftWorker,
-		stats:        statsWorker,
-		signalReport: signalReportWorker,
-		detection:    detectionWorker,
-		pgPool:       pgPool,
+		cfg:            cfg,
+		logger:         logger,
+		metrics:        met,
+		cache:          cache,
+		discover:       discoverLoop,
+		collect:        collectLoop,
+		detectRun:      detectLoop.Run,
+		httpSrv:        httpSrv,
+		backfill:       backfillWorker,
+		sender:         senderWorker,
+		sanity:         sanityWorker,
+		outcomes:       outcomesWorker,
+		drift:          driftWorker,
+		stats:          statsWorker,
+		signalReport:   signalReportWorker,
+		detection:      detectionWorker,
+		stableFavorite: stableFavWorker,
+		aiAnalysis:     aiSvc,
+		pgPool:         pgPool,
 	}, nil
 }
 
@@ -700,6 +777,24 @@ func (s signalReportMetricsAdapter) ObserveReportSent(periodType, status string)
 	s.m.SignalReportsSent.WithLabelValues(periodType, status).Inc()
 }
 
+// stableFavoriteCacheAdapter projects *marketcache.Cache into the
+// MarketView the stablefavorite worker consumes. Kept here rather
+// than in the worker package because *marketcache.Cache's return
+// type (market.Market) lives in a separate domain package and would
+// otherwise force the worker to depend on it transitively.
+type stableFavoriteCacheAdapter struct{ cache *marketcache.Cache }
+
+func (a stableFavoriteCacheAdapter) View(id vo.MarketID) (stablefavorite.MarketView, bool) {
+	m, ok := a.cache.Get(id)
+	if !ok {
+		return stablefavorite.MarketView{}, false
+	}
+	return stablefavorite.MarketView{
+		Tokens:   m.TokenIDs,
+		Outcomes: m.Outcomes,
+	}, true
+}
+
 // marketcacheUpstream adapts *marketcache.Cache to sanity.UpstreamChecker.
 // "Active upstream" is exactly "present in the most recent discover
 // sweep" — which is what the cache contains. Cache miss → market is no
@@ -755,6 +850,12 @@ func (a *App) Run() error {
 	if a.detection != nil {
 		execs = append(execs, shutdown2.Exec{Name: "detection", Fn: func(ctx context.Context) error {
 			a.detection.Run(ctx)
+			return nil
+		}})
+	}
+	if a.stableFavorite != nil {
+		execs = append(execs, shutdown2.Exec{Name: "stablefavorite", Fn: func(ctx context.Context) error {
+			a.stableFavorite.Run(ctx)
 			return nil
 		}})
 	}

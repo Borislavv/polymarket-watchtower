@@ -8,6 +8,44 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type PolymarketAlertAnalyses struct {
+	ID               int64
+	AlertID          int64
+	Version          int32
+	TriggerKind      string
+	TriggerDetail    *string
+	Model            string
+	PromptChars      int32
+	OutputChars      int32
+	PromptTokens     int32
+	CompletionTokens int32
+	EstimatedCostUsd float64
+	AnalysisText     string
+	Verdict          *string
+	Status           string
+	LastError        *string
+	CreatedAt        pgtype.Timestamptz
+}
+
+type PolymarketAlertOutcomeAnalyses struct {
+	ID                int64
+	AlertID           int64
+	OutcomeStatus     string
+	WonExpected       *bool
+	AiReasonText      string
+	AiLessonsText     *string
+	Confidence        float64
+	Model             string
+	PromptTokens      int32
+	CompletionTokens  int32
+	EstimatedCostUsd  float64
+	TelegramMessageID *int64
+	TelegramChatID    *string
+	DeliveryStatus    string
+	LastDeliveryError *string
+	CreatedAt         pgtype.Timestamptz
+}
+
 type PolymarketAlerts struct {
 	ID                     int64
 	DedupKey               string
@@ -58,6 +96,25 @@ type PolymarketCategories struct {
 type PolymarketMarketCategories struct {
 	MarketID   int64
 	CategoryID int64
+}
+
+type PolymarketMarketIntelligenceReports struct {
+	ID                int64
+	GeneratedAt       pgtype.Timestamptz
+	PeriodStart       pgtype.Timestamptz
+	PeriodEnd         pgtype.Timestamptz
+	SummaryHash       string
+	ReportText        string
+	MarketsJson       []byte
+	Model             string
+	PromptTokens      int32
+	CompletionTokens  int32
+	EstimatedCostUsd  float64
+	TelegramMessageID *int64
+	TelegramChatID    *string
+	DeliveryStatus    string
+	LastDeliveryError *string
+	CreatedAt         pgtype.Timestamptz
 }
 
 type PolymarketMarketOutcomes struct {
@@ -136,4 +193,6 @@ type PolymarketTrades struct {
 	DetectionSkipReason *string
 	DetectionAttempts   int32
 	LastDetectionError  *string
+	DetectionClaimedAt  pgtype.Timestamptz
+	DetectionWorkerID   *string
 }

@@ -108,6 +108,21 @@ type Metrics struct {
 	// operators how stale the backlog gets.
 	DetectionLagSeconds prometheus.Histogram
 
+	// --- AI analysis -----------------------------------------------
+	// AIAnalysisRequests counts every analyzer call by terminal
+	// status (ok / skipped / error). Useful to graph the actionable
+	// hit-rate of the AI layer.
+	AIAnalysisRequests *prometheus.CounterVec // status
+	// AIAnalysisTokens by kind = prompt | completion.
+	AIAnalysisTokens *prometheus.CounterVec // kind
+	// AIAnalysisCost in USD, summed across all calls.
+	AIAnalysisCost prometheus.Counter
+	// AIAnalysisSkipped by reason: no_api_key / rate_limited /
+	// daily_budget_exhausted / refresh_skipped.
+	AIAnalysisSkipped *prometheus.CounterVec // reason
+	// AIAnalysisLatency wall-clock seconds end-to-end.
+	AIAnalysisLatency prometheus.Histogram
+
 	MarketsUpserted         prometheus.Counter     // every successful UpsertMarket call (incl. ON CONFLICT)
 	MarketOutcomesUpserted  prometheus.Counter     // every UpsertOutcome call (per token row)
 	MarketsSoftDeleted      prometheus.Counter     // sweep-driven `active=false, deleted_at=NOW()` flips
@@ -326,6 +341,28 @@ func New() *Metrics {
 		Buckets: []float64{1, 5, 15, 60, 300, 900, 3600, 7200, 21600, 86400},
 	})
 
+	m.AIAnalysisRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_analysis", Name: "requests_total",
+		Help: "AI analyzer calls by terminal status (ok|skipped|error).",
+	}, []string{"status"})
+	m.AIAnalysisTokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_analysis", Name: "tokens_total",
+		Help: "Tokens consumed by the AI analyzer, split by prompt/completion.",
+	}, []string{"kind"})
+	m.AIAnalysisCost = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_analysis", Name: "estimated_cost_usd_total",
+		Help: "Running total of estimated AI spend in USD. Approximate — reconcile against the analysis tables for ground truth.",
+	})
+	m.AIAnalysisSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_analysis", Name: "skipped_total",
+		Help: "AI calls deliberately skipped by policy. reason: no_api_key | rate_limited | daily_budget_exhausted | refresh_skipped | …",
+	}, []string{"reason"})
+	m.AIAnalysisLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "ai_analysis", Name: "latency_seconds",
+		Help:    "End-to-end wall-clock latency of an AI analyzer call.",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 30},
+	})
+
 	m.MarketsUpserted = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "persist", Name: "markets_upserted_total",
 		Help: "Successful UpsertMarket calls. Includes both fresh inserts and updates to existing rows (ON CONFLICT path).",
@@ -429,6 +466,7 @@ func New() *Metrics {
 		m.TelegramAlertsSent, m.TelegramAlertErrors,
 		m.TradesImported, m.TradesAnalyzed, m.TradesSkippedDetection,
 		m.TradesAnalyzedTotal, m.DetectionClaimed, m.DetectionFailed, m.DetectionLagSeconds,
+		m.AIAnalysisRequests, m.AIAnalysisTokens, m.AIAnalysisCost, m.AIAnalysisSkipped, m.AIAnalysisLatency,
 		m.MarketsUpserted, m.MarketOutcomesUpserted,
 		m.MarketsSoftDeleted, m.MarketsPurged, m.MarketsResumed,
 		m.TradesUpserted, m.TradesDuplicatesSkipped, m.TradersUpserted,

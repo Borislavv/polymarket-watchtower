@@ -27,6 +27,11 @@ type fakeClaimer struct {
 	skipped  []skipCall
 	failed   []failedCall
 	claimErr error
+
+	lastClaim      time.Time
+	resetCalls     int
+	resetReturns   int64
+	lastResetAfter time.Duration
 }
 
 type skipCall struct {
@@ -38,9 +43,10 @@ type failedCall struct {
 	msg string
 }
 
-func (f *fakeClaimer) ClaimUndetectedTrades(_ context.Context, _ int32) ([]repository.PendingDetectionTrade, error) {
+func (f *fakeClaimer) ClaimUndetectedTrades(_ context.Context, _ string, _ int32, _ time.Duration) ([]repository.PendingDetectionTrade, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastClaim = time.Now()
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
@@ -49,6 +55,16 @@ func (f *fakeClaimer) ClaimUndetectedTrades(_ context.Context, _ int32) ([]repos
 	}
 	f.served = true
 	return f.queue, nil
+}
+
+// ResetStaleDetectionClaims is the lease-reclaim primitive. Records
+// the call so tests can verify the worker invokes it once per tick.
+func (f *fakeClaimer) ResetStaleDetectionClaims(_ context.Context, after time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resetCalls++
+	f.lastResetAfter = after
+	return f.resetReturns, nil
 }
 func (f *fakeClaimer) MarkDetectionAnalyzed(_ context.Context, id int64) error {
 	f.mu.Lock()
@@ -253,6 +269,29 @@ func TestClaimErrorDoesNotKillWorker(t *testing.T) {
 
 	// Must return without panic.
 	w.Tick(context.Background())
+}
+
+// TestStaleClaimReclaimRunsOncePerTick pins the v6 lease-hardening
+// contract: every tick first calls ResetStaleDetectionClaims with the
+// configured ClaimTTL, then proceeds with the claim. A crashed
+// sibling's row therefore returns to the pool after ClaimTTL even
+// without operator intervention.
+func TestStaleClaimReclaimRunsOncePerTick(t *testing.T) {
+	cl := &fakeClaimer{resetReturns: 3}
+	cache := &fakeCache{m: map[string]market.Market{}}
+	obs := &fakeObserver{}
+	w := New(Config{Workers: 1, ClaimLimit: 10, Interval: time.Hour,
+		ClaimTTL: 7 * time.Minute, WorkerID: "test-worker",
+		Clock: func() time.Time { return time.Now() }},
+		cl, cache, obs, nil, metrics.New(), nopLogger())
+	w.Tick(context.Background())
+
+	if cl.resetCalls != 1 {
+		t.Fatalf("expected exactly 1 reset call per tick, got %d", cl.resetCalls)
+	}
+	if cl.lastResetAfter != 7*time.Minute {
+		t.Errorf("reset TTL: got %v want 7m", cl.lastResetAfter)
+	}
 }
 
 // TestEmptyQueueIsNoOp pins that an empty claim returns 0 trades and

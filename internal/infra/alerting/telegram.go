@@ -125,9 +125,74 @@ func FormatTelegramMessage(f anomaly.Finding) string {
 		return formatAccumulation(f)
 	case anomaly.KindOwnership:
 		return formatOwnership(f)
+	case anomaly.KindStableFavorite:
+		return formatStableFavorite(f)
 	default:
 		return formatTradeAnomaly(f)
 	}
+}
+
+// formatStableFavorite renders the late-market-stable-favorite alert.
+// Deliberately distinct from whale-flow shapes: the header carries
+// probability + return %, the Why block surfaces stability stats,
+// and the Risks block is REQUIRED — never describe these as safe
+// or guaranteed.
+func formatStableFavorite(f anomaly.Finding) string {
+	var b strings.Builder
+	sf := f.StableFavorite
+	if sf == nil {
+		// Defensive — should never happen, but render a minimal
+		// envelope instead of panicking.
+		fmt.Fprintf(&b, "<b>%s · stable favorite</b>\n", strings.ToUpper(string(f.Severity)))
+		writeLinks(&b, f)
+		writeAnalystNote(&b, f)
+		return b.String()
+	}
+	hot := ""
+	if f.Hot {
+		hot = " · HOT"
+	}
+	title := tradeTitle(f) // falls back to "Polymarket market" when Trade is nil
+	fmt.Fprintf(&b, "<b>%s · stable favorite · %.0f%% · +%.0f%% return%s · %s</b>\n",
+		strings.ToUpper(string(f.Severity)),
+		sf.Probability*100,
+		sf.RemainingReturnPct,
+		hot,
+		html.EscapeString(title),
+	)
+
+	b.WriteString("\n<b>Why</b>\n")
+	fmt.Fprintf(&b, "• market is <b>%.1f%%</b> through lifecycle\n", sf.LifecyclePct)
+	if sf.PriceSamples >= 2 {
+		fmt.Fprintf(&b, "• favorite price stable: %.0f–%.0f%% over %s (stddev %.3f)\n",
+			sf.PriceMin*100, sf.PriceMax*100, humanDuration(sf.StabilityWindow), sf.PriceStddev)
+	}
+	fmt.Fprintf(&b, "• remaining return if correct: <b>+%.1f%%</b>\n", sf.RemainingReturnPct)
+	if sf.AdverseMove6h < 0 {
+		fmt.Fprintf(&b, "• adverse 6h drift: %+.1f%% (above the gate's tolerance is rejected upstream)\n", sf.AdverseMove6h*100)
+	} else {
+		b.WriteString("• no adverse drift in last 6h\n")
+	}
+	fmt.Fprintf(&b, "• liquidity: $%s volume, %d recent trades\n", money(sf.RecentVolumeUSD), sf.RecentTradeCount)
+	fmt.Fprintf(&b, "• confidence: <b>%.2f</b> · score: <b>%.0f</b>/100\n", sf.Confidence, sf.Score)
+
+	b.WriteString("\n<b>Risks</b>\n")
+	b.WriteString("• political markets can gap on late news — this is NOT a guarantee\n")
+	switch sf.CrossMarketStatus {
+	case "confirmed":
+		fmt.Fprintf(&b, "• cross-market check: <b>confirmed</b> (within %.2f price units)\n", sf.CrossMarketDelta)
+	case "conflict":
+		fmt.Fprintf(&b, "• cross-market check: <b>conflict</b> (Δ %.2f) — treat as low confidence\n", sf.CrossMarketDelta)
+	default:
+		b.WriteString("• cross-market check: <b>unavailable</b> — no related-market price wired\n")
+	}
+	if sf.RecentVolumeUSD < 50_000 {
+		b.WriteString("• thin liquidity may slow exit\n")
+	}
+
+	writeLinks(&b, f)
+	writeAnalystNote(&b, f)
+	return b.String()
 }
 
 // formatOwnership renders the Strategy-E market-ownership concentration
@@ -144,7 +209,7 @@ func formatOwnership(f anomaly.Finding) string {
 	writeOwnershipHeader(&b, f)
 	writeOwnershipWhy(&b, f)
 	writeLinks(&b, f)
-	writeData(&b, f)
+	writeAnalystNote(&b, f)
 	return b.String()
 }
 
@@ -208,7 +273,7 @@ func formatAccumulation(f anomaly.Finding) string {
 	writeAccumulationWhy(&b, f)
 	writeAccumulationTraderLine(&b, f)
 	writeLinks(&b, f)
-	writeData(&b, f)
+	writeAnalystNote(&b, f)
 	return b.String()
 }
 
@@ -293,7 +358,7 @@ func formatTradeAnomaly(f anomaly.Finding) string {
 	writeWhy(&b, f)
 	writeTrade(&b, f)
 	writeLinks(&b, f)
-	writeData(&b, f)
+	writeAnalystNote(&b, f)
 	return b.String()
 }
 
@@ -302,7 +367,7 @@ func formatCategoryWatch(f anomaly.Finding) string {
 	writeClusterHeader(&b, f)
 	writeCluster(&b, f)
 	writeLinks(&b, f)
-	writeData(&b, f)
+	writeAnalystNote(&b, f)
 	return b.String()
 }
 
@@ -314,12 +379,18 @@ func writeTradeHeader(b *strings.Builder, f anomaly.Finding) {
 	if f.Hot {
 		hot = " · HOT"
 	}
-	// v5 header: severity, profit-if-win (the operator-relevant magnitude),
-	// notional, optional HOT tag, title. Multiplier-x was removed when the
-	// median multiplier stopped being a deciding gate.
-	fmt.Fprintf(b, "<b>%s: profit $%s · $%s%s · %s</b>\n",
+	// v6 header: severity, optional profit-if-win, notional, optional
+	// HOT, title. The profit segment is OMITTED rather than printed as
+	// "$0.00" when the payload doesn't carry a payoff value — typically
+	// a legacy alert serialized by a pre-v6 binary, or an input that
+	// failed validation (odds ≤ 1).
+	profit := ""
+	if f.ProfitIfWinUSD > 0 {
+		profit = "profit $" + money(f.ProfitIfWinUSD) + " · "
+	}
+	fmt.Fprintf(b, "<b>%s: %s$%s%s · %s</b>\n",
 		strings.ToUpper(string(f.Severity)),
-		money(f.ProfitIfWinUSD),
+		profit,
 		money(notional(f)),
 		hot,
 		html.EscapeString(title),
@@ -365,29 +436,25 @@ func writeWhy(b *strings.Builder, f anomaly.Finding) {
 			multiplierFmt(f.Trade.Odds), f.Trade.Price*100)
 	}
 	if f.Baseline != nil {
-		fmt.Fprintf(b, "• market baseline: <b>%d</b> trades, median $%s, mean $%s, p95 $%s, p99 $%s, span %s\n",
+		fmt.Fprintf(b, "• market baseline: <b>%d</b> trades, median $%s, mean $%s, p95 %s, p99 %s, span %s\n",
 			f.Baseline.SampleN, money(f.Baseline.MedianUSD), money(f.Baseline.MeanUSD),
-			money(f.Baseline.P95USD), money(f.Baseline.P99USD),
+			percentileCell(f.Baseline.P95USD), percentileCell(f.Baseline.P99USD),
 			humanDuration(f.Baseline.Span))
 	}
 	if f.TraderBaseline != nil {
-		fmt.Fprintf(b, "• trader history: <b>%d</b> trades, median $%s, p95 $%s, p99 $%s, span %s\n",
+		fmt.Fprintf(b, "• trader history: <b>%d</b> trades, median $%s, p95 %s, p99 %s, span %s\n",
 			f.TraderBaseline.SampleN, money(f.TraderBaseline.MedianUSD),
-			money(f.TraderBaseline.P95USD), money(f.TraderBaseline.P99USD),
+			percentileCell(f.TraderBaseline.P95USD), percentileCell(f.TraderBaseline.P99USD),
 			humanDuration(f.TraderBaseline.Span))
 	}
 	if !f.PayoffGatePassed && f.ProfitIfWinUSD > 0 {
 		b.WriteString("• payoff gate: unenforced (MinProfitUSD=0 for tier)\n")
 	}
-	if !f.TailGatePassed {
-		b.WriteString("• tail gate: unenforced (no baseline was ready)\n")
-	}
-	if f.LowMarketBaselineConfidence {
-		b.WriteString("• ⚠ market baseline thin — rarity ranking unenforced\n")
-	}
-	if f.LowTraderBaselineConfidence {
-		b.WriteString("• ⚠ trader history thin — wallet-tail ranking unenforced\n")
-	}
+	// Per-axis tail-gate explanation. The aggregate TailGatePassed flag
+	// hides which axis was unenforceable; render per-axis so the
+	// operator sees "market tail passed; trader tail unenforced" not the
+	// misleading "no baseline was ready" when one of two axes was ready.
+	writeTailGateStatus(b, f)
 	if f.SeverityCapped {
 		fmt.Fprintf(b, "• severity reduced to <b>%s</b> due to thin baseline\n", string(f.Severity))
 	}
@@ -459,17 +526,52 @@ func writeNewWallet(b *strings.Builder, f anomaly.Finding) {
 // gate exists with a 0 value, which is misleading.
 func writeTailRow(b *strings.Builder, label string, notionalUSD, r95, p95 float64, r99, p99 float64) {
 	fmt.Fprintf(b, "• %s: notional <b>$%s</b>", label, money(notionalUSD))
-	if r95 > 0 {
+	if r95 > 0 && p95 > 0 {
 		fmt.Fprintf(b, " = <b>%sx p95</b> ($%s)", ratioFmt(r95), money(p95))
 	}
-	if r99 > 0 {
+	if r99 > 0 && p99 > 0 {
 		sep := ","
-		if r95 <= 0 {
+		if r95 <= 0 || p95 <= 0 {
 			sep = " ="
 		}
 		fmt.Fprintf(b, "%s <b>%sx p99</b> ($%s)", sep, ratioFmt(r99), money(p99))
 	}
 	b.WriteByte('\n')
+}
+
+// percentileCell renders one percentile value as "$X" when positive
+// and "n/a" when zero/unset. Zero is ambiguous (either small sample
+// degenerate or pre-v6 payload missing the column); the truth is "we
+// don't have this percentile", so render it that way instead of
+// claiming "$0.00".
+func percentileCell(v float64) string {
+	if v <= 0 {
+		return "n/a"
+	}
+	return "$" + money(v)
+}
+
+// writeTailGateStatus replaces the old "tail gate: unenforced (no
+// baseline was ready)" line with per-axis explanations. The aggregate
+// f.TailGatePassed flag in score.Result is true when ANY tail gate
+// was enforced and passed — it hides cases where one axis was solid
+// and the other was thin. We use the dedicated confidence flags
+// instead.
+func writeTailGateStatus(b *strings.Builder, f anomaly.Finding) {
+	if f.LowMarketBaselineConfidence {
+		if f.Baseline != nil && f.Baseline.SampleN > 0 {
+			fmt.Fprintf(b, "• market tail: unenforced (baseline thin — %d samples)\n", f.Baseline.SampleN)
+		} else {
+			b.WriteString("• market tail: unenforced (no market baseline available)\n")
+		}
+	}
+	if f.LowTraderBaselineConfidence {
+		if f.TraderBaseline != nil && f.TraderBaseline.SampleN > 0 {
+			fmt.Fprintf(b, "• trader tail: unenforced (only %d trader trades on record)\n", f.TraderBaseline.SampleN)
+		} else {
+			b.WriteString("• trader tail: unenforced (no trader history available)\n")
+		}
+	}
 }
 
 // ratioFmt prints with a decimal when below 10 so "0.65x" reads correctly,
@@ -595,54 +697,33 @@ func writeLinks(b *strings.Builder, f anomaly.Finding) {
 //   - outcome_token: the CLOB token id for the firing outcome.
 //
 // All values are HTML-escaped and rendered inside <code> so Telegram
-// clients format them in a copy-friendly monospace font. The whole
-// section is skipped when none of the three fields are populated — older
-// findings (and tests that didn't set DedupKey) stay unchanged.
-func writeData(b *strings.Builder, f anomaly.Finding) {
-	dedup := f.DedupKey
-	marketID, outcomeToken := dataMarketRefs(f)
-	if dedup == "" && marketID == "" && outcomeToken == "" {
+// clients format them in a copy-friendly monospace font.
+//
+// writeAnalystNote replaces the v6 Data block. It renders the
+// AI-generated analyst note when present. When the note is empty
+// (AI layer disabled / rate-limited / errored), the block is
+// elided entirely — there is no fallback to the old Data block.
+func writeAnalystNote(b *strings.Builder, f anomaly.Finding) {
+	note := strings.TrimSpace(f.AnalystNote)
+	if note == "" {
 		return
 	}
-	b.WriteString("\n<b>Data</b>\n")
-	if marketID != "" {
-		fmt.Fprintf(b, "• market_id: <code>%s</code>\n", html.EscapeString(marketID))
-	}
-	if outcomeToken != "" {
-		fmt.Fprintf(b, "• outcome_token: <code>%s</code>\n", html.EscapeString(outcomeToken))
-	}
-	if dedup != "" {
-		fmt.Fprintf(b, "• dedup: <code>%s</code>\n", html.EscapeString(dedup))
-	}
-}
-
-// dataMarketRefs extracts the market_id and outcome_token for the Data
-// block. AccumulationRef and OwnershipRef both carry the canonical
-// pair (the line / position is by definition single-outcome); single-
-// trade and category-watch findings fall back to the firing trade. A
-// cluster Finding may legitimately have neither — clusters span markets.
-func dataMarketRefs(f anomaly.Finding) (marketID, outcomeToken string) {
-	if f.Accumulation != nil {
-		marketID = f.Accumulation.MarketID
-		outcomeToken = f.Accumulation.OutcomeToken
-	}
-	if f.Ownership != nil {
-		if marketID == "" {
-			marketID = f.Ownership.MarketID
+	b.WriteString("\n<b>Analyst note</b>\n")
+	// The note is plain text from the model; HTML-escape it so any
+	// stray `<` or `>` doesn't break Telegram's HTML parser. Bullet
+	// the first line so the formatting stays consistent with other
+	// sections.
+	for i, line := range strings.Split(note, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-		if outcomeToken == "" {
-			outcomeToken = f.Ownership.OutcomeToken
+		if i == 0 {
+			fmt.Fprintf(b, "• %s\n", html.EscapeString(line))
+			continue
 		}
+		fmt.Fprintf(b, "  %s\n", html.EscapeString(line))
 	}
-	if f.Trade != nil {
-		if marketID == "" {
-			marketID = string(f.Trade.Market)
-		}
-		// TradeRef does not carry the outcome token directly (only the
-		// outcome label). Accumulation / ownership Findings ship it
-		// pre-computed; leave outcomeToken blank otherwise.
-	}
-	return marketID, outcomeToken
 }
 
 // sanitizeLinkURL returns the URL when it is safe to put in front of an

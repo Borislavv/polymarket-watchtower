@@ -156,38 +156,59 @@ WHERE trader_id     = sqlc.arg(trader_id)::bigint
   AND (sqlc.narg(since)::timestamptz IS NULL OR traded_at >= sqlc.narg(since)::timestamptz);
 
 -- name: ClaimUndetectedTrades :many
--- Claim a batch of trades that have never been through the detection
--- worker. SKIP LOCKED keeps concurrent workers from contending on the
--- same rows; the partial index on (traded_at DESC) WHERE detected_at
--- IS NULL keeps this cheap.
---
--- The claimer does NOT mutate the rows — it just locks them. A second
--- statement (MarkTradeDetectionResult) records the terminal state once
--- the worker finishes processing. If the worker crashes mid-trade the
--- row stays pending and the next claimer picks it up.
-SELECT t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
-       t.size_shares, t.notional_usd, t.traded_at, t.external_id,
-       t.tx_hash, t.ingested_at, t.dedup_key,
-       t.detection_attempts,
-       m.condition_id AS market_condition_id
-FROM polymarket_trades t
-JOIN polymarket_markets m ON m.id = t.market_id
-WHERE t.detected_at IS NULL
-ORDER BY t.traded_at DESC, t.id DESC
-LIMIT sqlc.arg(claim_limit)::integer
-FOR UPDATE OF t SKIP LOCKED;
+-- Atomically lease a batch of trades that need detection processing.
+-- The UPDATE flips detection_claimed_at to NOW() and stamps the
+-- worker id; the inner SELECT … FOR UPDATE SKIP LOCKED ensures
+-- concurrent workers see disjoint batches. A leased row stays in
+-- 'pending' (detected_at IS NULL) until the worker calls
+-- MarkTradeDetectionResult; if the worker crashes, ResetStaleDetectionClaims
+-- reclaims rows whose lease is older than the configured TTL.
+UPDATE polymarket_trades t
+SET detection_claimed_at = NOW(),
+    detection_worker_id  = sqlc.arg(worker_id)::text
+FROM (
+    SELECT id
+    FROM polymarket_trades
+    WHERE detected_at IS NULL
+      AND (detection_claimed_at IS NULL OR detection_claimed_at < NOW() - sqlc.arg(claim_ttl)::interval)
+    ORDER BY traded_at DESC, id DESC
+    LIMIT sqlc.arg(claim_limit)::integer
+    FOR UPDATE SKIP LOCKED
+) AS picked
+JOIN polymarket_markets m ON TRUE
+WHERE t.id = picked.id AND m.id = t.market_id
+RETURNING t.id, t.market_id, t.trader_id, t.outcome_token, t.side, t.price,
+          t.size_shares, t.notional_usd, t.traded_at, t.external_id,
+          t.tx_hash, t.ingested_at, t.dedup_key,
+          t.detection_attempts,
+          m.condition_id AS market_condition_id;
+
+-- name: ResetStaleDetectionClaims :execrows
+-- Free leases held longer than the supplied interval, so the next
+-- claim picks the row back up. Returns the number of rows reset (the
+-- worker logs this so an operator can spot crash loops).
+UPDATE polymarket_trades
+SET detection_claimed_at = NULL,
+    detection_worker_id  = NULL
+WHERE detected_at IS NULL
+  AND detection_claimed_at IS NOT NULL
+  AND detection_claimed_at < NOW() - sqlc.arg(stale_after)::interval;
 
 -- name: MarkTradeDetectionResult :exec
 -- Stamp the terminal state for one trade. detected_at = NOW() always.
 -- detection_status is one of 'analyzed' | 'skipped' | 'failed' (the
 -- CHECK constraint enforces this). detection_skip_reason is set only
 -- when status='skipped'; last_detection_error only when status='failed'.
+-- The lease columns are cleared atomically so a row can never enter a
+-- "completed but still leased" state.
 UPDATE polymarket_trades
 SET detected_at           = NOW(),
     detection_status      = sqlc.arg(status)::text,
     detection_skip_reason = sqlc.narg(skip_reason)::text,
     last_detection_error  = sqlc.narg(error_message)::text,
-    detection_attempts    = detection_attempts + 1
+    detection_attempts    = detection_attempts + 1,
+    detection_claimed_at  = NULL,
+    detection_worker_id   = NULL
 WHERE id = sqlc.arg(trade_id)::bigint;
 
 -- name: PendingDetectionCount :one
@@ -221,3 +242,63 @@ SELECT MAX(t.traded_at)::timestamptz AS last_at
 FROM polymarket_trades t
 WHERE t.trader_id = sqlc.arg(trader_id)::bigint
   AND t.traded_at < sqlc.arg(before)::timestamptz;
+
+-- name: PriceWindowStats :one
+-- Per-(market, outcome) price/volume stats over a lookback window.
+-- Powers the late-market stable-favorite worker — stability,
+-- adverse-drift, and liquidity gates all read from this one row.
+--
+-- first/last via array_agg(ORDER BY) so a single scan yields both.
+-- STDDEV_POP (not _SAMP) because we treat the window as the
+-- population for stability purposes; the worker enforces a minimum
+-- sample count upstream.
+SELECT
+    COUNT(*)::bigint                                            AS sample_count,
+    COALESCE(AVG(price), 0)::double precision                   AS mean_price,
+    COALESCE(STDDEV_POP(price), 0)::double precision            AS stddev_price,
+    COALESCE(MIN(price), 0)::double precision                   AS min_price,
+    COALESCE(MAX(price), 0)::double precision                   AS max_price,
+    COALESCE((array_agg(price ORDER BY traded_at ASC))[1],  0)::double precision AS first_price,
+    COALESCE((array_agg(price ORDER BY traded_at DESC))[1], 0)::double precision AS last_price,
+    COALESCE(SUM(notional_usd), 0)::double precision            AS volume_usd,
+    COALESCE(SUM(notional_usd) FILTER (WHERE side = 'BUY'),  0)::double precision AS buy_volume_usd,
+    COALESCE(SUM(notional_usd) FILTER (WHERE side = 'SELL'), 0)::double precision AS sell_volume_usd
+FROM polymarket_trades
+WHERE market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text
+  AND traded_at    >= sqlc.arg(since)::timestamptz;
+
+-- name: ListLateMarketCandidates :many
+-- Active markets whose lifecycle progress has crossed the supplied
+-- threshold AND haven't been soft-deleted/purged. Returns enough
+-- context for the stable-favorite worker to build inputs without a
+-- second roundtrip per row.
+--
+-- The lifecycle math mirrors the in-memory market.LifecyclePct used
+-- by the per-trade scorer so the two strategies agree on what
+-- "late-market" means.
+SELECT m.id, m.condition_id, m.slug, m.question, m.event_slug, m.start_date, m.end_date,
+       (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+              NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct
+FROM polymarket_markets m
+WHERE m.active = TRUE
+  AND m.deleted_at IS NULL
+  AND m.purged_at  IS NULL
+  AND m.start_date IS NOT NULL
+  AND m.end_date   IS NOT NULL
+  AND m.end_date    > NOW()
+  AND (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
+             NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision >= sqlc.arg(min_lifecycle_pct)::double precision
+ORDER BY lifecycle_pct DESC
+LIMIT sqlc.arg(limit_count)::integer;
+
+-- name: LatestPriceForOutcome :one
+-- Most recent observed price for (market, outcome). Used by the
+-- stable-favorite worker as "current price" since there is no CLOB
+-- bid/ask wired upstream — the most recent trade is the best proxy
+-- we have for the implied probability.
+SELECT price FROM polymarket_trades
+WHERE market_id     = sqlc.arg(market_id)::bigint
+  AND outcome_token = sqlc.arg(outcome_token)::text
+ORDER BY traded_at DESC
+LIMIT 1;

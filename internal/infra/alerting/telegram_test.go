@@ -157,6 +157,103 @@ func TestTradeAnomalyMessageHasAllRequiredSections(t *testing.T) {
 	}
 }
 
+// --- Defensive rendering (v6) -------------------------------------------
+
+// TestHeaderProfitOmittedWhenZero pins the v6 defensive contract: a
+// pre-v6 alert payload (or any Finding whose ProfitIfWinUSD = 0) must
+// NOT render "profit $0.00" in the header. The header's profit
+// segment is OMITTED entirely. Tracking the production bug where a
+// legacy v4 payload bled into the v5/v6 binary and rendered
+// "INFO: profit $0.00 · $1,830 · ...".
+func TestHeaderProfitOmittedWhenZero(t *testing.T) {
+	f := sampleTradeFinding()
+	f.ProfitIfWinUSD = 0
+	f.GrossPayoutIfWinUSD = 0
+	msg := FormatTelegramMessage(f)
+	first := strings.SplitN(msg, "\n", 2)[0]
+	if strings.Contains(first, "profit $") {
+		t.Errorf("profit segment must be omitted when ProfitIfWinUSD=0:\n%s", first)
+	}
+	if !strings.Contains(first, "$120,000") {
+		t.Errorf("notional must still render:\n%s", first)
+	}
+}
+
+// TestHeaderProfitRendersFromV5Payload pins the canonical real-world
+// case the user reported: BUY YES, price 0.053, notional $1830 →
+// profit ≈ $1830 × (1/0.053 − 1) ≈ $32,720. With the upstream score
+// populating ProfitIfWinUSD correctly, the header must show it.
+func TestHeaderProfitRendersFromV5Payload(t *testing.T) {
+	f := sampleTradeFinding()
+	f.Severity = anomaly.SeverityInfo
+	f.Trade.NotionalUSD = 1_830
+	f.Trade.Price = 0.053
+	f.Trade.Odds = 1.0 / 0.053
+	notional := 1_830.0
+	odds := 1.0 / 0.053
+	f.ProfitIfWinUSD = notional * (odds - 1)
+	f.GrossPayoutIfWinUSD = notional * odds
+	msg := FormatTelegramMessage(f)
+	first := strings.SplitN(msg, "\n", 2)[0]
+	// Expect the header to carry the ~$32k figure (allow a wide range
+	// to dodge formatting precision).
+	if !strings.Contains(first, "profit $32,") {
+		t.Errorf("expected 'profit $32,...' in header, got:\n%s", first)
+	}
+}
+
+// TestBaselineRowRendersP99NA pins the v6 defensive rendering: when
+// P99USD = 0 (small sample, NULL in DB, or pre-v6 payload), the cell
+// reads "p99 n/a" rather than "p99 $0.00".
+func TestBaselineRowRendersP99NA(t *testing.T) {
+	f := sampleTradeFinding()
+	f.Baseline.P99USD = 0
+	f.TraderBaseline.P99USD = 0
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "p99 $0.00") {
+		t.Errorf("p99 $0.00 must never render — use n/a instead:\n%s", msg)
+	}
+	if !strings.Contains(msg, "p99 n/a") {
+		t.Errorf("expected 'p99 n/a' in:\n%s", msg)
+	}
+}
+
+// TestTailGateWording_PerAxis pins TASK 4: when the market baseline
+// is ready but the trader baseline is thin, the alert must say
+// "trader tail: unenforced (only N trader trades on record)" — NOT
+// the misleading "tail gate: unenforced (no baseline was ready)".
+func TestTailGateWording_PerAxis(t *testing.T) {
+	f := sampleTradeFinding()
+	f.LowMarketBaselineConfidence = false
+	f.LowTraderBaselineConfidence = true
+	f.TraderBaseline.SampleN = 4
+	f.TailGatePassed = true // market tail did pass
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "no baseline was ready") {
+		t.Errorf("must not say 'no baseline was ready' when market was ready:\n%s", msg)
+	}
+	if !strings.Contains(msg, "trader tail: unenforced (only 4 trader trades on record)") {
+		t.Errorf("expected per-axis trader-thin wording:\n%s", msg)
+	}
+}
+
+// TestTailGateWording_BothAxesThin pins the inverse: when BOTH
+// baselines are unready, both per-axis lines render.
+func TestTailGateWording_BothAxesThin(t *testing.T) {
+	f := sampleTradeFinding()
+	f.LowMarketBaselineConfidence = true
+	f.LowTraderBaselineConfidence = true
+	f.Baseline.SampleN = 0
+	f.TraderBaseline.SampleN = 0
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "market tail: unenforced") {
+		t.Errorf("missing market-tail unenforced line:\n%s", msg)
+	}
+	if !strings.Contains(msg, "trader tail: unenforced") {
+		t.Errorf("missing trader-tail unenforced line:\n%s", msg)
+	}
+}
+
 func TestSingleTradeAloneSaysSo(t *testing.T) {
 	f := sampleTradeFinding()
 	f.InCluster = false
@@ -188,6 +285,70 @@ func TestLinksOmitMissingEntries(t *testing.T) {
 	for _, want := range []string{"Polymarket market", "Polymarket category", "Trader"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+}
+
+// TestStableFavoriteRendering pins the new alert kind's surface:
+// header carries probability + return %, Why block carries
+// stability stats, Risks block is mandatory and explicitly says
+// "NOT a guarantee" — surveillance language is non-negotiable for
+// this strategy.
+func TestStableFavoriteRendering(t *testing.T) {
+	f := anomaly.Finding{
+		Kind:     anomaly.KindStableFavorite,
+		Severity: anomaly.SeverityInfo,
+		Reason:   anomaly.ReasonStableFavorite,
+		At:       time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC),
+		StableFavorite: &anomaly.StableFavoriteRef{
+			MarketID:           "0xmassie",
+			OutcomeToken:       "tok-yes",
+			Outcome:            "Yes",
+			Probability:        0.64,
+			RemainingReturnPct: 56.25,
+			StabilityWindow:    24 * time.Hour,
+			PriceMean:          0.64,
+			PriceStddev:        0.012,
+			PriceMin:           0.62,
+			PriceMax:           0.66,
+			PriceFirst:         0.63,
+			PriceLast:          0.64,
+			PriceSamples:       240,
+			Drawdown:           0.061,
+			AdverseMove6h:      0.0,
+			RecentVolumeUSD:    111_000,
+			RecentTradeCount:   240,
+			LifecyclePct:       96.4,
+			Score:              74,
+			Confidence:         0.74,
+			CrossMarketStatus:  "unavailable",
+		},
+		LifecyclePct: 96.4,
+		DedupKey:     "stable_favorite:informed-flow-v6:0xmassie:tok-yes:info",
+	}
+	msg := FormatTelegramMessage(f)
+	for _, want := range []string{
+		"INFO · stable favorite",
+		"64% · +56% return",
+		"<b>Why</b>",
+		"market is <b>96.4%</b> through lifecycle",
+		"favorite price stable: 62–66%",
+		"remaining return if correct: <b>+56.2%</b>",
+		"no adverse drift in last 6h",
+		"liquidity: $111,000 volume, 240 recent trades",
+		"confidence: <b>0.74</b>",
+		"<b>Risks</b>",
+		"NOT a guarantee",
+		"cross-market check: <b>unavailable</b>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+	// Negative pin: must NEVER claim safety.
+	for _, forbidden := range []string{"risk-free", "guaranteed", "safe bet"} {
+		if strings.Contains(strings.ToLower(msg), forbidden) {
+			t.Errorf("forbidden surveillance language %q in:\n%s", forbidden, msg)
 		}
 	}
 }
@@ -622,118 +783,50 @@ func TestLinksElideAllLocalhostSkipsSection(t *testing.T) {
 	}
 }
 
-// TestDataBlockOnTradeAnomaly pins the trailing Data block on a
-// single-trade Finding. The block carries the dedup_key (primary join
-// key for log / Grafana correlation) plus the market_id from the
-// firing trade. Values are wrapped in <code> for copy-friendliness.
-func TestDataBlockOnTradeAnomaly(t *testing.T) {
+// TestAnalystNoteOnTradeAnomaly pins the v7 contract: the Data
+// block is gone; in its place a single "Analyst note" block carries
+// the AI text when AnalystNote is non-empty.
+func TestAnalystNoteOnTradeAnomaly(t *testing.T) {
 	f := sampleTradeFinding()
 	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = "This looks like a watchlist candidate. Watch the next debate."
 	msg := FormatTelegramMessage(f)
+
+	// Positive: Analyst note must render.
 	for _, want := range []string{
-		"<b>Data</b>",
-		"• market_id: <code>0xabc</code>",
-		"• dedup: <code>single:v1:trade-1</code>",
+		"<b>Analyst note</b>",
+		"• This looks like a watchlist candidate. Watch the next debate.",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
 		}
 	}
-	// Data block must come AFTER Links — operators read top-down: severity,
-	// why, trade, links to act, raw identifiers last.
-	if li, di := strings.Index(msg, "<b>Links</b>"), strings.Index(msg, "<b>Data</b>"); !(li > 0 && di > li) {
-		t.Fatalf("Data must follow Links in layout:\n%s", msg)
-	}
-}
-
-// TestDataBlockOnAccumulation verifies the accumulation Finding
-// surfaces market_id + outcome_token from AccumulationRef. The
-// accumulation Finding is the only kind that carries the CLOB token
-// pre-computed (the line is by construction single-outcome).
-func TestDataBlockOnAccumulation(t *testing.T) {
-	f := anomaly.Finding{
-		Kind:     anomaly.KindAccumulation,
-		Severity: anomaly.SeverityWarning,
-		Reason:   anomaly.ReasonAccumulation,
-		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
-		Accumulation: &anomaly.AccumulationRef{
-			Wallet:           "0xabc1234567890def1234567890abcdef12345678",
-			MarketID:         "0xmarket",
-			OutcomeToken:     "12345678901234567890",
-			Outcome:          "Yes",
-			Side:             "BUY",
-			TradeCount:       7,
-			TotalNotionalUSD: 80_000,
-			Span:             2 * time.Hour,
-		},
-		Trade: &anomaly.TradeRef{
-			Market:      "0xmarket",
-			NotionalUSD: 8_000,
-		},
-		DedupKey: "accumulation:v1:0xabc:1:t:BUY:1747483200",
-	}
-	msg := FormatTelegramMessage(f)
-	for _, want := range []string{
-		"<b>Data</b>",
-		"• market_id: <code>0xmarket</code>",
-		"• outcome_token: <code>12345678901234567890</code>",
-		"• dedup: <code>accumulation:v1:0xabc:1:t:BUY:1747483200</code>",
-	} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("missing %q in:\n%s", want, msg)
-		}
-	}
-}
-
-// TestDataBlockOnCluster confirms cluster findings render the dedup
-// key. Cluster findings legitimately have no single market_id (a
-// cluster spans the category), so market_id may be missing — but the
-// block itself must render so the dedup key is visible.
-func TestDataBlockOnCluster(t *testing.T) {
-	f := sampleClusterFinding()
-	f.DedupKey = "cluster:v1:99:1747483200"
-	msg := FormatTelegramMessage(f)
-	if !strings.Contains(msg, "<b>Data</b>") {
-		t.Fatalf("cluster finding missing Data block:\n%s", msg)
-	}
-	if !strings.Contains(msg, "• dedup: <code>cluster:v1:99:1747483200</code>") {
-		t.Fatalf("cluster dedup not rendered:\n%s", msg)
-	}
-}
-
-// TestDataBlockOmittedWhenAllEmpty keeps the older trade-only fixtures
-// (those that don't set DedupKey) rendering exactly as before — no
-// orphan "Data" header, no empty block.
-func TestDataBlockOmittedWhenAllEmpty(t *testing.T) {
-	f := anomaly.Finding{
-		Kind:     anomaly.KindCategoryWatch,
-		Severity: anomaly.SeverityHard,
-		At:       time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC),
-		Category: &anomaly.CategoryRef{ID: 1, Slug: "x", Label: "X"},
-		Cluster:  &anomaly.ClusterStats{Window: time.Minute, AnomalousTrades: 1, UniqueWallets: 1, TotalUSD: 1},
-	}
-	msg := FormatTelegramMessage(f)
+	// Negative: Data block must NOT render — Analyst note replaces it.
 	if strings.Contains(msg, "<b>Data</b>") {
-		t.Fatalf("Data block must be skipped when dedup + market + token are all empty:\n%s", msg)
+		t.Errorf("Data block must be removed in v7:\n%s", msg)
 	}
 }
 
-// TestDataBlockEscapesValues protects against an alert payload that
-// (hypothetically) embedded HTML-unsafe characters in identifier
-// fields. dedup_key today is alphanumeric + ':' + '-', but defence in
-// depth matters: a future strategy version is free to widen the
-// charset and we don't want a stray '<' to break Telegram's HTML
-// parser.
-func TestDataBlockEscapesValues(t *testing.T) {
+// TestAnalystNoteOmittedWhenEmpty: when AnalystNote is empty, the
+// block must render NOTHING — no orphan header, no fallback Data.
+func TestAnalystNoteOmittedWhenEmpty(t *testing.T) {
 	f := sampleTradeFinding()
-	f.Trade.Market = "0x<evil>"
-	f.DedupKey = `single:v1:a&b<c>`
+	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = ""
 	msg := FormatTelegramMessage(f)
-	if !strings.Contains(msg, "• market_id: <code>0x&lt;evil&gt;</code>") {
-		t.Errorf("market_id not HTML-escaped:\n%s", msg)
+	if strings.Contains(msg, "<b>Analyst note</b>") {
+		t.Errorf("Analyst note must be elided when empty:\n%s", msg)
 	}
-	if !strings.Contains(msg, "• dedup: <code>single:v1:a&amp;b&lt;c&gt;</code>") {
-		t.Errorf("dedup not HTML-escaped:\n%s", msg)
+}
+
+// TestAnalystNoteEscapesHTML protects against a model output that
+// contains stray < or > which would break Telegram's HTML parser.
+func TestAnalystNoteEscapesHTML(t *testing.T) {
+	f := sampleTradeFinding()
+	f.AnalystNote = "Watch <emerging> & <breaking> news flow."
+	msg := FormatTelegramMessage(f)
+	if !strings.Contains(msg, "Watch &lt;emerging&gt; &amp; &lt;breaking&gt; news flow.") {
+		t.Errorf("AnalystNote not HTML-escaped:\n%s", msg)
 	}
 }
 
@@ -773,9 +866,6 @@ func TestOwnershipFindingRendersDistinctHeader(t *testing.T) {
 		"• outcome: <b>Yes</b>",
 		"<i>trade-flow approximation</i>",
 		"• reason: <code>MARKET_OWNERSHIP_CONCENTRATION</code>",
-		"<b>Data</b>",
-		"• dedup: <code>ownership:v4:0xwhale:1:tok:warning</code>",
-		"• outcome_token: <code>12345</code>",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in ownership message:\n%s", want, msg)

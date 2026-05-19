@@ -146,6 +146,59 @@ func TestTick_SenderFailureCountsError(t *testing.T) {
 	}
 }
 
+// TestFormat_DetectionSectionRendersWhenNonZero pins the v6 stats:
+// when the detection breakdown carries any non-zero counters, the
+// "Detection" header + each named row renders in the fixed order
+// analyzed → skipped → failed, followed by pending.
+func TestFormat_DetectionSectionRendersWhenNonZero(t *testing.T) {
+	s := Stats{
+		MarketsTotal: 1,
+		DetectionByStatus: map[string]int64{
+			"analyzed": 1234,
+			"skipped":  56,
+			"failed":   2,
+		},
+		DetectionPending: 18,
+		UptimeSince:      time.Now(),
+	}
+	msg := Format(s, time.Now())
+	for _, want := range []string{
+		"<b>Detection</b>",
+		"• analyzed: 1234",
+		"• skipped: 56",
+		"• failed: 2",
+		"• pending: 18",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+	// Order check — analyzed must precede skipped must precede failed
+	// must precede pending so two consecutive summaries diff cleanly.
+	idx := func(needle string) int { return strings.Index(msg, needle) }
+	if !(idx("analyzed: 1234") < idx("skipped: 56") &&
+		idx("skipped: 56") < idx("failed: 2") &&
+		idx("failed: 2") < idx("pending: 18")) {
+		t.Errorf("detection row order broken:\n%s", msg)
+	}
+}
+
+// TestFormat_DetectionSectionOmittedWhenAllZero confirms the
+// formatter skips the Detection block entirely when everything is
+// zero — same omit-on-empty rule as Backfill/Alerts.
+func TestFormat_DetectionSectionOmittedWhenAllZero(t *testing.T) {
+	s := Stats{
+		MarketsTotal:      1,
+		DetectionByStatus: map[string]int64{},
+		DetectionPending:  0,
+		UptimeSince:       time.Now(),
+	}
+	msg := Format(s, time.Now())
+	if strings.Contains(msg, "<b>Detection</b>") {
+		t.Errorf("Detection block must be skipped when all counters are zero:\n%s", msg)
+	}
+}
+
 // TestFormat_OmitsBackfillSectionWhenEmpty confirms the formatter
 // skips the Backfill block entirely rather than emitting an empty
 // header — same shape as the alert formatter's omit-on-empty rule.
