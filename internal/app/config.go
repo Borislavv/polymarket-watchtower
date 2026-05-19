@@ -585,12 +585,6 @@ type AIAnalysisConfig struct {
 	LogAlertsEnabled bool `env:"AI_ANALYSIS_LOG_ALERTS_ENABLED" envDefault:"true"`
 	ReportsEnabled   bool `env:"AI_ANALYSIS_REPORTS_ENABLED" envDefault:"true"`
 
-	// Web context (OpenAI Responses API + web_search tool). Scaffolded
-	// in v8 — config knobs are wired, the openai client carries a
-	// gate behind `web_context=true` requests, but the full Responses
-	// API HTTP shape needs live-API verification before production
-	// enable. Keep WebContextEnabled=false until verified.
-	WebContextEnabled           bool          `env:"AI_ANALYSIS_WEB_CONTEXT_ENABLED" envDefault:"false"`
 	WebContextMinSeverity       string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
 	WebContextForHotInfo        bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
 	WebContextForStableFavorite bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_STABLE_FAVORITE" envDefault:"true"`

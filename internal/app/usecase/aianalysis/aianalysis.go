@@ -390,36 +390,40 @@ func sanitizeAndCap(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// validateAlertOutput enforces the v8 prompt contract: the model
-// must produce a structured note with at least Thesis / Follow? /
-// Verdict markers. A response missing any of them is treated as
-// malformed — it would render as a wall of text that doesn't
-// answer the operator's decision question, so we reject it and
-// fall back to "no Analyst note attached".
+// validateAlertOutput runs MINIMAL safety checks on model output.
+// v8.1 incident-driven revision: we no longer reject paid model
+// output because it lacks Thesis:/Follow?:/Verdict: labels. Strict
+// structural validation was throwing away usable analysis the
+// operator had already paid OpenAI tokens for; the prompt asks for
+// the structure but the operator's feedback wins.
 //
-// Returns empty string when valid; otherwise a short reason code
-// the caller can store in the request log.
+// The only rejections that survive are the ones that would actively
+// poison the analytical table:
+//   - empty / whitespace-only output (nothing useful to render).
+//   - obvious provider-error JSON that slipped past the openai
+//     client's typed-error path (defence in depth — the openai
+//     client should already have categorised these as failures, but
+//     a bad upstream change could regress).
+//
+// Length capping is handled upstream (openai.Client.MaxOutputChars
+// + truncate); a long-but-genuine answer is NOT rejected here.
+//
+// Returns empty string when output is acceptable; otherwise a short
+// reason code stored on the request_log row.
 func validateAlertOutput(text string) string {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		return "empty_text"
 	}
-	// Reject outputs that look like raw provider errors — belt and
-	// braces over the openai client error path.
 	low := strings.ToLower(t)
-	for _, marker := range []string{"insufficient_quota", "rate_limit_exceeded", "\"error\":{"} {
+	for _, marker := range []string{
+		"insufficient_quota",
+		"rate_limit_exceeded",
+		"\"error\":{",
+	} {
 		if strings.Contains(low, marker) {
 			return "provider_error_text"
 		}
-	}
-	if !strings.Contains(t, "Thesis:") {
-		return "missing_thesis"
-	}
-	if !strings.Contains(t, "Follow?:") {
-		return "missing_follow"
-	}
-	if !strings.Contains(t, "Verdict:") {
-		return "missing_verdict"
 	}
 	return ""
 }

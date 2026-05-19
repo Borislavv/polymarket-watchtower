@@ -345,15 +345,47 @@ func TestProviderQuotaExceededIsNotStoredAsAnalysis(t *testing.T) {
 	}
 }
 
-// TestBadOutputFailsValidationAndIsRequestLogged pins the v8 output-
-// validation contract: a successful HTTP response whose text doesn't
-// match the structured format is rejected — request_log only, no
-// analysis row.
-func TestBadOutputFailsValidationAndIsRequestLogged(t *testing.T) {
+// TestFreeFormAnswerIsAccepted pins the v8.1 contract: non-empty
+// model output WITHOUT the Thesis/Follow?/Verdict markers MUST be
+// persisted as analysis and rendered. Prompt engineering shapes the
+// format; we never throw away paid model tokens because a label is
+// missing.
+func TestFreeFormAnswerIsAccepted(t *testing.T) {
+	freeForm := "This wallet's accumulation is large but the opposite-side flow last 24h is comparable, so I would watch rather than copy."
 	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
-		Status:       analysis.StatusOK,
-		Model:        "gpt-4o-mini",
-		AnalysisText: "This is just free text without the required structure.",
+		Status: analysis.StatusOK, Model: "gpt-4o-mini",
+		AnalysisText: freeForm,
+	}}
+	st := newFakeStore()
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	row, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if row.Status != string(analysis.StatusOK) {
+		t.Errorf("status: got %q want ok", row.Status)
+	}
+	if len(st.latest) != 1 {
+		t.Fatalf("free-form analysis must be persisted; got %d rows", len(st.latest))
+	}
+	if got := st.latest[42].AnalysisText; got != freeForm {
+		t.Errorf("analysis_text not preserved verbatim:\n got: %q\nwant: %q", got, freeForm)
+	}
+	// The request_log row must be the success path, not validation_failed.
+	if len(rl.rows) != 1 || rl.rows[0].Status != "success" {
+		t.Errorf("request_log must record success; got %+v", rl.rows)
+	}
+}
+
+// TestEmptyAnswerIsRejected pins the one validation that survives:
+// a 200 with empty / whitespace-only text is rejected so we don't
+// render a blank Analyst-note block.
+func TestEmptyAnswerIsRejected(t *testing.T) {
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
+		Status: analysis.StatusOK, Model: "gpt-4o-mini",
+		AnalysisText: "   \n\t  ",
 	}}
 	st := newFakeStore()
 	rl := &fakeRequestLog{}
@@ -364,13 +396,58 @@ func TestBadOutputFailsValidationAndIsRequestLogged(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(st.latest) != 0 {
-		t.Errorf("malformed output must NOT be stored as analysis; got %d rows", len(st.latest))
+		t.Errorf("empty output must NOT be stored as analysis; got %d rows", len(st.latest))
 	}
-	if len(rl.rows) != 1 {
-		t.Fatalf("expected 1 ai_request_logs row, got %d", len(rl.rows))
+	if len(rl.rows) != 1 || rl.rows[0].ErrorCategory != "validation_failed:empty_text" {
+		t.Errorf("expected validation_failed:empty_text; got %+v", rl.rows)
 	}
-	if !strings.HasPrefix(rl.rows[0].ErrorCategory, "validation_failed") {
-		t.Errorf("category: %q (must start with validation_failed)", rl.rows[0].ErrorCategory)
+}
+
+// TestProviderErrorJSONIsRejected pins the defence-in-depth path:
+// even if the openai client's typed-error machinery misses (e.g. a
+// 200-with-error body, a parser bug), aianalysis MUST NOT persist a
+// JSON payload that looks like a provider error as if it were an
+// AI answer.
+func TestProviderErrorJSONIsRejected(t *testing.T) {
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
+		Status: analysis.StatusOK, Model: "gpt-4o-mini",
+		AnalysisText: `{"error":{"code":"insufficient_quota","message":"You exceeded your quota"}}`,
+	}}
+	st := newFakeStore()
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	_, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(st.latest) != 0 {
+		t.Errorf("provider-error text must NOT be stored as analysis; got %d rows", len(st.latest))
+	}
+	if len(rl.rows) != 1 || !strings.Contains(rl.rows[0].ErrorCategory, "provider_error_text") {
+		t.Errorf("expected provider_error_text category; got %+v", rl.rows)
+	}
+}
+
+// TestLongAnswerIsAccepted pins that long but non-empty model
+// output is NOT rejected by aianalysis. Length capping is the
+// openai client's job (MaxOutputChars + truncate); the analysis
+// layer must not double-gate.
+func TestLongAnswerIsAccepted(t *testing.T) {
+	long := strings.Repeat("This wallet accumulated steadily over the last 24h. ", 30) // ~1560 chars
+	an := &fakeAnalyzer{result: analysis.AlertAnalysis{
+		Status: analysis.StatusOK, Model: "gpt-4o-mini",
+		AnalysisText: long,
+	}}
+	st := newFakeStore()
+	rl := &fakeRequestLog{}
+	svc := newSvcWithRequestLog(an, st, rl)
+
+	if _, err := svc.AnalyzeAndStore(context.Background(), 42, sampleFinding()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(st.latest) != 1 {
+		t.Errorf("long answer must be persisted; got %d rows", len(st.latest))
 	}
 }
 
