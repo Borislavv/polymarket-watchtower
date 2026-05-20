@@ -680,6 +680,7 @@ func New() (*App, error) {
 				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
 				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
 				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+				WebSearchEnabled:       cfg.AIAnalysis.WebSearchEnabled,
 			})
 			logger.Info().
 				Str("provider", "openai").
@@ -690,6 +691,7 @@ func New() (*App, error) {
 				Bool("telegram_alerts_enabled", cfg.AIAnalysis.AlertsEnabled).
 				Bool("reports_enabled", cfg.AIAnalysis.ReportsEnabled).
 				Bool("market_intelligence_enabled", cfg.AIAnalysis.MarketIntelligenceEnabled).
+				Bool("web_search_enabled", cfg.AIAnalysis.WebSearchEnabled).
 				Msg("ai analysis enabled")
 		}
 		aiSvc = aianalysis.New(aianalysis.Config{
@@ -779,6 +781,10 @@ func New() (*App, error) {
 				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
 				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
 				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+				// Market intel prompt asks the model to scan fresh
+				// news for trend confirmation/invalidation; without
+				// web_search the section is dead.
+				WebSearchEnabled: cfg.AIAnalysis.WebSearchEnabled,
 			})
 		}
 		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)

@@ -585,6 +585,13 @@ type AIAnalysisConfig struct {
 	LogAlertsEnabled bool `env:"AI_ANALYSIS_LOG_ALERTS_ENABLED" envDefault:"true"`
 	ReportsEnabled   bool `env:"AI_ANALYSIS_REPORTS_ENABLED" envDefault:"true"`
 
+	// WebSearchEnabled flips alert + market-report calls onto the
+	// OpenAI Responses API with the web_search_preview tool so the
+	// model can fetch real-time news to validate/invalidate the
+	// alert thesis. Operator-billable (web_search calls have their
+	// own cost line); default true now that the path is wired and
+	// tested. Set false to fall back to Chat Completions.
+	WebSearchEnabled            bool          `env:"AI_ANALYSIS_WEB_SEARCH_ENABLED" envDefault:"true"`
 	WebContextMinSeverity       string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
 	WebContextForHotInfo        bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
 	WebContextForStableFavorite bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_STABLE_FAVORITE" envDefault:"true"`

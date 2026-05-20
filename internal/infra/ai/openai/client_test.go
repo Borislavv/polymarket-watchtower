@@ -284,13 +284,20 @@ func TestPromptBuilder_TitleAndReasonsAppear(t *testing.T) {
 		"market_title: Will Massie win KY-04?",
 		"category: Politics",
 		"reasons: STABLE_PRICE, LOW_VOLATILITY",
-		// v8.2 prompt shape — structured operator-decision sections
-		// in the user message; tone + anti-hallucination + density
-		// live in defaultSystemPrompt (pinned by a separate test).
-		"Signal read:",
-		"Strategy validation:",
-		"Would I follow this?",
-		"Final verdict:",
+		// v9 prompt shape — Russian trend-confirmation/invalidation
+		// task block. Section headers in the user message; tone +
+		// anti-hallucination live in defaultSystemPrompt (pinned by
+		// a separate test). We assert the data-section headers + the
+		// load-bearing AI-analysis output bullets.
+		"Данные алерта:",
+		"Current market/price:",
+		"Recent flow/anomalies:",
+		"Fresh news / web context:",
+		"Previous context:",
+		"Fresh events check",
+		"Trend confirmation / invalidation",
+		"Practical stance",
+		"Watch next",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
@@ -321,10 +328,11 @@ func TestPromptBuilder_CrossFlowContradictoryAlerts(t *testing.T) {
 			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
 		}
 	}
-	// The "Why it may fail" section in the new task block tells the
-	// model where to consider opposite-side flow, replacing the
-	// old "conflicting flow" wording duplication.
-	if !strings.Contains(p, "opposite-side flow") {
+	// v9: the trend-confirmation task block lists "opposite-side flow"
+	// inside the Flow interpretation rubric (as opposite-side pressure
+	// / opposite-side flow). The literal "opposite-side" substring is
+	// the load-bearing token — assert that, not a tight phrase.
+	if !strings.Contains(p, "opposite-side") {
 		t.Errorf("task section must point the model at opposite-side flow:\n%s", p)
 	}
 }
@@ -466,6 +474,117 @@ func TestPickVerdict(t *testing.T) {
 		if got := pickVerdict(c.in); got != c.want {
 			t.Errorf("pickVerdict(%q): got %q want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestAnalyzeAlert_ResponsesAPIWithWebSearch pins v9: when
+// WebSearchEnabled=true the client posts to /v1/responses with the
+// `web_search_preview` tool, parses output_text out of the `output[]`
+// `message` items, and maps input_tokens/output_tokens onto the
+// existing PromptTokens/CompletionTokens fields. We also assert the
+// prompt body reflects the transport choice via PublicContextEnabled.
+func TestAnalyzeAlert_ResponsesAPIWithWebSearch(t *testing.T) {
+	var seenPath string
+	var seenBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"output": [
+				{"type": "web_search_call", "id": "ws_1", "status": "completed"},
+				{"type": "message", "id": "msg_1", "role": "assistant", "content": [
+					{"type": "output_text", "text": "AI analysis\n• Fresh events: poll just dropped, supports YES.\n• Trend read: confirms.\n• Practical stance: strong watchlist candidate.", "annotations": []}
+				]}
+			],
+			"usage": {"input_tokens": 320, "output_tokens": 95}
+		}`))
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		APIKey:                 "test-key",
+		BaseURL:                srv.URL,
+		Model:                  "test-model",
+		Timeout:                2 * time.Second,
+		MaxPromptChars:         2500,
+		MaxOutputChars:         700,
+		RatePerMin:             100,
+		DailyBudget:            5,
+		PromptCostPer1kUSD:     0.00015,
+		CompletionCostPer1kUSD: 0.0006,
+		WebSearchEnabled:       true,
+	}
+	c := New(cfg)
+	out, err := c.AnalyzeAlert(context.Background(), analysis.AlertAnalysisRequest{
+		Kind: "trade_anomaly", Severity: "warning", Title: "Will X happen?",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if seenPath != "/responses" {
+		t.Errorf("path: got %q want /responses", seenPath)
+	}
+	if !strings.Contains(string(seenBody), `"web_search_preview"`) {
+		t.Errorf("request body missing web_search_preview tool: %s", string(seenBody))
+	}
+	if !strings.Contains(string(seenBody), `"max_output_tokens"`) {
+		t.Errorf("request body must use max_output_tokens (Responses API): %s", string(seenBody))
+	}
+	if out.Status != analysis.StatusOK {
+		t.Fatalf("status: got %q want ok", out.Status)
+	}
+	if !strings.Contains(out.AnalysisText, "Fresh events") {
+		t.Errorf("body should carry the model output: %q", out.AnalysisText)
+	}
+	if out.PromptTokens != 320 || out.CompletionTokens != 95 {
+		t.Errorf("token accounting wrong: %+v", out)
+	}
+	if out.EstimatedCostUSD <= 0 {
+		t.Errorf("estimated cost must be > 0: %v", out.EstimatedCostUSD)
+	}
+}
+
+// TestAnalyzeAlert_WebSearchPromptStampsPublicContext pins that
+// when WebSearchEnabled is on the prompt the model sees declares
+// the public_context channel as attempted, so it stops issuing the
+// "Live public context was not checked." disclaimer.
+func TestAnalyzeAlert_WebSearchPromptStampsPublicContext(t *testing.T) {
+	var seenBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer srv.Close()
+	cfg := Config{
+		APIKey:           "test-key",
+		BaseURL:          srv.URL,
+		Model:            "m",
+		Timeout:          2 * time.Second,
+		RatePerMin:       100,
+		DailyBudget:      5,
+		WebSearchEnabled: true,
+	}
+	c := New(cfg)
+	// Caller passes PublicContextEnabled=false; client must flip it
+	// to true under WebSearchEnabled before building the prompt.
+	if _, err := c.AnalyzeAlert(context.Background(), analysis.AlertAnalysisRequest{PublicContextEnabled: false}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !strings.Contains(string(seenBody), "web_search was attempted") {
+		t.Errorf("WebSearchEnabled must stamp public_context disclosure in prompt; body=%s", string(seenBody))
+	}
+	// The user-message disclosure must NOT be the "NOT checked"
+	// branch. We can't substring on the system-prompt anti-
+	// hallucination phrase because it always contains the literal
+	// "Live public context was not checked." as guidance to the
+	// model; instead pin the user-message key `public_context: NOT
+	// checked` which lives only on the disabled branch.
+	if strings.Contains(string(seenBody), "public_context: NOT checked") {
+		t.Errorf("WebSearchEnabled must NOT emit the 'NOT checked' user-message disclosure; body=%s", string(seenBody))
 	}
 }
 

@@ -61,6 +61,16 @@ type Config struct {
 	PromptCostPer1kUSD     float64
 	CompletionCostPer1kUSD float64
 
+	// WebSearchEnabled flips alert and market-report calls onto the
+	// OpenAI Responses API (`POST /v1/responses`) with the
+	// `web_search_preview` tool attached. The model can then fetch
+	// real-time news to validate/invalidate the alert thesis. When
+	// false, the client uses the existing Chat Completions path and
+	// the prompt tells the model not to invent news. Operators flip
+	// this with AI_ANALYSIS_WEB_SEARCH_ENABLED=true. Cost: web_search
+	// calls are billed extra on top of token usage.
+	WebSearchEnabled bool
+
 	// Clock + HTTP for tests.
 	Clock      func() time.Time
 	HTTPClient *http.Client
@@ -160,7 +170,16 @@ Density discipline:
 // analyst note. On budget/rate-limit/timeout/error it returns a
 // non-error AlertAnalysis with Status set so the caller can persist
 // the skip-reason and still emit the underlying alert.
+//
+// When Config.WebSearchEnabled is true, the call goes through the
+// Responses API with the `web_search_preview` tool attached so the
+// model can fetch real-time news. PublicContextEnabled on the
+// request is stamped in this case so the prompt body reflects the
+// transport choice.
 func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisRequest) (analysis.AlertAnalysis, error) {
+	if c.cfg.WebSearchEnabled {
+		req.PublicContextEnabled = true
+	}
 	prompt := buildAlertPrompt(req)
 	if c.cfg.APIKey == "" {
 		return analysis.AlertAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "no_api_key"}, nil
@@ -171,7 +190,7 @@ func (c *Client) AnalyzeAlert(ctx context.Context, req analysis.AlertAnalysisReq
 	if !c.ledger.allow() {
 		return analysis.AlertAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "daily_budget_exhausted"}, nil
 	}
-	resp, err := c.callChat(ctx, prompt, c.cfg.MaxOutputChars)
+	resp, err := c.callModel(ctx, prompt, c.cfg.MaxOutputChars)
 	if err != nil {
 		// Surface a short canonical category in LastError (never the
 		// raw provider body). The aianalysis layer routes the full
@@ -227,7 +246,8 @@ func statusForCategory(cat ErrorCategory) analysis.Status {
 // AnalyzeMarketReport is implemented but the orchestrating worker
 // is staged behind a follow-up PR. The model call works end-to-end;
 // only the periodic top-N selection + dedup logic lives in the
-// usecase layer.
+// usecase layer. Honours Config.WebSearchEnabled the same way as
+// AnalyzeAlert.
 func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
 	prompt := buildMarketReportPrompt(req) // reports are bigger
 	if c.cfg.APIKey == "" {
@@ -239,7 +259,7 @@ func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketRep
 	if !c.ledger.allow() {
 		return analysis.MarketReportAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "daily_budget_exhausted"}, nil
 	}
-	resp, err := c.callChat(ctx, prompt, 2000)
+	resp, err := c.callModel(ctx, prompt, 2000)
 	if err != nil {
 		pe, ok := AsProviderError(err)
 		if !ok {
@@ -263,7 +283,8 @@ func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketRep
 	}, nil
 }
 
-// AnalyzeOutcome — postmortem path.
+// AnalyzeOutcome — postmortem path. Always uses Chat Completions;
+// the outcome is already resolved so live news adds nothing.
 func (c *Client) AnalyzeOutcome(ctx context.Context, req analysis.OutcomeAnalysisRequest) (analysis.OutcomeAnalysis, error) {
 	prompt := buildOutcomePrompt(req)
 	if c.cfg.APIKey == "" {
@@ -392,6 +413,119 @@ func (c *Client) callChat(ctx context.Context, userMsg string, maxChars int) (ch
 		Text:             strings.TrimSpace(parsed.Choices[0].Message.Content),
 		PromptTokens:     parsed.Usage.PromptTokens,
 		CompletionTokens: parsed.Usage.CompletionTokens,
+	}, nil
+}
+
+// callModel dispatches to the Responses API path when web_search is
+// enabled, otherwise to Chat Completions. The shared chatResp shape
+// lets the rest of the client treat both transports identically.
+func (c *Client) callModel(ctx context.Context, userMsg string, maxChars int) (chatResp, error) {
+	if c.cfg.WebSearchEnabled {
+		return c.callResponses(ctx, userMsg, maxChars)
+	}
+	return c.callChat(ctx, userMsg, maxChars)
+}
+
+// callResponses hits `POST /v1/responses` with the
+// `web_search_preview` tool attached so the model can fetch real-time
+// news. Response items of type `message` carry an array of `content`
+// entries; the analyst text is the concatenation of all `output_text`
+// entries (citations live in `annotations` and are intentionally
+// discarded — Telegram renders plain text). Token accounting maps
+// the Responses-API `input_tokens` / `output_tokens` onto the
+// PromptTokens / CompletionTokens fields the rest of the client
+// already uses for cost estimation and the request log.
+func (c *Client) callResponses(ctx context.Context, userMsg string, maxChars int) (chatResp, error) {
+	body, err := json.Marshal(map[string]any{
+		"model": c.cfg.Model,
+		"input": []map[string]string{
+			{"role": "system", "content": c.systemPrompt},
+			{"role": "user", "content": userMsg},
+		},
+		"tools": []map[string]any{
+			{"type": "web_search_preview"},
+		},
+		"max_output_tokens": maxChars / 3,
+		"temperature":       0.2,
+	})
+	if err != nil {
+		return chatResp{}, fmt.Errorf("marshal responses request: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return chatResp{}, fmt.Errorf("new responses request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		cat := CategoryNetwork
+		if errors.Is(err, context.DeadlineExceeded) {
+			cat = CategoryTimeout
+		}
+		return chatResp{}, &ProviderError{
+			Category:  cat,
+			Message:   sanitizeAndCap(err.Error(), 200),
+			Retryable: true,
+		}
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return chatResp{}, &ProviderError{
+			Category:  CategoryNetwork,
+			Message:   sanitizeAndCap(err.Error(), 200),
+			Retryable: true,
+		}
+	}
+	if resp.StatusCode/100 != 2 {
+		return chatResp{}, classifyHTTPError(resp.StatusCode, raw)
+	}
+	var parsed struct {
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content,omitempty"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return chatResp{}, &ProviderError{
+			Category:  CategoryUnknown,
+			Message:   sanitizeAndCap("responses unmarshal: "+err.Error(), 200),
+			Retryable: false,
+		}
+	}
+	var text strings.Builder
+	for _, item := range parsed.Output {
+		if item.Type != "message" {
+			continue
+		}
+		for _, part := range item.Content {
+			if part.Type == "output_text" {
+				text.WriteString(part.Text)
+			}
+		}
+	}
+	out := strings.TrimSpace(text.String())
+	if out == "" {
+		return chatResp{}, &ProviderError{
+			Category:  CategoryEmptyResponse,
+			Message:   "no output_text in responses payload",
+			Retryable: true,
+		}
+	}
+	return chatResp{
+		Text:             out,
+		PromptTokens:     parsed.Usage.InputTokens,
+		CompletionTokens: parsed.Usage.OutputTokens,
 	}, nil
 }
 
