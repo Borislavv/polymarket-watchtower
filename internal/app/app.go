@@ -38,9 +38,11 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/evolution"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/stablefavorite"
@@ -81,20 +83,21 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill         *backfill.Worker
-	sender           *alertsender.Worker
-	sanity           *sanity.Worker
-	outcomes         *outcomes.Worker
-	drift            *drift.Worker
-	stats            *statsreport.Worker
-	signalReport     *signalreport.Worker
-	detection        *detection.Worker
-	stableFavorite   *stablefavorite.Worker
-	aiAnalysis       *aianalysis.Service
-	outcomeAI        *outcomeai.Worker
-	marketIntel      *marketintel.Worker
-	catalystImporter *catalystimporter.Worker
-	dailyIntel       *dailypoliticalintel.Worker
+	backfill          *backfill.Worker
+	sender            *alertsender.Worker
+	sanity            *sanity.Worker
+	outcomes          *outcomes.Worker
+	drift             *drift.Worker
+	stats             *statsreport.Worker
+	signalReport      *signalreport.Worker
+	detection         *detection.Worker
+	stableFavorite    *stablefavorite.Worker
+	aiAnalysis        *aianalysis.Service
+	outcomeAI         *outcomeai.Worker
+	marketIntel       *marketintel.Worker
+	catalystImporter  *catalystimporter.Worker
+	dailyIntel        *dailypoliticalintel.Worker
+	predictionEvolver *evolution.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -993,31 +996,115 @@ func New() (*App, error) {
 			Msg("daily political intel: wired")
 	}
 
+	// v9.9 Prediction Evolution Worker (the heartbeat).
+	var evolutionWorker *evolution.Worker
+	if cfg.Postgres.Enabled() && cfg.Prediction.EvolutionEnabled && marketsRepo != nil && eventPageProvider != nil {
+		predsRepo := repository.NewRepricingPredictionsRepository(pgPool)
+		flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
+			Enabled:          true,
+			Lookback:         cfg.EventFlow.Lookback,
+			MaxAlerts:        cfg.EventFlow.MaxAlerts,
+			MaxTrades:        cfg.EventFlow.MaxTrades,
+			MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
+			TopItems:         cfg.EventFlow.TopItems,
+		}, met, logger)
+		repricingComp := repricing.New(repricing.Config{
+			Enabled:                cfg.Repricing.Enabled,
+			Lookback:               cfg.Repricing.Lookback,
+			PreWindow:              cfg.Repricing.PreWindow,
+			PostWindow:             cfg.Repricing.PostWindow,
+			MinAnnotationMove:      cfg.Repricing.MinAnnotationMove,
+			MinFlowUSD:             cfg.Repricing.MinFlowUSD,
+			UnderreactionThreshold: cfg.Repricing.UnderreactionThreshold,
+			OverreactionThreshold:  cfg.Repricing.OverreactionThreshold,
+		}, sqlc.New(pgPool), predsRepo, met, logger)
+		var aiGen analysis.PredictionEvolutionGenerator = analysis.NoopPredictionEvolutionGenerator{}
+		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.EvolutionAIEnabled {
+			aiGen = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.Prediction.EvolutionTimeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		catalystRepoForEvolver := repository.NewEventCatalystRepository(pgPool)
+		var tgAdapter evolution.Telegram
+		if bot != nil && cfg.Prediction.EvolutionSendTelegram {
+			tgAdapter = evolutionTelegramAdapter{bot: bot}
+		}
+		evolutionWorker = evolution.New(evolution.Config{
+			Enabled:            cfg.Prediction.EvolutionEnabled,
+			Interval:           cfg.Prediction.EvolutionInterval,
+			BatchSize:          cfg.Prediction.EvolutionBatchSize,
+			Concurrency:        cfg.Prediction.EvolutionConcurrency,
+			Timeout:            cfg.Prediction.EvolutionTimeout,
+			AIEnabled:          cfg.Prediction.EvolutionAIEnabled,
+			AIMinInterval:      cfg.Prediction.EvolutionAIMinInterval,
+			AIMaxPerRun:        cfg.Prediction.EvolutionAIMaxPerRun,
+			StaleAfter:         cfg.Prediction.EvolutionStaleAfter,
+			DecayEnabled:       cfg.Prediction.EvolutionDecayEnabled,
+			DecayPerDay:        cfg.Prediction.EvolutionDecayPerDay,
+			MinConfidence:      cfg.Prediction.EvolutionMinConfidence,
+			MajorPriceMove:     cfg.Prediction.EvolutionMajorPriceMove,
+			CatalystNearWindow: cfg.Prediction.EvolutionCatalystNearWindow,
+			SendTelegram:       cfg.Prediction.EvolutionSendTelegram,
+			TelegramCooldown:   cfg.Prediction.EvolutionTelegramCooldown,
+			TelegramChatID:     cfg.Alerting.TelegramChatID,
+		}, predsRepo, eventPageProvider, catalystRepoForEvolver, flowRepo, repricingComp, aiGen, tgAdapter, met, logger)
+		logger.Info().
+			Bool("enabled", cfg.Prediction.EvolutionEnabled).
+			Dur("interval", cfg.Prediction.EvolutionInterval).
+			Int("batch_size", cfg.Prediction.EvolutionBatchSize).
+			Int("concurrency", cfg.Prediction.EvolutionConcurrency).
+			Bool("ai_enabled", cfg.Prediction.EvolutionAIEnabled).
+			Dur("ai_min_interval", cfg.Prediction.EvolutionAIMinInterval).
+			Bool("decay_enabled", cfg.Prediction.EvolutionDecayEnabled).
+			Bool("send_telegram", cfg.Prediction.EvolutionSendTelegram).
+			Msg("prediction evolution: wired")
+	}
+
 	return &App{
-		cfg:              cfg,
-		logger:           logger,
-		metrics:          met,
-		cache:            cache,
-		discover:         discoverLoop,
-		collect:          collectLoop,
-		detectRun:        detectLoop.Run,
-		httpSrv:          httpSrv,
-		backfill:         backfillWorker,
-		sender:           senderWorker,
-		sanity:           sanityWorker,
-		outcomes:         outcomesWorker,
-		drift:            driftWorker,
-		stats:            statsWorker,
-		signalReport:     signalReportWorker,
-		detection:        detectionWorker,
-		stableFavorite:   stableFavWorker,
-		aiAnalysis:       aiSvc,
-		outcomeAI:        outcomeAIWorker,
-		marketIntel:      marketIntelWorker,
-		catalystImporter: catalystImporterWorker,
-		dailyIntel:       dailyIntelWorker,
-		pgPool:           pgPool,
+		cfg:               cfg,
+		logger:            logger,
+		metrics:           met,
+		cache:             cache,
+		discover:          discoverLoop,
+		collect:           collectLoop,
+		detectRun:         detectLoop.Run,
+		httpSrv:           httpSrv,
+		backfill:          backfillWorker,
+		sender:            senderWorker,
+		sanity:            sanityWorker,
+		outcomes:          outcomesWorker,
+		drift:             driftWorker,
+		stats:             statsWorker,
+		signalReport:      signalReportWorker,
+		detection:         detectionWorker,
+		stableFavorite:    stableFavWorker,
+		aiAnalysis:        aiSvc,
+		outcomeAI:         outcomeAIWorker,
+		marketIntel:       marketIntelWorker,
+		catalystImporter:  catalystImporterWorker,
+		dailyIntel:        dailyIntelWorker,
+		predictionEvolver: evolutionWorker,
+		pgPool:            pgPool,
 	}, nil
+}
+
+// evolutionTelegramAdapter narrows *telegram.Bot to the evolution
+// worker's small Telegram seam — same pattern as the daily-intel
+// adapter, kept local to keep cross-package wiring tight.
+type evolutionTelegramAdapter struct{ bot *telegram.Bot }
+
+func (a evolutionTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (evolution.TelegramResult, error) {
+	res, err := a.bot.SendHTML(ctx, chatID, text)
+	return evolution.TelegramResult{MessageID: res.MessageID}, err
 }
 
 // dailyIntelTelegramAdapter narrows *telegram.Bot to the small seam
@@ -1347,6 +1434,12 @@ func (a *App) Run() error {
 	if a.dailyIntel != nil {
 		execs = append(execs, shutdown2.Exec{Name: "daily-political-intel", Fn: func(ctx context.Context) error {
 			a.dailyIntel.Run(ctx)
+			return nil
+		}})
+	}
+	if a.predictionEvolver != nil {
+		execs = append(execs, shutdown2.Exec{Name: "prediction-evolution", Fn: func(ctx context.Context) error {
+			a.predictionEvolver.Run(ctx)
 			return nil
 		}})
 	}

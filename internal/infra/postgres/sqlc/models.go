@@ -315,6 +315,7 @@ type PolymarketMarketPredictions struct {
 	Confidence                float64
 	CreatedAt                 pgtype.Timestamptz
 	UpdatedAt                 pgtype.Timestamptz
+	LastEvolvedAt             pgtype.Timestamptz
 }
 
 type PolymarketMarkets struct {

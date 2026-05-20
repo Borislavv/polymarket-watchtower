@@ -59,7 +59,7 @@ SELECT
     current_state, state_reason,
     previous_prediction_id, supersedes_prediction_id,
     last_repriced_at, last_confirmed_by_alert_at, last_contradicted_by_alert_at,
-    confidence, created_at, updated_at
+    confidence, created_at, updated_at, last_evolved_at
 FROM polymarket_market_predictions
 WHERE event_slug = @event_slug AND condition_id = @condition_id;
 
@@ -102,3 +102,59 @@ FROM polymarket_market_prediction_states
 WHERE prediction_id = @prediction_id
 ORDER BY created_at DESC, id DESC
 LIMIT @limit_count;
+
+-- name: ListPredictionsForEvolution :many
+-- Selection for the evolution worker. Filters out resolved /
+-- invalidated rows + rows whose last_evolved_at is fresher than
+-- @max_age. Orders by state priority (blocked / catalyst-blocked
+-- first, then repricing / confirmed / contradicted / watching /
+-- already_priced) so the most operationally relevant predictions
+-- get the cycle's compute budget first.
+SELECT
+    id, event_slug, condition_id, outcome, side_bias, summary,
+    current_state, state_reason,
+    previous_prediction_id, supersedes_prediction_id,
+    last_repriced_at, last_confirmed_by_alert_at, last_contradicted_by_alert_at,
+    confidence, created_at, updated_at
+FROM polymarket_market_predictions
+WHERE current_state NOT IN ('resolved', 'invalidated')
+  AND (last_evolved_at IS NULL OR last_evolved_at < @max_age)
+ORDER BY
+    CASE current_state
+        WHEN 'blocked'              THEN 1
+        WHEN 'active_catalyst'      THEN 2
+        WHEN 'repricing'            THEN 3
+        WHEN 'confirmed_by_flow'    THEN 4
+        WHEN 'contradicted_by_flow' THEN 5
+        WHEN 'new'                  THEN 6
+        WHEN 'watching'             THEN 7
+        WHEN 'already_priced'       THEN 8
+        WHEN 'stale'                THEN 9
+        ELSE 99
+    END,
+    last_evolved_at NULLS FIRST,
+    updated_at
+LIMIT @limit_count;
+
+-- name: TouchPredictionEvolution :exec
+-- Bumps last_evolved_at without touching state/confidence — the
+-- worker calls this on EVERY processed prediction so the row drops
+-- to the back of the selection queue even when nothing material
+-- changed. Decoupled from UpsertMarketPrediction so we avoid the
+-- updated_at bump that confuses dashboards.
+UPDATE polymarket_market_predictions
+SET last_evolved_at = NOW()
+WHERE id = @id;
+
+-- name: ApplyPredictionDecay :exec
+-- Deterministic decay step: decreases confidence by @delta, clamps
+-- to @floor (never below). Always bumps last_evolved_at + updated_at
+-- so dashboards can see the decay tick. No state change here — the
+-- worker's Decide() decides whether the lower confidence triggers
+-- a state transition.
+UPDATE polymarket_market_predictions
+SET confidence      = GREATEST(@floor, confidence - @delta),
+    last_evolved_at = NOW(),
+    updated_at      = NOW(),
+    state_reason    = @reason
+WHERE id = @id;

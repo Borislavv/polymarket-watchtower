@@ -27,6 +27,12 @@ type Querier interface {
 	// has the given event_slug within the lookback window.
 	AggregateEventAlertsByKindAndSeverity(ctx context.Context, arg AggregateEventAlertsByKindAndSeverityParams) ([]AggregateEventAlertsByKindAndSeverityRow, error)
 	AlertExistsByDedupKey(ctx context.Context, dedupKey string) (bool, error)
+	// Deterministic decay step: decreases confidence by @delta, clamps
+	// to @floor (never below). Always bumps last_evolved_at + updated_at
+	// so dashboards can see the decay tick. No state change here — the
+	// worker's Decide() decides whether the lower confidence triggers
+	// a state transition.
+	ApplyPredictionDecay(ctx context.Context, arg ApplyPredictionDecayParams) error
 	// Single-roundtrip statistical summary for the per-bucket reservoir.
 	// Powers the DB-backed detector's hot path: count + total + mean + median
 	// + p95 + observed time-span, server-side. PERCENTILE_CONT does the heavy
@@ -208,6 +214,13 @@ type Querier interface {
 	// ranking; we provide a generous shortlist.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
 	ListMarketPredictionStates(ctx context.Context, arg ListMarketPredictionStatesParams) ([]PolymarketMarketPredictionStates, error)
+	// Selection for the evolution worker. Filters out resolved /
+	// invalidated rows + rows whose last_evolved_at is fresher than
+	// @max_age. Orders by state priority (blocked / catalyst-blocked
+	// first, then repricing / confirmed / contradicted / watching /
+	// already_priced) so the most operationally relevant predictions
+	// get the cycle's compute budget first.
+	ListPredictionsForEvolution(ctx context.Context, arg ListPredictionsForEvolutionParams) ([]ListPredictionsForEvolutionRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	ListRepricingSignalsForEvent(ctx context.Context, arg ListRepricingSignalsForEventParams) ([]PolymarketRepricingSignals, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
@@ -369,6 +382,12 @@ type Querier interface {
 	// Per-(condition_id, outcome_token, side) sums + counts for the
 	// event. Drives the strongest-side + directional-imbalance fields.
 	SumEventTradesByConditionAndSide(ctx context.Context, arg SumEventTradesByConditionAndSideParams) ([]SumEventTradesByConditionAndSideRow, error)
+	// Bumps last_evolved_at without touching state/confidence — the
+	// worker calls this on EVERY processed prediction so the row drops
+	// to the back of the selection queue even when nothing material
+	// changed. Decoupled from UpsertMarketPrediction so we avoid the
+	// updated_at bump that confuses dashboards.
+	TouchPredictionEvolution(ctx context.Context, id int64) error
 	// Returns the price of the FIRST trade on (market, outcome_token) at or
 	// after the supplied timestamp. NULL when no later trade exists yet.
 	// Powers the CLV-lite drift worker's per-window reference price lookup.

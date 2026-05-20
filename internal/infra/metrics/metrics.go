@@ -285,6 +285,35 @@ type Metrics struct {
 	// usage (flow / repricing / state / matched_alerts) and
 	// status (rendered / empty).
 	PredictionContextBlocks *prometheus.CounterVec
+
+	// --- v9.9 Prediction Evolution Worker ---
+	// PredictionEvolutionRuns: cycle-level outcome counter.
+	PredictionEvolutionRuns *prometheus.CounterVec
+	// PredictionEvolutionSelected: cumulative predictions
+	// shortlisted by the selection query.
+	PredictionEvolutionSelected prometheus.Counter
+	// PredictionEvolutionProcessed: per-prediction outcomes within
+	// a cycle (ok / failed / skipped).
+	PredictionEvolutionProcessed *prometheus.CounterVec
+	// PredictionEvolutionStateChanges: prediction state transitions
+	// captured by the evolution worker (from → to). Distinct from
+	// MarketPredictionStateTransitions which counts ALL transitions
+	// across the system.
+	PredictionEvolutionStateChanges *prometheus.CounterVec
+	// PredictionEvolutionAIRequests: thesis-refresh AI calls
+	// (ok / failed).
+	PredictionEvolutionAIRequests *prometheus.CounterVec
+	// PredictionEvolutionAISkipped: AI calls the gating layer
+	// dropped (reason label).
+	PredictionEvolutionAISkipped *prometheus.CounterVec
+	// PredictionEvolutionTelegram: Telegram deliveries per cycle
+	// (sent / failed / suppressed_cooldown).
+	PredictionEvolutionTelegram *prometheus.CounterVec
+	// PredictionEvolutionLatency: end-to-end Tick duration.
+	PredictionEvolutionLatency prometheus.Histogram
+	// PredictionEvolutionDecay: decay applications, labelled by
+	// the state the prediction is in when decayed.
+	PredictionEvolutionDecay *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -705,6 +734,45 @@ func New() *Metrics {
 		Help: "Per-prompt context block usage (block, status).",
 	}, []string{"block", "status"})
 
+	// v9.9 Prediction Evolution Worker
+	m.PredictionEvolutionRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "runs_total",
+		Help: "Evolution worker cycle outcomes (ok / failed / empty).",
+	}, []string{"status"})
+	m.PredictionEvolutionSelected = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "selected_total",
+		Help: "Cumulative predictions shortlisted by the selection query.",
+	})
+	m.PredictionEvolutionProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "processed_total",
+		Help: "Per-prediction outcomes within a cycle (ok / failed / skipped).",
+	}, []string{"status"})
+	m.PredictionEvolutionStateChanges = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "state_changes_total",
+		Help: "Prediction state transitions captured by the evolution worker (from → to).",
+	}, []string{"from", "to"})
+	m.PredictionEvolutionAIRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "ai_requests_total",
+		Help: "Thesis-refresh AI calls (ok / failed).",
+	}, []string{"status"})
+	m.PredictionEvolutionAISkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "ai_skipped_total",
+		Help: "AI calls the gating layer dropped, by reason.",
+	}, []string{"reason"})
+	m.PredictionEvolutionTelegram = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "telegram_total",
+		Help: "Telegram deliveries per cycle (sent / failed / suppressed_cooldown).",
+	}, []string{"status"})
+	m.PredictionEvolutionLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "latency_seconds",
+		Help:    "End-to-end Tick duration.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 9),
+	})
+	m.PredictionEvolutionDecay = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "decay_total",
+		Help: "Decay applications by state.",
+	}, []string{"state"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -748,6 +816,11 @@ func New() *Metrics {
 		m.EventFlowSummaryLoad, m.EventFlowSummaryEmpty,
 		m.RepricingSignals, m.MarketPredictionStateTransitions,
 		m.MarketPredictionMatches, m.PredictionContextBlocks,
+		m.PredictionEvolutionRuns, m.PredictionEvolutionSelected,
+		m.PredictionEvolutionProcessed, m.PredictionEvolutionStateChanges,
+		m.PredictionEvolutionAIRequests, m.PredictionEvolutionAISkipped,
+		m.PredictionEvolutionTelegram, m.PredictionEvolutionLatency,
+		m.PredictionEvolutionDecay,
 	)
 	return m
 }

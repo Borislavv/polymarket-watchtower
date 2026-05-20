@@ -586,12 +586,35 @@ type RepricingConfig struct {
 	OverreactionThreshold  float64       `env:"REPRICING_OVERREACTION_THRESHOLD" envDefault:"0.08" validate:"gt=0,lte=1"`
 }
 
-// PredictionConfig drives the prediction state machine.
+// PredictionConfig drives the prediction state machine + evolution
+// worker.
 type PredictionConfig struct {
 	StateEnabled            bool          `env:"MARKET_PREDICTION_STATE_ENABLED" envDefault:"true"`
 	StaleAfter              time.Duration `env:"MARKET_PREDICTION_STALE_AFTER" envDefault:"24h" validate:"gt=0"`
 	ConfirmAlertScoreFloor  float64       `env:"MARKET_PREDICTION_CONFIRM_ALERT_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
 	ContradictFlowImbalance float64       `env:"MARKET_PREDICTION_CONTRADICT_FLOW_IMBALANCE" envDefault:"0.65" validate:"gte=0,lte=1"`
+
+	// v9.9 Evolution worker (heartbeat).
+	EvolutionEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_ENABLED" envDefault:"true"`
+	EvolutionInterval    time.Duration `env:"MARKET_PREDICTION_EVOLUTION_INTERVAL" envDefault:"15m" validate:"gt=0"`
+	EvolutionBatchSize   int           `env:"MARKET_PREDICTION_EVOLUTION_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
+	EvolutionConcurrency int           `env:"MARKET_PREDICTION_EVOLUTION_CONCURRENCY" envDefault:"4" validate:"gte=1,lte=32"`
+	EvolutionTimeout     time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+
+	EvolutionAIEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_AI_ENABLED" envDefault:"true"`
+	EvolutionAIMinInterval time.Duration `env:"MARKET_PREDICTION_EVOLUTION_AI_MIN_INTERVAL" envDefault:"6h" validate:"gt=0"`
+	EvolutionAIMaxPerRun   int           `env:"MARKET_PREDICTION_EVOLUTION_AI_MAX_PER_RUN" envDefault:"10" validate:"gte=0,lte=200"`
+
+	EvolutionStaleAfter    time.Duration `env:"MARKET_PREDICTION_EVOLUTION_STALE_AFTER" envDefault:"24h" validate:"gt=0"`
+	EvolutionDecayEnabled  bool          `env:"MARKET_PREDICTION_EVOLUTION_DECAY_ENABLED" envDefault:"true"`
+	EvolutionDecayPerDay   float64       `env:"MARKET_PREDICTION_EVOLUTION_DECAY_PER_DAY" envDefault:"0.15" validate:"gte=0,lte=1"`
+	EvolutionMinConfidence float64       `env:"MARKET_PREDICTION_EVOLUTION_MIN_CONFIDENCE" envDefault:"0.10" validate:"gte=0,lte=1"`
+
+	EvolutionMajorPriceMove     float64       `env:"MARKET_PREDICTION_EVOLUTION_MAJOR_PRICE_MOVE" envDefault:"0.08" validate:"gte=0,lte=1"`
+	EvolutionCatalystNearWindow time.Duration `env:"MARKET_PREDICTION_EVOLUTION_CATALYST_NEAR_WINDOW" envDefault:"12h" validate:"gt=0"`
+
+	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"true"`
+	EvolutionTelegramCooldown time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
 }
 
 // DailyPoliticalIntelConfig wires the v9.7 once-per-day political /

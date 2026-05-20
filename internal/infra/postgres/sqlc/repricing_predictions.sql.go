@@ -11,13 +11,44 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const applyPredictionDecay = `-- name: ApplyPredictionDecay :exec
+UPDATE polymarket_market_predictions
+SET confidence      = GREATEST($1, confidence - $2),
+    last_evolved_at = NOW(),
+    updated_at      = NOW(),
+    state_reason    = $3
+WHERE id = $4
+`
+
+type ApplyPredictionDecayParams struct {
+	Floor  float64
+	Delta  float64
+	Reason string
+	ID     int64
+}
+
+// Deterministic decay step: decreases confidence by @delta, clamps
+// to @floor (never below). Always bumps last_evolved_at + updated_at
+// so dashboards can see the decay tick. No state change here — the
+// worker's Decide() decides whether the lower confidence triggers
+// a state transition.
+func (q *Queries) ApplyPredictionDecay(ctx context.Context, arg ApplyPredictionDecayParams) error {
+	_, err := q.db.Exec(ctx, applyPredictionDecay,
+		arg.Floor,
+		arg.Delta,
+		arg.Reason,
+		arg.ID,
+	)
+	return err
+}
+
 const getMarketPrediction = `-- name: GetMarketPrediction :one
 SELECT
     id, event_slug, condition_id, outcome, side_bias, summary,
     current_state, state_reason,
     previous_prediction_id, supersedes_prediction_id,
     last_repriced_at, last_confirmed_by_alert_at, last_contradicted_by_alert_at,
-    confidence, created_at, updated_at
+    confidence, created_at, updated_at, last_evolved_at
 FROM polymarket_market_predictions
 WHERE event_slug = $1 AND condition_id = $2
 `
@@ -47,6 +78,7 @@ func (q *Queries) GetMarketPrediction(ctx context.Context, arg GetMarketPredicti
 		&i.Confidence,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastEvolvedAt,
 	)
 	return i, err
 }
@@ -109,6 +141,101 @@ func (q *Queries) ListMarketPredictionStates(ctx context.Context, arg ListMarket
 			&i.Reason,
 			&i.EvidenceJson,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPredictionsForEvolution = `-- name: ListPredictionsForEvolution :many
+SELECT
+    id, event_slug, condition_id, outcome, side_bias, summary,
+    current_state, state_reason,
+    previous_prediction_id, supersedes_prediction_id,
+    last_repriced_at, last_confirmed_by_alert_at, last_contradicted_by_alert_at,
+    confidence, created_at, updated_at
+FROM polymarket_market_predictions
+WHERE current_state NOT IN ('resolved', 'invalidated')
+  AND (last_evolved_at IS NULL OR last_evolved_at < $1)
+ORDER BY
+    CASE current_state
+        WHEN 'blocked'              THEN 1
+        WHEN 'active_catalyst'      THEN 2
+        WHEN 'repricing'            THEN 3
+        WHEN 'confirmed_by_flow'    THEN 4
+        WHEN 'contradicted_by_flow' THEN 5
+        WHEN 'new'                  THEN 6
+        WHEN 'watching'             THEN 7
+        WHEN 'already_priced'       THEN 8
+        WHEN 'stale'                THEN 9
+        ELSE 99
+    END,
+    last_evolved_at NULLS FIRST,
+    updated_at
+LIMIT $2
+`
+
+type ListPredictionsForEvolutionParams struct {
+	MaxAge     pgtype.Timestamptz
+	LimitCount int32
+}
+
+type ListPredictionsForEvolutionRow struct {
+	ID                        int64
+	EventSlug                 string
+	ConditionID               string
+	Outcome                   string
+	SideBias                  string
+	Summary                   string
+	CurrentState              string
+	StateReason               string
+	PreviousPredictionID      *int64
+	SupersedesPredictionID    *int64
+	LastRepricedAt            pgtype.Timestamptz
+	LastConfirmedByAlertAt    pgtype.Timestamptz
+	LastContradictedByAlertAt pgtype.Timestamptz
+	Confidence                float64
+	CreatedAt                 pgtype.Timestamptz
+	UpdatedAt                 pgtype.Timestamptz
+}
+
+// Selection for the evolution worker. Filters out resolved /
+// invalidated rows + rows whose last_evolved_at is fresher than
+// @max_age. Orders by state priority (blocked / catalyst-blocked
+// first, then repricing / confirmed / contradicted / watching /
+// already_priced) so the most operationally relevant predictions
+// get the cycle's compute budget first.
+func (q *Queries) ListPredictionsForEvolution(ctx context.Context, arg ListPredictionsForEvolutionParams) ([]ListPredictionsForEvolutionRow, error) {
+	rows, err := q.db.Query(ctx, listPredictionsForEvolution, arg.MaxAge, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPredictionsForEvolutionRow
+	for rows.Next() {
+		var i ListPredictionsForEvolutionRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventSlug,
+			&i.ConditionID,
+			&i.Outcome,
+			&i.SideBias,
+			&i.Summary,
+			&i.CurrentState,
+			&i.StateReason,
+			&i.PreviousPredictionID,
+			&i.SupersedesPredictionID,
+			&i.LastRepricedAt,
+			&i.LastConfirmedByAlertAt,
+			&i.LastContradictedByAlertAt,
+			&i.Confidence,
+			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -183,6 +310,22 @@ func (q *Queries) ListRepricingSignalsForEvent(ctx context.Context, arg ListRepr
 		return nil, err
 	}
 	return items, nil
+}
+
+const touchPredictionEvolution = `-- name: TouchPredictionEvolution :exec
+UPDATE polymarket_market_predictions
+SET last_evolved_at = NOW()
+WHERE id = $1
+`
+
+// Bumps last_evolved_at without touching state/confidence — the
+// worker calls this on EVERY processed prediction so the row drops
+// to the back of the selection queue even when nothing material
+// changed. Decoupled from UpsertMarketPrediction so we avoid the
+// updated_at bump that confuses dashboards.
+func (q *Queries) TouchPredictionEvolution(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, touchPredictionEvolution, id)
+	return err
 }
 
 const upsertMarketPrediction = `-- name: UpsertMarketPrediction :one

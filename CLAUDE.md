@@ -863,6 +863,103 @@ Repricing scenarios and prediction state reasons are likewise DATA.
 Renderers HTML-escape; the AI consumes the prompt block as
 evidence, never as instructions.
 
+## Prediction Evolution worker (v9.9)
+
+The operational heartbeat of the prediction system. Without this
+worker, predictions were "born and forgotten" — created once and
+never revisited. v9.9 makes a prediction a **living market thesis**.
+
+Worker (`internal/app/usecase/marketprediction/evolution.Worker`)
+runs on a `MARKET_PREDICTION_EVOLUTION_INTERVAL` ticker (default
+15m, immediate first tick). Each tick:
+
+1. **Select.** `ListPredictionsForEvolution(maxAge, limit)` returns
+   active predictions ordered by state priority — blocked /
+   active_catalyst / confirmed_by_flow / contradicted_by_flow first,
+   then repricing / already_priced, then watching / new, then stale.
+   `NULLS FIRST` on `last_evolved_at` so never-evolved rows lead the
+   queue. Resolved/invalidated excluded via partial index.
+2. **Refresh deterministic intel per prediction.** Re-fetch the
+   event page (eventpagecontext), top recent catalysts
+   (`EventCatalystRepository.GetTopByConfidenceForEvent`), event
+   flow summary (eventflow), repricing signal for the newest
+   annotation (`repricing.Provider.ComputeForAnnotation`), and
+   re-score matched alerts against the prediction
+   (`marketprediction.Score` over `polymarket_alerts` recent window).
+3. **Decide + apply.** `marketprediction.Decide(...)` returns the
+   new state; `marketprediction.Applier.Apply(...)` upserts the
+   prediction row + the transition audit row.
+4. **Decay.** When the prediction is idle (flow empty, no state
+   change, state not in {blocked, active_catalyst, resolved,
+   invalidated}) and confidence > floor, apply
+   `decayPerCycle = DecayPerDay × cyclesPerDay` via
+   `ApplyPredictionDecay` — `GREATEST(confidence - delta, floor)`.
+5. **AI gating.** Refresh thesis ONLY when one of:
+   `dec.Changed` ‖ repricing status in {underreacting, overreacting,
+   reversed} ‖ ≥1 strong recent alert (severity ≥
+   `AIStrongAlertSeverity`) ‖ no prior `predicted_summary` ‖
+   `now - last_ai_at ≥ AIStaleAfter`. Otherwise skipped with one
+   of `state_unchanged` / `repricing_quiet` / `no_strong_alerts` /
+   `cooldown_active` / `budget_exhausted` and a metric label so an
+   operator can see *why* AI was skipped.
+6. **Telegram.** Only on `dec.Changed` AND per-prediction cooldown
+   elapsed (`TelegramCooldown`, default 4h, in-memory map —
+   restart-resets are safe; worst case one extra post per flap).
+   Body via `evolution.RenderEvolutionUpdate` (HTML-escaped header
+   + Prediction state / Repricing / Catalyst / Flow / AI sections).
+7. **Touch.** `TouchPredictionEvolution` always runs at the end so
+   the row drops to the back of the queue even when nothing changed.
+
+Concurrency: bounded fan-out via `sem` channel
+(`MARKET_PREDICTION_EVOLUTION_CONCURRENCY`, default 2). Per-
+prediction `recover()` ensures one panic never stops the batch.
+AI budget shared across goroutines via mutex-protected counter
+(`MARKET_PREDICTION_EVOLUTION_AI_BUDGET_PER_TICK`, default 8).
+
+**Fail-open.** Worker NEVER blocks normal alerting. If the worker
+panics, deadlocks, or never runs, the alertsender + detector loops
+are completely independent — `detect.Loop → polymarket_alerts →
+alertsender.Worker → Telegram` has zero dependency on prediction
+state.
+
+**Dry-run.** `TickOne(ctx, pred, dryRun=true)` runs every
+deterministic layer end-to-end against the live DB but short-
+circuits all writes (Apply / Touch / Decay) and Telegram. Used
+by `cli evolve-predictions --dry-run`.
+
+Schema (migration 00020):
+- `polymarket_market_predictions.last_evolved_at TIMESTAMPTZ NULL`
+- Partial index `idx_predictions_evolution_queue` ON
+  `(last_evolved_at NULLS FIRST, state)` WHERE
+  `state NOT IN ('resolved','invalidated')`.
+
+The EXACT verbatim Russian Prediction Evolution prompt (PART 9 of
+the operator spec) lives in
+`internal/infra/ai/openai/prediction_evolution_prompt.go` —
+starts "Ты — senior analyst на political/geopolitical prediction-
+market desk." Nine placeholders ({{PREVIOUS_PREDICTION}},
+{{PREDICTION_STATE}}, {{MARKET_DATA}}, {{ANNOTATIONS}},
+{{CATALYSTS}}, {{REPRICING}}, {{FLOW_SUMMARY}},
+{{MATCHED_ALERTS}}, {{WEB_CONTEXT}}) substituted with fallbacks
+("(no prior thesis on file)", etc.) — pinned by
+`TestBuildPredictionEvolutionUserMessage_*`.
+
+v9.9 metrics:
+- `watchtower_prediction_evolution_runs_total{status}` (ok / failed / skipped)
+- `watchtower_prediction_evolution_selected_total` — counter
+- `watchtower_prediction_evolution_processed_total{status}`
+- `watchtower_prediction_evolution_state_changes_total{from,to}`
+- `watchtower_prediction_evolution_ai_requests_total{status}` (refreshed / failed)
+- `watchtower_prediction_evolution_ai_skipped_total{reason}`
+- `watchtower_prediction_evolution_telegram_total{status}` (sent / skipped / failed)
+- `watchtower_prediction_evolution_latency_seconds` (histogram)
+- `watchtower_prediction_evolution_decay_total{state}`
+
+CLI: `go run ./cmd/cli evolve-predictions --dsn=$POSTGRES_DSN
+--once --limit 10 --dry-run`. Prints a per-prediction table (id /
+event_slug / old_state -> new_state / AI yes-no-skp / repricing /
+strongest_side / matched_alerts / decay / telegram).
+
 ## Periodic Telegram stats summary
 
 - `internal/app/usecase/statsreport.Worker` posts a single aggregate

@@ -194,7 +194,29 @@ func (r *RepricingPredictionsRepository) GetPrediction(ctx context.Context, even
 		}
 		return MarketPrediction{}, fmt.Errorf("get market prediction: %w", err)
 	}
-	return predictionFromSQLC(row), nil
+	out := MarketPrediction{
+		ID:                        row.ID,
+		EventSlug:                 row.EventSlug,
+		ConditionID:               row.ConditionID,
+		Outcome:                   row.Outcome,
+		SideBias:                  row.SideBias,
+		Summary:                   row.Summary,
+		CurrentState:              row.CurrentState,
+		StateReason:               row.StateReason,
+		LastRepricedAt:            tsTime(row.LastRepricedAt),
+		LastConfirmedByAlertAt:    tsTime(row.LastConfirmedByAlertAt),
+		LastContradictedByAlertAt: tsTime(row.LastContradictedByAlertAt),
+		Confidence:                row.Confidence,
+		CreatedAt:                 row.CreatedAt.Time,
+		UpdatedAt:                 row.UpdatedAt.Time,
+	}
+	if row.PreviousPredictionID != nil {
+		out.PreviousPredictionID = *row.PreviousPredictionID
+	}
+	if row.SupersedesPredictionID != nil {
+		out.SupersedesPredictionID = *row.SupersedesPredictionID
+	}
+	return out, nil
 }
 
 // UpsertPrediction returns the persisted prediction id. Mutable
@@ -223,6 +245,64 @@ func (r *RepricingPredictionsRepository) RecordStateTransition(ctx context.Conte
 		NewState:      t.NewState,
 		Reason:        t.Reason,
 		EvidenceJson:  t.EvidenceJSON,
+	})
+}
+
+// ListPredictionsForEvolution returns the selection queue for the
+// evolution worker. maxAge is the latest last_evolved_at value a
+// row may have — anything stricter than that is "fresh enough" and
+// gets skipped this cycle.
+func (r *RepricingPredictionsRepository) ListPredictionsForEvolution(ctx context.Context, maxAge time.Time, limit int32) ([]MarketPrediction, error) {
+	rows, err := r.q.ListPredictionsForEvolution(ctx, sqlc.ListPredictionsForEvolutionParams{
+		MaxAge:     tsFromTime(maxAge),
+		LimitCount: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list predictions for evolution: %w", err)
+	}
+	out := make([]MarketPrediction, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, MarketPrediction{
+			ID:                        row.ID,
+			EventSlug:                 row.EventSlug,
+			ConditionID:               row.ConditionID,
+			Outcome:                   row.Outcome,
+			SideBias:                  row.SideBias,
+			Summary:                   row.Summary,
+			CurrentState:              row.CurrentState,
+			StateReason:               row.StateReason,
+			LastRepricedAt:            tsTime(row.LastRepricedAt),
+			LastConfirmedByAlertAt:    tsTime(row.LastConfirmedByAlertAt),
+			LastContradictedByAlertAt: tsTime(row.LastContradictedByAlertAt),
+			Confidence:                row.Confidence,
+			CreatedAt:                 row.CreatedAt.Time,
+			UpdatedAt:                 row.UpdatedAt.Time,
+		})
+		if row.PreviousPredictionID != nil {
+			out[len(out)-1].PreviousPredictionID = *row.PreviousPredictionID
+		}
+		if row.SupersedesPredictionID != nil {
+			out[len(out)-1].SupersedesPredictionID = *row.SupersedesPredictionID
+		}
+	}
+	return out, nil
+}
+
+// TouchPredictionEvolution drops the prediction to the back of the
+// selection queue without bumping state/confidence/updated_at. The
+// worker calls this on every processed row.
+func (r *RepricingPredictionsRepository) TouchPredictionEvolution(ctx context.Context, id int64) error {
+	return r.q.TouchPredictionEvolution(ctx, id)
+}
+
+// ApplyPredictionDecay decreases confidence by delta, clamped to
+// floor. Bumps last_evolved_at + updated_at + state_reason.
+func (r *RepricingPredictionsRepository) ApplyPredictionDecay(ctx context.Context, id int64, delta, floor float64, reason string) error {
+	return r.q.ApplyPredictionDecay(ctx, sqlc.ApplyPredictionDecayParams{
+		ID:     id,
+		Delta:  delta,
+		Floor:  floor,
+		Reason: reason,
 	})
 }
 

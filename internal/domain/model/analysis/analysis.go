@@ -551,6 +551,54 @@ func (NoopDailyPoliticalIntelGenerator) GenerateDailyPoliticalIntel(_ context.Co
 	return DailyPoliticalIntelResponse{Status: StatusSkipped, Model: "noop"}, nil
 }
 
+// --- v9.9 Prediction Evolution ------------------------------------------
+
+// PredictionEvolutionRequest is the input for the verbatim PART 9
+// "обнови thesis" prompt. The worker only calls the generator when
+// AI gating signals a meaningful change; for routine refreshes the
+// deterministic layers carry the state forward unchanged.
+type PredictionEvolutionRequest struct {
+	EventSlug          string
+	ConditionID        string
+	PreviousPrediction string // operator-facing summary from the prior cycle
+	PredictionState    string
+	StateReason        string
+	MarketSnapshot     string // compact "key: value" block
+	AnnotationsBlock   string
+	CatalystsBlock     string
+	RepricingBlock     string
+	FlowSummaryBlock   string
+	MatchedAlertsBlock string
+	WebContextBlock    string
+	PublicContextOn    bool
+}
+
+// PredictionEvolutionResponse is the free-text Russian update the AI
+// returns. Rendered HTML-escaped into the "PREDICTION UPDATE" Telegram
+// body when delivery is gated open.
+type PredictionEvolutionResponse struct {
+	ThesisUpdate     string
+	Status           Status
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	EstimatedCostUSD float64
+	LastError        string
+}
+
+// PredictionEvolutionGenerator is the AI seam.
+type PredictionEvolutionGenerator interface {
+	RefreshPredictionThesis(ctx context.Context, req PredictionEvolutionRequest) (PredictionEvolutionResponse, error)
+}
+
+// NoopPredictionEvolutionGenerator returns StatusSkipped — the
+// worker treats this as "no AI update this cycle".
+type NoopPredictionEvolutionGenerator struct{}
+
+func (NoopPredictionEvolutionGenerator) RefreshPredictionThesis(_ context.Context, _ PredictionEvolutionRequest) (PredictionEvolutionResponse, error) {
+	return PredictionEvolutionResponse{Status: StatusSkipped, Model: "noop"}, nil
+}
+
 // --- Analyzer interface ---------------------------------------------------
 
 // Analyzer is the single seam between the AI provider and the rest
