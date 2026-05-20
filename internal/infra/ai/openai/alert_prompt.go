@@ -179,7 +179,7 @@ Flow выглядит как:
 
 ФОРМАТ ОТВЕТА:
 
-• Fresh context:
+Fresh context:
 • Trend status:
 • Market reaction:
 • Flow quality:
