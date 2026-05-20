@@ -33,6 +33,8 @@ type Querier interface {
 	// worker's Decide() decides whether the lower confidence triggers
 	// a state transition.
 	ApplyPredictionDecay(ctx context.Context, arg ApplyPredictionDecayParams) error
+	// Stamps archived_at + the operator-facing terminal_reason. Idempotent.
+	ArchivePrediction(ctx context.Context, arg ArchivePredictionParams) error
 	// Single-roundtrip statistical summary for the per-bucket reservoir.
 	// Powers the DB-backed detector's hot path: count + total + mean + median
 	// + p95 + observed time-span, server-side. PERCENTILE_CONT does the heavy
@@ -92,7 +94,7 @@ type Querier interface {
 	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
-	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (PolymarketMarketPredictions, error)
+	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (GetMarketPredictionRow, error)
 	GetPredictionUsefulnessScore(ctx context.Context, predictionID int64) (GetPredictionUsefulnessScoreRow, error)
 	// Reverse of GetTraderByWallet — used by the detection worker to
 	// resolve a trader_id back to its wallet string when rebuilding a
@@ -228,6 +230,14 @@ type Querier interface {
 	// ranking; we provide a generous shortlist.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
 	ListMarketPredictionStates(ctx context.Context, arg ListMarketPredictionStatesParams) ([]PolymarketMarketPredictionStates, error)
+	// Powers the daily calibration report + CLI. Pulls evaluations
+	// newer than `since`, joined with the prediction row so the
+	// aggregator sees side_bias, current_state, confidence in one go.
+	ListPredictionEvaluationsForCalibration(ctx context.Context, arg ListPredictionEvaluationsForCalibrationParams) ([]ListPredictionEvaluationsForCalibrationRow, error)
+	// The v10.3 archival worker pulls terminal predictions that have
+	// aged past TerminalRetention. Already-archived rows excluded by
+	// the partial index `idx_market_predictions_terminal_for_archival`.
+	ListPredictionsForArchival(ctx context.Context, arg ListPredictionsForArchivalParams) ([]ListPredictionsForArchivalRow, error)
 	// Selection for the evolution worker. Filters out resolved /
 	// invalidated rows + rows whose last_evolved_at is fresher than
 	// @max_age. Orders by state priority (blocked / catalyst-blocked
@@ -239,6 +249,9 @@ type Querier interface {
 	// older than the smallest horizon, paired with whichever horizon
 	// rows are missing. The worker filters per-horizon afterwards.
 	ListPredictionsForFeedback(ctx context.Context, arg ListPredictionsForFeedbackParams) ([]ListPredictionsForFeedbackRow, error)
+	// Selection for the stale-no-signal sweep. The worker filters
+	// further (annotations, catalysts) before flipping state.
+	ListPredictionsForStaleSignal(ctx context.Context, arg ListPredictionsForStaleSignalParams) ([]ListPredictionsForStaleSignalRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	ListRepricingSignalsForEvent(ctx context.Context, arg ListRepricingSignalsForEventParams) ([]PolymarketRepricingSignals, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
@@ -320,6 +333,10 @@ type Querier interface {
 	// so the sanity worker's retention window starts at the original
 	// disappearance, not at every subsequent tick.
 	MarkMarketsInactiveNotIn(ctx context.Context, arg MarkMarketsInactiveNotInParams) (int64, error)
+	// Used by the archival worker's "no fresh signal" gate. Sets state
+	// to 'stale' on rows that had no annotation / catalyst update /
+	// material price move within StaleNoSignalAfter.
+	MarkPredictionStaleNoSignal(ctx context.Context, arg MarkPredictionStaleNoSignalParams) error
 	// Captures a send failure on the row. The scheduler treats failed rows
 	// as permanently failed for the period (idempotency over correctness:
 	// a flapping Telegram send is far worse than a missed report).
@@ -494,6 +511,8 @@ type Querier interface {
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error)
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
 	UpsertMarketPrediction(ctx context.Context, arg UpsertMarketPredictionParams) (int64, error)
+	// v10.3 evaluation classifier output. One row per (prediction, horizon).
+	UpsertPredictionEvaluation(ctx context.Context, arg UpsertPredictionEvaluationParams) error
 	// One row per (prediction_id, horizon). Re-runs with the same key
 	// update the prior measurement (the worker may revise as more
 	// trades land).

@@ -993,6 +993,221 @@
           "refId": "B"
         }
       ]
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Production Readiness (v10.3)",
+      "gridPos": {"x": 0, "y": 240, "w": 24, "h": 1}
+    },
+    {
+      "id": 301,
+      "type": "timeseries",
+      "title": "Worker cycle duration (p95) by worker",
+      "description": "Per-worker tick wall-clock latency. Compare to the worker's Interval — when latency approaches Interval, the next Ticker fire will be skipped by the overlap guard.",
+      "gridPos": {"x": 0, "y": 241, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (worker, le) (rate(watchtower_worker_cycle_duration_seconds_bucket[10m])))",
+        "legendFormat": "{{worker}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 302,
+      "type": "timeseries",
+      "title": "Worker overlap skips (rate / 1h)",
+      "description": "Ticks the overlap guard skipped because the previous tick was still running. Persistent non-zero = the worker is consistently slower than its Interval.",
+      "gridPos": {"x": 12, "y": 241, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (worker) (rate(watchtower_worker_cycle_skipped_total{reason=\"overlap\"}[1h]))",
+        "legendFormat": "{{worker}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 303,
+      "type": "timeseries",
+      "title": "AI prompt chars distribution by surface",
+      "description": "Per-surface compacted prompt size. Drift past the configured cap means the v10.3 compactor is firing; chart against ai_compactions_total.",
+      "gridPos": {"x": 0, "y": 248, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (surface, le) (rate(watchtower_ai_prompt_chars_bucket[1h])))",
+        "legendFormat": "{{surface}} p95",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 304,
+      "type": "timeseries",
+      "title": "AI compactions / skips by surface (rate / 1h)",
+      "description": "How often each AI surface had its prompt compacted vs entirely skipped over-cap. A spike on chars_cap skips = caps may be too tight.",
+      "gridPos": {"x": 12, "y": 248, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {
+          "expr": "sum by (surface, reason) (rate(watchtower_ai_compactions_total[1h]))",
+          "legendFormat": "compact · {{surface}} · {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (surface, reason) (rate(watchtower_ai_surface_skipped_total[1h]))",
+          "legendFormat": "skip · {{surface}} · {{reason}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 305,
+      "type": "timeseries",
+      "title": "Prediction evaluations by class (rate / 24h)",
+      "description": "v10.3 deterministic classifier output across horizons. Watch the wrong_direction line: a persistent climb means the prediction engine is mis-calibrated.",
+      "gridPos": {"x": 0, "y": 255, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (evaluation) (rate(watchtower_prediction_evaluation_total[24h]))",
+        "legendFormat": "{{evaluation}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 306,
+      "type": "timeseries",
+      "title": "Prediction evaluations by horizon (rate / 24h)",
+      "description": "Split of evaluations across 1h/6h/24h. Healthy: 1h-heavy early, 24h takes over after 24h of runtime.",
+      "gridPos": {"x": 12, "y": 255, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (horizon) (rate(watchtower_prediction_evaluation_total[24h]))",
+        "legendFormat": "{{horizon}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 307,
+      "type": "stat",
+      "title": "Predictions archived (24h)",
+      "description": "v10.3 archival worker. Healthy when terminal predictions are being retired regularly.",
+      "gridPos": {"x": 0, "y": 262, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_archival_archived_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 308,
+      "type": "stat",
+      "title": "Predictions staled (24h)",
+      "description": "v10.3 stale-no-signal sweep. Predictions the archival worker flipped to state=stale.",
+      "gridPos": {"x": 6, "y": 262, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_archival_staled_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 309,
+      "type": "stat",
+      "title": "Wrong-direction predictions (7d)",
+      "description": "The load-bearing failure class. Persistent climb = calibration issue.",
+      "gridPos": {"x": 12, "y": 262, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]}}},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_evaluation_total{evaluation=\"wrong_direction\"}[7d]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 310,
+      "type": "stat",
+      "title": "Useful_correct + useful_early (7d)",
+      "description": "Positive evaluation outcomes — what we want to see climbing.",
+      "gridPos": {"x": 18, "y": 262, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_evaluation_total{evaluation=~\"useful_correct|useful_early\"}[7d]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 311,
+      "type": "timeseries",
+      "title": "AI surface estimated vs charged cost (USD, today)",
+      "description": "Estimated cost (preflight) vs. charged cost (actual). A growing gap means our per-call estimate is wrong; recalibrate the surface's EstCostUSD.",
+      "gridPos": {"x": 0, "y": 268, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [
+        {
+          "expr": "sum by (surface) (increase(watchtower_ai_estimated_cost_usd_total[24h]))",
+          "legendFormat": "{{surface}} estimated",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (bucket) (increase(watchtower_ai_budget_charged_usd_total[24h]))",
+          "legendFormat": "{{bucket}} charged",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 312,
+      "type": "timeseries",
+      "title": "Outcome mapping success vs unknown (rate / 1h)",
+      "description": "The v10.2 outcome mapper. A growing share of unknowns = parser drift or new outcome shapes; check the unknown breakdown panel.",
+      "gridPos": {"x": 12, "y": 268, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(watchtower_outcome_mapping_total[1h]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(watchtower_outcome_mapping_unknown_total[1h]))",
+          "legendFormat": "unknown · {{reason}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 313,
+      "type": "timeseries",
+      "title": "Repricing status distribution (v10.3 healthy mix)",
+      "description": "After v10.2 outcome-mapping wiring, the 'unclear' share should drop. Persistent unclear-dominance = mapper failing or stale annotations.",
+      "gridPos": {"x": 0, "y": 275, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_repricing_signals_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 314,
+      "type": "timeseries",
+      "title": "Telegram sends/skips by reason (v10.3 verified)",
+      "description": "Total sent vs skipped (with reason). The v10.3 audit verified every surface is gated; persistent startup_suppressed or cooldown shows the guards firing.",
+      "gridPos": {"x": 12, "y": 275, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {
+          "expr": "sum(rate(watchtower_prediction_creation_telegram_sent_total[1h]))",
+          "legendFormat": "sent",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(watchtower_prediction_creation_telegram_skipped_total[1h]))",
+          "legendFormat": "skipped · {{reason}}",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

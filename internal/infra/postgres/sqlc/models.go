@@ -316,6 +316,8 @@ type PolymarketMarketPredictions struct {
 	CreatedAt                 pgtype.Timestamptz
 	UpdatedAt                 pgtype.Timestamptz
 	LastEvolvedAt             pgtype.Timestamptz
+	ArchivedAt                pgtype.Timestamptz
+	TerminalReason            *string
 }
 
 type PolymarketMarkets struct {
@@ -343,6 +345,17 @@ type PolymarketMarkets struct {
 	PurgedAt                pgtype.Timestamptz
 	// Cursor for the collect loop. MAX(traded_at) of trades the COLLECT path persisted. Backfill never updates this column.
 	LastCollectTradedAt pgtype.Timestamptz
+}
+
+type PolymarketPredictionEvaluations struct {
+	ID           int64
+	PredictionID int64
+	Horizon      string
+	Evaluation   string
+	Score        float64
+	EvidenceJson []byte
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
 }
 
 type PolymarketPredictionFeedback struct {

@@ -559,6 +559,7 @@ type Config struct {
 	Repricing         RepricingConfig
 	Prediction        PredictionConfig
 	AIBudget          AIBudgetConfig
+	AIPreflight       AIPreflightConfig
 }
 
 // EventFlowConfig drives the deterministic event-level flow
@@ -668,6 +669,42 @@ type PredictionConfig struct {
 	FeedbackInterval    time.Duration `env:"PREDICTION_FEEDBACK_INTERVAL" envDefault:"15m" validate:"gt=0"`
 	FeedbackHorizonsCSV string        `env:"PREDICTION_FEEDBACK_HORIZONS" envDefault:"1h,6h,24h"`
 	FeedbackBatchSize   int           `env:"PREDICTION_FEEDBACK_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
+
+	// --- v10.3 evaluation classifier knobs (PART 2) -------------
+	EvaluationEnabled           bool    `env:"PREDICTION_EVALUATION_ENABLED" envDefault:"true"`
+	EvaluationHorizonsCSV       string  `env:"PREDICTION_EVALUATION_HORIZONS" envDefault:"1h,6h,24h"`
+	EvaluationMinPriceDelta     float64 `env:"PREDICTION_EVALUATION_MIN_PRICE_DELTA" envDefault:"0.03" validate:"gte=0,lte=1"`
+	EvaluationUsefulEarlyWindow string  `env:"PREDICTION_EVALUATION_USEFUL_EARLY_WINDOW" envDefault:"6h"`
+
+	// --- v10.3 archival worker knobs (PART 4) -------------------
+	ArchivalEnabled            bool          `env:"PREDICTION_ARCHIVAL_ENABLED" envDefault:"true"`
+	ArchivalInterval           time.Duration `env:"PREDICTION_ARCHIVAL_INTERVAL" envDefault:"1h" validate:"gt=0"`
+	ArchivalTerminalRetention  time.Duration `env:"PREDICTION_ARCHIVAL_TERMINAL_RETENTION" envDefault:"72h" validate:"gt=0"`
+	ArchivalStaleNoSignalAfter time.Duration `env:"PREDICTION_STALE_NO_SIGNAL_AFTER" envDefault:"18h" validate:"gt=0"`
+	ArchivalBlockedRevalidate  time.Duration `env:"PREDICTION_BLOCKED_REVALIDATE_INTERVAL" envDefault:"6h" validate:"gt=0"`
+	ArchivalBatchSize          int           `env:"PREDICTION_ARCHIVAL_BATCH_SIZE" envDefault:"200" validate:"gte=1,lte=2000"`
+
+	// --- v10.3 calibration report (PART 7) ----------------------
+	CalibrationReportEnabled      bool   `env:"PREDICTION_CALIBRATION_REPORT_ENABLED" envDefault:"true"`
+	CalibrationReportTime         string `env:"PREDICTION_CALIBRATION_REPORT_TIME" envDefault:"09:00"`
+	CalibrationReportSendTelegram bool   `env:"PREDICTION_CALIBRATION_REPORT_SEND_TELEGRAM" envDefault:"true"`
+}
+
+// AIPreflightConfig wires the v10.3 per-surface preflight caps.
+// Every AI surface routes its prompt through aipreflight.Preflight
+// which enforces these caps + the AIBudgetConfig daily budgets.
+type AIPreflightConfig struct {
+	MaxInputCharsAlert              int `env:"AI_MAX_INPUT_CHARS_ALERT" envDefault:"18000" validate:"gte=1000"`
+	MaxInputCharsCatalyst           int `env:"AI_MAX_INPUT_CHARS_CATALYST" envDefault:"18000" validate:"gte=1000"`
+	MaxInputCharsPredictionCreate   int `env:"AI_MAX_INPUT_CHARS_PREDICTION_CREATE" envDefault:"22000" validate:"gte=1000"`
+	MaxInputCharsPredictionEvolve   int `env:"AI_MAX_INPUT_CHARS_PREDICTION_EVOLUTION" envDefault:"18000" validate:"gte=1000"`
+	MaxInputCharsDailyIntel         int `env:"AI_MAX_INPUT_CHARS_DAILY_INTEL" envDefault:"35000" validate:"gte=1000"`
+	MaxInputCharsMarketIntel        int `env:"AI_MAX_INPUT_CHARS_MARKET_INTEL" envDefault:"20000" validate:"gte=1000"`
+	MaxOutputTokensAlert            int `env:"AI_MAX_OUTPUT_TOKENS_ALERT" envDefault:"1200" validate:"gte=200"`
+	MaxOutputTokensPredictionCreate int `env:"AI_MAX_OUTPUT_TOKENS_PREDICTION" envDefault:"1200" validate:"gte=200"`
+	MaxOutputTokensPredictionEvolve int `env:"AI_MAX_OUTPUT_TOKENS_EVOLUTION" envDefault:"1000" validate:"gte=200"`
+	MaxOutputTokensCatalyst         int `env:"AI_MAX_OUTPUT_TOKENS_CATALYST" envDefault:"1200" validate:"gte=200"`
+	MaxOutputTokensDailyIntel       int `env:"AI_MAX_OUTPUT_TOKENS_DAILY_INTEL" envDefault:"2500" validate:"gte=200"`
 }
 
 // AIBudgetConfig wires the process-local AI budget governor (PART 5

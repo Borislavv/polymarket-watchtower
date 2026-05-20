@@ -43,6 +43,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionarchival"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionfeedback"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
@@ -103,6 +104,7 @@ type App struct {
 	predictionEvolver *evolution.Worker
 	predictionCreator *create.Worker
 	predictionFeedbk  *predictionfeedback.Worker
+	predictionArchive *predictionarchival.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -1103,6 +1105,16 @@ func New() (*App, error) {
 	if catalystImporterWorker != nil {
 		catalystImporterWorker.SetBudget(aiBudget)
 	}
+	// v10.3: ensure every periodic AI surface is gated by the
+	// shared aibudget governor. The alert analyzer is covered by
+	// the openai.Client's internal ledger (AI_ANALYSIS_DAILY_BUDGET_USD);
+	// these two were previously bypassing the v10.0 governor.
+	if dailyIntelWorker != nil {
+		dailyIntelWorker.SetBudget(aiBudget)
+	}
+	if marketIntelWorker != nil {
+		marketIntelWorker.SetBudget(aiBudget)
+	}
 	// v10.2: usefulness scoring is persisted via the new
 	// PredictionIntelligenceRepository. The evolver writes a fresh
 	// score row at the end of every per-prediction cycle.
@@ -1118,18 +1130,45 @@ func New() (*App, error) {
 		eventPageRepo := repository.NewEventPageRepository(pgPool)
 		predictionFeedback = predictionfeedback.New(
 			predictionfeedback.Config{
-				Enabled:   cfg.Prediction.FeedbackEnabled,
-				Interval:  cfg.Prediction.FeedbackInterval,
-				Horizons:  horizons,
-				BatchSize: cfg.Prediction.FeedbackBatchSize,
+				Enabled:           cfg.Prediction.FeedbackEnabled,
+				Interval:          cfg.Prediction.FeedbackInterval,
+				Horizons:          horizons,
+				BatchSize:         cfg.Prediction.FeedbackBatchSize,
+				MinMaterialDelta:  cfg.Prediction.EvaluationMinPriceDelta,
+				UsefulEarlyWindow: cfg.Prediction.EvaluationUsefulEarlyWindow,
 			},
 			intelRepo, marketsRepo, eventPageRepo, tradesRepo, met, logger,
 		)
+		// v10.3: feedback worker also writes prediction evaluations.
+		predictionFeedback.SetEvaluator(intelRepo)
 		logger.Info().
 			Bool("enabled", cfg.Prediction.FeedbackEnabled).
 			Dur("interval", cfg.Prediction.FeedbackInterval).
 			Int("horizons", len(horizons)).
 			Msg("prediction feedback: wired")
+	}
+
+	// v10.3 prediction archival worker.
+	var predictionArchiver *predictionarchival.Worker
+	if cfg.Postgres.Enabled() && cfg.Prediction.ArchivalEnabled {
+		intelRepo := repository.NewPredictionIntelligenceRepository(pgPool)
+		predictionArchiver = predictionarchival.New(
+			predictionarchival.Config{
+				Enabled:            cfg.Prediction.ArchivalEnabled,
+				Interval:           cfg.Prediction.ArchivalInterval,
+				TerminalRetention:  cfg.Prediction.ArchivalTerminalRetention,
+				StaleNoSignalAfter: cfg.Prediction.ArchivalStaleNoSignalAfter,
+				BlockedRevalidate:  cfg.Prediction.ArchivalBlockedRevalidate,
+				BatchSize:          cfg.Prediction.ArchivalBatchSize,
+			},
+			intelRepo, met, logger,
+		)
+		logger.Info().
+			Bool("enabled", cfg.Prediction.ArchivalEnabled).
+			Dur("interval", cfg.Prediction.ArchivalInterval).
+			Dur("terminal_retention", cfg.Prediction.ArchivalTerminalRetention).
+			Dur("stale_no_signal_after", cfg.Prediction.ArchivalStaleNoSignalAfter).
+			Msg("prediction archival: wired")
 	}
 
 	// v10.0 Prediction Creation Worker (cold-start path). Without
@@ -1246,6 +1285,7 @@ func New() (*App, error) {
 		predictionEvolver: evolutionWorker,
 		predictionCreator: predictionCreator,
 		predictionFeedbk:  predictionFeedback,
+		predictionArchive: predictionArchiver,
 		pgPool:            pgPool,
 	}, nil
 }
@@ -1635,6 +1675,12 @@ func (a *App) Run() error {
 	if a.predictionFeedbk != nil {
 		execs = append(execs, shutdown2.Exec{Name: "prediction-feedback", Fn: func(ctx context.Context) error {
 			a.predictionFeedbk.Run(ctx)
+			return nil
+		}})
+	}
+	if a.predictionArchive != nil {
+		execs = append(execs, shutdown2.Exec{Name: "prediction-archival", Fn: func(ctx context.Context) error {
+			a.predictionArchive.Run(ctx)
 			return nil
 		}})
 	}

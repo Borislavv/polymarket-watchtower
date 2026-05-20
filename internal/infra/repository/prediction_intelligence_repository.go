@@ -130,6 +130,101 @@ func (r *PredictionIntelligenceRepository) ListPredictionsForFeedback(ctx contex
 	return out, nil
 }
 
+// ArchivalCandidate is one row returned by ListPredictionsForArchival.
+type ArchivalCandidate struct {
+	ID           int64
+	EventSlug    string
+	ConditionID  string
+	CurrentState string
+	UpdatedAt    time.Time
+}
+
+// ListPredictionsForArchival returns terminal predictions whose
+// updated_at < olderThan (i.e. aged past terminal retention).
+func (r *PredictionIntelligenceRepository) ListPredictionsForArchival(ctx context.Context, olderThan time.Time, limit int32) ([]ArchivalCandidate, error) {
+	rows, err := r.q.ListPredictionsForArchival(ctx, sqlc.ListPredictionsForArchivalParams{
+		OlderThan:  tsFromTime(olderThan),
+		LimitCount: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ArchivalCandidate, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ArchivalCandidate{
+			ID:           r.ID,
+			EventSlug:    r.EventSlug,
+			ConditionID:  r.ConditionID,
+			CurrentState: r.CurrentState,
+			UpdatedAt:    r.UpdatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// ArchivePrediction stamps archived_at + the operator-facing reason.
+func (r *PredictionIntelligenceRepository) ArchivePrediction(ctx context.Context, id int64, terminalReason string) error {
+	return r.q.ArchivePrediction(ctx, sqlc.ArchivePredictionParams{
+		ID:             id,
+		TerminalReason: &terminalReason,
+	})
+}
+
+// ListPredictionsForStaleSignal returns active predictions older
+// than the stale-no-signal threshold for the worker's secondary
+// sweep.
+func (r *PredictionIntelligenceRepository) ListPredictionsForStaleSignal(ctx context.Context, olderThan time.Time, limit int32) ([]ArchivalCandidate, error) {
+	rows, err := r.q.ListPredictionsForStaleSignal(ctx, sqlc.ListPredictionsForStaleSignalParams{
+		OlderThan:  tsFromTime(olderThan),
+		LimitCount: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ArchivalCandidate, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ArchivalCandidate{
+			ID:           r.ID,
+			EventSlug:    r.EventSlug,
+			ConditionID:  r.ConditionID,
+			CurrentState: r.CurrentState,
+			UpdatedAt:    r.UpdatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// MarkPredictionStaleNoSignal stamps state=stale + the reason on
+// one prediction. Idempotent at the SQL level.
+func (r *PredictionIntelligenceRepository) MarkPredictionStaleNoSignal(ctx context.Context, id int64, reason string) error {
+	return r.q.MarkPredictionStaleNoSignal(ctx, sqlc.MarkPredictionStaleNoSignalParams{
+		ID:     id,
+		Reason: reason,
+	})
+}
+
+// PredictionEvaluationRow is the upsert shape for one evaluation
+// row written by the v10.3 prediction-evaluation pipeline.
+type PredictionEvaluationRow struct {
+	PredictionID int64
+	Horizon      string
+	Evaluation   string
+	Score        float64
+	EvidenceJSON []byte
+}
+
+// UpsertEvaluation writes one classifier output per
+// (prediction_id, horizon).
+func (r *PredictionIntelligenceRepository) UpsertEvaluation(ctx context.Context, in PredictionEvaluationRow) error {
+	return r.q.UpsertPredictionEvaluation(ctx, sqlc.UpsertPredictionEvaluationParams{
+		PredictionID: in.PredictionID,
+		Horizon:      in.Horizon,
+		Evaluation:   in.Evaluation,
+		Score:        in.Score,
+		EvidenceJson: in.EvidenceJSON,
+	})
+}
+
 // HorizonsRecorded returns the set of horizons already measured for
 // one prediction. The worker subtracts this from the configured
 // horizons list to find the missing work.

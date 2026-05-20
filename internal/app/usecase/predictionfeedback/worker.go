@@ -27,8 +27,10 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomemapping"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionevaluation"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/workerguard"
 )
 
 // Config tunes the worker.
@@ -41,6 +43,17 @@ type Config struct {
 	Horizons []time.Duration
 	// BatchSize bounds the candidates pulled per Tick.
 	BatchSize int
+
+	// --- v10.3 evaluation classifier knobs ---
+	// MinMaterialDelta is the |price_delta| threshold below which a
+	// horizon is treated as "no movement" rather than "direction
+	// correct/wrong". Default 0.03 (3 percentage points of probability).
+	MinMaterialDelta float64
+	// UsefulEarlyWindow is the horizon at or below which a correct
+	// call is classified "useful_early" rather than "useful_correct".
+	// Default "6h".
+	UsefulEarlyWindow string
+
 	// Clock is overridable for tests.
 	Clock func() time.Time
 }
@@ -68,6 +81,14 @@ type FeedbackStore interface {
 	UpsertFeedback(ctx context.Context, in repository.FeedbackRow) error
 }
 
+// EvaluationStore is the v10.3 seam to the
+// PredictionIntelligenceRepository's evaluation upsert. nil =
+// disabled (the feedback worker still writes feedback rows; only
+// the evaluation classification step is skipped).
+type EvaluationStore interface {
+	UpsertEvaluation(ctx context.Context, in repository.PredictionEvaluationRow) error
+}
+
 type MarketResolver interface {
 	GetByConditionID(ctx context.Context, conditionID string) (repository.Market, error)
 }
@@ -82,15 +103,16 @@ type TradePriceLookup interface {
 
 // Worker is the periodic feedback loop.
 type Worker struct {
-	cfg     Config
-	store   FeedbackStore
-	markets MarketResolver
-	pages   EventPageMarketLister
-	trades  TradePriceLookup
-	met     *metrics.Metrics
-	log     *zerolog.Logger
-	startMu sync.Mutex
-	started bool
+	cfg       Config
+	evaluator EvaluationStore
+	store     FeedbackStore
+	markets   MarketResolver
+	pages     EventPageMarketLister
+	trades    TradePriceLookup
+	met       *metrics.Metrics
+	log       *zerolog.Logger
+	startMu   sync.Mutex
+	started   bool
 }
 
 func New(cfg Config, store FeedbackStore, markets MarketResolver, pages EventPageMarketLister, trades TradePriceLookup, met *metrics.Metrics, log *zerolog.Logger) *Worker {
@@ -106,15 +128,16 @@ func (w *Worker) Run(ctx context.Context) {
 	if !w.cfg.Enabled {
 		return
 	}
+	guard := workerguard.New("prediction_feedback", w.met, w.log)
 	t := time.NewTicker(w.cfg.Interval)
 	defer t.Stop()
-	w.Tick(ctx)
+	guard.Run(ctx, func(ctx context.Context) { w.Tick(ctx) })
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			w.Tick(ctx)
+			guard.Run(ctx, func(ctx context.Context) { w.Tick(ctx) })
 		}
 	}
 }
@@ -220,8 +243,55 @@ func (w *Worker) measureOne(ctx context.Context, c repository.FeedbackCandidate,
 		written++
 		w.observePred("ok")
 		w.observeHorizon(label)
+		// v10.3: write a deterministic evaluation classification
+		// row beside the feedback row.
+		w.evaluateAndStore(ctx, c, row)
 	}
 	return written
+}
+
+// evaluateAndStore wraps the deterministic classifier + persists
+// one evaluation row per (prediction, horizon). nil evaluator
+// short-circuits silently.
+func (w *Worker) evaluateAndStore(ctx context.Context, c repository.FeedbackCandidate, row repository.FeedbackRow) {
+	if w.evaluator == nil {
+		return
+	}
+	in := predictionevaluation.Inputs{
+		Horizon:                  row.Horizon,
+		SideBias:                 c.SideBias,
+		PriceAtPrediction:        row.PriceAtPrediction,
+		PriceAtHorizon:           row.PriceAtHorizon,
+		StateAtHorizon:           c.CurrentState,
+		RepricingStatusAtHorizon: row.RepricingStatusAtHorizon,
+		FlowConfirmed:            row.FlowConfirmed,
+		MinMaterialDelta:         w.cfg.MinMaterialDelta,
+		UsefulEarlyWindow:        w.cfg.UsefulEarlyWindow,
+	}
+	dec := predictionevaluation.Classify(in)
+	if err := w.evaluator.UpsertEvaluation(ctx, repository.PredictionEvaluationRow{
+		PredictionID: c.ID,
+		Horizon:      row.Horizon,
+		Evaluation:   string(dec.Class),
+		Score:        dec.Score,
+		EvidenceJSON: dec.Evidence,
+	}); err != nil {
+		if w.log != nil {
+			w.log.Warn().Err(err).Int64("id", c.ID).Str("horizon", row.Horizon).Msg("prediction evaluation: upsert failed")
+		}
+		return
+	}
+	w.observeEvaluation(string(dec.Class), row.Horizon)
+}
+
+// SetEvaluator attaches the v10.3 evaluation persistence seam.
+func (w *Worker) SetEvaluator(s EvaluationStore) { w.evaluator = s }
+
+func (w *Worker) observeEvaluation(class, horizon string) {
+	if w.met == nil || w.met.PredictionEvaluation == nil {
+		return
+	}
+	w.met.PredictionEvaluation.WithLabelValues(class, horizon).Inc()
 }
 
 // directionCorrect maps side_bias + signed delta into a boolean.

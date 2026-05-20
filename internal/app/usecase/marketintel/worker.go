@@ -98,6 +98,16 @@ type AnnotationRankingHook interface {
 	RankAndRender(ctx context.Context, candidates []repository.IntelligenceCandidate, periodStart, periodEnd time.Time, limit int) string
 }
 
+// BudgetGuard is the v10.3 seam to the shared aibudget governor.
+// nil = fail-open.
+type BudgetGuard interface {
+	Allow(bucket string, estCost float64) (bool, string)
+	Charge(bucket string, actualCost float64)
+}
+
+// estPerMarketIntelUSD is the conservative pre-flight cost estimate.
+const estPerMarketIntelUSD = 0.05
+
 // Worker is the periodic 2h intelligence loop.
 type Worker struct {
 	cfg         Config
@@ -107,9 +117,13 @@ type Worker struct {
 	narrative   NarrativeLoader
 	rankingHook AnnotationRankingHook
 	bot         Bot
+	budget      BudgetGuard
 	metrics     *metrics.Metrics
 	log         *zerolog.Logger
 }
+
+// SetBudget attaches the shared aibudget governor. nil = fail-open.
+func (w *Worker) SetBudget(b BudgetGuard) { w.budget = b }
 
 // New wires the worker. All deps required. Pass analysis.NoopAnalyzer
 // to disable the AI call (the worker still selects candidates and
@@ -200,7 +214,17 @@ func (w *Worker) tick(ctx context.Context) {
 			}
 		}
 	}
+	if w.budget != nil {
+		if ok, reason := w.budget.Allow("market_intel", estPerMarketIntelUSD); !ok {
+			w.observeSkip("ai_budget_denied")
+			w.log.Warn().Str("reason", reason).Msg("market intel: AI denied by budget")
+			return
+		}
+	}
 	res, err := w.analyzer.AnalyzeMarketReport(ctx, req)
+	if w.budget != nil && res.EstimatedCostUSD > 0 {
+		w.budget.Charge("market_intel", res.EstimatedCostUSD)
+	}
 	if err != nil {
 		w.log.Err(err).
 			Str("period_key", periodKey).

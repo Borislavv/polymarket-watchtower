@@ -97,9 +97,29 @@ type GetMarketPredictionParams struct {
 	ConditionID string
 }
 
-func (q *Queries) GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (PolymarketMarketPredictions, error) {
+type GetMarketPredictionRow struct {
+	ID                        int64
+	EventSlug                 string
+	ConditionID               string
+	Outcome                   string
+	SideBias                  string
+	Summary                   string
+	CurrentState              string
+	StateReason               string
+	PreviousPredictionID      *int64
+	SupersedesPredictionID    *int64
+	LastRepricedAt            pgtype.Timestamptz
+	LastConfirmedByAlertAt    pgtype.Timestamptz
+	LastContradictedByAlertAt pgtype.Timestamptz
+	Confidence                float64
+	CreatedAt                 pgtype.Timestamptz
+	UpdatedAt                 pgtype.Timestamptz
+	LastEvolvedAt             pgtype.Timestamptz
+}
+
+func (q *Queries) GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (GetMarketPredictionRow, error) {
 	row := q.db.QueryRow(ctx, getMarketPrediction, arg.EventSlug, arg.ConditionID)
-	var i PolymarketMarketPredictions
+	var i GetMarketPredictionRow
 	err := row.Scan(
 		&i.ID,
 		&i.EventSlug,

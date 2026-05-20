@@ -310,6 +310,40 @@ type Metrics struct {
 	OutcomeMapping        *prometheus.CounterVec
 	OutcomeMappingUnknown *prometheus.CounterVec
 
+	// --- v10.3 worker overlap + cycle metrics ---
+	// WorkerCycleDuration: per-worker tick wall-clock latency.
+	// Labelled by worker name so the operator can see "creation
+	// took 45s vs interval 30m" at a glance.
+	WorkerCycleDuration *prometheus.HistogramVec
+	// WorkerCycleSkipped: tick skipped because the previous tick
+	// is still running (overlap=true). label: worker, reason.
+	WorkerCycleSkipped *prometheus.CounterVec
+	// WorkerCycleItems: count of items the worker processed in a
+	// cycle, labelled by worker + status (ok | skipped | failed).
+	WorkerCycleItems *prometheus.CounterVec
+
+	// --- v10.3 AI cost + preflight ---
+	// AIPromptChars: histogram of compacted prompt sizes per
+	// surface. Operator-actionable: drift on prediction_creation
+	// past the configured cap = compaction is firing.
+	AIPromptChars *prometheus.HistogramVec
+	// AICompactions: count of prompts the preflight had to compact,
+	// labelled by surface + reason (chars_cap | output_cap).
+	AICompactions *prometheus.CounterVec
+	// AISurfaceSkipped: AI calls the preflight skipped after
+	// compaction still left them over-cap, labelled by surface +
+	// reason.
+	AISurfaceSkipped *prometheus.CounterVec
+	// AISurfaceEstimatedCost: pre-flight cost estimate counter,
+	// labelled by surface. Pair with the real charged total to see
+	// estimation drift.
+	AISurfaceEstimatedCost *prometheus.CounterVec
+
+	// --- v10.3 prediction archival + evaluation ---
+	PredictionArchived   *prometheus.CounterVec
+	PredictionStaled     *prometheus.CounterVec
+	PredictionEvaluation *prometheus.CounterVec
+
 	// --- v9.6 Political-Catalyst Intelligence importer ---
 	// EventCatalystImporterRuns: importer cycle outcomes, labelled
 	// by status (ok / empty / partial / failed).
@@ -845,6 +879,54 @@ func New() *Metrics {
 		Help: "Outcome-mapping unknowns labelled by reason code (unknown_condition_id | unknown_token_id | label_not_found | …).",
 	}, []string{"reason"})
 
+	// v10.3 worker overlap + cycle metrics.
+	m.WorkerCycleDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "worker", Name: "cycle_duration_seconds",
+		Help:    "Per-worker tick wall-clock latency. Use to see when a Tick is approaching its Interval and tune timeouts.",
+		Buckets: prometheus.ExponentialBuckets(0.1, 2, 12),
+	}, []string{"worker"})
+	m.WorkerCycleSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "worker", Name: "cycle_skipped_total",
+		Help: "Worker ticks skipped — labelled by worker + reason (overlap | timeout | disabled).",
+	}, []string{"worker", "reason"})
+	m.WorkerCycleItems = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "worker", Name: "cycle_items_total",
+		Help: "Per-worker per-item outcome counter. Workers wire their own status taxonomy here for the operator dashboard.",
+	}, []string{"worker", "status"})
+
+	// v10.3 AI cost + preflight.
+	m.AIPromptChars = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "prompt_chars",
+		Help:    "Compacted prompt size per AI surface (alert / catalyst / prediction_create / prediction_evolution / daily_intel / market_intel).",
+		Buckets: prometheus.ExponentialBuckets(1000, 2, 8),
+	}, []string{"surface"})
+	m.AICompactions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "compactions_total",
+		Help: "Prompts the preflight compacted, labelled by surface + reason (chars_cap | output_cap).",
+	}, []string{"surface", "reason"})
+	m.AISurfaceSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "surface_skipped_total",
+		Help: "AI calls the preflight skipped after compaction still left them over the cap, labelled by surface + reason.",
+	}, []string{"surface", "reason"})
+	m.AISurfaceEstimatedCost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "estimated_cost_usd_total",
+		Help: "Pre-flight cost estimate counter labelled by surface. Compare against ai_budget_charged_usd_total to see estimation drift.",
+	}, []string{"surface"})
+
+	// v10.3 prediction archival + evaluation.
+	m.PredictionArchived = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_archival", Name: "archived_total",
+		Help: "Predictions archived by the v10.3 worker, labelled by terminal state + reason.",
+	}, []string{"state", "reason"})
+	m.PredictionStaled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_archival", Name: "staled_total",
+		Help: "Predictions the worker flipped to state=stale, labelled by reason.",
+	}, []string{"reason"})
+	m.PredictionEvaluation = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_evaluation", Name: "total",
+		Help: "Prediction evaluations written, labelled by classifier output + horizon.",
+	}, []string{"evaluation", "horizon"})
+
 	// v9.6 Political-Catalyst Intelligence importer
 	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "runs_total",
@@ -1014,6 +1096,9 @@ func New() *Metrics {
 		m.PredictionSchedulerStartupSuppressed, m.PredictionMessageChunks,
 		m.PredictionFeedbackRuns, m.PredictionFeedbackProcessed, m.PredictionFeedbackHorizons,
 		m.OutcomeMapping, m.OutcomeMappingUnknown,
+		m.WorkerCycleDuration, m.WorkerCycleSkipped, m.WorkerCycleItems,
+		m.AIPromptChars, m.AICompactions, m.AISurfaceSkipped, m.AISurfaceEstimatedCost,
+		m.PredictionArchived, m.PredictionStaled, m.PredictionEvaluation,
 		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,

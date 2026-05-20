@@ -56,6 +56,10 @@ func main() {
 		runEvolvePredictions(os.Args[2:])
 	case "diag-eventpage":
 		runDiagEventPage(os.Args[2:])
+	case "prediction-calibration":
+		// v10.3 operator calibration report. Read-only; no AI; no
+		// Telegram. Same aggregation backs the daily report worker.
+		runPredictionCalibration(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)

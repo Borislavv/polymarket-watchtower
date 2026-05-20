@@ -48,6 +48,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/workerguard"
 )
 
 // Config tunes the worker.
@@ -253,19 +254,24 @@ func (w *Worker) SetBudget(b BudgetGuard) { w.budget = b }
 // Run blocks until ctx cancels, ticking every Interval. Immediate
 // first tick on startup so a freshly-deployed worker doesn't sit
 // idle for one Interval before evolving.
+//
+// v10.3: an in-flight gate (workerguard) prevents the next Ticker
+// fire from kicking off a second concurrent Tick when the previous
+// one is still running.
 func (w *Worker) Run(ctx context.Context) {
 	if !w.cfg.Enabled {
 		return
 	}
+	guard := workerguard.New("prediction_evolution", w.metrics, w.log)
 	t := time.NewTicker(w.cfg.Interval)
 	defer t.Stop()
-	w.Tick(ctx)
+	guard.Run(ctx, func(ctx context.Context) { w.Tick(ctx) })
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			w.Tick(ctx)
+			guard.Run(ctx, func(ctx context.Context) { w.Tick(ctx) })
 		}
 	}
 }

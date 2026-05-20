@@ -142,6 +142,18 @@ type TelegramResult struct {
 	MessageID int64
 }
 
+// BudgetGuard is the v10.3 seam to the shared aibudget governor.
+// nil = fail-open (legacy behavior).
+type BudgetGuard interface {
+	Allow(bucket string, estCost float64) (bool, string)
+	Charge(bucket string, actualCost float64)
+}
+
+// estPerDailyIntelUSD is the conservative pre-flight per-call cost
+// estimate for the daily intel AI generation. Adjust if the prompt
+// shape changes materially.
+const estPerDailyIntelUSD = 0.20
+
 // Worker is the periodic daily-report loop.
 type Worker struct {
 	cfg        Config
@@ -153,9 +165,13 @@ type Worker struct {
 	generator  analysis.DailyPoliticalIntelGenerator
 	tg         Telegram
 	flow       FlowLoader
+	budget     BudgetGuard
 	metrics    *metrics.Metrics
 	log        *zerolog.Logger
 }
+
+// SetBudget attaches the shared aibudget governor. nil = fail-open.
+func (w *Worker) SetBudget(b BudgetGuard) { w.budget = b }
 
 // New wires the worker.
 func New(
@@ -291,11 +307,30 @@ func (w *Worker) Tick(ctx context.Context, reportDate time.Time) {
 		return
 	}
 
+	// v10.3 budget gate. Daily intel is the most token-expensive
+	// AI call we make; the global + daily-intel bucket caps stop
+	// the run before it lands when today's spend is exhausted.
+	if w.budget != nil {
+		if ok, reason := w.budget.Allow("daily_political_intel", estPerDailyIntelUSD); !ok {
+			row.DeliveryStatus = "ai_budget_denied"
+			row.LastDeliveryError = "budget:" + reason
+			_, _ = w.store.UpsertDailyReport(ctx, row)
+			w.observeReport("ai_budget_denied")
+			if w.log != nil {
+				w.log.Warn().Str("reason", reason).Msg("daily intel: AI denied by budget")
+			}
+			return
+		}
+	}
+
 	aiCtx, cancel := context.WithTimeout(ctx, w.cfg.AITimeout)
 	defer cancel()
 	aiStart := w.cfg.Clock()
 	res, err := w.generator.GenerateDailyPoliticalIntel(aiCtx, req)
 	w.observeAILatency(w.cfg.Clock().Sub(aiStart))
+	if w.budget != nil && res.EstimatedCostUSD > 0 {
+		w.budget.Charge("daily_political_intel", res.EstimatedCostUSD)
+	}
 	if err != nil || res.Status == analysis.StatusError {
 		row.DeliveryStatus = "ai_failed"
 		row.LastDeliveryError = sanitiseErr(err, res.LastError)
