@@ -10,31 +10,44 @@ import (
 
 // buildAlertPrompt constructs the user message for a single alert.
 //
-// v9 reformulation: the model's primary task is no longer to summarise
-// the alert. It is to validate or invalidate the trend implied by the
-// alert against fresh world/political events. When the Responses API
-// path is used (Client.WebSearchEnabled), the model also has the
-// web_search_preview tool and can fetch real-time news; the prompt
-// asks it to do so. When the Chat Completions path is used, the
-// prompt tells the model NOT to invent news and to reduce confidence.
+// PART 6 of the Political-Catalyst Intelligence spec mandates an
+// EXACT prompt template (alert_prompt.go::promptForAlert). The
+// template carries six placeholders:
 //
-// Section layout matches the request template the spec defines:
+//	{{ALERT_DATA}}        — alert identity + lifecycle
+//	{{MARKET_STATE}}      — side, price, odds, payoff
+//	{{FLOW_DATA}}         — score, anomalies, accumulation, cross-flow
+//	{{EVENT_ANNOTATIONS}} — Polymarket event-page narrative
+//	{{CATALYST_CONTEXT}}  — Political-Catalyst Intelligence overlay
+//	{{WEB_CONTEXT}}       — web_search disclosure / fresh-news context
 //
-//	Данные алерта:        {{ALERT_DATA}}
-//	Current market/price: {{MARKET_PRICE_DATA}}
-//	Recent flow/anomalies:{{FLOW_DATA}}
-//	Fresh news / web context: {{EVENTS_NEWS}}
-//	Previous context:     {{PREVIOUS_CONTEXT}}
-//
-// All data fields stay structured `key: value` lines so the model can
-// parse them reliably. Empty fields are elided rather than rendered
-// as zeros.
+// This builder renders each section as a structured `key: value`
+// block (so the model can parse reliably) and substitutes them into
+// the verbatim template via strings.NewReplacer. Empty fields elide
+// to "n/a" — the template stays the same shape regardless of which
+// upstream contexts are wired.
 func buildAlertPrompt(req analysis.AlertAnalysisRequest) string {
-	var b strings.Builder
-	b.WriteString("ANALYZE THIS PREDICTION-MARKET ALERT.\n\n")
+	alertData := buildAlertDataBlock(req)
+	marketState := buildMarketStateBlock(req)
+	flowData := buildFlowDataBlock(req)
+	annotations := buildAnnotationsBlock(req)
+	catalyst := buildCatalystBlock(req)
+	web := buildWebContextBlock(req)
 
-	// --- Данные алерта (alert identity) ---------------------------------
-	b.WriteString("Данные алерта:\n")
+	repl := strings.NewReplacer(
+		"{{ALERT_DATA}}", alertData,
+		"{{MARKET_STATE}}", marketState,
+		"{{FLOW_DATA}}", flowData,
+		"{{EVENT_ANNOTATIONS}}", annotations,
+		"{{CATALYST_CONTEXT}}", catalyst,
+		"{{WEB_CONTEXT}}", web,
+	)
+	return "ANALYZE THIS PREDICTION-MARKET ALERT.\n\n" + repl.Replace(promptForAlert)
+}
+
+// buildAlertDataBlock fills {{ALERT_DATA}}. Empty fields elide.
+func buildAlertDataBlock(req analysis.AlertAnalysisRequest) string {
+	var b strings.Builder
 	fmt.Fprintf(&b, "alert_kind: %s\n", nz(req.Kind))
 	fmt.Fprintf(&b, "severity: %s\n", nz(req.Severity))
 	fmt.Fprintf(&b, "reason: %s\n", nz(req.Reason))
@@ -54,9 +67,12 @@ func buildAlertPrompt(req analysis.AlertAnalysisRequest) string {
 		left := req.EndsAt.Sub(req.NowAt)
 		fmt.Fprintf(&b, "ends_at: %s (in %s)\n", req.EndsAt.Format(time.RFC3339), humanShort(left))
 	}
+	return strings.TrimRight(b.String(), "\n")
+}
 
-	// --- Current market/price -------------------------------------------
-	b.WriteString("\nCurrent market/price:\n")
+// buildMarketStateBlock fills {{MARKET_STATE}}.
+func buildMarketStateBlock(req analysis.AlertAnalysisRequest) string {
+	var b strings.Builder
 	if req.Side != "" {
 		fmt.Fprintf(&b, "side: %s\n", req.Side)
 	}
@@ -75,9 +91,17 @@ func buildAlertPrompt(req analysis.AlertAnalysisRequest) string {
 	if req.RemainingReturnPct > 0 {
 		fmt.Fprintf(&b, "remaining_return_pct: %.1f\n", req.RemainingReturnPct)
 	}
+	out := strings.TrimRight(b.String(), "\n")
+	if out == "" {
+		return "n/a"
+	}
+	return out
+}
 
-	// --- Recent flow / anomalies ----------------------------------------
-	b.WriteString("\nRecent flow/anomalies:\n")
+// buildFlowDataBlock fills {{FLOW_DATA}}. Pulls every scoring +
+// context-booster signal the detector stamped on the Finding.
+func buildFlowDataBlock(req analysis.AlertAnalysisRequest) string {
+	var b strings.Builder
 	if req.Score > 0 {
 		fmt.Fprintf(&b, "score: %.0f/100\n", req.Score)
 	}
@@ -93,15 +117,15 @@ func buildAlertPrompt(req analysis.AlertAnalysisRequest) string {
 	if len(req.Reasons) > 0 {
 		fmt.Fprintf(&b, "reasons: %s\n", strings.Join(req.Reasons, ", "))
 	}
-	for label, v := range map[string]string{
-		"accumulation":   req.AccumulationNote,
-		"ownership":      req.OwnershipNote,
-		"quiet_market":   req.QuietMarketNote,
-		"new_wallet":     req.NewWalletNote,
-		"outcome_status": req.OutcomeStatus,
+	for _, kv := range []struct{ label, value string }{
+		{"accumulation", req.AccumulationNote},
+		{"ownership", req.OwnershipNote},
+		{"quiet_market", req.QuietMarketNote},
+		{"new_wallet", req.NewWalletNote},
+		{"outcome_status", req.OutcomeStatus},
 	} {
-		if v != "" {
-			fmt.Fprintf(&b, "%s: %s\n", label, v)
+		if kv.value != "" {
+			fmt.Fprintf(&b, "%s: %s\n", kv.label, kv.value)
 		}
 	}
 	if req.SameMarketRecentAlerts > 0 {
@@ -115,28 +139,47 @@ func buildAlertPrompt(req analysis.AlertAnalysisRequest) string {
 	if req.NoveltyOrMemeGuess {
 		b.WriteString("market_appears_novelty_or_meme: yes (low-information / joke topic — downgrade usefulness)\n")
 	}
-
-	// --- Fresh news / web context ---------------------------------------
-	// The Responses API path actually populates this section via the
-	// web_search_preview tool. The Chat Completions path leaves it
-	// empty and the model is instructed not to invent news.
-	b.WriteString("\nFresh news / web context:\n")
-	if req.PublicContextEnabled {
-		b.WriteString("public_context: web_search was attempted; use the web_search tool to retrieve the most recent (last 24-72h) news directly relevant to this market or event, then cite specific facts only when found by the tool.\n")
-	} else {
-		b.WriteString("public_context: NOT checked. Do not invent public facts; if asked, say \"Live public context was not checked.\"\n")
+	out := strings.TrimRight(b.String(), "\n")
+	if out == "" {
+		return "n/a"
 	}
+	return out
+}
 
-	// --- Previous context -----------------------------------------------
-	// Reserved for prior AI analysis text once we plumb it through the
-	// request shape. Empty for now — the slot is still emitted so the
-	// model sees a stable layout across calls.
-	b.WriteString("\nPrevious context:\n")
-	b.WriteString("n/a — first or refreshed analysis; prior analyst notes not threaded.\n")
+// buildAnnotationsBlock fills {{EVENT_ANNOTATIONS}} with the rendered
+// Polymarket event-page narrative. The renderer prefixes its own
+// "Polymarket event page context:" header which we strip here — the
+// outer template already labels the slot.
+func buildAnnotationsBlock(req analysis.AlertAnalysisRequest) string {
+	epc := strings.TrimSpace(req.EventNarrativeContext)
+	if epc == "" {
+		return "unavailable. Do not invent annotations; reduce confidence."
+	}
+	const lead = "Polymarket event page context:"
+	if strings.HasPrefix(epc, lead) {
+		epc = strings.TrimSpace(epc[len(lead):])
+	}
+	return epc
+}
 
-	// --- TASK (v9 Russian, trend-confirmation/invalidation focus) -------
-	b.WriteString(promptForAlert)
-	return b.String()
+// buildCatalystBlock fills {{CATALYST_CONTEXT}} with the rendered
+// Political-Catalyst Intelligence overlay.
+func buildCatalystBlock(req analysis.AlertAnalysisRequest) string {
+	cc := strings.TrimSpace(req.CatalystContext)
+	if cc == "" {
+		return "no catalyst recorded for this event. Do not invent catalysts."
+	}
+	return cc
+}
+
+// buildWebContextBlock fills {{WEB_CONTEXT}}. The Responses API path
+// instructs the model to invoke web_search; the Chat Completions
+// path tells it not to invent news.
+func buildWebContextBlock(req analysis.AlertAnalysisRequest) string {
+	if req.PublicContextEnabled {
+		return "public_context: web_search was attempted; use the web_search tool to retrieve the most recent (last 24-72h) news directly relevant to this market or event, then cite specific facts only when found by the tool."
+	}
+	return "public_context: NOT checked. Do not invent public facts; if asked, say \"Live public context was not checked.\""
 }
 
 // buildMarketReportPrompt — 2h market-news-review.
@@ -167,6 +210,17 @@ func buildMarketReportPrompt(req analysis.MarketReportRequest) string {
 	}
 	b.WriteString("\nFresh news / web context:\n")
 	b.WriteString("If you have web_search available, use it to retrieve the most recent (last 24-72h) news relevant to the candidate markets. Cite specific facts only when found by the tool. If the tool is unavailable, write \"Live public context was not checked.\" and do not invent news.\n")
+	b.WriteString("\nPolymarket event page context:\n")
+	if epc := strings.TrimSpace(req.EventNarrativeContext); epc != "" {
+		const lead = "Polymarket event page context:"
+		if strings.HasPrefix(epc, lead) {
+			epc = strings.TrimSpace(epc[len(lead):])
+		}
+		b.WriteString(epc)
+		b.WriteString("\n")
+	} else {
+		b.WriteString("unavailable. Do not invent market news; reduce confidence.\n")
+	}
 	b.WriteString(marketReportPrompt)
 	return b.String()
 }
@@ -210,6 +264,17 @@ func buildOutcomePrompt(req analysis.OutcomeAnalysisRequest) string {
 	if req.CLV15m != 0 || req.CLV1h != 0 || req.CLV6h != 0 || req.CLV24h != 0 {
 		fmt.Fprintf(&b, "clv: 15m=%.3f, 1h=%.3f, 6h=%.3f, 24h=%.3f\n",
 			req.CLV15m, req.CLV1h, req.CLV6h, req.CLV24h)
+	}
+	b.WriteString("\nPolymarket event page context:\n")
+	if epc := strings.TrimSpace(req.EventNarrativeContext); epc != "" {
+		const lead = "Polymarket event page context:"
+		if strings.HasPrefix(epc, lead) {
+			epc = strings.TrimSpace(epc[len(lead):])
+		}
+		b.WriteString(epc)
+		b.WriteString("\n")
+	} else {
+		b.WriteString("unavailable. Do not invent market news; reduce confidence.\n")
 	}
 	b.WriteString(outcomePrompt)
 	return b.String()

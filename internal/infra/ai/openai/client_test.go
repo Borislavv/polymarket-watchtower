@@ -267,6 +267,42 @@ func TestAnalyzeAlert_429PerMinuteRateLimit(t *testing.T) {
 	}
 }
 
+// TestPromptBuilder_PlaceholdersAreSubstituted pins PART 6 of the
+// Political-Catalyst Intelligence spec: the verbatim template carries
+// six placeholders and buildAlertPrompt MUST replace every one. A
+// stray `{{...}}` token in the final prompt means substitution
+// regressed.
+func TestPromptBuilder_PlaceholdersAreSubstituted(t *testing.T) {
+	p := buildAlertPrompt(analysis.AlertAnalysisRequest{
+		Kind: "trade_anomaly", Severity: "warning",
+		Title: "Will Ken Paxton win the Texas Republican Senate primary?",
+		Side:  "BUY", NotionalUSD: 15000, Price: 0.62,
+		Reasons:               []string{"WHALE_FLOW"},
+		EventNarrativeContext: "event_slug: tx\ntitle: Texas Republican Senate Primary\n",
+		CatalystContext:       "- type=runoff | status=active | expected_at=2026-06-15T12:00:00Z | title=Texas GOP runoff\n  bullish: decisive Paxton win\n",
+	})
+	for _, ph := range []string{
+		"{{ALERT_DATA}}",
+		"{{MARKET_STATE}}",
+		"{{FLOW_DATA}}",
+		"{{EVENT_ANNOTATIONS}}",
+		"{{CATALYST_CONTEXT}}",
+		"{{WEB_CONTEXT}}",
+	} {
+		if strings.Contains(p, ph) {
+			t.Errorf("placeholder %s must be substituted; prompt still contains it:\n%s", ph, p)
+		}
+	}
+	// Catalyst content must reach the prompt verbatim under the
+	// "Future catalysts:" header — load-bearing for the AI reasoning.
+	if !strings.Contains(p, "Future catalysts:") {
+		t.Error("Future catalysts: header missing")
+	}
+	if !strings.Contains(p, "type=runoff | status=active") {
+		t.Error("catalyst content missing from prompt")
+	}
+}
+
 // TestPromptBuilder_TitleAndReasonsAppear pins that the prompt
 // carries the structured signals the model needs. We don't assert
 // the entire content; we assert specific tokens are present.
@@ -284,20 +320,25 @@ func TestPromptBuilder_TitleAndReasonsAppear(t *testing.T) {
 		"market_title: Will Massie win KY-04?",
 		"category: Politics",
 		"reasons: STABLE_PRICE, LOW_VOLATILITY",
-		// v9 prompt shape — Russian trend-confirmation/invalidation
-		// task block. Section headers in the user message; tone +
-		// anti-hallucination live in defaultSystemPrompt (pinned by
-		// a separate test). We assert the data-section headers + the
-		// load-bearing AI-analysis output bullets.
+		// PART 6 prompt shape — verbatim template with six
+		// placeholders rendered by buildAlertPrompt. The data-
+		// section labels live inside the template; assert each.
 		"Данные алерта:",
-		"Current market/price:",
-		"Recent flow/anomalies:",
-		"Fresh news / web context:",
-		"Previous context:",
-		"Fresh events check",
-		"Trend confirmation / invalidation",
-		"Practical stance",
-		"Watch next",
+		"Current market state:",
+		"Flow / anomalies:",
+		"Polymarket event annotations:",
+		"Future catalysts:",
+		"External news/web context:",
+		// Load-bearing output bullets the Telegram renderer + the
+		// operator depend on.
+		"AI analysis",
+		"Trend status:",
+		"Flow quality:",
+		"Catalyst status:",
+		"Catalyst scenarios:",
+		"Risk to thesis:",
+		"Watch next:",
+		"Verdict:",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
@@ -328,12 +369,11 @@ func TestPromptBuilder_CrossFlowContradictoryAlerts(t *testing.T) {
 			t.Errorf("prompt missing %q. Prompt:\n%s", want, p)
 		}
 	}
-	// v9: the trend-confirmation task block lists "opposite-side flow"
-	// inside the Flow interpretation rubric (as opposite-side pressure
-	// / opposite-side flow). The literal "opposite-side" substring is
-	// the load-bearing token — assert that, not a tight phrase.
-	if !strings.Contains(p, "opposite-side") {
-		t.Errorf("task section must point the model at opposite-side flow:\n%s", p)
+	// v9 prompt body uses "contradictory flow" as the load-bearing
+	// signal the model should weigh; the raw same/opposite-side
+	// numeric fields are already pinned via the assertions above.
+	if !strings.Contains(p, "contradictory flow") {
+		t.Errorf("task section must point the model at contradictory flow:\n%s", p)
 	}
 }
 

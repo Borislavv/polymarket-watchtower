@@ -70,6 +70,7 @@ type Querier interface {
 	GetAlertByID(ctx context.Context, id int64) (PolymarketAlerts, error)
 	GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (PolymarketAlertOutcomeAnalyses, error)
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
+	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
 	// Reverse of GetTraderByWallet — used by the detection worker to
@@ -92,6 +93,10 @@ type Querier interface {
 	// when the market resolves. Unique constraint on alert_id makes the
 	// write idempotent.
 	InsertAlertOutcomeAnalysis(ctx context.Context, arg InsertAlertOutcomeAnalysisParams) (PolymarketAlertOutcomeAnalyses, error)
+	InsertEventPageMarket(ctx context.Context, arg InsertEventPageMarketParams) error
+	// Inserts a snapshot row. raw_json is capped by the writer before
+	// this call lands so the column stays bounded.
+	InsertEventPageSnapshot(ctx context.Context, arg InsertEventPageSnapshotParams) (int64, error)
 	// Persist one 2h report. period_key UNIQUE — two ticks landing in the
 	// same bucket (computed deterministically in the worker) collapse to
 	// a single row, eliminating the duplicate-Telegram-send class of bug
@@ -131,6 +136,10 @@ type Querier interface {
 	// keeping an in-process map. Returns NULL when no trades yet exist.
 	LatestTradeAt(ctx context.Context, marketID int64) (pgtype.Timestamptz, error)
 	LinkMarketCategory(ctx context.Context, arg LinkMarketCategoryParams) error
+	// Returns the catalysts the operator + AI should reason about: any
+	// row in (expected, active) status. Newest-first by expected_at
+	// (NULL-last) so the renderer prefers near-term events.
+	ListActiveEventCatalysts(ctx context.Context, eventSlug string) ([]PolymarketEventCatalysts, error)
 	// Pick the next batch of markets to backfill, prioritised by upcoming
 	// end_date (markets nearer resolution have the most actionable history).
 	// Excludes soft-deleted and purged markets — backfill never wastes API
@@ -163,6 +172,11 @@ type Querier interface {
 	// detector to count distinct wallets and total notional.
 	ListClusterWindowTrades(ctx context.Context, arg ListClusterWindowTradesParams) ([]ListClusterWindowTradesRow, error)
 	ListEnabledCategories(ctx context.Context) ([]PolymarketCategories, error)
+	// Returns ALL catalysts for an event (including resolved + stale +
+	// invalidated). Used by the postmortem AI path so the model can
+	// reason about whether a previously expected catalyst actually
+	// materialised.
+	ListEventCatalysts(ctx context.Context, eventSlug string) ([]PolymarketEventCatalysts, error)
 	// Active markets whose lifecycle progress has crossed the supplied
 	// threshold AND haven't been soft-deleted/purged. Returns enough
 	// context for the stable-favorite worker to build inputs without a
@@ -172,12 +186,17 @@ type Querier interface {
 	// by the per-trade scorer so the two strategies agree on what
 	// "late-market" means.
 	ListLateMarketCandidates(ctx context.Context, arg ListLateMarketCandidatesParams) ([]ListLateMarketCandidatesRow, error)
+	// Returns one row per (event_slug, market_id) — the newest snapshot
+	// wins via the DISTINCT ON ordering. Used by the renderer + lag
+	// detector so we always read the freshest event-wide pricing.
+	ListLatestEventPageMarkets(ctx context.Context, eventSlug string) ([]PolymarketEventPageMarkets, error)
 	ListMarketCategoryIDs(ctx context.Context, marketID int64) ([]int64, error)
 	// Top-N candidate markets for the 2h intelligence report. Selection
 	// philosophy: deep into lifecycle + recent activity + non-trivial
 	// liquidity. The query is intentionally simple — the AI does the
 	// ranking; we provide a generous shortlist.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
+	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
 	// yet have an outcome-analysis row. The LEFT JOIN keeps the query
 	// a single roundtrip per claim cycle.
@@ -319,6 +338,7 @@ type Querier interface {
 	// supplied cutoff is moved back to 'pending'. Called by the sender worker
 	// on each tick (cheap when zero rows match).
 	ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.Timestamptz) error
+	SetEventCatalystStatus(ctx context.Context, arg SetEventCatalystStatusParams) error
 	// One-shot aggregate that powers the daily/weekly/monthly/quarterly/yearly
 	// reports. Returns total counts, resolved counts, success/failure
 	// counts, and the CLV-summary fields — all in a single roundtrip so
@@ -390,6 +410,14 @@ type Querier interface {
 	// Insert-or-update a Polymarket category. `enabled` is preserved on update
 	// (it's a local setting driven by CATEGORY_WHITELIST, not Polymarket data).
 	UpsertCategory(ctx context.Context, arg UpsertCategoryParams) (PolymarketCategories, error)
+	// Idempotent insert keyed on (event_slug, item_hash). On conflict we
+	// bump last_seen_at + refresh mutable fields (Polymarket sometimes
+	// edits a summary in place) but keep first_seen_at frozen.
+	UpsertEventAnnotation(ctx context.Context, arg UpsertEventAnnotationParams) error
+	// Idempotent insert keyed on (event_slug, catalyst_type, title).
+	// Mutable fields refresh on conflict; created_at stays frozen.
+	UpsertEventCatalyst(ctx context.Context, arg UpsertEventCatalystParams) error
+	UpsertEventPageFetchState(ctx context.Context, arg UpsertEventPageFetchStateParams) error
 	// Insert or update a market by condition_id. Backfill state fields are
 	// preserved on update — only discovery-sourced fields are touched. A
 	// market resurfacing after a soft-delete:

@@ -1,0 +1,147 @@
+{
+  "pageProps": {
+    "dehydratedState": {
+      "queries": [
+        {
+          "queryKey": ["/api/event/slug", "texas-republican-senate-primary-winner"],
+          "state": {
+            "data": {
+              "id": "evt_42",
+              "slug": "texas-republican-senate-primary-winner",
+              "title": "Texas Republican Senate Primary Winner",
+              "description": "Who will win the 2026 Texas Republican Senate primary?",
+              "resolutionRules": "Resolves YES for the candidate who wins the primary as called by AP or Decision Desk HQ.",
+              "category": "Politics",
+              "startDate": "2026-02-01T00:00:00Z",
+              "endDate": "2026-06-15T00:00:00Z",
+              "active": true,
+              "closed": false,
+              "volume": 4500000,
+              "volume24hr": 250000,
+              "liquidity": 800000,
+              "context_description": "Texas's open Senate seat draws Paxton, Cornyn, and three lower-profile entrants.",
+              "context_updated_at": "2026-05-18T10:00:00Z",
+              "image": "https://polymarket.com/img/tx.png",
+              "markets": [
+                {
+                  "id": "m_1",
+                  "conditionId": "0xpaxton",
+                  "slug": "will-ken-paxton-win",
+                  "question": "Will Ken Paxton win the Texas Republican Senate primary?",
+                  "groupItemTitle": "Ken Paxton",
+                  "outcomes": "[\"Yes\",\"No\"]",
+                  "outcomePrices": "[\"0.62\",\"0.38\"]",
+                  "volume": 1800000,
+                  "volume24hr": 95000,
+                  "liquidity": 250000,
+                  "active": true,
+                  "closed": false,
+                  "endDate": "2026-06-15T00:00:00Z",
+                  "oneHourPriceChange": 0.01,
+                  "oneDayPriceChange": 0.08,
+                  "oneWeekPriceChange": 0.12,
+                  "lastTradePrice": 0.62,
+                  "bestBid": 0.61,
+                  "bestAsk": 0.63,
+                  "clobTokenIds": "[\"tok_yes_paxton\",\"tok_no_paxton\"]"
+                },
+                {
+                  "id": "m_2",
+                  "conditionId": "0xcornyn",
+                  "slug": "will-john-cornyn-win",
+                  "question": "Will John Cornyn win the Texas Republican Senate primary?",
+                  "groupItemTitle": "John Cornyn",
+                  "outcomes": "[\"Yes\",\"No\"]",
+                  "outcomePrices": "[\"0.28\",\"0.72\"]",
+                  "volume": 1500000,
+                  "volume24hr": 120000,
+                  "liquidity": 200000,
+                  "active": true,
+                  "closed": false,
+                  "endDate": "2026-06-15T00:00:00Z",
+                  "oneHourPriceChange": -0.02,
+                  "oneDayPriceChange": -0.07,
+                  "oneWeekPriceChange": -0.10,
+                  "lastTradePrice": 0.28,
+                  "bestBid": 0.27,
+                  "bestAsk": 0.29,
+                  "clobTokenIds": "[\"tok_yes_cornyn\",\"tok_no_cornyn\"]"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "queryKey": ["annotations", "event", "texas-republican-senate-primary-winner"],
+          "state": {
+            "data": [
+              {
+                "timestamp": "2026-05-09T14:00:00Z",
+                "unixTime": 1778421600,
+                "timeRange": "2026-05-09",
+                "title": "Final pre-runoff poll shows Paxton leading with 63%",
+                "summary": "UT/Texas Tribune poll released Friday puts Paxton at 63 percent of likely primary voters; Cornyn at 24 percent. Margin of error 3.4%.",
+                "outcome": "Ken Paxton",
+                "priceBefore": 0.54,
+                "priceAfter": 0.61,
+                "priceChange": 0.07,
+                "source": "UT/Texas Tribune",
+                "sources": [
+                  {"name": "Texas Tribune", "url": "https://example.com/tt-poll"}
+                ]
+              },
+              {
+                "timestamp": "2026-04-28T18:00:00Z",
+                "unixTime": 1777003200,
+                "timeRange": "2026-04-28",
+                "title": "Cornyn campaign suffers after scandal over undisclosed offshore accounts emerges",
+                "summary": "Houston Chronicle reports Cornyn-linked PAC routed donations through offshore vehicles; campaign denies wrongdoing.",
+                "outcome": "John Cornyn",
+                "priceBefore": 0.41,
+                "priceAfter": 0.30,
+                "priceChange": -0.11,
+                "source": "Houston Chronicle",
+                "sources": [
+                  {"name": "Houston Chronicle", "url": "https://example.com/hc-scandal"}
+                ]
+              },
+              {
+                "timestamp": "2026-03-15T12:00:00Z",
+                "unixTime": 1773345600,
+                "timeRange": "2026-03-15",
+                "title": "Paxton picks up endorsement from state GOP",
+                "summary": "Texas GOP state committee endorses Paxton by a 2-to-1 margin.",
+                "outcome": "Ken Paxton",
+                "priceBefore": 0.48,
+                "priceAfter": 0.52,
+                "priceChange": 0.04,
+                "source": "Texas GOP",
+                "sources": [
+                  {"name": "Texas GOP", "url": "https://example.com/gop"}
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "queryKey": ["similar-markets", "tag:politics", 5],
+          "state": {
+            "data": [
+              {"slug": "georgia-senate-2026", "question": "Who wins the Georgia Senate seat 2026?"}
+            ]
+          }
+        },
+        {
+          "queryKey": ["/api/tags"],
+          "state": {
+            "data": [
+              {"slug": "politics", "label": "Politics"},
+              {"slug": "us-elections", "label": "US Elections"}
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "__N_SSP": true
+}

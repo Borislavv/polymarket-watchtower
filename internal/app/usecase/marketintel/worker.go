@@ -79,12 +79,22 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// NarrativeLoader is the optional seam used to stamp Polymarket
+// event-page context onto the market-intelligence prompt. Keyed by
+// market conditionID — the loader internally resolves event_slug
+// and renders the prompt slot. Empty result is the "unavailable"
+// fallback. nil disables the slot entirely.
+type NarrativeLoader interface {
+	LoadAndRenderForConditionID(ctx context.Context, conditionID string, maxChars int) string
+}
+
 // Worker is the periodic 2h intelligence loop.
 type Worker struct {
 	cfg        Config
 	candidates Candidates
 	store      Store
 	analyzer   Analyzer
+	narrative  NarrativeLoader
 	bot        Bot
 	metrics    *metrics.Metrics
 	log        *zerolog.Logger
@@ -102,6 +112,10 @@ func New(cfg Config, candidates Candidates, store Store, analyzer Analyzer, bot 
 // SetMetrics wires the optional metrics sink for skip/AI-error
 // counters. Called once at boot; nil keeps the worker metrics-agnostic.
 func (w *Worker) SetMetrics(m *metrics.Metrics) { w.metrics = m }
+
+// SetNarrativeLoader wires the optional Polymarket event-page
+// context loader. nil keeps the slot empty.
+func (w *Worker) SetNarrativeLoader(loader NarrativeLoader) { w.narrative = loader }
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -158,6 +172,19 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 
 	req := buildRequest(candidates, periodEnd, w.cfg.Interval)
+	// Stamp event-page context for the top-volume candidate. The
+	// 2h report covers many markets, but a single event-page slot
+	// keeps the prompt bounded — the candidate with the highest
+	// alert load is the best signal of "what's moving right now".
+	if w.narrative != nil && len(candidates) > 0 {
+		top := pickContextCandidate(candidates)
+		if top != "" {
+			req.EventNarrativeContext = w.narrative.LoadAndRenderForConditionID(ctx, top, 5000)
+			if req.EventNarrativeContext != "" && w.metrics != nil && w.metrics.EventPageContextUsed != nil {
+				w.metrics.EventPageContextUsed.WithLabelValues("market_intelligence").Inc()
+			}
+		}
+	}
 	res, err := w.analyzer.AnalyzeMarketReport(ctx, req)
 	if err != nil {
 		w.log.Err(err).
@@ -441,4 +468,19 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+// pickContextCandidate selects the conditionID whose event-page
+// context is most worth fetching for the 2h report: first preference
+// is the candidate with the highest Alerts24h count (the period
+// surfaced it for a reason); ties break on Volume24hUSD.
+func pickContextCandidate(rows []repository.IntelligenceCandidate) string {
+	var best repository.IntelligenceCandidate
+	for _, r := range rows {
+		if r.Alerts24h > best.Alerts24h ||
+			(r.Alerts24h == best.Alerts24h && r.Volume24hUSD > best.Volume24hUSD) {
+			best = r
+		}
+	}
+	return best.ConditionID
 }

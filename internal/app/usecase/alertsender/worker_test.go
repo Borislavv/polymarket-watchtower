@@ -165,7 +165,7 @@ func (f *fakeAttributionStore) Upsert(_ context.Context, d repository.StrategyDi
 
 // TestAIEnricherStampsAnalystNote pins the v7 contract: the sender
 // calls the enricher before render and the resulting note appears
-// in the Telegram body inside an "Analyst note" block.
+// in the Telegram body inside an "AI analysis" block.
 func TestAIEnricherStampsAnalystNote(t *testing.T) {
 	st := newFakeStore(sampleAlert(t, 1, "info"))
 	bot := &fakeBot{}
@@ -179,8 +179,8 @@ func TestAIEnricherStampsAnalystNote(t *testing.T) {
 		t.Fatalf("expected 1 send, got %d", bot.count.Load())
 	}
 	body := bot.calls[0].Text
-	if !strings.Contains(body, "<b>Analyst note</b>") {
-		t.Errorf("missing Analyst note block in:\n%s", body)
+	if !strings.Contains(body, "<b>AI analysis</b>") {
+		t.Errorf("missing AI analysis block in:\n%s", body)
 	}
 	if !strings.Contains(body, "Watchlist candidate.") {
 		t.Errorf("note text not stamped:\n%s", body)
@@ -202,8 +202,8 @@ func TestAIEnricherFailureDoesNotBlockSend(t *testing.T) {
 	if bot.count.Load() != 1 {
 		t.Fatalf("send must still fire on enricher failure: %d", bot.count.Load())
 	}
-	if strings.Contains(bot.calls[0].Text, "<b>Analyst note</b>") {
-		t.Errorf("Analyst note block must be elided on enricher failure:\n%s", bot.calls[0].Text)
+	if strings.Contains(bot.calls[0].Text, "<b>AI analysis</b>") {
+		t.Errorf("AI analysis block must be elided on enricher failure:\n%s", bot.calls[0].Text)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestAIEnricherEmptyTextElidesBlock(t *testing.T) {
 
 	w.Drain(context.Background())
 
-	if strings.Contains(bot.calls[0].Text, "<b>Analyst note</b>") {
+	if strings.Contains(bot.calls[0].Text, "<b>AI analysis</b>") {
 		t.Errorf("empty note must not render the block")
 	}
 }
@@ -328,8 +328,8 @@ func TestAIEnricherCompletedLogsAttached(t *testing.T) {
 	if !strings.Contains(out, `"ai alert analysis: attached to telegram alert"`) {
 		t.Errorf("missing attached log:\n%s", out)
 	}
-	if !strings.Contains(bot.calls[0].Text, "Analyst note") {
-		t.Errorf("Telegram body missing Analyst note block:\n%s", bot.calls[0].Text)
+	if !strings.Contains(bot.calls[0].Text, "AI analysis") {
+		t.Errorf("Telegram body missing AI analysis block:\n%s", bot.calls[0].Text)
 	}
 	if !strings.Contains(bot.calls[0].Text, "Watchlist candidate.") {
 		t.Errorf("Telegram body missing note text:\n%s", bot.calls[0].Text)

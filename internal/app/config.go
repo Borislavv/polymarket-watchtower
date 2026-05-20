@@ -552,6 +552,58 @@ type Config struct {
 	Detection         DetectionConfig
 	StableFavorite    StableFavoriteConfig
 	AIAnalysis        AIAnalysisConfig
+	EventPage         EventPageContextConfig
+	Catalyst          CatalystConfig
+}
+
+// CatalystConfig wires the Political-Catalyst Intelligence overlay.
+// Catalyst rows are stored in polymarket_event_catalysts and modify
+// the interpretation of every alert (the Telegram "Blocked Alert"
+// block + the prompt "Future catalysts:" slot). Reading is always
+// safe: an empty table degrades to "no catalyst recorded" and the
+// alert pipeline is unaffected.
+type CatalystConfig struct {
+	Enabled        bool `env:"CATALYST_ENABLED" envDefault:"true"`
+	PromptMaxItems int  `env:"CATALYST_PROMPT_MAX_ITEMS" envDefault:"6" validate:"gte=1,lte=50"`
+	PromptMaxChars int  `env:"CATALYST_PROMPT_MAX_CHARS" envDefault:"2000" validate:"gte=200,lte=20000"`
+
+	// Importer — periodic background extractor (v9.6). When
+	// enabled, the system imports / refreshes catalyst rows
+	// automatically every Interval. Operator seeding is no longer
+	// required. Failure NEVER blocks alert delivery.
+	ImporterEnabled        bool          `env:"EVENT_CATALYST_IMPORTER_ENABLED" envDefault:"true"`
+	ImporterInterval       time.Duration `env:"EVENT_CATALYST_IMPORTER_INTERVAL" envDefault:"5m" validate:"gt=0"`
+	ImporterCategoryCSV    string        `env:"EVENT_CATALYST_IMPORTER_CATEGORY_WHITELIST" envDefault:"Politics,Geopolitics,Elections"`
+	ImporterBatchSize      int           `env:"EVENT_CATALYST_IMPORTER_BATCH_SIZE" envDefault:"50" validate:"gte=1,lte=500"`
+	ImporterConcurrency    int           `env:"EVENT_CATALYST_IMPORTER_CONCURRENCY" envDefault:"4" validate:"gte=1,lte=32"`
+	ImporterLookback       time.Duration `env:"EVENT_CATALYST_IMPORTER_LOOKBACK" envDefault:"48h" validate:"gt=0"`
+	ImporterAIEnabled      bool          `env:"EVENT_CATALYST_IMPORTER_AI_ENABLED" envDefault:"true"`
+	ImporterAITimeout      time.Duration `env:"EVENT_CATALYST_IMPORTER_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	ImporterMaxAnnotations int           `env:"EVENT_CATALYST_IMPORTER_MAX_ANNOTATIONS" envDefault:"40" validate:"gte=1,lte=500"`
+	ImporterMaxPromptChars int           `env:"EVENT_CATALYST_IMPORTER_MAX_PROMPT_CHARS" envDefault:"12000" validate:"gte=1000,lte=64000"`
+	ImporterMinConfidence  float64       `env:"EVENT_CATALYST_IMPORTER_MIN_CONFIDENCE" envDefault:"0.55" validate:"gte=0,lte=1"`
+	ImporterStaleAfter     time.Duration `env:"EVENT_CATALYST_IMPORTER_STALE_AFTER" envDefault:"168h" validate:"gt=0"`
+}
+
+// EventPageContextConfig wires the Polymarket event-page narrative
+// pipeline. Source: https://polymarket.com/_next/data/<buildId>/en/
+// event/<slug>.json — hydrated Next.js payload that carries the
+// curated chart annotations (queryKey ["annotations","event",<slug>])
+// the Polymarket UI shows around the event chart. Failure NEVER
+// blocks alert delivery; the AI prompt renders an "unavailable" slot.
+type EventPageContextConfig struct {
+	Enabled          bool          `env:"POLYMARKET_EVENT_PAGE_CONTEXT_ENABLED" envDefault:"true"`
+	RefreshInfo      time.Duration `env:"POLYMARKET_EVENT_PAGE_REFRESH_INFO" envDefault:"10m" validate:"gt=0"`
+	RefreshImportant time.Duration `env:"POLYMARKET_EVENT_PAGE_REFRESH_IMPORTANT" envDefault:"5m" validate:"gt=0"`
+	RefreshHot       time.Duration `env:"POLYMARKET_EVENT_PAGE_REFRESH_HOT" envDefault:"5m" validate:"gt=0"`
+	FetchTimeout     time.Duration `env:"POLYMARKET_EVENT_PAGE_TIMEOUT" envDefault:"8s" validate:"gt=0"`
+	BuildIDTTL       time.Duration `env:"POLYMARKET_EVENT_PAGE_BUILD_ID_TTL" envDefault:"30m" validate:"gt=0"`
+	RawJSONMaxBytes  int           `env:"POLYMARKET_EVENT_PAGE_RAW_JSON_MAX_BYTES" envDefault:"1048576" validate:"gte=4096"`
+	PromptMaxItems   int           `env:"POLYMARKET_EVENT_PAGE_PROMPT_MAX_ITEMS" envDefault:"25" validate:"gte=1,lte=200"`
+	PromptMaxChars   int           `env:"POLYMARKET_EVENT_PAGE_PROMPT_MAX_CHARS" envDefault:"5000" validate:"gte=200,lte=20000"`
+	// HTMLBaseURL is the public Polymarket site. Override only for
+	// integration tests / staging.
+	HTMLBaseURL string `env:"POLYMARKET_EVENT_PAGE_HTML_BASE_URL" envDefault:"https://polymarket.com"`
 }
 
 // AIAnalysisConfig wires the AI market-intelligence layer. The

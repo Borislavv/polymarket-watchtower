@@ -783,39 +783,107 @@ func TestLinksElideAllLocalhostSkipsSection(t *testing.T) {
 	}
 }
 
-// TestAnalystNoteOnTradeAnomaly pins the v7 contract: the Data
-// block is gone; in its place a single "Analyst note" block carries
-// the AI text when AnalystNote is non-empty.
+// TestAnalystNoteOnTradeAnomaly pins the v9.5 contract: the
+// "AI analysis" block (formerly "Analyst note") carries the AI text
+// when AnalystNote is non-empty. The Data block is gone.
 func TestAnalystNoteOnTradeAnomaly(t *testing.T) {
 	f := sampleTradeFinding()
 	f.DedupKey = "single:v1:trade-1"
 	f.AnalystNote = "This looks like a watchlist candidate. Watch the next debate."
 	msg := FormatTelegramMessage(f)
 
-	// Positive: Analyst note must render.
+	// Positive: AI analysis block must render.
 	for _, want := range []string{
-		"<b>Analyst note</b>",
+		"<b>AI analysis</b>",
 		"• This looks like a watchlist candidate. Watch the next debate.",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
 		}
 	}
-	// Negative: Data block must NOT render — Analyst note replaces it.
+	// Negative: Data block must NOT render — AI analysis replaces it.
 	if strings.Contains(msg, "<b>Data</b>") {
 		t.Errorf("Data block must be removed in v7:\n%s", msg)
 	}
 }
 
-// TestAnalystNoteOmittedWhenEmpty: when AnalystNote is empty, the
-// block must render NOTHING — no orphan header, no fallback Data.
+// TestAnalystNoteOmittedWhenEmpty: when AnalystNote is empty AND no
+// Blocked Alert overlay is stamped, the block must render NOTHING.
 func TestAnalystNoteOmittedWhenEmpty(t *testing.T) {
 	f := sampleTradeFinding()
 	f.DedupKey = "single:v1:trade-1"
 	f.AnalystNote = ""
 	msg := FormatTelegramMessage(f)
-	if strings.Contains(msg, "<b>Analyst note</b>") {
-		t.Errorf("Analyst note must be elided when empty:\n%s", msg)
+	if strings.Contains(msg, "<b>AI analysis</b>") {
+		t.Errorf("AI analysis must be elided when empty:\n%s", msg)
+	}
+}
+
+// TestBlockedAlertRendersBeforeAIAnalysis pins PART 4 of the
+// Political-Catalyst Intelligence spec: the Blocked Alert block MUST
+// appear ABOVE the AI analysis when the Finding carries one.
+func TestBlockedAlertRendersBeforeAIAnalysis(t *testing.T) {
+	f := sampleTradeFinding()
+	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = "This looks like a watchlist candidate."
+	f.Blocked = &anomaly.BlockedAlert{
+		Status:               "blocked until Texas GOP runoff results",
+		Reason:               "market waiting for final resolution of primary uncertainty",
+		CatalystType:         "runoff",
+		ExpectedTiming:       "2026-06-15T12:00:00Z",
+		BullishScenario:      "decisive Paxton win reprices YES toward 95-99%",
+		BearishScenario:      "weak result or recount sharply weakens confidence",
+		InvalidationScenario: "disputed outcome extends volatility",
+		Stance:               "accumulation before catalyst is more meaningful than late chasing",
+	}
+	msg := FormatTelegramMessage(f)
+	for _, want := range []string{
+		"<b>Blocked Alert</b>",
+		"• status: blocked until Texas GOP runoff results",
+		"• reason: market waiting for final resolution of primary uncertainty",
+		"• catalyst type: runoff",
+		"• expected timing: 2026-06-15T12:00:00Z",
+		"• bullish scenario: decisive Paxton win reprices YES toward 95-99%",
+		"• bearish scenario: weak result or recount sharply weakens confidence",
+		"• invalidation scenario: disputed outcome extends volatility",
+		"• stance: accumulation before catalyst is more meaningful than late chasing",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+	// Order: Blocked Alert header must precede AI analysis header.
+	iBlocked := strings.Index(msg, "<b>Blocked Alert</b>")
+	iAI := strings.Index(msg, "<b>AI analysis</b>")
+	if iBlocked < 0 || iAI < 0 {
+		t.Fatalf("both blocks must render; iBlocked=%d iAI=%d", iBlocked, iAI)
+	}
+	if iBlocked >= iAI {
+		t.Errorf("Blocked Alert must render BEFORE AI analysis: %d vs %d\n%s", iBlocked, iAI, msg)
+	}
+}
+
+// TestBlockedAlertEscapesHTML pins the safety contract: Polymarket /
+// AI-authored fields are DATA, not markup. The formatter MUST
+// HTML-escape every Blocked Alert field so an annotation containing
+// `<script>` cannot break Telegram parse mode.
+func TestBlockedAlertEscapesHTML(t *testing.T) {
+	f := sampleTradeFinding()
+	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = "ok"
+	f.Blocked = &anomaly.BlockedAlert{
+		Status: "<script>alert(1)</script>",
+		Reason: "rogue & special <chars>",
+	}
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<script>alert(1)</script>") {
+		t.Errorf("unescaped HTML in Blocked Alert:\n%s", msg)
+	}
+	if !strings.Contains(msg, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Errorf("expected HTML-escaped status:\n%s", msg)
+	}
+	if !strings.Contains(msg, "rogue &amp; special &lt;chars&gt;") {
+		t.Errorf("expected HTML-escaped reason:\n%s", msg)
 	}
 }
 

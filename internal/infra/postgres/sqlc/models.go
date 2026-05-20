@@ -134,6 +134,94 @@ type PolymarketCategories struct {
 	UpdatedAt  pgtype.Timestamptz
 }
 
+type PolymarketEventAnnotations struct {
+	ID          int64
+	EventSlug   string
+	ItemHash    string
+	Timestamp   pgtype.Timestamptz
+	UnixTime    int64
+	TimeRange   *string
+	Title       string
+	Summary     *string
+	Outcome     *string
+	PriceBefore *float64
+	PriceAfter  *float64
+	PriceChange *float64
+	Source      *string
+	SourcesJson []byte
+	TweetsJson  []byte
+	RawJson     []byte
+	FirstSeenAt pgtype.Timestamptz
+	LastSeenAt  pgtype.Timestamptz
+}
+
+type PolymarketEventCatalysts struct {
+	ID                   int64
+	EventSlug            string
+	ConditionID          *string
+	CatalystType         string
+	Title                string
+	Description          string
+	ExpectedAt           pgtype.Timestamptz
+	Confidence           float64
+	Source               string
+	SourceUrl            string
+	Status               string
+	BullishScenario      string
+	BearishScenario      string
+	InvalidationScenario string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+type PolymarketEventPageFetches struct {
+	EventSlug       string
+	LastFetchedAt   pgtype.Timestamptz
+	LastSuccessAt   pgtype.Timestamptz
+	LastError       *string
+	LastBuildID     *string
+	LastAnnotations int32
+	UpdatedAt       pgtype.Timestamptz
+}
+
+type PolymarketEventPageMarkets struct {
+	ID                 int64
+	SnapshotID         int64
+	EventSlug          string
+	MarketID           string
+	ConditionID        string
+	MarketSlug         string
+	Question           string
+	GroupItemTitle     *string
+	OutcomesJson       []byte
+	OutcomePricesJson  []byte
+	Volume             float64
+	Volume24h          float64
+	Liquidity          float64
+	Active             bool
+	Closed             bool
+	EndDate            pgtype.Timestamptz
+	OneHourPriceChange *float64
+	OneDayPriceChange  *float64
+	OneWeekPriceChange *float64
+	LastTradePrice     *float64
+	BestBid            *float64
+	BestAsk            *float64
+	ClobTokenIdsJson   []byte
+	RawJson            []byte
+	CreatedAt          pgtype.Timestamptz
+}
+
+type PolymarketEventPageSnapshots struct {
+	ID        int64
+	EventSlug string
+	BuildID   string
+	FetchedAt pgtype.Timestamptz
+	RawHash   string
+	RawJson   []byte
+	CreatedAt pgtype.Timestamptz
+}
+
 type PolymarketMarketCategories struct {
 	MarketID   int64
 	CategoryID int64

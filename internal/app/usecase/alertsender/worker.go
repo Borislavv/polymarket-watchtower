@@ -130,12 +130,23 @@ type AttributionStore interface {
 	Upsert(ctx context.Context, d repository.StrategyDimensions) error
 }
 
+// BlockedAlertStamper is the optional Political-Catalyst Intelligence
+// hook. The sender calls it once per claimed alert AFTER unmarshal
+// and BEFORE render. The implementation reads
+// polymarket_event_catalysts for the alert's event and stamps the
+// most relevant active catalyst onto f.Blocked. Failures degrade
+// silently — an alert is never blocked by a missing catalyst lookup.
+type BlockedAlertStamper interface {
+	StampBlockedAlert(ctx context.Context, f *anomaly.Finding)
+}
+
 // Worker is the long-running sender loop.
 type Worker struct {
 	cfg         Config
 	store       AlertStore
 	tg          Telegram
 	enricher    AIEnricher
+	blocked     BlockedAlertStamper
 	attribution AttributionStore
 	metrics     *metrics.Metrics
 	log         *zerolog.Logger
@@ -194,6 +205,11 @@ func (w *Worker) SetAIEnricher(e AIEnricher) { w.enricher = e }
 // Failures degrade silently — attribution is a research signal, never
 // gates Telegram delivery.
 func (w *Worker) SetAttributionStore(s AttributionStore) { w.attribution = s }
+
+// SetBlockedAlertStamper wires the optional Political-Catalyst
+// Intelligence stamper. Called once at boot; nil keeps the sender
+// catalyst-agnostic. Failures degrade silently.
+func (w *Worker) SetBlockedAlertStamper(s BlockedAlertStamper) { w.blocked = s }
 
 // Run blocks until ctx is cancelled. Fires an initial drain immediately
 // so alerts queued during startup don't wait one full interval.
@@ -260,6 +276,13 @@ func (w *Worker) send(ctx context.Context, a repository.Alert) {
 		// record the failure but do not stop the worker.
 		w.markFailed(ctx, a, fmt.Errorf("render: %w", err))
 		return
+	}
+	// Political-Catalyst Intelligence stamp: load the most relevant
+	// active catalyst for this event and attach it to the Finding so
+	// the Telegram formatter renders the "Blocked Alert" block ABOVE
+	// the AI analysis. Failures degrade silently.
+	if w.blocked != nil {
+		w.blocked.StampBlockedAlert(ctx, &f)
 	}
 	// AI enrichment: generate or refresh the analyst note BEFORE
 	// rendering. Failures here are non-fatal — the note will simply

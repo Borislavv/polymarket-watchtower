@@ -39,8 +39,33 @@ type Service struct {
 	analyzer   analysis.Analyzer
 	repo       AnalysisStore
 	requestLog RequestLogStore
+	narrative  NarrativeLoader // optional — nil silently disables event-page context enrichment
+	catalyst   CatalystLoader  // optional — nil silently disables catalyst context enrichment
 	metrics    *metrics.Metrics
 	log        *zerolog.Logger
+}
+
+// NarrativeLoader is the seam to the eventpagecontext.Provider. It
+// loads a compact Polymarket event-page narrative summary keyed by
+// the Finding's market id (which the loader resolves to event_slug
+// internally). The interface lives here to keep aianalysis free of
+// any dependency on the usecase package implementing the loader.
+//
+// Failure contract: return "" on any failure (slug unresolved, fetch
+// error, parse error). The aianalysis service treats empty as "no
+// usable context" and the prompt renders an "unavailable" slot — the
+// alert path NEVER blocks on the loader.
+type NarrativeLoader interface {
+	LoadAndRenderForFinding(ctx context.Context, f anomaly.Finding, maxChars int) string
+}
+
+// CatalystLoader is the seam to the eventcatalyst.Provider — the
+// Political-Catalyst Intelligence overlay. Returns the rendered
+// "Future catalysts:" prompt block. Same fail-silent contract as
+// NarrativeLoader: empty result yields a "no catalyst recorded"
+// fallback in the prompt and a no-op in the Telegram renderer.
+type CatalystLoader interface {
+	LoadAndRenderForFinding(ctx context.Context, f anomaly.Finding, maxChars int) string
 }
 
 // Config tunes refresh behavior + master switches.
@@ -81,6 +106,14 @@ type RequestLogStore interface {
 func New(cfg Config, analyzer analysis.Analyzer, repo AnalysisStore, requestLog RequestLogStore, met *metrics.Metrics, log *zerolog.Logger) *Service {
 	return &Service{cfg: cfg, analyzer: analyzer, repo: repo, requestLog: requestLog, metrics: met, log: log}
 }
+
+// SetNarrativeLoader wires the optional Polymarket event-page
+// narrative loader. nil keeps the slot empty.
+func (s *Service) SetNarrativeLoader(loader NarrativeLoader) { s.narrative = loader }
+
+// SetCatalystLoader wires the optional Political-Catalyst
+// Intelligence loader. nil keeps the slot empty.
+func (s *Service) SetCatalystLoader(loader CatalystLoader) { s.catalyst = loader }
 
 // Canonical skip/failure reason strings. Stable identifiers — the
 // alertsender logs them and dashboards may group by them.
@@ -165,6 +198,22 @@ func (s *Service) AnalyzeAndStore(ctx context.Context, alertID int64, f anomaly.
 	}
 
 	req := BuildAlertRequest(f, time.Now())
+	// Load Polymarket event-page narrative context BEFORE the AI
+	// call. Failure is silent — empty string falls back to a
+	// "context unavailable" slot in the prompt and the model is
+	// told not to invent news. The alert path NEVER blocks on this.
+	if s.narrative != nil {
+		req.EventNarrativeContext = s.narrative.LoadAndRenderForFinding(ctx, f, 5000)
+		if req.EventNarrativeContext != "" && s.metrics != nil && s.metrics.EventPageContextUsed != nil {
+			s.metrics.EventPageContextUsed.WithLabelValues("alert").Inc()
+		}
+	}
+	// Political-Catalyst Intelligence overlay. Fails silently —
+	// empty result falls back to "no catalyst recorded" in the
+	// prompt. Never blocks the alert path.
+	if s.catalyst != nil {
+		req.CatalystContext = s.catalyst.LoadAndRenderForFinding(ctx, f, 2000)
+	}
 	startedAt := time.Now()
 	res, analyzerErr := s.analyzer.AnalyzeAlert(ctx, req)
 	latency := time.Since(startedAt)

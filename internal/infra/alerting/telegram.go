@@ -703,12 +703,18 @@ func writeLinks(b *strings.Builder, f anomaly.Finding) {
 // AI-generated analyst note when present. When the note is empty
 // (AI layer disabled / rate-limited / errored), the block is
 // elided entirely — there is no fallback to the old Data block.
+//
+// PART 4 of the Political-Catalyst Intelligence spec mandates that
+// when a Blocked Alert block exists for the Finding, it MUST render
+// ABOVE the analyst note. writeAnalystNote handles the ordering by
+// delegating to writeBlockedAlertBlock first.
 func writeAnalystNote(b *strings.Builder, f anomaly.Finding) {
+	writeBlockedAlertBlock(b, f)
 	note := strings.TrimSpace(f.AnalystNote)
 	if note == "" {
 		return
 	}
-	b.WriteString("\n<b>Analyst note</b>\n")
+	b.WriteString("\n<b>AI analysis</b>\n")
 	// The note is plain text from the model; HTML-escape it so any
 	// stray `<` or `>` doesn't break Telegram's HTML parser. Bullet
 	// the first line so the formatting stays consistent with other
@@ -723,6 +729,50 @@ func writeAnalystNote(b *strings.Builder, f anomaly.Finding) {
 			continue
 		}
 		fmt.Fprintf(b, "  %s\n", html.EscapeString(line))
+	}
+}
+
+// writeBlockedAlertBlock renders the Political-Catalyst Intelligence
+// "Blocked Alert" payload. The block appears ABOVE the AI analysis
+// when present so the operator sees the structural-uncertainty
+// summary first.
+//
+// All fields are HTML-escaped: Polymarket-authored and AI-authored
+// content is DATA, never markup. Empty fields elide. The whole
+// block is skipped when f.Blocked is nil.
+func writeBlockedAlertBlock(b *strings.Builder, f anomaly.Finding) {
+	bl := f.Blocked
+	if bl == nil {
+		return
+	}
+	if bl.Status == "" && bl.Reason == "" && bl.CatalystType == "" && bl.BullishScenario == "" &&
+		bl.BearishScenario == "" && bl.InvalidationScenario == "" && bl.Stance == "" {
+		return
+	}
+	b.WriteString("\n<b>Blocked Alert</b>\n")
+	if bl.Status != "" {
+		fmt.Fprintf(b, "• status: %s\n", html.EscapeString(bl.Status))
+	}
+	if bl.Reason != "" {
+		fmt.Fprintf(b, "• reason: %s\n", html.EscapeString(bl.Reason))
+	}
+	if bl.CatalystType != "" {
+		fmt.Fprintf(b, "• catalyst type: %s\n", html.EscapeString(bl.CatalystType))
+	}
+	if bl.ExpectedTiming != "" {
+		fmt.Fprintf(b, "• expected timing: %s\n", html.EscapeString(bl.ExpectedTiming))
+	}
+	if bl.BullishScenario != "" {
+		fmt.Fprintf(b, "• bullish scenario: %s\n", html.EscapeString(bl.BullishScenario))
+	}
+	if bl.BearishScenario != "" {
+		fmt.Fprintf(b, "• bearish scenario: %s\n", html.EscapeString(bl.BearishScenario))
+	}
+	if bl.InvalidationScenario != "" {
+		fmt.Fprintf(b, "• invalidation scenario: %s\n", html.EscapeString(bl.InvalidationScenario))
+	}
+	if bl.Stance != "" {
+		fmt.Fprintf(b, "• stance: %s\n", html.EscapeString(bl.Stance))
 	}
 }
 

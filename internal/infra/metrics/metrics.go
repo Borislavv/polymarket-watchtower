@@ -196,6 +196,51 @@ type Metrics struct {
 	// cardinality: 7 buckets × 4 statuses × 4 severities × ~5 kinds
 	// = 560 series cap. Cheap.
 	AlertCalibrationTotal *prometheus.CounterVec // bucket, status, severity, kind
+
+	// --- Event page narrative (Polymarket /event/<slug>.json) ---
+	// EventPageFetch: fetch attempts labelled by status
+	// (success / failed / persist_failed).
+	EventPageFetch *prometheus.CounterVec
+	// EventPageBuildIDChanges: incremented whenever the resolver
+	// observes a NEW buildId (Polymarket Vercel deploy rotated).
+	EventPageBuildIDChanges prometheus.Counter
+	// EventPageAnnotations: total annotations parsed across all
+	// fetches. Operator gauge for narrative volume.
+	EventPageAnnotations prometheus.Counter
+	// EventPageContextUsed: labelled by target_kind
+	// (alert / market_intelligence / outcome) — increments every
+	// time a non-empty event page context lands in an AI prompt.
+	EventPageContextUsed *prometheus.CounterVec
+	// EventPageAlerts: labelled by status — fires of the optional
+	// event-page review worker (PART 8, currently scaffold only).
+	EventPageAlerts *prometheus.CounterVec
+	// EventPageLagCandidates: counts related-market lag flags
+	// emitted by the lag detector (PART 9, currently scaffold).
+	EventPageLagCandidates prometheus.Counter
+	// EventPageFetchLatency: end-to-end fetch + parse latency.
+	EventPageFetchLatency prometheus.Histogram
+
+	// --- v9.6 Political-Catalyst Intelligence importer ---
+	// EventCatalystImporterRuns: importer cycle outcomes, labelled
+	// by status (ok / empty / partial / failed).
+	EventCatalystImporterRuns *prometheus.CounterVec
+	// EventCatalystImporterSelected: cumulative unique event slugs
+	// the selection step shortlisted across all cycles.
+	EventCatalystImporterSelected prometheus.Counter
+	// EventCatalystImporterProcessed: per-event outcomes within a
+	// cycle (ok / fetch_failed / ai_failed / ai_skipped /
+	// ai_disabled). High failure rates here are operator-actionable.
+	EventCatalystImporterProcessed *prometheus.CounterVec
+	// EventCatalystAIRequests: AI extraction calls, by status
+	// (ok / skipped / failed).
+	EventCatalystAIRequests *prometheus.CounterVec
+	// EventCatalystUpserted: per-row outcomes (status, catalyst_type).
+	EventCatalystUpserted *prometheus.CounterVec
+	// EventCatalystImportLatency: end-to-end Tick latency.
+	EventCatalystImportLatency prometheus.Histogram
+	// EventCatalystBlockedAlerts: counts Telegram alerts stamped
+	// with a Blocked Alert block by the alertsender.
+	EventCatalystBlockedAlerts prometheus.Counter
 }
 
 func New() *Metrics {
@@ -497,6 +542,68 @@ func New() *Metrics {
 		Help: "Provider returned HTTP 429 with insufficient_quota. Operator action required; retry is useless.",
 	}, []string{"provider", "model"})
 
+	// Event page narrative (Polymarket /event/<slug>.json).
+	m.EventPageFetch = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "fetch_total",
+		Help: "Polymarket event page fetch attempts, by status (success / failed / persist_failed).",
+	}, []string{"status"})
+	m.EventPageBuildIDChanges = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "build_id_changes_total",
+		Help: "Resolver observed a NEW Polymarket Next.js buildId (Vercel deploy rotated).",
+	})
+	m.EventPageAnnotations = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "annotations_total",
+		Help: "Total annotations parsed across all event page fetches.",
+	})
+	m.EventPageContextUsed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "context_used_total",
+		Help: "Event page context blocks injected into AI prompts, by target_kind (alert / market_intelligence / outcome).",
+	}, []string{"target_kind"})
+	m.EventPageAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "alerts_total",
+		Help: "Event-page-review alert firings, by status (sent / skipped / failed). Scaffold; populated when the review worker is enabled.",
+	}, []string{"status"})
+	m.EventPageLagCandidates = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "lag_candidates_total",
+		Help: "Related-market lag flags emitted by the lag detector. Scaffold; populated when the detector is enabled.",
+	})
+	m.EventPageFetchLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "fetch_latency_seconds",
+		Help:    "End-to-end latency of one event page fetch + parse.",
+		Buckets: prometheus.ExponentialBuckets(0.05, 2, 9),
+	})
+
+	// v9.6 Political-Catalyst Intelligence importer
+	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "runs_total",
+		Help: "Importer cycles, by status (ok / empty / partial / failed).",
+	}, []string{"status"})
+	m.EventCatalystImporterSelected = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "events_selected_total",
+		Help: "Cumulative unique event slugs the selection step shortlisted.",
+	})
+	m.EventCatalystImporterProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "events_processed_total",
+		Help: "Per-event outcomes within a cycle (ok / fetch_failed / ai_failed / ai_skipped / ai_disabled).",
+	}, []string{"status"})
+	m.EventCatalystAIRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst", Name: "ai_requests_total",
+		Help: "AI catalyst-extraction calls, by status (ok / skipped / failed).",
+	}, []string{"status"})
+	m.EventCatalystUpserted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst", Name: "upserted_total",
+		Help: "Catalyst row writes by (status, catalyst_type). status=stale is emitted by the stale-marker path.",
+	}, []string{"status", "type"})
+	m.EventCatalystImportLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "import_latency_seconds",
+		Help:    "End-to-end Tick latency for one importer cycle.",
+		Buckets: prometheus.ExponentialBuckets(0.5, 2, 10),
+	})
+	m.EventCatalystBlockedAlerts = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_catalyst", Name: "blocked_alerts_total",
+		Help: "Telegram alerts stamped with a Blocked Alert block.",
+	})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -526,6 +633,13 @@ func New() *Metrics {
 		m.AlertRealizedEdge,
 		m.AlertWeightedSuccessTotal, m.AlertWeightedResolvedTotal,
 		m.AlertCalibrationTotal,
+		m.EventPageFetch, m.EventPageBuildIDChanges, m.EventPageAnnotations,
+		m.EventPageContextUsed, m.EventPageAlerts, m.EventPageLagCandidates,
+		m.EventPageFetchLatency,
+		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
+		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
+		m.EventCatalystUpserted, m.EventCatalystImportLatency,
+		m.EventCatalystBlockedAlerts,
 	)
 	return m
 }

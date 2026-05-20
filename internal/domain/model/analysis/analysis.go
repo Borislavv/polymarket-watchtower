@@ -92,6 +92,26 @@ type AlertAnalysisRequest struct {
 	// "Live context was not checked." sentence in Risk or Next so
 	// the operator never confuses an offline note with a researched one.
 	PublicContextEnabled bool
+
+	// EventNarrativeContext is the rendered Polymarket event-page
+	// narrative block (event metadata + event markets + chart
+	// annotations). Sourced from
+	// internal/app/usecase/eventpagecontext.Provider, which fetches
+	// the hydrated /event/<slug>.json payload via the
+	// internal/infra/polymarket/eventpage client. Empty when the
+	// loader is not wired OR the slug could not be resolved OR the
+	// fetch failed — the prompt then renders an "unavailable" slot
+	// and tells the model not to invent news.
+	EventNarrativeContext string
+
+	// CatalystContext is the rendered Political-Catalyst
+	// Intelligence block ("Future catalysts:" prompt slot). Sourced
+	// from internal/app/usecase/eventcatalyst.Provider; empty when
+	// no active/expected catalysts are registered for the event.
+	// Carries the catalyst_type, status, expected_at, and the
+	// bullish/bearish/invalidation scenarios the AI uses to reason
+	// about pre/post-catalyst flow timing.
+	CatalystContext string
 }
 
 // AlertAnalysis is what the analyzer returns.
@@ -143,6 +163,13 @@ type MarketReportRequest struct {
 	// continue; UK summer recess". When empty the AI is told to say
 	// "no external context provided".
 	UpcomingEventsNote string
+
+	// EventNarrativeContext is an OPTIONAL rendered Polymarket
+	// event-page narrative block. The market-intelligence worker
+	// stamps it for the highest-priority candidate market in the
+	// period when the event-page provider is wired. Empty otherwise;
+	// the prompt renders an "unavailable" slot.
+	EventNarrativeContext string
 }
 
 // MarketReportAnalysis is the analyzer's response. Telegram body
@@ -187,6 +214,13 @@ type OutcomeAnalysisRequest struct {
 	CLV6h          float64
 	CLV24h         float64
 	ResolvedAt     time.Time
+
+	// EventNarrativeContext is the rendered Polymarket event-page
+	// narrative block (annotations + event metadata + event-wide
+	// market pricing) as of the resolution time. Used by the
+	// postmortem to ask "did the catalyst the market priced in
+	// actually happen?". Empty when the provider is not wired.
+	EventNarrativeContext string
 }
 
 type OutcomeAnalysis struct {
@@ -200,6 +234,149 @@ type OutcomeAnalysis struct {
 	CompletionTokens int
 	EstimatedCostUSD float64
 	LastError        string
+}
+
+// --- Political-Catalyst extraction (v9.6) -------------------------------
+
+// CatalystExtractionRequest is the structured prompt input the
+// eventcatalyst importer hands to the AI for one event slug. The
+// importer composes this from the event-page payload + recent
+// Watchtower flow + existing catalyst rows; the AI returns a strict
+// JSON `CatalystExtractionResponse`.
+//
+// All Polymarket-authored fields (annotations, event metadata) are
+// DATA the AI reasons over, never instructions. The system never
+// re-interprets returned strings except by JSON schema validation.
+type CatalystExtractionRequest struct {
+	EventSlug         string
+	AnalysisTimeUTC   time.Time
+	EventMetadata     CatalystEventMetadata
+	Markets           []CatalystMarket
+	Annotations       []CatalystAnnotation
+	FlowSummary       CatalystFlowSummary
+	ExistingCatalysts []CatalystExistingRow
+}
+
+// CatalystEventMetadata is the compact event header the prompt gets.
+type CatalystEventMetadata struct {
+	Title              string
+	Description        string
+	ResolutionRules    string
+	Category           string
+	StartDate          time.Time
+	EndDate            time.Time
+	ContextDescription string
+	ContextUpdatedAt   time.Time
+}
+
+// CatalystMarket is one market under the event with current pricing.
+type CatalystMarket struct {
+	ConditionID        string
+	Question           string
+	GroupItemTitle     string
+	Outcomes           []string
+	OutcomePrices      []string
+	Volume24hUSD       float64
+	Liquidity          float64
+	OneHourPriceChange *float64
+	OneDayPriceChange  *float64
+	OneWeekPriceChange *float64
+	LastTradePrice     *float64
+	Active             bool
+	Closed             bool
+	EndDate            time.Time
+}
+
+// CatalystAnnotation is one normalised annotation row passed to AI.
+type CatalystAnnotation struct {
+	Timestamp   time.Time
+	Title       string
+	Summary     string
+	Outcome     string
+	PriceBefore *float64
+	PriceAfter  *float64
+	PriceChange *float64
+	SourceNames []string
+}
+
+// CatalystFlowSummary is the compact recent-flow rollup.
+type CatalystFlowSummary struct {
+	RecentAlertsCount       int
+	StrongestSide           string
+	AccumulationNote        string
+	OwnershipNote           string
+	ClusterNote             string
+	SameSideNotional24h     float64
+	OppositeSideNotional24h float64
+	LargestRecentTradeUSD   float64
+}
+
+// CatalystExistingRow describes a catalyst the system already knows.
+// Passed so the model can preserve / update / invalidate it instead
+// of duplicating.
+type CatalystExistingRow struct {
+	CatalystType string
+	Title        string
+	ExpectedAt   time.Time
+	Status       string
+	Confidence   float64
+}
+
+// CatalystExtractionResponse is the strict JSON shape the model
+// returns. JSON tags MUST match PART 4 schema verbatim.
+type CatalystExtractionResponse struct {
+	EventSlug       string              `json:"event_slug"`
+	AnalysisTimeUTC string              `json:"analysis_time_utc"`
+	Catalysts       []ExtractedCatalyst `json:"catalysts"`
+	// Transport metadata stamped by the analyzer; not part of the
+	// JSON contract.
+	Status           Status  `json:"-"`
+	Model            string  `json:"-"`
+	PromptTokens     int     `json:"-"`
+	CompletionTokens int     `json:"-"`
+	EstimatedCostUSD float64 `json:"-"`
+	LastError        string  `json:"-"`
+}
+
+// ExtractedCatalyst is one catalyst row from the strict JSON
+// response. Nullable upstream fields use pointers so we can
+// distinguish "absent" from "empty / zero".
+type ExtractedCatalyst struct {
+	CatalystType         string   `json:"catalyst_type"`
+	Title                string   `json:"title"`
+	Description          string   `json:"description"`
+	ExpectedAt           *string  `json:"expected_at"`
+	Confidence           float64  `json:"confidence"`
+	Source               string   `json:"source"`
+	SourceURL            *string  `json:"source_url"`
+	Status               string   `json:"status"`
+	BlockedReason        *string  `json:"blocked_reason"`
+	BullishScenario      string   `json:"bullish_scenario"`
+	BearishScenario      string   `json:"bearish_scenario"`
+	InvalidationScenario string   `json:"invalidation_scenario"`
+	FlowInterpretation   string   `json:"flow_interpretation"`
+	AffectedOutcomes     []string `json:"affected_outcomes"`
+}
+
+// CatalystExtractor is the seam used by the importer. *openai.Client
+// satisfies it for production; tests inject fakes. NoopExtractor
+// returns an empty response so the importer can run end-to-end
+// without an AI key (it will skip the upsert path).
+type CatalystExtractor interface {
+	ExtractCatalysts(ctx context.Context, req CatalystExtractionRequest) (CatalystExtractionResponse, error)
+}
+
+// NoopExtractor returns an empty StatusSkipped response.
+type NoopExtractor struct{}
+
+func (NoopExtractor) ExtractCatalysts(_ context.Context, req CatalystExtractionRequest) (CatalystExtractionResponse, error) {
+	return CatalystExtractionResponse{
+		EventSlug:       req.EventSlug,
+		AnalysisTimeUTC: req.AnalysisTimeUTC.UTC().Format(time.RFC3339),
+		Catalysts:       nil,
+		Status:          StatusSkipped,
+		Model:           "noop",
+	}, nil
 }
 
 // --- Analyzer interface ---------------------------------------------------

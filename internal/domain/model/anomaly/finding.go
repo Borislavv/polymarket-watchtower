@@ -445,4 +445,29 @@ type Finding struct {
 	// rate-limited, or otherwise unavailable. Telegram formatter
 	// renders an "Analyst note" block when this is non-empty.
 	AnalystNote string
+
+	// Blocked is the Political-Catalyst Intelligence overlay
+	// stamped onto the Finding by alertsender before render time.
+	// When non-nil the Telegram formatter emits a "Blocked Alert"
+	// block ABOVE the AI analysis explaining what catalyst the
+	// market is structurally waiting on and what the bullish /
+	// bearish / invalidation scenarios are. Polymarket-authored /
+	// AI-authored fields are DATA: the formatter HTML-escapes them
+	// at render time.
+	Blocked *BlockedAlert
+}
+
+// BlockedAlert is the per-alert snapshot of the most relevant
+// active catalyst. Sourced from polymarket_event_catalysts via the
+// eventcatalyst.Provider. All fields are operator-facing prose; the
+// formatter renders them verbatim under sanitisation.
+type BlockedAlert struct {
+	Status               string // "blocked until <event>" or short headline
+	Reason               string
+	CatalystType         string
+	ExpectedTiming       string // RFC3339 or "tbd"
+	BullishScenario      string
+	BearishScenario      string
+	InvalidationScenario string
+	Stance               string // operator-facing stance
 }

@@ -41,6 +41,13 @@ func main() {
 		// operator whether alerts are being created and whether the
 		// AI enricher is producing usable output.
 		runDiagnoseAI(os.Args[2:])
+	case "import-catalysts":
+		// One-shot Political-Catalyst Intelligence import for a
+		// single event slug. Fetches the event page, runs AI
+		// extraction (when the key is wired), and prints the
+		// extracted catalysts. Defaults to DRY RUN — no DB writes —
+		// unless --persist is set.
+		runImportCatalysts(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -48,10 +55,11 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cli <migrate|diagnose-alerts|diagnose-ai> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cli <migrate|diagnose-alerts|diagnose-ai|import-catalysts> [flags]")
 	fmt.Fprintln(os.Stderr, "  migrate          -dsn postgres://…")
 	fmt.Fprintln(os.Stderr, "  diagnose-alerts  -dsn postgres://… [--lookback 24h]")
 	fmt.Fprintln(os.Stderr, "  diagnose-ai      -dsn postgres://… [--limit 20]")
+	fmt.Fprintln(os.Stderr, "  import-catalysts --event <slug> [--persist] [--ai-key $OPENAI_API_KEY] [--model gpt-4.1-mini]")
 }
 
 func runMigrate(args []string) {

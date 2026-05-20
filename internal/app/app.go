@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,6 +30,9 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detection"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst"
+	catalystimporter "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst/importer"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
@@ -47,6 +51,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/log"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/dataapi"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/eventpage"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	pg "github.com/Borislavv/polymarket-watchtower/internal/infra/postgres"
@@ -72,18 +77,19 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill       *backfill.Worker
-	sender         *alertsender.Worker
-	sanity         *sanity.Worker
-	outcomes       *outcomes.Worker
-	drift          *drift.Worker
-	stats          *statsreport.Worker
-	signalReport   *signalreport.Worker
-	detection      *detection.Worker
-	stableFavorite *stablefavorite.Worker
-	aiAnalysis     *aianalysis.Service
-	outcomeAI      *outcomeai.Worker
-	marketIntel    *marketintel.Worker
+	backfill         *backfill.Worker
+	sender           *alertsender.Worker
+	sanity           *sanity.Worker
+	outcomes         *outcomes.Worker
+	drift            *drift.Worker
+	stats            *statsreport.Worker
+	signalReport     *signalreport.Worker
+	detection        *detection.Worker
+	stableFavorite   *stablefavorite.Worker
+	aiAnalysis       *aianalysis.Service
+	outcomeAI        *outcomeai.Worker
+	marketIntel      *marketintel.Worker
+	catalystImporter *catalystimporter.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -652,6 +658,8 @@ func New() (*App, error) {
 	// refresh/cost policy + persistence. Wiring stays inert when
 	// alertAnalysisRepo is nil (memory-only mode).
 	var aiSvc *aianalysis.Service
+	var eventPageProvider *eventpagecontext.Provider
+	var catalystProvider *eventcatalyst.Provider
 	if alertAnalysisRepo != nil {
 		var analyzer analysis.Analyzer = analysis.NoopAnalyzer{}
 		// Startup classification — answers the operator's first
@@ -701,6 +709,41 @@ func New() (*App, error) {
 		}, analyzer, alertAnalysisRepo,
 			repository.NewAIRequestLogRepository(pgPool),
 			met, logger)
+
+		// Polymarket event-page narrative context. Resolves event_slug
+		// from the Finding's market via marketsRepo.GetByConditionID,
+		// fetches /event/<slug>.json (with buildId resolved + cached),
+		// persists annotations + per-market snapshot, and renders a
+		// compact prompt slot. Failure is silent: the loader returns
+		// "" and aianalysis renders an "unavailable" slot. NEVER
+		// blocks alert delivery.
+		eventPageProvider = wireEventPageProvider(cfg, marketsRepo, met, logger)
+		if eventPageProvider != nil {
+			aiSvc.SetNarrativeLoader(eventPageProvider)
+			logger.Info().
+				Bool("enabled", cfg.EventPage.Enabled).
+				Dur("refresh_info", cfg.EventPage.RefreshInfo).
+				Dur("refresh_important", cfg.EventPage.RefreshImportant).
+				Dur("build_id_ttl", cfg.EventPage.BuildIDTTL).
+				Int("prompt_max_items", cfg.EventPage.PromptMaxItems).
+				Msg("event page context: wired")
+		}
+
+		// Political-Catalyst Intelligence overlay. Reads
+		// polymarket_event_catalysts via the same conditionID →
+		// event_slug resolver used by the event-page provider.
+		// Failure NEVER blocks the alert path.
+		catalystProvider = wireCatalystProvider(cfg, marketsRepo, met, logger)
+		if catalystProvider != nil {
+			aiSvc.SetCatalystLoader(catalystProvider)
+			if senderWorker != nil {
+				senderWorker.SetBlockedAlertStamper(catalystProvider)
+			}
+			logger.Info().
+				Bool("enabled", cfg.Catalyst.Enabled).
+				Int("prompt_max_items", cfg.Catalyst.PromptMaxItems).
+				Msg("event catalyst: wired")
+		}
 
 		// Wire the AI enricher into the sender so every claimed alert
 		// generates / refreshes its analyst note BEFORE Telegram render.
@@ -759,6 +802,9 @@ func New() (*App, error) {
 			SuccessReaction: cfg.TelegramReactions.SuccessEmoji,
 			FailureReaction: cfg.TelegramReactions.FailureEmoji,
 		}, alertsRepo, repository.NewAlertOutcomeAnalysisRepository(pgPool), analyzerForOutcome, bot, logger)
+		if eventPageProvider != nil {
+			outcomeAIWorker.SetNarrativeLoader(eventPageProvider)
+		}
 	}
 
 	// 2h market intelligence report worker. Same gating: Postgres
@@ -796,31 +842,106 @@ func New() (*App, error) {
 			ChatID:         cfg.Alerting.TelegramChatID,
 		}, intelRepo, intelRepo, analyzerForReport, bot, logger)
 		marketIntelWorker.SetMetrics(met)
+		if eventPageProvider != nil {
+			marketIntelWorker.SetNarrativeLoader(eventPageProvider)
+		}
+	}
+
+	// v9.6 Political-Catalyst Intelligence importer. Every Interval
+	// (default 5m) the importer refreshes annotations + extracts
+	// catalysts via AI + upserts them. Operator seeding is no longer
+	// required. Disabled in dev (no Postgres / no event-page
+	// provider) and when EVENT_CATALYST_IMPORTER_ENABLED=false.
+	var catalystImporterWorker *catalystimporter.Worker
+	if cfg.Postgres.Enabled() && cfg.Catalyst.ImporterEnabled && marketsRepo != nil && eventPageProvider != nil {
+		// Use a dedicated openai.Client instance for catalyst
+		// extraction so it doesn't share the rate-bucket / budget
+		// ledger with the per-alert analyzer. When the API key is
+		// missing, the importer falls back to NoopExtractor — it
+		// still refreshes annotations but emits no catalysts.
+		var extractor analysis.CatalystExtractor = analysis.NoopExtractor{}
+		if cfg.AIAnalysis.APIKey != "" && cfg.Catalyst.ImporterAIEnabled {
+			extractor = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.Catalyst.ImporterAITimeout,
+				MaxPromptChars:         cfg.Catalyst.ImporterMaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+				// The extractor uses JSON mode + strict-JSON parse;
+				// web_search is not used for this path.
+			})
+		}
+		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
+		catalystRepo := repository.NewEventCatalystRepository(pgPool)
+		catalystImporterWorker = catalystimporter.New(catalystimporter.Config{
+			Enabled:           cfg.Catalyst.ImporterEnabled,
+			Interval:          cfg.Catalyst.ImporterInterval,
+			CategoryWhitelist: splitCSV(cfg.Catalyst.ImporterCategoryCSV),
+			BatchSize:         cfg.Catalyst.ImporterBatchSize,
+			Concurrency:       cfg.Catalyst.ImporterConcurrency,
+			Lookback:          cfg.Catalyst.ImporterLookback,
+			AIEnabled:         cfg.Catalyst.ImporterAIEnabled,
+			AITimeout:         cfg.Catalyst.ImporterAITimeout,
+			MaxAnnotations:    cfg.Catalyst.ImporterMaxAnnotations,
+			MaxPromptChars:    cfg.Catalyst.ImporterMaxPromptChars,
+			MinConfidence:     cfg.Catalyst.ImporterMinConfidence,
+			StaleAfter:        cfg.Catalyst.ImporterStaleAfter,
+		}, intelRepo, marketsRepo, eventPageProvider, catalystRepo, extractor, met, logger)
+		logger.Info().
+			Bool("enabled", cfg.Catalyst.ImporterEnabled).
+			Dur("interval", cfg.Catalyst.ImporterInterval).
+			Strs("category_whitelist", splitCSV(cfg.Catalyst.ImporterCategoryCSV)).
+			Int("batch_size", cfg.Catalyst.ImporterBatchSize).
+			Int("concurrency", cfg.Catalyst.ImporterConcurrency).
+			Bool("ai_enabled", cfg.Catalyst.ImporterAIEnabled).
+			Msg("event catalyst importer: wired")
 	}
 
 	return &App{
-		cfg:            cfg,
-		logger:         logger,
-		metrics:        met,
-		cache:          cache,
-		discover:       discoverLoop,
-		collect:        collectLoop,
-		detectRun:      detectLoop.Run,
-		httpSrv:        httpSrv,
-		backfill:       backfillWorker,
-		sender:         senderWorker,
-		sanity:         sanityWorker,
-		outcomes:       outcomesWorker,
-		drift:          driftWorker,
-		stats:          statsWorker,
-		signalReport:   signalReportWorker,
-		detection:      detectionWorker,
-		stableFavorite: stableFavWorker,
-		aiAnalysis:     aiSvc,
-		outcomeAI:      outcomeAIWorker,
-		marketIntel:    marketIntelWorker,
-		pgPool:         pgPool,
+		cfg:              cfg,
+		logger:           logger,
+		metrics:          met,
+		cache:            cache,
+		discover:         discoverLoop,
+		collect:          collectLoop,
+		detectRun:        detectLoop.Run,
+		httpSrv:          httpSrv,
+		backfill:         backfillWorker,
+		sender:           senderWorker,
+		sanity:           sanityWorker,
+		outcomes:         outcomesWorker,
+		drift:            driftWorker,
+		stats:            statsWorker,
+		signalReport:     signalReportWorker,
+		detection:        detectionWorker,
+		stableFavorite:   stableFavWorker,
+		aiAnalysis:       aiSvc,
+		outcomeAI:        outcomeAIWorker,
+		marketIntel:      marketIntelWorker,
+		catalystImporter: catalystImporterWorker,
+		pgPool:           pgPool,
 	}, nil
+}
+
+// splitCSV trims and splits a comma-separated env value. Empty
+// entries are dropped; the empty input returns nil.
+func splitCSV(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // walletResolver returns a wallet-resolution callback for the
@@ -964,6 +1085,93 @@ func (u marketcacheUpstream) IsActiveUpstream(conditionID string) bool {
 	return ok
 }
 
+// wireEventPageProvider constructs the Polymarket event-page
+// narrative provider when enabled in config. Returns nil when the
+// feature is disabled OR a market repo isn't available (memory mode
+// or missing dependencies) — callers handle nil by skipping the
+// loader wiring. Slug resolution is delegated to a closure over
+// marketsRepo.GetByConditionID so the loader stays decoupled from
+// the repository package.
+func wireEventPageProvider(cfg *Config, marketsRepo *repository.MarketRepository, met *metrics.Metrics, logger *zerolog.Logger) *eventpagecontext.Provider {
+	if !cfg.EventPage.Enabled || marketsRepo == nil {
+		return nil
+	}
+	resolver := eventpage.NewBuildIDResolver(eventpage.BuildIDResolverConfig{
+		HTMLBaseURL: cfg.EventPage.HTMLBaseURL,
+		Timeout:     cfg.EventPage.FetchTimeout,
+		TTL:         cfg.EventPage.BuildIDTTL,
+		Logger:      logger,
+	})
+	client, err := eventpage.NewClient(eventpage.ClientConfig{
+		HTMLBaseURL: cfg.EventPage.HTMLBaseURL,
+		Resolver:    resolver,
+		Logger:      logger,
+	})
+	if err != nil {
+		logger.Warn().Err(err).Msg("event page client: construction failed; narrative context disabled")
+		return nil
+	}
+	repo := repository.NewEventPageRepository(a_pgPool(marketsRepo))
+	// The slug resolver closes over the market repo; a missing
+	// market (purged, never seen) returns "" so the loader skips
+	// the call cleanly.
+	slugResolver := func(ctx context.Context, conditionID string) string {
+		if conditionID == "" {
+			return ""
+		}
+		m, err := marketsRepo.GetByConditionID(ctx, conditionID)
+		if err != nil {
+			return ""
+		}
+		return m.EventSlug
+	}
+	return eventpagecontext.New(eventpagecontext.Config{
+		Enabled:          cfg.EventPage.Enabled,
+		RefreshInfo:      cfg.EventPage.RefreshInfo,
+		RefreshImportant: cfg.EventPage.RefreshImportant,
+		PromptMaxItems:   cfg.EventPage.PromptMaxItems,
+		PromptMaxChars:   cfg.EventPage.PromptMaxChars,
+		FetchTimeout:     cfg.EventPage.FetchTimeout,
+	}, client, repo, slugResolver, met, logger)
+}
+
+// a_pgPool is a tiny escape hatch: the event-page repo needs a
+// *pgxpool.Pool, but we only thread *MarketRepository through the
+// signature for slug resolution. The market repo carries the pool
+// internally; we expose it here to avoid widening the wireEventPageProvider
+// signature. Returning nil is safe — the repo handles a nil pool by
+// failing every call, which the provider treats as a silent skip.
+func a_pgPool(r *repository.MarketRepository) *pgxpool.Pool {
+	return r.Pool()
+}
+
+// wireCatalystProvider constructs the Political-Catalyst Intelligence
+// loader. Returns nil when the feature is disabled OR a market repo
+// isn't available (memory mode / missing deps). Reuses the same
+// conditionID → event_slug resolver as the event-page provider so
+// the alert pipeline only has one slug-resolution semantic.
+func wireCatalystProvider(cfg *Config, marketsRepo *repository.MarketRepository, met *metrics.Metrics, logger *zerolog.Logger) *eventcatalyst.Provider {
+	if !cfg.Catalyst.Enabled || marketsRepo == nil {
+		return nil
+	}
+	repo := repository.NewEventCatalystRepository(a_pgPool(marketsRepo))
+	slugResolver := func(ctx context.Context, conditionID string) string {
+		if conditionID == "" {
+			return ""
+		}
+		m, err := marketsRepo.GetByConditionID(ctx, conditionID)
+		if err != nil {
+			return ""
+		}
+		return m.EventSlug
+	}
+	return eventcatalyst.New(eventcatalyst.Config{
+		Enabled:        cfg.Catalyst.Enabled,
+		PromptMaxItems: cfg.Catalyst.PromptMaxItems,
+		PromptMaxChars: cfg.Catalyst.PromptMaxChars,
+	}, repo, slugResolver, met, logger)
+}
+
 func (a *App) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1023,6 +1231,12 @@ func (a *App) Run() error {
 	if a.marketIntel != nil {
 		execs = append(execs, shutdown2.Exec{Name: "marketintel", Fn: func(ctx context.Context) error {
 			a.marketIntel.Run(ctx)
+			return nil
+		}})
+	}
+	if a.catalystImporter != nil {
+		execs = append(execs, shutdown2.Exec{Name: "catalyst-importer", Fn: func(ctx context.Context) error {
+			a.catalystImporter.Run(ctx)
 			return nil
 		}})
 	}

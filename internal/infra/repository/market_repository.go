@@ -81,6 +81,17 @@ func NewMarketRepository(pool *pgxpool.Pool) *MarketRepository {
 	return &MarketRepository{pool: pool, q: sqlc.New(pool)}
 }
 
+// Pool exposes the underlying pgx pool so composition code in app.go
+// can wire sibling repositories without re-threading the pool
+// through every constructor signature. Returns nil for a zero-value
+// receiver — callers should treat nil as "no DB".
+func (r *MarketRepository) Pool() *pgxpool.Pool {
+	if r == nil {
+		return nil
+	}
+	return r.pool
+}
+
 // UpsertSeen upserts each market, refreshes its category links, and returns
 // the persisted rows in input order. Each market is processed in its own
 // short transaction so a single bad row doesn't roll back the batch.

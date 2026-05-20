@@ -92,14 +92,21 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// NarrativeLoader is the optional seam used to stamp Polymarket
+// event-page context onto the postmortem prompt. nil = empty slot.
+type NarrativeLoader interface {
+	LoadAndRenderForFinding(ctx context.Context, f anomaly.Finding, maxChars int) string
+}
+
 // Worker is the periodic postmortem loop.
 type Worker struct {
-	cfg      Config
-	alerts   AlertSource
-	store    PostmortemStore
-	analyzer Analyzer
-	bot      Bot
-	log      *zerolog.Logger
+	cfg       Config
+	alerts    AlertSource
+	store     PostmortemStore
+	analyzer  Analyzer
+	narrative NarrativeLoader
+	bot       Bot
+	log       *zerolog.Logger
 }
 
 // New wires the worker. All deps required; pass analysis.NoopAnalyzer
@@ -109,6 +116,10 @@ func New(cfg Config, alerts AlertSource, store PostmortemStore, analyzer Analyze
 	cfg.applyDefaults()
 	return &Worker{cfg: cfg, alerts: alerts, store: store, analyzer: analyzer, bot: bot, log: log}
 }
+
+// SetNarrativeLoader wires the optional Polymarket event-page
+// context loader. nil keeps the slot empty.
+func (w *Worker) SetNarrativeLoader(loader NarrativeLoader) { w.narrative = loader }
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -162,6 +173,9 @@ func (w *Worker) processOne(ctx context.Context, a repository.Alert) {
 
 	// 2. Build the AI request and call the analyzer.
 	req := buildOutcomeRequest(a, f)
+	if w.narrative != nil {
+		req.EventNarrativeContext = w.narrative.LoadAndRenderForFinding(ctx, f, 5000)
+	}
 	out, err := w.analyzer.AnalyzeOutcome(ctx, req)
 	if err != nil {
 		w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomeai: analyzer returned error")

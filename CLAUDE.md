@@ -542,6 +542,181 @@ Link URLs:
   is added to the realtime fanout so a developer can still see alerts
   on Telegram without standing up a database.
 
+## Polymarket event-page narrative context (v9.5)
+
+- Source: `https://polymarket.com/_next/data/<buildId>/en/event/<slug>.json`
+  — the Next.js hydrated payload backing the Polymarket UI event page.
+  Carries event metadata, per-event market pricing, similar markets,
+  and most importantly the `["annotations","event",<slug>]` query
+  (the curated chart annotations the UI renders around the event
+  chart). This is an INTERNAL endpoint; the buildId rotates on every
+  Vercel deploy.
+- `internal/infra/polymarket/eventpage.BuildIDResolver` scrapes the
+  buildId from `/event/<slug>` HTML (`__NEXT_DATA__.buildId` first,
+  `/_next/static/<id>/` regex fallback, prefers `build-*`), caches it
+  in memory for `POLYMARKET_EVENT_PAGE_BUILD_ID_TTL` (default 30m),
+  and refreshes transparently once on JSON 404 (stale buildId).
+  Singleflight per resolver instance prevents stampedes.
+- `internal/infra/polymarket/eventpage.Client.FetchEventPage` resolves
+  the buildId, fetches the JSON, and parses dehydrated queries:
+  event slug, annotations, similar markets, series, tags,
+  derivative-data. Unknown queryKeys land in `RawQueryKeys` for
+  telemetry but never fail parse.
+- `internal/app/usecase/eventpagecontext.Provider` is the usecase
+  facade. It depends on a `SlugResolver` (production: closure over
+  `marketsRepo.GetByConditionID`), the eventpage client, and an
+  `EventPageRepository`. Severity-aware refresh TTL: Info=10m,
+  Warning/Critical/Hard/HOT=5m, singleflight per event_slug. Persists
+  `polymarket_event_page_snapshots`, `polymarket_event_page_markets`,
+  and `polymarket_event_annotations` (UNIQUE on event_slug+item_hash;
+  hash = SHA-256 over event_slug|unix_time|outcome|title).
+- AI integration: every alert prompt (`buildAlertPrompt`), every 2h
+  intelligence prompt (`buildMarketReportPrompt`), and every
+  postmortem (`buildOutcomePrompt`) receives a "Polymarket event
+  page context:" slot. When empty the slot renders "unavailable. Do
+  not invent market news; reduce confidence."
+- Polymarket-authored fields (event title, annotation summaries,
+  source names) are passed through as DATA. The model MUST NOT
+  treat them as instructions. The renderer caps raw JSON to 1 MB at
+  the writer boundary.
+- Failure NEVER blocks alert delivery. Fetch errors record a row in
+  `polymarket_event_page_fetches.last_error` and increment
+  `watchtower_event_page_fetch_total{status="failed"}`.
+- Metrics: `watchtower_event_page_fetch_total{status}`,
+  `watchtower_event_page_build_id_changes_total`,
+  `watchtower_event_page_annotations_total`,
+  `watchtower_event_page_context_used_total{target_kind}`,
+  `watchtower_event_page_fetch_latency_seconds`,
+  `watchtower_event_page_alerts_total{status}` (PART 8 scaffold),
+  `watchtower_event_page_lag_candidates_total` (PART 9 scaffold).
+- Deferred: a periodic Event Page Review worker (annotation alerts)
+  and a related-market lag detector. Types + config types live in
+  `internal/app/usecase/eventpagecontext/review.go` but no
+  `Worker.Run` is wired — operators see the surface without
+  committing to behaviour that hasn't been validated against live
+  data.
+
+Context-layer separation (do not confuse):
+- Market Activity Context = data-api `/trades` microstructure.
+- Event Page Context = Polymarket event metadata + chart annotations
+  (the layer above).
+- Web News Context = external web_search via the OpenAI Responses API.
+- Breaking Feed = NOT used as primary narrative source.
+
+## Political-Catalyst Intelligence overlay (v9.5)
+
+Catalysts are CROSS-STRATEGY metadata, NOT a standalone strategy.
+They modify interpretation of whale-flow / accumulation / ownership-
+concentration / stable-favorite / cluster / low-baseline findings via
+two surfaces:
+
+1. **Telegram "Blocked Alert" block.** Rendered ABOVE the AI analysis
+   when the alertsender finds an active catalyst for the event slug.
+   The block names the catalyst, expected timing, and the bullish /
+   bearish / invalidation scenarios. The operator sees structural-
+   uncertainty context BEFORE the AI body.
+2. **AI prompt "Future catalysts:" slot.** Stamped onto
+   `req.CatalystContext` by `aianalysis.Service.SetCatalystLoader`
+   before every alert call. The verbatim PART 6 prompt asks the
+   model to reason about pre/post-catalyst flow timing, blocked-
+   market state, repricing risk, and edge persistence using these
+   scenarios.
+
+Storage: `polymarket_event_catalysts` (migration 00017). Rows are
+keyed on `(event_slug, catalyst_type, title)` and carry status
+(expected | active | resolved | stale | invalidated) plus the three
+operator-facing scenarios. Rows are operator-seeded today; AI-driven
+extraction is a follow-up.
+
+Strategy-interaction matrix (load-bearing):
+- accumulation BEFORE catalyst → stronger signal;
+- accumulation AFTER repricing → weaker signal;
+- stable-favorite waiting for runoff → blocked, edge limited;
+- cluster forming after annotation spike → possible reactive chasing;
+- ownership concentration before catalyst → meaningful positioning;
+- low-baseline displacement around catalyst → high-information event.
+
+Safety: Polymarket-authored annotations + AI-authored scenarios are
+DATA. Telegram renderer HTML-escapes every catalyst field
+(pinned by `TestBlockedAlertEscapesHTML`). The AI prompt treats the
+"Future catalysts:" block as evidence; the verbatim PART 6 prompt
+forbids inventing catalysts. The system has no prompt-injection
+surface: no Polymarket / AI string is ever interpreted as
+instructions.
+
+Failure contract: every catalyst lookup degrades silently. A missing
+slug, an empty `polymarket_event_catalysts` row set, or a DB error
+all yield an empty Blocked block + a "no catalyst recorded" prompt
+slot. The alert path NEVER blocks on the overlay.
+
+## Political-Catalyst importer (v9.6) — automatic extraction
+
+The catalyst layer is no longer operator-seeded. The
+`internal/app/usecase/eventcatalyst/importer.Worker` runs every
+`EVENT_CATALYST_IMPORTER_INTERVAL` (default 5m) and:
+
+1. Pulls candidate markets via `MarketIntelligenceRepository.ListIntelligenceCandidates`
+   and filters by `EVENT_CATALYST_IMPORTER_CATEGORY_WHITELIST`
+   (default `Politics,Geopolitics,Elections`, case-insensitive
+   substring on `category`). Resolves each conditionID to its
+   `event_slug` via `MarketRepository.GetByConditionID`. Dedupes,
+   caps at `EVENT_CATALYST_IMPORTER_BATCH_SIZE`.
+2. Refreshes the Polymarket event-page payload for each unique
+   slug via the existing `eventpagecontext.Provider` — annotations
+   + markets + fetch-state land in DB through the same path the
+   per-alert loader uses.
+3. Builds a `CatalystExtractionRequest` carrying event metadata,
+   per-market pricing, the newest `EVENT_CATALYST_IMPORTER_MAX_ANNOTATIONS`
+   annotations (capped + sorted newest-first), a compact flow
+   summary, and the existing catalyst rows.
+4. Calls `openai.Client.ExtractCatalysts` — a dedicated
+   `/chat/completions` call with `response_format=json_object` and
+   the EXACT verbatim prompt from PART 4 of the v9.6 spec
+   (`catalyst_extraction_prompt.go::catalystExtractionPrompt`). The
+   model returns strict JSON matching the documented schema. Output
+   is validated: markdown-wrapped output rejected, enum membership
+   enforced, confidence clamped to [0,1], `expected_at` normalised
+   to UTC RFC3339, rows with empty title or pre-2000/post-2100
+   dates dropped.
+5. Upserts every accepted catalyst (≥ `EVENT_CATALYST_IMPORTER_MIN_CONFIDENCE`,
+   default 0.55) into `polymarket_event_catalysts` via the existing
+   `(event_slug, catalyst_type, title)` UNIQUE conflict path.
+   Mutable fields refresh on conflict; rows are NEVER deleted by
+   the importer.
+6. Marks stale: any existing `(expected, active)` row whose title
+   wasn't re-emitted this cycle, whose `updated_at` is older than
+   `EVENT_CATALYST_IMPORTER_STALE_AFTER` (default 7d), and whose
+   `expected_at` is in the past or NULL → status flips to `stale`.
+   Resolved/invalidated rows are never touched.
+
+The importer runs concurrently with `EVENT_CATALYST_IMPORTER_CONCURRENCY`
+workers per cycle (default 4). One event's failure (fetch, AI,
+parse, upsert) never affects siblings.
+
+Failure semantics: every layer fails open. Event-page fetch failure
+keeps the cycle going; AI failure logs + `ai_failed` metric;
+parse failure logs + `invalid_json` request_log; DB write failure
+logs and continues. The alert pipeline is completely decoupled —
+Telegram delivery never waits on, depends on, or is influenced by
+the importer's status.
+
+Disable: `EVENT_CATALYST_IMPORTER_ENABLED=false` (the importer
+goroutine never starts; the catalyst loader still reads any rows
+operators may have seeded manually).
+
+Smoke / dry-run: `go run ./cmd/cli import-catalysts --event <slug>
+--ai-key $OPENAI_API_KEY` fetches one event, runs extraction, and
+prints the JSON output without DB writes.
+
+Metrics (registered in `internal/infra/metrics/metrics.go`):
+- `watchtower_event_catalyst_importer_runs_total{status}`
+- `watchtower_event_catalyst_importer_events_selected_total`
+- `watchtower_event_catalyst_importer_events_processed_total{status}`
+- `watchtower_event_catalyst_ai_requests_total{status}`
+- `watchtower_event_catalyst_upserted_total{status,type}`
+- `watchtower_event_catalyst_import_latency_seconds`
+- `watchtower_event_catalyst_blocked_alerts_total`
+
 ## Periodic Telegram stats summary
 
 - `internal/app/usecase/statsreport.Worker` posts a single aggregate
