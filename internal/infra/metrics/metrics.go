@@ -271,6 +271,31 @@ type Metrics struct {
 	// PredictionCreationLatency: end-to-end Tick duration.
 	PredictionCreationLatency prometheus.Histogram
 
+	// --- v10.1 Telegram/quality polish (PART 8) ---
+	// PredictionCreationTelegramSkipped: Telegram sends suppressed
+	// by the v10.1 gates, labelled by reason
+	// (startup_suppressed | cooldown | max_per_run_reached |
+	//  low_quality).
+	PredictionCreationTelegramSkipped *prometheus.CounterVec
+	// PredictionCreationTelegramSent: successful Telegram sends.
+	PredictionCreationTelegramSent prometheus.Counter
+	// PredictionCreationDedupeSkipped: dedupe outcomes from the
+	// pre-AI filter, labelled by reason
+	// (active_prediction | dedupe_window | low_interest |
+	//  neutral_low_value).
+	PredictionCreationDedupeSkipped *prometheus.CounterVec
+	// PredictionCreationQualityGate: post-AI gate outcomes
+	// (ok | low_confidence | low_summary | neutral_no_signal | no_signal).
+	PredictionCreationQualityGate *prometheus.CounterVec
+	// PredictionSchedulerStartupSuppressed: cross-worker counter
+	// for "this scheduler suppressed Telegram on first cycle"
+	// (currently emitted by the creation worker).
+	PredictionSchedulerStartupSuppressed *prometheus.CounterVec
+	// PredictionMessageChunks: count of Telegram chunks shipped per
+	// surface (prediction_creation | prediction_evolution).
+	// Multi-chunk implies the safe-split path fired.
+	PredictionMessageChunks *prometheus.CounterVec
+
 	// --- v9.6 Political-Catalyst Intelligence importer ---
 	// EventCatalystImporterRuns: importer cycle outcomes, labelled
 	// by status (ok / empty / partial / failed).
@@ -758,6 +783,32 @@ func New() *Metrics {
 		Buckets: prometheus.ExponentialBuckets(1, 2, 9),
 	})
 
+	// v10.1 Telegram + quality + scheduler polish (PART 8).
+	m.PredictionCreationTelegramSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "telegram_skipped_total",
+		Help: "Telegram sends suppressed by the gates: startup_suppressed | cooldown | max_per_run_reached | low_quality.",
+	}, []string{"reason"})
+	m.PredictionCreationTelegramSent = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "telegram_sent_total",
+		Help: "Successful Telegram sends from the creation worker (one increment per prediction, not per chunk).",
+	})
+	m.PredictionCreationDedupeSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "dedupe_skipped_total",
+		Help: "Pre-AI dedupe outcomes: active_prediction | dedupe_window | low_interest | neutral_low_value.",
+	}, []string{"reason"})
+	m.PredictionCreationQualityGate = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "quality_gate_total",
+		Help: "Post-AI quality gate outcomes: ok | low_confidence | low_summary | neutral_no_signal | no_signal.",
+	}, []string{"result"})
+	m.PredictionSchedulerStartupSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_scheduler", Name: "startup_suppressed_total",
+		Help: "First-cycle Telegram suppression per worker (currently prediction_creation).",
+	}, []string{"worker"})
+	m.PredictionMessageChunks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction", Name: "message_chunks_total",
+		Help: "Telegram chunks shipped per surface (prediction_creation | prediction_evolution). Multi-chunk implies the safe-split path fired.",
+	}, []string{"surface"})
+
 	// v9.6 Political-Catalyst Intelligence importer
 	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "runs_total",
@@ -922,6 +973,9 @@ func New() *Metrics {
 		m.PredictionCreationRuns, m.PredictionCreationCandidates, m.PredictionCreationCreated,
 		m.PredictionCreationAIRequests, m.PredictionCreationAISkipped, m.PredictionCreationTelegram,
 		m.PredictionCreationLatency,
+		m.PredictionCreationTelegramSkipped, m.PredictionCreationTelegramSent,
+		m.PredictionCreationDedupeSkipped, m.PredictionCreationQualityGate,
+		m.PredictionSchedulerStartupSuppressed, m.PredictionMessageChunks,
 		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,

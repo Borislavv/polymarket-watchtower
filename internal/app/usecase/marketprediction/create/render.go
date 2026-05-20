@@ -1,6 +1,7 @@
 package create
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
 
@@ -146,6 +148,12 @@ func oneLine(s string) string {
 // "PREDICTION CREATED" Telegram body. All strings are passed
 // verbatim from operator-facing fields + AI output; the renderer
 // is responsible for HTML escape at the boundary.
+//
+// The optional context blocks (Annotations, MatchedAlerts, Links)
+// are appended only when populated — an empty slice renders to
+// nothing, NOT to "no data". This matches the existing alert
+// renderer's omit-on-empty rule so a minimal prediction (just
+// summary) never ships orphan headers.
 type CreationRenderInput struct {
 	EventSlug   string
 	Question    string
@@ -154,6 +162,35 @@ type CreationRenderInput struct {
 	Confidence  float64
 	Summary     string
 	RiskFactors string
+
+	// Annotations is the chronological (newest-first) list of
+	// Polymarket event annotations to render under
+	// "Latest Polymarket events". The caller MUST pre-cap the slice
+	// to the operator-configured limit (default 5).
+	Annotations []repository.EventAnnotation
+	// MaxAnnotationTitleChars caps the per-row title length used by
+	// the renderer's compaction. 0 falls through to a sensible
+	// default; callers normally pass the configured cap.
+	MaxAnnotationTitleChars int
+	// MaxAnnotationSourceNames caps how many citation names render
+	// per annotation row. 0 falls through to a default of 3.
+	MaxAnnotationSourceNames int
+
+	// MatchedAlertCount is the count of matched Watchtower alerts
+	// that pointed at the same market — populated by the worker
+	// only when it has actually replayed the matched alerts. 0
+	// elides the "Matched Watchtower alerts" section entirely.
+	MatchedAlertCount int
+
+	// Links — operator-actionable URLs the renderer pipes through
+	// alerting.SanitizeLinkURL + alerting.RenderLink so the dead-
+	// link / localhost-grafana / unsafe-scheme rules already pinned
+	// by the alert tests apply here too. Empty fields elide their
+	// bullet; an entirely-empty Links block elides the whole section.
+	PolymarketEventURL  string
+	PolymarketMarketURL string
+	GrafanaURL          string
+	TraderURL           string
 }
 
 // RenderCreationTelegram builds the HTML body used by the
@@ -189,5 +226,152 @@ func RenderCreationTelegram(in CreationRenderInput) string {
 		b.WriteString(html.EscapeString(r))
 		b.WriteString("\n")
 	}
+	if in.MatchedAlertCount > 0 {
+		fmt.Fprintf(&b, "\n<b>Matched Watchtower alerts</b>: %d\n", in.MatchedAlertCount)
+	}
+	if anns := renderAnnotationsTelegramBlock(in.Annotations, in.MaxAnnotationTitleChars, in.MaxAnnotationSourceNames); anns != "" {
+		b.WriteString("\n")
+		b.WriteString(anns)
+		b.WriteString("\n")
+	}
+	if links := renderLinksTelegramBlock(in); links != "" {
+		b.WriteString("\n")
+		b.WriteString(links)
+		b.WriteString("\n")
+	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderAnnotationsTelegramBlock builds the "Latest Polymarket events"
+// section. Returns "" when there's nothing to render — the caller
+// omits the section entirely. Per-field caps + HTML escape applied.
+func renderAnnotationsTelegramBlock(rows []repository.EventAnnotation, maxTitleChars, maxSourceNames int) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	if maxTitleChars <= 0 {
+		maxTitleChars = 160
+	}
+	if maxSourceNames <= 0 {
+		maxSourceNames = 3
+	}
+	var b strings.Builder
+	b.WriteString("<b>Latest Polymarket events</b>\n")
+	for i, a := range rows {
+		date := "—"
+		if !a.Timestamp.IsZero() {
+			date = a.Timestamp.UTC().Format("2006-01-02")
+		}
+		// Header line: 1. <date> · <outcome> · <priceBefore>→<priceAfter> (<delta>)
+		fmt.Fprintf(&b, "%d. %s", i+1, html.EscapeString(date))
+		if outcome := strings.TrimSpace(a.Outcome); outcome != "" {
+			fmt.Fprintf(&b, " · %s", html.EscapeString(outcome))
+		}
+		if a.PriceBefore != nil && a.PriceAfter != nil {
+			fmt.Fprintf(&b, " · %s→%s",
+				html.EscapeString(formatPrice(*a.PriceBefore)),
+				html.EscapeString(formatPrice(*a.PriceAfter)))
+			if a.PriceChange != nil {
+				fmt.Fprintf(&b, " (%s)", html.EscapeString(formatSignedPrice(*a.PriceChange)))
+			}
+		}
+		b.WriteString("\n")
+		// Title line — truncated to MaxAnnotationTitleChars.
+		if title := strings.TrimSpace(a.Title); title != "" {
+			fmt.Fprintf(&b, "   %s\n", html.EscapeString(truncateChars(oneLine(title), maxTitleChars)))
+		}
+		// Sources line (only when we can parse them out of the
+		// SourcesJSON blob). Defensive — failure here MUST NOT
+		// drop the annotation row; we simply skip the sources line.
+		if names := decodeSourceNames(a.SourcesJSON, maxSourceNames); len(names) > 0 {
+			fmt.Fprintf(&b, "   sources: %s\n", html.EscapeString(strings.Join(names, ", ")))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderLinksTelegramBlock builds the Links section. Every URL is
+// piped through alerting.SanitizeLinkURL (rejects unsafe schemes,
+// loopback hosts, link-local IPs) so a localhost grafana never
+// renders as a dead-text bullet. An entirely-empty section elides.
+func renderLinksTelegramBlock(in CreationRenderInput) string {
+	type entry struct{ label, href string }
+	candidates := []entry{
+		{"Polymarket event", in.PolymarketEventURL},
+		{"Polymarket market", in.PolymarketMarketURL},
+		{"Grafana", in.GrafanaURL},
+		{"Trader", in.TraderURL},
+	}
+	var bullets []string
+	for _, e := range candidates {
+		safe := alerting.SanitizeLinkURL(e.href)
+		if safe == "" {
+			continue
+		}
+		bullets = append(bullets, "• "+alerting.RenderLink(e.label, safe))
+	}
+	if len(bullets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<b>Links</b>\n")
+	for _, line := range bullets {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// formatPrice renders a 0..1 probability as "0.62" or "62%" depending
+// on magnitude. Polymarket annotations historically arrive as
+// 0..100 percentages; we keep the raw value and just trim the
+// decimal noise so the Telegram line stays compact.
+func formatPrice(v float64) string {
+	if v >= 1 || v <= -1 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
+func formatSignedPrice(v float64) string {
+	if v >= 1 || v <= -1 {
+		return fmt.Sprintf("%+.0f", v)
+	}
+	return fmt.Sprintf("%+.2f", v)
+}
+
+func truncateChars(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
+}
+
+// decodeSourceNames extracts source names from the annotation's
+// SourcesJSON blob. Best-effort: unmarshal failure returns nil so
+// the renderer simply omits the sources line. Capped at limit.
+func decodeSourceNames(raw []byte, limit int) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var rows []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil
+	}
+	out := make([]string, 0, limit)
+	seen := map[string]bool{}
+	for _, r := range rows {
+		name := strings.TrimSpace(r.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }

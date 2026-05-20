@@ -87,7 +87,8 @@ Practical stance:
 
 Rules:
 - Russian language.
-- 1000–3500 characters.
+- 800–2500 characters.
+- Target length: 1200–2000 characters.
 - Dense, practical, no filler.
 - No invented facts.
 

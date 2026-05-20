@@ -1160,6 +1160,23 @@ func New() (*App, error) {
 			SendTelegram: cfg.Prediction.CreationSendTelegram,
 			Concurrency:  cfg.Prediction.CreationConcurrency,
 			Categories:   cfg.Prediction.CreationCategories,
+			// v10.1 Telegram polish + quality gate + throttling.
+			AnnotationsEnabled:        cfg.Prediction.TelegramAnnotationsEnabled,
+			AnnotationsLimit:          cfg.Prediction.TelegramAnnotationsLimit,
+			AnnotationsMaxTitleChars:  cfg.Prediction.TelegramAnnotationsMaxTitleChars,
+			AnnotationsMaxSourceNames: cfg.Prediction.TelegramAnnotationsMaxSourceNames,
+			LinksEnabled:              cfg.Prediction.TelegramLinksEnabled,
+			PolymarketBase:            cfg.Polymarket.PublicBaseURL,
+			GrafanaBaseURL:            cfg.Alerting.GrafanaBaseURL,
+			GrafanaDashUID:            cfg.Alerting.GrafanaDashUID,
+			TelegramCooldown:          cfg.Prediction.CreationTelegramCooldown,
+			MaxTelegramPerRun:         cfg.Prediction.CreationMaxTelegramPerRun,
+			SendOnStartup:             cfg.Prediction.CreationSendOnStartup,
+			SendNeutral:               cfg.Prediction.CreationSendNeutral,
+			PersistLowQuality:         cfg.Prediction.CreationPersistLowQuality,
+			MinConfidence:             cfg.Prediction.CreationMinConfidence,
+			RequireSignal:             cfg.Prediction.CreationRequireSignal,
+			MinSummaryChars:           cfg.Prediction.CreationMinSummaryChars,
 		}, intelRepo, marketsRepo, predsRepo, eventPageProvider, catalystRepoForCreator, flowRepo, repricingComp, ranker, creator, creatorTG, met, logger)
 		predictionCreator.SetBudget(aiBudget)
 		logger.Info().

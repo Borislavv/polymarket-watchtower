@@ -837,6 +837,11 @@ func writeBlockedAlertBlock(b *strings.Builder, f anomaly.Finding) {
 // and an alert recipient seeing a dead "Grafana" bullet is worse than
 // not seeing it at all. Returning empty here cascades through writeLinks
 // → renderLink and the entry is elided.
+//
+// SanitizeLinkURL is the exported alias used by the prediction
+// creation worker so we don't duplicate the unsafe-URL rules.
+func SanitizeLinkURL(raw string) string { return sanitizeLinkURL(raw) }
+
 func sanitizeLinkURL(raw string) string {
 	if raw == "" {
 		return ""
@@ -862,6 +867,11 @@ func sanitizeLinkURL(raw string) string {
 	}
 	return raw
 }
+
+// RenderLink is the exported alias used by the prediction creation
+// worker — same sanitize + html.EscapeString contract as the
+// per-alert renderer.
+func RenderLink(label, href string) string { return renderLink(label, href) }
 
 // renderLink returns a Telegram HTML-parse-mode anchor: `<a href="...">label</a>`.
 //

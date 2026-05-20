@@ -635,6 +635,28 @@ type PredictionConfig struct {
 	CreationConcurrency  int           `env:"MARKET_PREDICTION_CREATION_CONCURRENCY" envDefault:"2" validate:"gte=1,lte=16"`
 	CreationSendTelegram bool          `env:"MARKET_PREDICTION_CREATION_SEND_TELEGRAM" envDefault:"true"`
 	CreationCategories   []string      `env:"MARKET_PREDICTION_CREATION_CATEGORIES" envDefault:"politics,geopolitics,elections" envSeparator:","`
+
+	// --- v10.1 Telegram polish (PART 1/3/5/7) ---------------------
+	// Annotations + Links blocks under the AI thesis.
+	TelegramAnnotationsEnabled        bool `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_ENABLED" envDefault:"true"`
+	TelegramAnnotationsLimit          int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_LIMIT" envDefault:"5" validate:"gte=0,lte=20"`
+	TelegramAnnotationsMaxTitleChars  int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_MAX_TITLE_CHARS" envDefault:"160" validate:"gte=20,lte=512"`
+	TelegramAnnotationsMaxSourceNames int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_MAX_SOURCE_NAMES" envDefault:"3" validate:"gte=0,lte=10"`
+	TelegramLinksEnabled              bool `env:"MARKET_PREDICTION_TELEGRAM_LINKS_ENABLED" envDefault:"true"`
+
+	// Per-event Telegram cooldown for the creation worker (PART 5).
+	// In-memory map + a deterministic skip-reason log line.
+	CreationTelegramCooldown  time.Duration `env:"MARKET_PREDICTION_CREATION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
+	CreationMaxTelegramPerRun int           `env:"MARKET_PREDICTION_CREATION_MAX_TELEGRAM_PER_RUN" envDefault:"3" validate:"gte=0,lte=50"`
+	CreationSendOnStartup     bool          `env:"MARKET_PREDICTION_CREATION_SEND_ON_STARTUP" envDefault:"false"`
+
+	// Quality gate (PART 7). Persist always (if PersistLowQuality);
+	// gate Telegram send strictly.
+	CreationSendNeutral       bool    `env:"MARKET_PREDICTION_CREATION_SEND_NEUTRAL" envDefault:"false"`
+	CreationPersistLowQuality bool    `env:"MARKET_PREDICTION_CREATION_PERSIST_LOW_QUALITY" envDefault:"true"`
+	CreationMinConfidence     float64 `env:"MARKET_PREDICTION_CREATION_MIN_CONFIDENCE" envDefault:"0.55" validate:"gte=0,lte=1"`
+	CreationRequireSignal     bool    `env:"MARKET_PREDICTION_CREATION_REQUIRE_SIGNAL" envDefault:"true"`
+	CreationMinSummaryChars   int     `env:"MARKET_PREDICTION_CREATION_MIN_SUMMARY_CHARS" envDefault:"300" validate:"gte=0,lte=10000"`
 }
 
 // AIBudgetConfig wires the process-local AI budget governor (PART 5

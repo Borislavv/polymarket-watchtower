@@ -73,9 +73,18 @@ Recent Watchtower flow:
 Matched alerts:
 {{MATCHED_ALERTS}}
 
+Output rules:
+- Russian language.
+- 900–3000 characters.
+- Target length: 1800–2500 characters.
+- Dense, practical, no filler.
+- Do not repeat raw market fields already provided in the message.
+- Opinionated practical stance required.
+- If no edge, say it shortly.
+
 Return strict JSON (no markdown fences, no commentary outside JSON):
 {
-  "summary": "<Russian thesis body, 800–1800 chars, dense, no filler>",
+  "summary": "<Russian thesis body following the output rules above>",
   "side_bias": "bullish" | "bearish" | "neutral",
   "confidence": <0..1 decimal>,
   "risk_factors": "<2-4 short bullets joined by '\\n', operator-facing>"

@@ -66,7 +66,30 @@ type Config struct {
 	SendTelegram bool
 	Concurrency  int
 	Categories   []string // category whitelist (case-insensitive substring on category label)
-	Clock        func() time.Time
+
+	// --- v10.1 Telegram polish (PART 1/3/5/7) -----------------
+	// Annotations block (under AI thesis, above Links).
+	AnnotationsEnabled        bool
+	AnnotationsLimit          int
+	AnnotationsMaxTitleChars  int
+	AnnotationsMaxSourceNames int
+	// Links block (under annotations).
+	LinksEnabled   bool
+	PolymarketBase string // e.g. "https://polymarket.com"
+	GrafanaBaseURL string // empty → Grafana link elided
+	GrafanaDashUID string // dashboard uid for deep-linking
+	// Telegram throttling.
+	TelegramCooldown  time.Duration
+	MaxTelegramPerRun int
+	SendOnStartup     bool
+	// Quality gate.
+	SendNeutral       bool
+	PersistLowQuality bool
+	MinConfidence     float64
+	RequireSignal     bool
+	MinSummaryChars   int
+
+	Clock func() time.Time
 }
 
 func (c *Config) applyDefaults() {
@@ -96,6 +119,31 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.Categories) == 0 {
 		c.Categories = []string{"politics", "geopolitics", "elections"}
+	}
+	// v10.1 Telegram polish defaults.
+	if c.AnnotationsLimit <= 0 {
+		c.AnnotationsLimit = 5
+	}
+	if c.AnnotationsMaxTitleChars <= 0 {
+		c.AnnotationsMaxTitleChars = 160
+	}
+	if c.AnnotationsMaxSourceNames <= 0 {
+		c.AnnotationsMaxSourceNames = 3
+	}
+	if c.PolymarketBase == "" {
+		c.PolymarketBase = "https://polymarket.com"
+	}
+	if c.TelegramCooldown <= 0 {
+		c.TelegramCooldown = 6 * time.Hour
+	}
+	if c.MaxTelegramPerRun <= 0 {
+		c.MaxTelegramPerRun = 3
+	}
+	if c.MinConfidence < 0 {
+		c.MinConfidence = 0
+	}
+	if c.MinSummaryChars <= 0 {
+		c.MinSummaryChars = 300
 	}
 	if c.Clock == nil {
 		c.Clock = time.Now
@@ -178,6 +226,14 @@ type Worker struct {
 	tg          Telegram
 	met         *metrics.Metrics
 	log         *zerolog.Logger
+
+	// startupDone flips after the first Tick — gates the
+	// SendOnStartup=false suppression so subsequent cycles can send
+	// normally even when the very first cycle was muted.
+	tgMu          sync.Mutex
+	startupDone   bool
+	tgSentThisRun int                  // reset at the top of every Tick
+	lastTGSentAt  map[string]time.Time // event_slug → last send (per-event cooldown)
 }
 
 // Pre-flight cost estimates (USD) per AI stage. Conservative;
@@ -206,19 +262,20 @@ func New(
 ) *Worker {
 	cfg.applyDefaults()
 	return &Worker{
-		cfg:         cfg,
-		candidates:  candidates,
-		markets:     markets,
-		predictions: predictions,
-		pages:       pages,
-		catalysts:   catalysts,
-		flow:        flow,
-		repricing:   repricingComp,
-		ranker:      ranker,
-		creator:     creator,
-		tg:          tg,
-		met:         met,
-		log:         log,
+		cfg:          cfg,
+		candidates:   candidates,
+		markets:      markets,
+		predictions:  predictions,
+		pages:        pages,
+		catalysts:    catalysts,
+		flow:         flow,
+		repricing:    repricingComp,
+		ranker:       ranker,
+		creator:      creator,
+		tg:           tg,
+		met:          met,
+		log:          log,
+		lastTGSentAt: make(map[string]time.Time),
 	}
 }
 
@@ -259,6 +316,12 @@ type Summary struct {
 func (w *Worker) Tick(ctx context.Context) Summary {
 	start := w.cfg.Clock()
 	defer func() { w.observeLatency(time.Since(start)) }()
+	// Reset the per-run Telegram counter so MaxTelegramPerRun is an
+	// exact per-tick cap, not a cumulative-since-startup one.
+	w.resetPerRunCounter()
+	// Stamp startupDone AFTER the tick so the very first cycle's
+	// canSendTelegram() decisions see startupDone=false.
+	defer w.markStartupDone()
 	sum := Summary{Skipped: map[string]int{}}
 
 	// Per-day cap check FIRST — cheap; avoids any AI work when full.
@@ -385,17 +448,47 @@ func (w *Worker) collectCandidates(ctx context.Context) ([]analysis.PredictionCa
 	return out, nil
 }
 
-// filterDedupe drops candidates with an active prediction or with a
-// recent creation in the dedupe window. Updates sum.Skipped with the
-// reason buckets so the CLI can print them.
+// filterDedupe drops candidates that would create a redundant
+// prediction. The rules are deterministic and the worker logs every
+// skip with its reason code so the operator can audit cycles.
+//
+// Rules in priority order:
+//
+//  1. active_prediction — a prediction row already exists for this
+//     exact (event_slug, condition_id). The evolution worker will
+//     refresh it; we don't create a sibling.
+//  2. dedupe_window — the same event_slug had a prediction created
+//     within DedupeWindow (default 24h), regardless of condition_id
+//     or side_bias. Prevents spamming a single event with N
+//     predictions for N markets in one cycle.
+//
+// (1) is stricter than (2). The same event with a DIFFERENT
+// condition_id still trips (2) inside the window — by design, so
+// "Texas senate primary" doesn't yield 5 simultaneous predictions.
 func (w *Worker) filterDedupe(ctx context.Context, in []analysis.PredictionCandidate, sum *Summary) []analysis.PredictionCandidate {
 	out := make([]analysis.PredictionCandidate, 0, len(in))
 	cutoff := w.cfg.Clock().Add(-w.cfg.DedupeWindow)
+	seenEventSlugInCycle := map[string]bool{}
 	for _, c := range in {
 		// Active prediction exists?
 		_, err := w.predictions.GetPrediction(ctx, c.EventSlug, c.ConditionID)
 		if err == nil {
 			sum.Skipped["active_prediction"]++
+			w.observeDedupeSkipped("active_prediction")
+			if w.log != nil {
+				w.log.Debug().Str("event_slug", c.EventSlug).Str("condition_id", c.ConditionID).Msg("prediction creation: skipped_active_prediction")
+			}
+			continue
+		}
+		// Already shortlisted another condition under the same
+		// event in THIS cycle? Suppress so a multi-market event
+		// produces one prediction per dedupe window, not N.
+		if seenEventSlugInCycle[c.EventSlug] {
+			sum.Skipped["dedupe_same_event_cycle"]++
+			w.observeDedupeSkipped("dedupe_same_event_cycle")
+			if w.log != nil {
+				w.log.Debug().Str("event_slug", c.EventSlug).Msg("prediction creation: skipped_dedupe_same_event_cycle")
+			}
 			continue
 		}
 		// Recent creation for the same event?
@@ -403,12 +496,18 @@ func (w *Worker) filterDedupe(ctx context.Context, in []analysis.PredictionCandi
 		if err != nil {
 			// fail-open: counting failure should not block creation.
 			out = append(out, c)
+			seenEventSlugInCycle[c.EventSlug] = true
 			continue
 		}
 		if n > 0 {
 			sum.Skipped["dedupe_window"]++
+			w.observeDedupeSkipped("dedupe_window")
+			if w.log != nil {
+				w.log.Debug().Str("event_slug", c.EventSlug).Msg("prediction creation: skipped_dedupe_window")
+			}
 			continue
 		}
+		seenEventSlugInCycle[c.EventSlug] = true
 		out = append(out, c)
 	}
 	return out
@@ -532,6 +631,25 @@ func (w *Worker) createOne(ctx context.Context, pick analysis.PredictionRankingP
 	}
 	w.observeAI("creator_ok")
 
+	// --- Quality gate (PART 7) ----------------------------------
+	// The deterministic gate runs BEFORE persist so we can both
+	// (a) decide whether to persist at all (PersistLowQuality knob)
+	// and (b) make the Telegram-suppression decision visible in
+	// metrics. The gate is intentionally simple: confidence floor +
+	// neutral-skip + minimum-summary-length + at-least-one-signal.
+	qualityOK, gateReason := w.passesQuality(res, page, cats, flow, sig)
+	if !qualityOK {
+		w.observeQualityGate("low_" + gateReason)
+		if !w.cfg.PersistLowQuality {
+			if w.log != nil {
+				w.log.Info().Str("event_slug", cand.EventSlug).Str("reason", gateReason).Msg("prediction creation: quality gate skipped persist")
+			}
+			return "low_quality_skipped"
+		}
+	} else {
+		w.observeQualityGate("ok")
+	}
+
 	// Persist via UpsertPrediction. We INSERT as state="watching" so
 	// the next evolution tick runs Decide() and immediately picks
 	// the correct state (blocked / active_catalyst / etc).
@@ -566,35 +684,54 @@ func (w *Worker) createOne(ctx context.Context, pick analysis.PredictionRankingP
 	_ = w.predictions.TouchPredictionEvolution(ctx, id)
 
 	w.observeCreated(cand.Category)
-	if w.cfg.SendTelegram && w.tg != nil {
-		body := RenderCreationTelegram(CreationRenderInput{
-			EventSlug:   cand.EventSlug,
-			Question:    cand.Question,
-			Outcome:     cand.Outcome,
-			SideBias:    res.SideBias,
-			Confidence:  res.Confidence,
-			Summary:     res.Summary,
-			RiskFactors: res.RiskFactors,
-		})
-		// Safe-split on the 4000-char Telegram cap. Short bodies
-		// pass through unchanged; long bodies (catalyst-dense
-		// markets) are split on paragraph boundaries with HTML
-		// tag pairs preserved.
-		chunks := alerting.SafeSplitForTelegram(body)
-		anySent := false
-		for _, chunk := range chunks {
-			if _, err := w.tg.SendHTML(ctx, chunk); err != nil {
-				w.observeTelegram("failed")
-				if w.log != nil {
-					w.log.Warn().Err(err).Str("event_slug", cand.EventSlug).Msg("prediction creation: telegram send failed")
-				}
-				break
+
+	// --- Telegram gates (PART 5 throttling + PART 7 quality) ----
+	// The row is persisted at this point — the gates below only
+	// decide whether Telegram ships. A skipped send still returns
+	// "created" because the prediction itself exists; the Telegram
+	// outcome is tracked separately via the *_telegram_* metrics.
+	// Reasons NOT to ship:
+	//  * worker disabled / Telegram unwired.
+	//  * quality gate failed (regardless of PersistLowQuality).
+	//  * very first cycle and SendOnStartup=false.
+	//  * per-event cooldown still ticking.
+	//  * already shipped MaxTelegramPerRun in this cycle.
+	if !w.cfg.SendTelegram || w.tg == nil {
+		return "created"
+	}
+	if !qualityOK {
+		w.observeTelegramSkipped("low_quality")
+		w.logTelegramSkip(cand.EventSlug, "low_quality")
+		return "created"
+	}
+	if reason := w.canSendTelegram(cand.EventSlug); reason != "" {
+		w.observeTelegramSkipped(reason)
+		w.logTelegramSkip(cand.EventSlug, reason)
+		return "created"
+	}
+
+	body := RenderCreationTelegram(w.buildRenderInput(cand, res, page, 0))
+	// Safe-split on the 4000-char Telegram cap. Short bodies
+	// pass through unchanged; long bodies (catalyst-dense
+	// markets) are split on paragraph boundaries with HTML
+	// tag pairs preserved.
+	chunks := alerting.SafeSplitForTelegram(body)
+	w.observeMessageChunks("prediction_creation", len(chunks))
+	anySent := false
+	for _, chunk := range chunks {
+		if _, err := w.tg.SendHTML(ctx, chunk); err != nil {
+			w.observeTelegram("failed")
+			if w.log != nil {
+				w.log.Warn().Err(err).Str("event_slug", cand.EventSlug).Msg("prediction creation: telegram send failed")
 			}
-			anySent = true
+			break
 		}
-		if anySent {
-			w.observeTelegram("sent")
-		}
+		anySent = true
+	}
+	if anySent {
+		w.observeTelegram("sent")
+		w.observeTelegramSent()
+		w.markTelegramSent(cand.EventSlug)
 	}
 	return "created"
 }

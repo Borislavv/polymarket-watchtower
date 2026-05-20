@@ -203,6 +203,18 @@ func mkWorker(t *testing.T, cfg Config, store *fakePredictionStore, ranker *fake
 	cfg.Enabled = true
 	cfg.AIEnabled = true
 	cfg.Clock = func() time.Time { return time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC) }
+	// Default the quality gate to "pass" so legacy tests that
+	// don't exercise the gate continue to assert their narrow
+	// invariants. PART 7's gate-specific tests override these.
+	if cfg.MinConfidence == 0 {
+		cfg.MinConfidence = 0
+	}
+	cfg.MinSummaryChars = 1
+	cfg.PersistLowQuality = true
+	if cfg.MaxTelegramPerRun == 0 {
+		cfg.MaxTelegramPerRun = 100 // large default for legacy tests
+	}
+	cfg.SendOnStartup = true // legacy tests assert against the immediate tick
 	w := New(cfg, mkCandidates(), mkMarkets(), store, &fakePages{}, &fakeCats{}, &fakeFlow{}, fakeRepricing{}, ranker, creator, tg, nil, nil)
 	if budget != nil {
 		w.SetBudget(budget)

@@ -179,8 +179,6 @@ Flow выглядит как:
 
 ФОРМАТ ОТВЕТА:
 
-AI analysis
-
 • Fresh context:
 • Trend status:
 • Market reaction:
