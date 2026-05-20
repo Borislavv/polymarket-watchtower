@@ -657,6 +657,17 @@ type PredictionConfig struct {
 	CreationMinConfidence     float64 `env:"MARKET_PREDICTION_CREATION_MIN_CONFIDENCE" envDefault:"0.55" validate:"gte=0,lte=1"`
 	CreationRequireSignal     bool    `env:"MARKET_PREDICTION_CREATION_REQUIRE_SIGNAL" envDefault:"true"`
 	CreationMinSummaryChars   int     `env:"MARKET_PREDICTION_CREATION_MIN_SUMMARY_CHARS" envDefault:"300" validate:"gte=0,lte=10000"`
+
+	// --- v10.2 usefulness scoring (PART 3) ------------------------
+	UsefulnessEnabled      bool    `env:"PREDICTION_USEFULNESS_ENABLED" envDefault:"true"`
+	UsefulnessMinTelegram  float64 `env:"PREDICTION_USEFULNESS_MIN_TELEGRAM_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
+	UsefulnessHighPriority float64 `env:"PREDICTION_USEFULNESS_HIGH_PRIORITY_SCORE" envDefault:"0.80" validate:"gte=0,lte=1"`
+
+	// --- v10.2 feedback worker (PART 4) ---------------------------
+	FeedbackEnabled     bool          `env:"PREDICTION_FEEDBACK_ENABLED" envDefault:"true"`
+	FeedbackInterval    time.Duration `env:"PREDICTION_FEEDBACK_INTERVAL" envDefault:"15m" validate:"gt=0"`
+	FeedbackHorizonsCSV string        `env:"PREDICTION_FEEDBACK_HORIZONS" envDefault:"1h,6h,24h"`
+	FeedbackBatchSize   int           `env:"PREDICTION_FEEDBACK_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
 }
 
 // AIBudgetConfig wires the process-local AI budget governor (PART 5

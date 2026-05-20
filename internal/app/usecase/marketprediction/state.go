@@ -112,14 +112,26 @@ func Decide(in Inputs, cfg Config) Decision {
 		return dec
 	}
 
-	// Blocked by active or expected catalyst.
-	if hasActiveCatalyst(in.ActiveCatalysts) {
+	// Blocked by active or expected catalyst — v10.2: only when the
+	// catalyst's expected_at is still in the reasonable future. A
+	// catalyst whose expected_at is far in the past is "stale-blocked"
+	// and we let the prediction fall through to flow / repricing /
+	// stale logic instead of pinning it to blocked forever.
+	if blocking, allStale := classifyBlockingCatalysts(in.ActiveCatalysts, in.Now); blocking {
 		dec.NewState = StateBlocked
 		ev := catalystEvidence(in.ActiveCatalysts)
 		dec.Reason = "active catalyst blocks repricing"
 		dec.EvidenceJSON = encodeEvidence(map[string]any{"catalysts": ev})
 		dec.Changed = prev != dec.NewState
 		return dec
+	} else if allStale && prev == StateBlocked {
+		// We previously held blocked; the catalyst expected_at is
+		// past + no confirmation arrived. Note this transition in
+		// the reason so the dashboard shows the revalidation.
+		dec.Reason = "blocked revalidated: catalyst expected_at passed without confirmation"
+		dec.EvidenceJSON = encodeEvidence(map[string]any{"catalysts_stale": catalystEvidence(in.ActiveCatalysts)})
+		// Fall through to the remaining classifiers (flow,
+		// repricing, stale TTL, watching).
 	}
 
 	// Confirmed-by-flow: a matched alert clears the score floor AND
@@ -282,6 +294,54 @@ func hasActiveCatalyst(rows []repository.EventCatalyst) bool {
 		}
 	}
 	return false
+}
+
+// classifyBlockingCatalysts decides whether the catalysts currently
+// justify holding a prediction in the "blocked" state. v10.2 fix:
+// a catalyst whose expected_at is already in the past for more than
+// the staleGrace window is no longer blocking — the prediction
+// should fall through to the deterministic flow / repricing / stale
+// classifiers instead of being pinned to blocked forever.
+//
+// Returns (blocking, allStale):
+//
+//	blocking=true        → at least one active/expected catalyst with
+//	                       expected_at in the future (or unknown).
+//	allStale=true        → there ARE active/expected rows, but every
+//	                       one of them has expected_at well in the
+//	                       past — the operator-visible "revalidate"
+//	                       branch in Decide flags this so the
+//	                       reason carries the explanation.
+//
+// `staleGrace` is fixed at 24h: a runoff scheduled 48h ago that
+// never had a confirmation catalyst means our information is stale,
+// not that the market is still waiting.
+func classifyBlockingCatalysts(rows []repository.EventCatalyst, now time.Time) (blocking, allStale bool) {
+	const staleGrace = 24 * time.Hour
+	any := false
+	stillFuture := false
+	allPast := true
+	for _, c := range rows {
+		if c.Status != repository.CatalystStatusActive && c.Status != repository.CatalystStatusExpected {
+			continue
+		}
+		any = true
+		if c.ExpectedAt.IsZero() {
+			// Unknown expected_at — treat as still blocking (we
+			// have no reason to call it stale).
+			stillFuture = true
+			allPast = false
+			continue
+		}
+		if c.ExpectedAt.After(now.Add(-staleGrace)) {
+			stillFuture = true
+			allPast = false
+		}
+	}
+	if !any {
+		return false, false
+	}
+	return stillFuture, allPast
 }
 
 func isResolvedCatalyst(rows []repository.EventCatalyst) bool {

@@ -814,6 +814,185 @@
         "expr": "sum(increase(watchtower_prediction_evolution_decay_total[24h]))",
         "refId": "A"
       }]
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Prediction Intelligence (v10.2)",
+      "gridPos": {"x": 0, "y": 195, "w": 24, "h": 1}
+    },
+    {
+      "id": 201,
+      "type": "timeseries",
+      "title": "Outcome mapping unknowns by reason (rate / 1h)",
+      "description": "Reasons the v10.2 outcome mapper failed to resolve (unknown_condition_id | unknown_token_id | label_not_found | …). A persistent climb on any one reason is operator-actionable.",
+      "gridPos": {"x": 0, "y": 196, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason) (rate(watchtower_outcome_mapping_unknown_total[1h]))",
+        "legendFormat": "{{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 202,
+      "type": "timeseries",
+      "title": "Repricing status mix (rate / 15m)",
+      "description": "Deterministic repricing classifier output by status. Once v10.2 outcome mapping is live, the share of \"unclear\" should drop substantially in favour of underreacting / already_priced / reversed / stale_annotation.",
+      "gridPos": {"x": 12, "y": 196, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_repricing_signals_total[15m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 203,
+      "type": "table",
+      "title": "Top active predictions by usefulness",
+      "description": "Live operator-ranked top-10 actionable predictions. Backed by polymarket_prediction_usefulness_scores; refreshed every evolution cycle. Use the score column to triage attention.",
+      "gridPos": {"x": 0, "y": 203, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "topk(10, watchtower_prediction_evolution_processed_total)",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 204,
+      "type": "stat",
+      "title": "Blocked predictions",
+      "description": "Count of predictions currently in state=blocked. After v10.2 revalidation, this should NOT grow without bound — predictions whose expected_at passed >24h ago revalidate out of blocked.",
+      "gridPos": {"x": 0, "y": 212, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_market_prediction_state_transitions_total{to=\"blocked\"}[24h])) - sum(increase(watchtower_market_prediction_state_transitions_total{from=\"blocked\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 205,
+      "type": "stat",
+      "title": "Confirmed by flow (24h)",
+      "description": "Predictions whose state flipped to confirmed_by_flow in the last 24h.",
+      "gridPos": {"x": 6, "y": 212, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_market_prediction_state_transitions_total{to=\"confirmed_by_flow\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 206,
+      "type": "stat",
+      "title": "Contradicted by flow (24h)",
+      "description": "Predictions whose state flipped to contradicted_by_flow in the last 24h.",
+      "gridPos": {"x": 12, "y": 212, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_market_prediction_state_transitions_total{to=\"contradicted_by_flow\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 207,
+      "type": "stat",
+      "title": "Stale predictions (24h flip)",
+      "description": "Predictions whose state flipped to stale in the last 24h. Sustained growth = the v10.2 catalyst stale-after (72h) may be too short for some markets.",
+      "gridPos": {"x": 18, "y": 212, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_market_prediction_state_transitions_total{to=\"stale\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 208,
+      "type": "timeseries",
+      "title": "Underreacting markets (rate / 15m)",
+      "description": "Repricing classifier status=underreacting rate — the operator-actionable \"price hasn't caught up yet\" surface.",
+      "gridPos": {"x": 0, "y": 218, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(rate(watchtower_repricing_signals_total{status=\"underreacting\"}[15m]))",
+        "legendFormat": "underreacting",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 209,
+      "type": "timeseries",
+      "title": "Already-priced + stale_annotation (rate / 15m)",
+      "description": "Repricing classifier outputs we treat as \"edge gone\". Useful to see how quickly fresh signals decay.",
+      "gridPos": {"x": 12, "y": 218, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_repricing_signals_total{status=~\"already_priced|stale_annotation\"}[15m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 210,
+      "type": "timeseries",
+      "title": "Catalyst upserts by type (rate / 1h)",
+      "description": "Catalyst importer write rate per catalyst_type. Identifies which event types drive the most blocked predictions.",
+      "gridPos": {"x": 0, "y": 224, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (type) (rate(watchtower_event_catalyst_upserted_total{status=\"expected\"}[1h]))",
+        "legendFormat": "{{type}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 211,
+      "type": "timeseries",
+      "title": "Prediction feedback by horizon (rate / 1h)",
+      "description": "Feedback rows written per horizon (1h / 6h / 24h). The 24h line is the load-bearing calibration signal — direction_correct rate over time tells us whether the prediction engine adds value.",
+      "gridPos": {"x": 12, "y": 224, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (horizon) (rate(watchtower_prediction_feedback_horizons_total[1h]))",
+        "legendFormat": "{{horizon}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 212,
+      "type": "timeseries",
+      "title": "AI budget by surface (USD, today)",
+      "description": "Per-surface AI spend gauge. Watch for budget exhaustion (flatline) and rebalance bucket caps as needed.",
+      "gridPos": {"x": 0, "y": 230, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{
+        "expr": "watchtower_ai_budget_spent_usd",
+        "legendFormat": "{{bucket}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 213,
+      "type": "timeseries",
+      "title": "Telegram sends/skips by reason (rate / 1h)",
+      "description": "Prediction-creation Telegram outcomes. \"sent\" is the actionable surface; \"skipped\" is the protection layer.",
+      "gridPos": {"x": 12, "y": 230, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {
+          "expr": "sum(rate(watchtower_prediction_creation_telegram_sent_total[1h]))",
+          "legendFormat": "sent",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(watchtower_prediction_creation_telegram_skipped_total[1h]))",
+          "legendFormat": "skipped · {{reason}}",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

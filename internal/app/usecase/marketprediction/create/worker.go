@@ -44,6 +44,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventflow"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionusefulness"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
@@ -586,7 +587,12 @@ func (w *Worker) createOne(ctx context.Context, pick analysis.PredictionRankingP
 	var sig *repricing.Signal
 	if w.repricing != nil && len(page.Annotations) > 0 {
 		newest := newestAnnotation(page.Annotations)
-		s, err := w.repricing.Compute(ctx, repricing.AnnotationInput{
+		// v10.2: outcome mapping fills CurrentPrice from the right
+		// outcome leg (Yes/No / candidate). Without this the
+		// classifier defaults to "unclear" on most multi-candidate
+		// events.
+		mapper := repricing.MapperFromMarkets(page.Markets)
+		in := repricing.AnnotationInput{
 			EventSlug:      cand.EventSlug,
 			ConditionID:    cand.ConditionID,
 			Outcome:        newest.Outcome,
@@ -596,8 +602,9 @@ func (w *Worker) createOne(ctx context.Context, pick analysis.PredictionRankingP
 			PriceBefore:    newest.PriceBefore,
 			PriceAfter:     newest.PriceAfter,
 			PriceChange:    newest.PriceChange,
-			CurrentPrice:   currentPriceFor(page, cand.ConditionID),
-		}, false /* persist=false; the creation pass is a one-shot read */)
+		}
+		repricing.FillFromMapping(&in, mapper, cand.EventSlug, cand.ConditionID, newest.Outcome)
+		s, err := w.repricing.Compute(ctx, in, false /* persist=false; one-shot read */)
 		if err == nil {
 			sig = &s
 		}
@@ -710,7 +717,30 @@ func (w *Worker) createOne(ctx context.Context, pick analysis.PredictionRankingP
 		return "created"
 	}
 
-	body := RenderCreationTelegram(w.buildRenderInput(cand, res, page, 0))
+	// v10.2: compute the deterministic usefulness score so the
+	// Telegram body's "Prediction quality" section can rank
+	// operator attention. Failure to compute is fine — the section
+	// elides per-row.
+	useful := predictionusefulness.Compute(predictionusefulness.Inputs{
+		Prediction:          repository.MarketPrediction{Confidence: res.Confidence, CurrentState: marketprediction.StateWatching},
+		Repricing:           sig,
+		Flow:                flow,
+		HasRecentAnnotation: len(page.Annotations) > 0,
+		AnnotationCount:     len(page.Annotations),
+		EventLastTradePrice: cand.LastTradePrice,
+		Now:                 w.cfg.Clock,
+	})
+	repricingStatus := ""
+	if sig != nil {
+		repricingStatus = sig.RepricingStatus
+	}
+	flowSummary := ""
+	if flow.StrongestSide != "" {
+		flowSummary = "strongest=" + flow.StrongestSide
+	}
+	renderInput := w.buildRenderInput(cand, res, page, 0)
+	fillQualitySection(&renderInput, useful.Score, useful.Reason, marketprediction.StateWatching, repricingStatus, flowSummary)
+	body := RenderCreationTelegram(renderInput)
 	// Safe-split on the 4000-char Telegram cap. Short bodies
 	// pass through unchanged; long bodies (catalyst-dense
 	// markets) are split on paragraph boundaries with HTML

@@ -43,6 +43,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionfeedback"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
@@ -101,6 +102,7 @@ type App struct {
 	dailyIntel        *dailypoliticalintel.Worker
 	predictionEvolver *evolution.Worker
 	predictionCreator *create.Worker
+	predictionFeedbk  *predictionfeedback.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -1101,6 +1103,34 @@ func New() (*App, error) {
 	if catalystImporterWorker != nil {
 		catalystImporterWorker.SetBudget(aiBudget)
 	}
+	// v10.2: usefulness scoring is persisted via the new
+	// PredictionIntelligenceRepository. The evolver writes a fresh
+	// score row at the end of every per-prediction cycle.
+	if evolutionWorker != nil && cfg.Postgres.Enabled() {
+		evolutionWorker.SetUsefulness(repository.NewPredictionIntelligenceRepository(pgPool))
+	}
+
+	// v10.2 prediction feedback worker.
+	var predictionFeedback *predictionfeedback.Worker
+	if cfg.Postgres.Enabled() && cfg.Prediction.FeedbackEnabled && marketsRepo != nil {
+		horizons := parseHorizonsCSV(cfg.Prediction.FeedbackHorizonsCSV)
+		intelRepo := repository.NewPredictionIntelligenceRepository(pgPool)
+		eventPageRepo := repository.NewEventPageRepository(pgPool)
+		predictionFeedback = predictionfeedback.New(
+			predictionfeedback.Config{
+				Enabled:   cfg.Prediction.FeedbackEnabled,
+				Interval:  cfg.Prediction.FeedbackInterval,
+				Horizons:  horizons,
+				BatchSize: cfg.Prediction.FeedbackBatchSize,
+			},
+			intelRepo, marketsRepo, eventPageRepo, tradesRepo, met, logger,
+		)
+		logger.Info().
+			Bool("enabled", cfg.Prediction.FeedbackEnabled).
+			Dur("interval", cfg.Prediction.FeedbackInterval).
+			Int("horizons", len(horizons)).
+			Msg("prediction feedback: wired")
+	}
 
 	// v10.0 Prediction Creation Worker (cold-start path). Without
 	// this loop, the evolution worker has nothing to evolve.
@@ -1215,6 +1245,7 @@ func New() (*App, error) {
 		dailyIntel:        dailyIntelWorker,
 		predictionEvolver: evolutionWorker,
 		predictionCreator: predictionCreator,
+		predictionFeedbk:  predictionFeedback,
 		pgPool:            pgPool,
 	}, nil
 }
@@ -1252,6 +1283,23 @@ type dailyIntelTelegramAdapter struct {
 func (a dailyIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (dailypoliticalintel.TelegramResult, error) {
 	res, err := a.bot.SendHTML(ctx, chatID, text)
 	return dailypoliticalintel.TelegramResult{MessageID: res.MessageID}, err
+}
+
+// parseHorizonsCSV converts "1h,6h,24h" into []time.Duration. Bad
+// entries are silently dropped; an empty list falls back to the
+// worker's default at construction time.
+func parseHorizonsCSV(s string) []time.Duration {
+	var out []time.Duration
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if d, err := time.ParseDuration(p); err == nil {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // splitCSV trims and splits a comma-separated env value. Empty
@@ -1581,6 +1629,12 @@ func (a *App) Run() error {
 	if a.predictionCreator != nil {
 		execs = append(execs, shutdown2.Exec{Name: "prediction-creation", Fn: func(ctx context.Context) error {
 			a.predictionCreator.Run(ctx)
+			return nil
+		}})
+	}
+	if a.predictionFeedbk != nil {
+		execs = append(execs, shutdown2.Exec{Name: "prediction-feedback", Fn: func(ctx context.Context) error {
+			a.predictionFeedbk.Run(ctx)
 			return nil
 		}})
 	}

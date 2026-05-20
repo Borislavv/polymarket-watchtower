@@ -191,6 +191,18 @@ type CreationRenderInput struct {
 	PolymarketMarketURL string
 	GrafanaURL          string
 	TraderURL           string
+
+	// --- v10.2 Prediction quality section (PART 9) -------------------
+	// Optional compact block below the AI thesis. All fields elide
+	// when zero/empty. UsefulnessScore is the deterministic 0..1
+	// produced by the predictionusefulness package; UsefulnessReason
+	// is its stable short string. Repricing / Flow / State carry the
+	// current operator-facing classifier outputs.
+	UsefulnessScore  float64
+	UsefulnessReason string
+	State            string
+	RepricingStatus  string
+	FlowSummary      string
 }
 
 // RenderCreationTelegram builds the HTML body used by the
@@ -224,6 +236,11 @@ func RenderCreationTelegram(in CreationRenderInput) string {
 	if r := strings.TrimSpace(in.RiskFactors); r != "" {
 		b.WriteString("\n<b>Risk factors</b>\n")
 		b.WriteString(html.EscapeString(r))
+		b.WriteString("\n")
+	}
+	if quality := renderPredictionQualityBlock(in); quality != "" {
+		b.WriteString("\n")
+		b.WriteString(quality)
 		b.WriteString("\n")
 	}
 	if in.MatchedAlertCount > 0 {
@@ -286,6 +303,39 @@ func renderAnnotationsTelegramBlock(rows []repository.EventAnnotation, maxTitleC
 		if names := decodeSourceNames(a.SourcesJSON, maxSourceNames); len(names) > 0 {
 			fmt.Fprintf(&b, "   sources: %s\n", html.EscapeString(strings.Join(names, ", ")))
 		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderPredictionQualityBlock builds the v10.2 compact "Prediction
+// quality" section. Each row elides individually so a minimal
+// prediction with no usefulness/state/etc doesn't ship orphan
+// bullets. The block itself elides when every row is empty.
+func renderPredictionQualityBlock(in CreationRenderInput) string {
+	bullets := make([]string, 0, 5)
+	if in.UsefulnessScore > 0 {
+		bullets = append(bullets, fmt.Sprintf("• usefulness: %.2f", in.UsefulnessScore))
+	}
+	if r := strings.TrimSpace(in.UsefulnessReason); r != "" {
+		bullets = append(bullets, "• reason: "+html.EscapeString(r))
+	}
+	if s := strings.TrimSpace(in.State); s != "" {
+		bullets = append(bullets, "• state: "+html.EscapeString(s))
+	}
+	if s := strings.TrimSpace(in.RepricingStatus); s != "" {
+		bullets = append(bullets, "• repricing: "+html.EscapeString(s))
+	}
+	if s := strings.TrimSpace(in.FlowSummary); s != "" {
+		bullets = append(bullets, "• flow: "+html.EscapeString(s))
+	}
+	if len(bullets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<b>Prediction quality</b>\n")
+	for _, line := range bullets {
+		b.WriteString(line)
+		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

@@ -41,6 +41,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventflow"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionusefulness"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
@@ -169,6 +170,12 @@ type BudgetGuard interface {
 	Charge(bucket string, actualCost float64)
 }
 
+// UsefulnessStore is the v10.2 seam to
+// PredictionIntelligenceRepository. nil = feature disabled.
+type UsefulnessStore interface {
+	UpsertUsefulnessScore(ctx context.Context, in repository.UsefulnessScoreInput) (int64, error)
+}
+
 // Worker is the long-running evolution loop.
 type Worker struct {
 	cfg         Config
@@ -180,8 +187,15 @@ type Worker struct {
 	aiGenerator analysis.PredictionEvolutionGenerator
 	budget      BudgetGuard
 	tg          Telegram
+	usefulness  UsefulnessStore
 	metrics     *metrics.Metrics
 	log         *zerolog.Logger
+
+	// v10.2 cached score per prediction so the EvolutionResult and
+	// Telegram render can show usefulness without an extra round
+	// trip. Restart-resets are acceptable.
+	usefulMu       sync.Mutex
+	lastUsefulness map[int64]float64
 
 	// lastTelegramAt tracks per-prediction cooldown so a flapping
 	// state doesn't spam Telegram. In-memory; restart resets — a
@@ -223,8 +237,14 @@ func New(
 		metrics:        met,
 		log:            log,
 		lastTelegramAt: map[int64]time.Time{},
+		lastUsefulness: map[int64]float64{},
 	}
 }
+
+// SetUsefulness attaches the usefulness scorer's persistence seam.
+// nil = feature disabled (score row is not written; the EvolutionResult
+// will report Score=0).
+func (w *Worker) SetUsefulness(s UsefulnessStore) { w.usefulness = s }
 
 // SetBudget attaches the global AI budget guard. nil is allowed
 // (fail-open). Called once at startup from app.go.
@@ -339,7 +359,8 @@ type EvolutionResult struct {
 	AISkipReason    string
 	DecayApplied    bool
 	TelegramSent    bool
-	Status          string // ok / failed / skipped
+	UsefulnessScore float64 // v10.2; 0 when scorer disabled
+	Status          string  // ok / failed / skipped
 	Error           error
 }
 
@@ -392,16 +413,12 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 		}
 	}
 	if newestAnn != nil {
-		var current *float64
-		// Use the market's latest reference price from the event-page
-		// snapshot for the matching condition_id.
-		for _, m := range pageSummary.Markets {
-			if m.ConditionID == pred.ConditionID && m.LastTradePrice != nil {
-				current = m.LastTradePrice
-				break
-			}
-		}
-		sig, _ := w.repricing.Compute(ctx, repricing.AnnotationInput{
+		// v10.2: use the outcome mapper to resolve CurrentPrice from
+		// the right outcome (Yes/No / candidate name) — avoids the
+		// v10.0 bug where repricing collapsed to "unclear" because
+		// LastTradePrice on the market row was nil/wrong-leg.
+		mapper := repricing.MapperFromMarkets(pageSummary.Markets)
+		in := repricing.AnnotationInput{
 			EventSlug:      pred.EventSlug,
 			ConditionID:    pred.ConditionID,
 			Outcome:        pred.Outcome,
@@ -411,8 +428,9 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 			PriceBefore:    newestAnn.PriceBefore,
 			PriceAfter:     newestAnn.PriceAfter,
 			PriceChange:    newestAnn.PriceChange,
-			CurrentPrice:   current,
-		}, !dryRun)
+		}
+		repricing.FillFromMapping(&in, mapper, pred.EventSlug, pred.ConditionID, newestAnn.Outcome)
+		sig, _ := w.repricing.Compute(ctx, in, !dryRun)
 		topSignal = &sig
 		res.RepricingStatus = sig.RepricingStatus
 	}
@@ -552,7 +570,81 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 			w.log.Warn().Err(err).Int64("id", pred.ID).Msg("prediction evolution: touch failed")
 		}
 	}
+
+	// 12. v10.2 usefulness score — deterministic; failure NEVER
+	// blocks the rest of the cycle.
+	if !dryRun && w.usefulness != nil {
+		w.scoreAndPersistUsefulness(ctx, pred, dec, cats, topSignal, flowSum, matches, pageSummary)
+	}
+	res.UsefulnessScore = w.lastUsefulnessFor(pred.ID)
 	return res
+}
+
+// scoreAndPersistUsefulness composes the predictionusefulness.Inputs
+// from the work already done above and writes the live score row.
+// Reads through w.usefulness which may be nil in tests.
+func (w *Worker) scoreAndPersistUsefulness(
+	ctx context.Context,
+	pred repository.MarketPrediction,
+	dec marketprediction.Decision,
+	cats []repository.EventCatalyst,
+	sig *repricing.Signal,
+	flow eventflow.EventFlowSummary,
+	matches []marketprediction.MatchedAlert,
+	page eventpagecontext.Summary,
+) {
+	score := predictionusefulness.Compute(predictionusefulness.Inputs{
+		Prediction:          pred,
+		Catalysts:           cats,
+		Repricing:           sig,
+		Flow:                flow,
+		MatchedAlerts:       len(matches),
+		AnnotationCount:     len(page.Annotations),
+		HasRecentAnnotation: hasRecentAnnotation(page.Annotations, w.cfg.Clock()),
+		LifecycleEndDate:    page.Event.EndDate,
+		EventLastTradePrice: leadingPrice(page),
+		Now:                 w.cfg.Clock,
+	})
+	_, err := w.usefulness.UpsertUsefulnessScore(ctx, repository.UsefulnessScoreInput{
+		PredictionID:   pred.ID,
+		Score:          score.Score,
+		ComponentsJSON: score.MarshalComponents(),
+		Reason:         score.Reason,
+	})
+	if err != nil && w.log != nil {
+		w.log.Warn().Err(err).Int64("id", pred.ID).Msg("prediction evolution: usefulness upsert failed")
+	}
+	// Cache the score so the EvolutionResult can carry it back to
+	// the CLI / Telegram render without a round-trip to Postgres.
+	w.usefulMu.Lock()
+	w.lastUsefulness[pred.ID] = score.Score
+	w.usefulMu.Unlock()
+	_ = dec
+}
+
+func (w *Worker) lastUsefulnessFor(id int64) float64 {
+	w.usefulMu.Lock()
+	defer w.usefulMu.Unlock()
+	return w.lastUsefulness[id]
+}
+
+func hasRecentAnnotation(rows []repository.EventAnnotation, now time.Time) bool {
+	cutoff := now.Add(-24 * time.Hour)
+	for _, a := range rows {
+		if a.Timestamp.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+func leadingPrice(page eventpagecontext.Summary) float64 {
+	for _, m := range page.Markets {
+		if m.LastTradePrice != nil {
+			return *m.LastTradePrice
+		}
+	}
+	return 0
 }
 
 // scoreMatches replays the flow summary's TopAlerts through the

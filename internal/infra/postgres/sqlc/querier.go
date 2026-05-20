@@ -93,6 +93,7 @@ type Querier interface {
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
 	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (PolymarketMarketPredictions, error)
+	GetPredictionUsefulnessScore(ctx context.Context, predictionID int64) (GetPredictionUsefulnessScoreRow, error)
 	// Reverse of GetTraderByWallet — used by the detection worker to
 	// resolve a trader_id back to its wallet string when rebuilding a
 	// trade.Trade from polymarket_trades.
@@ -202,6 +203,10 @@ type Querier interface {
 	ListEventTopAlerts(ctx context.Context, arg ListEventTopAlertsParams) ([]ListEventTopAlertsRow, error)
 	// Top N trades by notional for one event in the lookback window.
 	ListEventTopTrades(ctx context.Context, arg ListEventTopTradesParams) ([]ListEventTopTradesRow, error)
+	// Reports which horizons already have a feedback row for the given
+	// prediction. The worker subtracts this set from the configured
+	// horizons list to find the work it still owes.
+	ListHorizonsRecorded(ctx context.Context, predictionID int64) ([]string, error)
 	// Active markets whose lifecycle progress has crossed the supplied
 	// threshold AND haven't been soft-deleted/purged. Returns enough
 	// context for the stable-favorite worker to build inputs without a
@@ -230,6 +235,10 @@ type Querier interface {
 	// already_priced) so the most operationally relevant predictions
 	// get the cycle's compute budget first.
 	ListPredictionsForEvolution(ctx context.Context, arg ListPredictionsForEvolutionParams) ([]ListPredictionsForEvolutionRow, error)
+	// Selection query for the feedback worker. Returns active predictions
+	// older than the smallest horizon, paired with whichever horizon
+	// rows are missing. The worker filters per-horizon afterwards.
+	ListPredictionsForFeedback(ctx context.Context, arg ListPredictionsForFeedbackParams) ([]ListPredictionsForFeedbackRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	ListRepricingSignalsForEvent(ctx context.Context, arg ListRepricingSignalsForEventParams) ([]PolymarketRepricingSignals, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
@@ -259,6 +268,8 @@ type Querier interface {
 	// a market that has resumed flips back via UpsertMarket; one that is
 	// still gone gets stamped purged_at.
 	ListSoftDeletedForPurge(ctx context.Context, arg ListSoftDeletedForPurgeParams) ([]PolymarketMarkets, error)
+	// Operator-ranked top-N for the Grafana panel + future Telegram digests.
+	ListTopUsefulnessScores(ctx context.Context, limitCount int32) ([]ListTopUsefulnessScoresRow, error)
 	// Used by the BackfillWorker to verify which fetched trade dedup_keys are
 	// already persisted (defence in depth on top of ON CONFLICT DO NOTHING).
 	ListTradesForBackfillPage(ctx context.Context, arg ListTradesForBackfillPageParams) ([]string, error)
@@ -483,6 +494,12 @@ type Querier interface {
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error)
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
 	UpsertMarketPrediction(ctx context.Context, arg UpsertMarketPredictionParams) (int64, error)
+	// One row per (prediction_id, horizon). Re-runs with the same key
+	// update the prior measurement (the worker may revise as more
+	// trades land).
+	UpsertPredictionFeedback(ctx context.Context, arg UpsertPredictionFeedbackParams) error
+	// Single live score per prediction; insert-or-replace.
+	UpsertPredictionUsefulnessScore(ctx context.Context, arg UpsertPredictionUsefulnessScoreParams) (int64, error)
 	UpsertRepricingSignal(ctx context.Context, arg UpsertRepricingSignalParams) error
 	// Insert a trader by wallet address; on conflict bump last_seen_at.
 	UpsertTrader(ctx context.Context, walletAddress string) (PolymarketTraders, error)

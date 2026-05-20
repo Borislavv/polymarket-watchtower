@@ -330,8 +330,10 @@ func TestPromptBuilder_TitleAndReasonsAppear(t *testing.T) {
 		"Future catalysts:",
 		"External news/web context:",
 		// Load-bearing output bullets the Telegram renderer + the
-		// operator depend on.
-		"AI analysis",
+		// operator depend on. The legacy "AI analysis" header was
+		// removed from the prompt in commit 5816abd ("feat: resolved
+		// AI analisis."); the bullet labels below are what the
+		// downstream Telegram renderer actually keys on.
 		"Trend status:",
 		"Flow quality:",
 		"Catalyst status:",

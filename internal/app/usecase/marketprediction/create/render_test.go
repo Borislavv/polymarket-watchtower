@@ -158,6 +158,36 @@ func TestRenderCreation_BodySplitKeepsHTMLValid(t *testing.T) {
 	}
 }
 
+// TestRenderCreation_PredictionQualityBlock pins the v10.2 compact
+// quality section: bullets appear when populated and elide when
+// empty. The block elides entirely when no row carries data.
+func TestRenderCreation_PredictionQualityBlock(t *testing.T) {
+	full := RenderCreationTelegram(CreationRenderInput{
+		EventSlug:        "tx",
+		Summary:          "thesis body",
+		UsefulnessScore:  0.74,
+		UsefulnessReason: "actionable; catalyst present; repricing actionable",
+		State:            "watching",
+		RepricingStatus:  "underreacting",
+		FlowSummary:      "strongest=BUY",
+	})
+	for _, want := range []string{
+		"<b>Prediction quality</b>",
+		"• usefulness: 0.74",
+		"• state: watching",
+		"• repricing: underreacting",
+		"• flow: strongest=BUY",
+	} {
+		if !strings.Contains(full, want) {
+			t.Errorf("missing %q in body:\n%s", want, full)
+		}
+	}
+	empty := RenderCreationTelegram(CreationRenderInput{EventSlug: "tx", Summary: "x"})
+	if strings.Contains(empty, "Prediction quality") {
+		t.Errorf("empty quality section should elide; body=%q", empty)
+	}
+}
+
 // snippet keeps test output legible when assertions fail on long bodies.
 func snippet(s string) string {
 	if len(s) <= 240 {

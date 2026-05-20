@@ -148,6 +148,18 @@ func (w *Worker) buildRenderInput(
 	return in
 }
 
+// fillQualitySection layers the v10.2 "Prediction quality" data on
+// top of a render input. Called from createOne AFTER the
+// deterministic context (sig, flow) is already in hand. Empty
+// fields simply elide their bullet at render time.
+func fillQualitySection(in *CreationRenderInput, useful float64, usefulReason, state, repricing, flow string) {
+	in.UsefulnessScore = useful
+	in.UsefulnessReason = usefulReason
+	in.State = state
+	in.RepricingStatus = repricing
+	in.FlowSummary = flow
+}
+
 // buildPolymarketEventURL returns the canonical /event/<slug> URL.
 // Empty input → empty (the sanitizer at render time drops it).
 func (w *Worker) buildPolymarketEventURL(eventSlug string) string {

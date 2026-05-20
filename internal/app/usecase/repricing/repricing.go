@@ -41,12 +41,14 @@ const (
 	FlowTimingNoFlow    = "no_flow"
 	FlowTimingUnknown   = "unknown"
 
-	StatusUnderreacting  = "underreacting"
-	StatusOverreacting   = "overreacting"
-	StatusAlreadyPriced  = "already_priced"
-	StatusStillRepricing = "still_repricing"
-	StatusReversed       = "reversed"
-	StatusUnclear        = "unclear"
+	StatusUnderreacting         = "underreacting"
+	StatusOverreacting          = "overreacting"
+	StatusAlreadyPriced         = "already_priced"
+	StatusStillRepricing        = "still_repricing"
+	StatusReversed              = "reversed"
+	StatusUnclear               = "unclear"
+	StatusLaggingRelatedOutcome = "lagging_related_outcome"
+	StatusStaleAnnotation       = "stale_annotation"
 )
 
 // Config tunes thresholds.
@@ -97,6 +99,15 @@ type AnnotationInput struct {
 	PriceAfter     *float64
 	PriceChange    *float64
 	CurrentPrice   *float64 // resolved by caller from the event-page snapshot
+
+	// v10.2 outcome-mapping metadata. When OutcomeMapped=true the
+	// caller has resolved the outcome via outcomemapping.Mapper —
+	// the classifier trusts CurrentPrice and the verdict can be
+	// "underreacting"/"reversed"/"already_priced" instead of the
+	// v10.0 default of "unclear" when CurrentPrice was nil.
+	OutcomeMapped            bool
+	OutcomeMappingConfidence float64
+	OutcomeMappingReason     string
 }
 
 // Signal is the in-memory shape of one computed RepricingSignal.
@@ -122,6 +133,25 @@ type Signal struct {
 	RepricingStatus         string
 	Confidence              float64
 	Explanation             string
+
+	// --- v10.2 outcome-mapping fields ----------------------------
+	// Populated by the caller when an outcomemapping.Mapper resolved
+	// the (event, condition, outcome) tuple to a specific market.
+	// OutcomeMapped=false ⇒ the classifier should treat
+	// CurrentVsPriceAfter as low-confidence and prefer "unclear"
+	// when other inputs are also weak. OutcomeMapped=true with a
+	// MappingConfidence near 1.0 means the underreacting /
+	// reversed / already_priced verdicts can be trusted.
+	OutcomeMapped            bool
+	OutcomeMappingConfidence float64
+	MappingReason            string
+	// RelatedOutcomeLag fires when (in a multi-candidate event) the
+	// annotation's outcome already moved but a sibling outcome has
+	// not yet adjusted in the expected complementary direction.
+	// The classifier sets Status=lagging_related_outcome on the
+	// SIBLING signal so downstream consumers see an actionable lag.
+	RelatedOutcomeLag       bool
+	RelatedOutcomeLagReason string
 }
 
 // Store is the persistence seam.
@@ -159,18 +189,21 @@ func (p *Provider) Compute(ctx context.Context, in AnnotationInput, persist bool
 		return Signal{}, nil
 	}
 	sig := Signal{
-		EventSlug:             in.EventSlug,
-		ConditionID:           in.ConditionID,
-		Outcome:               in.Outcome,
-		AnnotationHash:        in.AnnotationHash,
-		AnnotationTime:        in.Timestamp,
-		AnnotationTitle:       in.Title,
-		PriceBefore:           in.PriceBefore,
-		PriceAfter:            in.PriceAfter,
-		AnnotationPriceChange: in.PriceChange,
-		CurrentPrice:          in.CurrentPrice,
-		FlowTiming:            FlowTimingUnknown,
-		RepricingStatus:       StatusUnclear,
+		EventSlug:                in.EventSlug,
+		ConditionID:              in.ConditionID,
+		Outcome:                  in.Outcome,
+		AnnotationHash:           in.AnnotationHash,
+		AnnotationTime:           in.Timestamp,
+		AnnotationTitle:          in.Title,
+		PriceBefore:              in.PriceBefore,
+		PriceAfter:               in.PriceAfter,
+		AnnotationPriceChange:    in.PriceChange,
+		CurrentPrice:             in.CurrentPrice,
+		FlowTiming:               FlowTimingUnknown,
+		RepricingStatus:          StatusUnclear,
+		OutcomeMapped:            in.OutcomeMapped,
+		OutcomeMappingConfidence: in.OutcomeMappingConfidence,
+		MappingReason:            in.OutcomeMappingReason,
 	}
 
 	// Skip when we don't have enough to reason.
@@ -206,6 +239,21 @@ func (p *Provider) Compute(ctx context.Context, in AnnotationInput, persist bool
 	sig.FlowTiming = classifyFlowTiming(p.cfg, sig.PreAnnotationFlowUSD, sig.PostAnnotationFlowUSD)
 	// Classify repricing status.
 	sig.RepricingStatus, sig.Confidence, sig.Explanation = classifyRepricing(p.cfg, in, sig)
+	// v10.2 stale-annotation override: if the annotation predates
+	// the lookback window AND we still couldn't get a clear verdict,
+	// surface that explicitly so the operator sees "we have nothing
+	// fresh on this" instead of "no decisive signal".
+	if sig.RepricingStatus == StatusUnclear && !in.Timestamp.IsZero() {
+		age := time.Since(in.Timestamp)
+		// Use 2× the lookback as the "stale" threshold so a 24h
+		// lookback considers anything older than 48h stale.
+		if age > 2*p.cfg.Lookback {
+			sig.RepricingStatus = StatusStaleAnnotation
+			sig.Confidence = 0.4
+			sig.Explanation = fmt.Sprintf("annotation is %.0fh old (> %.0fh stale threshold)",
+				age.Hours(), (2 * p.cfg.Lookback).Hours())
+		}
+	}
 
 	if persist && p.store != nil {
 		_ = p.store.UpsertRepricingSignal(ctx, repository.NewRepricingSignal{

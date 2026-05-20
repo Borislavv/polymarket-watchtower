@@ -296,6 +296,20 @@ type Metrics struct {
 	// Multi-chunk implies the safe-split path fired.
 	PredictionMessageChunks *prometheus.CounterVec
 
+	// --- v10.2 prediction feedback (PART 4) ---
+	// PredictionFeedbackRuns: per-cycle outcome counter
+	// (ok | empty | failed).
+	PredictionFeedbackRuns *prometheus.CounterVec
+	// PredictionFeedbackProcessed: per-prediction outcome counter
+	// (ok | market_lookup_failed | outcome_token_unknown | upsert_failed).
+	PredictionFeedbackProcessed *prometheus.CounterVec
+	// PredictionFeedbackHorizons: cumulative measurements by
+	// horizon label (1h | 6h | 24h).
+	PredictionFeedbackHorizons *prometheus.CounterVec
+	// OutcomeMapping outcomes for telemetry on the v10.2 mapper.
+	OutcomeMapping        *prometheus.CounterVec
+	OutcomeMappingUnknown *prometheus.CounterVec
+
 	// --- v9.6 Political-Catalyst Intelligence importer ---
 	// EventCatalystImporterRuns: importer cycle outcomes, labelled
 	// by status (ok / empty / partial / failed).
@@ -809,6 +823,28 @@ func New() *Metrics {
 		Help: "Telegram chunks shipped per surface (prediction_creation | prediction_evolution). Multi-chunk implies the safe-split path fired.",
 	}, []string{"surface"})
 
+	// v10.2 prediction feedback + outcome mapping.
+	m.PredictionFeedbackRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_feedback", Name: "runs_total",
+		Help: "Per-cycle outcome counter for the prediction-feedback worker.",
+	}, []string{"status"})
+	m.PredictionFeedbackProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_feedback", Name: "processed_total",
+		Help: "Per-prediction feedback outcomes: ok | market_lookup_failed | outcome_token_unknown | upsert_failed.",
+	}, []string{"status"})
+	m.PredictionFeedbackHorizons = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_feedback", Name: "horizons_total",
+		Help: "Cumulative feedback measurements written per horizon (1h | 6h | 24h).",
+	}, []string{"horizon"})
+	m.OutcomeMapping = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "outcome_mapping", Name: "total",
+		Help: "Outcome mapping outcomes labelled by status (ok | unknown).",
+	}, []string{"status"})
+	m.OutcomeMappingUnknown = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "outcome_mapping", Name: "unknown_total",
+		Help: "Outcome-mapping unknowns labelled by reason code (unknown_condition_id | unknown_token_id | label_not_found | …).",
+	}, []string{"reason"})
+
 	// v9.6 Political-Catalyst Intelligence importer
 	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "runs_total",
@@ -976,6 +1012,8 @@ func New() *Metrics {
 		m.PredictionCreationTelegramSkipped, m.PredictionCreationTelegramSent,
 		m.PredictionCreationDedupeSkipped, m.PredictionCreationQualityGate,
 		m.PredictionSchedulerStartupSuppressed, m.PredictionMessageChunks,
+		m.PredictionFeedbackRuns, m.PredictionFeedbackProcessed, m.PredictionFeedbackHorizons,
+		m.OutcomeMapping, m.OutcomeMappingUnknown,
 		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,

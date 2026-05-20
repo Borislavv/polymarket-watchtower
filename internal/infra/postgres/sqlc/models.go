@@ -345,6 +345,31 @@ type PolymarketMarkets struct {
 	LastCollectTradedAt pgtype.Timestamptz
 }
 
+type PolymarketPredictionFeedback struct {
+	ID                       int64
+	PredictionID             int64
+	Horizon                  string
+	PriceAtPrediction        *float64
+	PriceAtHorizon           *float64
+	PriceDelta               *float64
+	DirectionCorrect         *bool
+	StateAtHorizon           *string
+	RepricingStatusAtHorizon *string
+	CatalystStatusAtHorizon  *string
+	FlowConfirmed            bool
+	CreatedAt                pgtype.Timestamptz
+}
+
+type PolymarketPredictionUsefulnessScores struct {
+	ID             int64
+	PredictionID   int64
+	Score          float64
+	ComponentsJson []byte
+	Reason         string
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+}
+
 type PolymarketRepricingSignals struct {
 	ID                      int64
 	EventSlug               string
