@@ -38,6 +38,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/create"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/evolution"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
@@ -51,6 +52,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
 	alerting2 "github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	httpsrv "github.com/Borislavv/polymarket-watchtower/internal/infra/http"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/log"
@@ -98,6 +100,7 @@ type App struct {
 	catalystImporter  *catalystimporter.Worker
 	dailyIntel        *dailypoliticalintel.Worker
 	predictionEvolver *evolution.Worker
+	predictionCreator *create.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -911,18 +914,26 @@ func New() (*App, error) {
 		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
 		catalystRepo := repository.NewEventCatalystRepository(pgPool)
 		catalystImporterWorker = catalystimporter.New(catalystimporter.Config{
-			Enabled:           cfg.Catalyst.ImporterEnabled,
-			Interval:          cfg.Catalyst.ImporterInterval,
-			CategoryWhitelist: splitCSV(cfg.Catalyst.ImporterCategoryCSV),
-			BatchSize:         cfg.Catalyst.ImporterBatchSize,
-			Concurrency:       cfg.Catalyst.ImporterConcurrency,
-			Lookback:          cfg.Catalyst.ImporterLookback,
-			AIEnabled:         cfg.Catalyst.ImporterAIEnabled,
-			AITimeout:         cfg.Catalyst.ImporterAITimeout,
-			MaxAnnotations:    cfg.Catalyst.ImporterMaxAnnotations,
-			MaxPromptChars:    cfg.Catalyst.ImporterMaxPromptChars,
-			MinConfidence:     cfg.Catalyst.ImporterMinConfidence,
-			StaleAfter:        cfg.Catalyst.ImporterStaleAfter,
+			Enabled:              cfg.Catalyst.ImporterEnabled,
+			Interval:             cfg.Catalyst.ImporterInterval,
+			CategoryWhitelist:    splitCSV(cfg.Catalyst.ImporterCategoryCSV),
+			BatchSize:            cfg.Catalyst.ImporterBatchSize,
+			Concurrency:          cfg.Catalyst.ImporterConcurrency,
+			Lookback:             cfg.Catalyst.ImporterLookback,
+			AIEnabled:            cfg.Catalyst.ImporterAIEnabled,
+			AITimeout:            cfg.Catalyst.ImporterAITimeout,
+			MaxAnnotations:       cfg.Catalyst.ImporterMaxAnnotations,
+			MaxPromptChars:       cfg.Catalyst.ImporterMaxPromptChars,
+			MinConfidence:        cfg.Catalyst.ImporterMinConfidence,
+			StaleAfter:           cfg.Catalyst.ImporterStaleAfter,
+			TieringEnabled:       cfg.Catalyst.ImporterTieringEnabled,
+			Tier1Interval:        cfg.Catalyst.ImporterTier1Interval,
+			Tier2Interval:        cfg.Catalyst.ImporterTier2Interval,
+			Tier3Interval:        cfg.Catalyst.ImporterTier3Interval,
+			Tier1MinVolume24hUSD: cfg.Catalyst.ImporterTier1MinVolume24hUSD,
+			Tier1MinAlerts24h:    cfg.Catalyst.ImporterTier1MinAlerts24h,
+			Tier2MinVolume24hUSD: cfg.Catalyst.ImporterTier2MinVolume24hUSD,
+			Tier1Categories:      splitCSV(cfg.Catalyst.ImporterTier1CategoriesCSV),
 		}, intelRepo, marketsRepo, eventPageProvider, catalystRepo, extractor, met, logger)
 		logger.Info().
 			Bool("enabled", cfg.Catalyst.ImporterEnabled).
@@ -1069,6 +1080,99 @@ func New() (*App, error) {
 			Msg("prediction evolution: wired")
 	}
 
+	// AI budget governor — single process-local instance shared by
+	// every worker that issues AI calls. nil-friendly seam: any
+	// worker without a budget passed in fails open.
+	aiBudget := aibudget.New(aibudget.Config{
+		GlobalDailyBudgetUSD: cfg.AIBudget.GlobalDailyUSD,
+		BucketDailyBudgetsUSD: map[string]float64{
+			aibudget.BucketAlertAnalysis:     cfg.AIBudget.AlertAnalysisDailyUSD,
+			aibudget.BucketCatalystImporter:  cfg.AIBudget.CatalystImporterDailyUSD,
+			aibudget.BucketPredictionCreate:  cfg.AIBudget.PredictionCreationDailyUSD,
+			aibudget.BucketPredictionEvolve:  cfg.AIBudget.PredictionEvolveDailyUSD,
+			aibudget.BucketMarketIntel:       cfg.AIBudget.MarketIntelDailyUSD,
+			aibudget.BucketDailyIntel:        cfg.AIBudget.DailyIntelDailyUSD,
+			aibudget.BucketAnnotationRanking: cfg.AIBudget.AnnotationRankDailyUSD,
+		},
+	}, met)
+	if evolutionWorker != nil {
+		evolutionWorker.SetBudget(aiBudget)
+	}
+	if catalystImporterWorker != nil {
+		catalystImporterWorker.SetBudget(aiBudget)
+	}
+
+	// v10.0 Prediction Creation Worker (cold-start path). Without
+	// this loop, the evolution worker has nothing to evolve.
+	var predictionCreator *create.Worker
+	if cfg.Postgres.Enabled() && cfg.Prediction.CreationEnabled && marketsRepo != nil && eventPageProvider != nil {
+		predsRepo := repository.NewRepricingPredictionsRepository(pgPool)
+		flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
+			Enabled:          true,
+			Lookback:         cfg.EventFlow.Lookback,
+			MaxAlerts:        cfg.EventFlow.MaxAlerts,
+			MaxTrades:        cfg.EventFlow.MaxTrades,
+			MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
+			TopItems:         cfg.EventFlow.TopItems,
+		}, met, logger)
+		repricingComp := repricing.New(repricing.Config{
+			Enabled:                cfg.Repricing.Enabled,
+			Lookback:               cfg.Repricing.Lookback,
+			PreWindow:              cfg.Repricing.PreWindow,
+			PostWindow:             cfg.Repricing.PostWindow,
+			MinAnnotationMove:      cfg.Repricing.MinAnnotationMove,
+			MinFlowUSD:             cfg.Repricing.MinFlowUSD,
+			UnderreactionThreshold: cfg.Repricing.UnderreactionThreshold,
+			OverreactionThreshold:  cfg.Repricing.OverreactionThreshold,
+		}, sqlc.New(pgPool), predsRepo, met, logger)
+		catalystRepoForCreator := repository.NewEventCatalystRepository(pgPool)
+		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
+		var ranker analysis.PredictionRanker = analysis.NoopPredictionRanker{}
+		var creator analysis.PredictionCreator = analysis.NoopPredictionCreator{}
+		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.CreationAIEnabled {
+			cli := openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.Prediction.CreationAIModel,
+				Timeout:                cfg.Prediction.CreationAITimeout,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+			ranker = cli
+			creator = cli
+		}
+		var creatorTG create.Telegram
+		if bot != nil && cfg.Prediction.CreationSendTelegram {
+			creatorTG = creationTelegramAdapter{bot: bot, chatID: cfg.Alerting.TelegramChatID}
+		}
+		predictionCreator = create.New(create.Config{
+			Enabled:      cfg.Prediction.CreationEnabled,
+			Interval:     cfg.Prediction.CreationInterval,
+			BatchSize:    cfg.Prediction.CreationBatchSize,
+			MaxSelected:  cfg.Prediction.CreationMaxSelected,
+			MinScore:     cfg.Prediction.CreationMinScore,
+			MaxPerDay:    cfg.Prediction.CreationMaxPerDay,
+			DedupeWindow: cfg.Prediction.CreationDedupeWindow,
+			AIEnabled:    cfg.Prediction.CreationAIEnabled,
+			AITimeout:    cfg.Prediction.CreationAITimeout,
+			SendTelegram: cfg.Prediction.CreationSendTelegram,
+			Concurrency:  cfg.Prediction.CreationConcurrency,
+			Categories:   cfg.Prediction.CreationCategories,
+		}, intelRepo, marketsRepo, predsRepo, eventPageProvider, catalystRepoForCreator, flowRepo, repricingComp, ranker, creator, creatorTG, met, logger)
+		predictionCreator.SetBudget(aiBudget)
+		logger.Info().
+			Bool("enabled", cfg.Prediction.CreationEnabled).
+			Dur("interval", cfg.Prediction.CreationInterval).
+			Int("max_selected", cfg.Prediction.CreationMaxSelected).
+			Int("max_per_day", cfg.Prediction.CreationMaxPerDay).
+			Float64("min_score", cfg.Prediction.CreationMinScore).
+			Bool("ai_enabled", cfg.Prediction.CreationAIEnabled).
+			Bool("send_telegram", cfg.Prediction.CreationSendTelegram).
+			Msg("prediction creation: wired")
+	}
+
 	return &App{
 		cfg:               cfg,
 		logger:            logger,
@@ -1093,8 +1197,22 @@ func New() (*App, error) {
 		catalystImporter:  catalystImporterWorker,
 		dailyIntel:        dailyIntelWorker,
 		predictionEvolver: evolutionWorker,
+		predictionCreator: predictionCreator,
 		pgPool:            pgPool,
 	}, nil
+}
+
+// creationTelegramAdapter narrows *telegram.Bot to the create
+// worker's small SendHTML seam. Keeps the create package free of a
+// hard dependency on the telegram package.
+type creationTelegramAdapter struct {
+	bot    *telegram.Bot
+	chatID string
+}
+
+func (a creationTelegramAdapter) SendHTML(ctx context.Context, body string) (int64, error) {
+	res, err := a.bot.SendHTML(ctx, a.chatID, body)
+	return res.MessageID, err
 }
 
 // evolutionTelegramAdapter narrows *telegram.Bot to the evolution
@@ -1440,6 +1558,12 @@ func (a *App) Run() error {
 	if a.predictionEvolver != nil {
 		execs = append(execs, shutdown2.Exec{Name: "prediction-evolution", Fn: func(ctx context.Context) error {
 			a.predictionEvolver.Run(ctx)
+			return nil
+		}})
+	}
+	if a.predictionCreator != nil {
+		execs = append(execs, shutdown2.Exec{Name: "prediction-creation", Fn: func(ctx context.Context) error {
+			a.predictionCreator.Run(ctx)
 			return nil
 		}})
 	}

@@ -33,9 +33,25 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
+
+// BudgetGuard is the subset of *aibudget.Manager the importer uses.
+// Defined as an interface so tests can pass nil (fail-open) or a
+// stub without depending on the budget package internals.
+type BudgetGuard interface {
+	Allow(bucket string, estCost float64) (bool, string)
+	Charge(bucket string, actualCost float64)
+}
+
+// estPerCatalystExtractionUSD is the conservative pre-flight cost
+// estimate per AI extraction (gpt-4.1, ~11k prompt + 0.5k output
+// tokens at $2/$8 per million = ~$0.026, rounded up). The Charge
+// after the call uses the real token count from the response so the
+// running total stays accurate.
+const estPerCatalystExtractionUSD = 0.03
 
 // Config tunes the importer.
 type Config struct {
@@ -56,6 +72,27 @@ type Config struct {
 	// ListIntelligenceCandidates before category filtering. Defaults
 	// to BatchSize * 4 — gives the category filter headroom.
 	CandidateLimit int
+
+	// --- v10.0 tiering (PART 6) ---
+	// The importer used to refresh every selected event on a uniform
+	// 5m cadence, which burns AI tokens on low-signal markets. The
+	// tier filter assigns each candidate a deterministic tier from
+	// its signal density and skips events that haven't aged past
+	// their tier's cadence yet. Tier 1 = high-signal political /
+	// geopolitical race; Tier 2 = normal political market; Tier 3 =
+	// low-signal / low-liquidity noise.
+	TieringEnabled       bool
+	Tier1Interval        time.Duration
+	Tier2Interval        time.Duration
+	Tier3Interval        time.Duration
+	Tier1MinVolume24hUSD float64
+	Tier1MinAlerts24h    int
+	Tier2MinVolume24hUSD float64
+	// Tier1Categories names categories that promote a market to
+	// Tier 1 regardless of volume / alert density (e.g.
+	// "geopolitics", "elections"). Case-insensitive substring match
+	// on the candidate's category label.
+	Tier1Categories []string
 
 	// Clock is overridable for tests.
 	Clock func() time.Time
@@ -94,6 +131,33 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CandidateLimit <= 0 {
 		c.CandidateLimit = c.BatchSize * 4
+	}
+	// Tiering defaults reflect the operational evidence from the
+	// v9.x audit: catalyst importer was running at 5m × 28 events
+	// = ~28 AI calls per cycle. Tier 1 stays at 5m (high-signal),
+	// Tier 2 moves to 15m, Tier 3 to 60m. With realistic
+	// distributions this cuts AI calls by ~3× without losing
+	// freshness on the load-bearing markets.
+	if c.Tier1Interval <= 0 {
+		c.Tier1Interval = 5 * time.Minute
+	}
+	if c.Tier2Interval <= 0 {
+		c.Tier2Interval = 15 * time.Minute
+	}
+	if c.Tier3Interval <= 0 {
+		c.Tier3Interval = 60 * time.Minute
+	}
+	if c.Tier1MinVolume24hUSD <= 0 {
+		c.Tier1MinVolume24hUSD = 100000
+	}
+	if c.Tier1MinAlerts24h <= 0 {
+		c.Tier1MinAlerts24h = 3
+	}
+	if c.Tier2MinVolume24hUSD <= 0 {
+		c.Tier2MinVolume24hUSD = 10000
+	}
+	if len(c.Tier1Categories) == 0 {
+		c.Tier1Categories = []string{"geopolitics", "elections"}
 	}
 	if c.Clock == nil {
 		c.Clock = time.Now
@@ -135,8 +199,15 @@ type Worker struct {
 	pages      EventPageRefresher
 	catalysts  CatalystStore
 	extractor  analysis.CatalystExtractor
+	budget     BudgetGuard
 	metrics    *metrics.Metrics
 	log        *zerolog.Logger
+
+	// tierMu guards lastFetched. Reset across process restarts
+	// (acceptable — worst case one extra fetch per market after
+	// restart).
+	tierMu      sync.Mutex
+	lastFetched map[string]time.Time // event_slug → last attempted fetch
 }
 
 // New wires the worker. extractor may be analysis.NoopExtractor in
@@ -154,16 +225,95 @@ func New(
 ) *Worker {
 	cfg.applyDefaults()
 	return &Worker{
-		cfg:        cfg,
-		candidates: candidates,
-		markets:    markets,
-		pages:      pages,
-		catalysts:  catalysts,
-		extractor:  extractor,
-		metrics:    met,
-		log:        log,
+		cfg:         cfg,
+		candidates:  candidates,
+		markets:     markets,
+		pages:       pages,
+		catalysts:   catalysts,
+		extractor:   extractor,
+		metrics:     met,
+		log:         log,
+		lastFetched: make(map[string]time.Time),
 	}
 }
+
+// classifyTier assigns a tier number (1..3) to a candidate from its
+// signal density. Deterministic, pure, easy to test.
+//
+//	tier 1: high-signal — Geopolitics / Elections category, OR
+//	        volume24h ≥ Tier1MinVolume24hUSD, OR alerts24h ≥
+//	        Tier1MinAlerts24h.
+//	tier 2: normal political race — volume24h ≥
+//	        Tier2MinVolume24hUSD OR alerts24h ≥ 1.
+//	tier 3: everything else — low-signal / low-liquidity noise.
+func (w *Worker) classifyTier(c repository.IntelligenceCandidate) int {
+	if w.matchesTier1Category(c.Category) {
+		return 1
+	}
+	if c.Volume24hUSD >= w.cfg.Tier1MinVolume24hUSD {
+		return 1
+	}
+	if int(c.Alerts24h) >= w.cfg.Tier1MinAlerts24h {
+		return 1
+	}
+	if c.Volume24hUSD >= w.cfg.Tier2MinVolume24hUSD {
+		return 2
+	}
+	if c.Alerts24h >= 1 {
+		return 2
+	}
+	return 3
+}
+
+func (w *Worker) matchesTier1Category(cat string) bool {
+	low := strings.ToLower(cat)
+	for _, t := range w.cfg.Tier1Categories {
+		if strings.Contains(low, strings.ToLower(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+// tierInterval returns the per-tier cadence floor.
+func (w *Worker) tierInterval(tier int) time.Duration {
+	switch tier {
+	case 1:
+		return w.cfg.Tier1Interval
+	case 2:
+		return w.cfg.Tier2Interval
+	default:
+		return w.cfg.Tier3Interval
+	}
+}
+
+// dueByTier reports whether `eventSlug` has aged past its tier's
+// cadence. The lastFetched map is updated by recordFetched() at the
+// end of every processOne call so we don't have to wait for the DB
+// fetch-state to propagate.
+func (w *Worker) dueByTier(eventSlug string, tier int) bool {
+	if !w.cfg.TieringEnabled {
+		return true
+	}
+	w.tierMu.Lock()
+	defer w.tierMu.Unlock()
+	last := w.lastFetched[eventSlug]
+	if last.IsZero() {
+		return true
+	}
+	return w.cfg.Clock().Sub(last) >= w.tierInterval(tier)
+}
+
+func (w *Worker) recordFetched(eventSlug string) {
+	w.tierMu.Lock()
+	defer w.tierMu.Unlock()
+	w.lastFetched[eventSlug] = w.cfg.Clock()
+}
+
+// SetBudget attaches the global AI budget guard. nil is allowed
+// (fail-open). Called once at startup from app.go; not safe to call
+// after Run starts.
+func (w *Worker) SetBudget(b BudgetGuard) { w.budget = b }
 
 // Run blocks until ctx cancels. Performs an immediate tick so
 // startup-queued events are processed without waiting one full
@@ -231,8 +381,11 @@ func (w *Worker) Tick(ctx context.Context) {
 
 // processOne refreshes a single event, runs AI extraction, upserts
 // catalysts, and marks stale rows. Returns a short status string
-// for the events_processed metric.
-func (w *Worker) processOne(ctx context.Context, eventSlug string) string {
+// for the events_processed metric. Always stamps lastFetched on
+// return so the tier cooldown is honored even for failed cycles
+// (we don't want to retry a fetch-failing event every 5m).
+func (w *Worker) processOne(ctx context.Context, eventSlug string) (status string) {
+	defer w.recordFetched(eventSlug)
 	// Refresh the event-page payload. This persists annotations +
 	// markets + fetch state via the existing eventpagecontext
 	// machinery. Failure is silent at the provider boundary; the
@@ -251,6 +404,21 @@ func (w *Worker) processOne(ctx context.Context, eventSlug string) string {
 		return "ai_disabled"
 	}
 
+	// Budget governor — block AI extraction when today's spend for
+	// the catalyst-importer bucket (or the global cap) is exhausted.
+	// The deterministic refresh path above already ran, so the event
+	// page snapshot + annotations are still up to date for this
+	// cycle even when AI is denied.
+	if w.budget != nil {
+		if ok, reason := w.budget.Allow(aibudget.BucketCatalystImporter, estPerCatalystExtractionUSD); !ok {
+			w.observeAI("budget_denied")
+			if w.log != nil {
+				w.log.Warn().Str("event_slug", eventSlug).Str("reason", reason).Msg("event catalyst importer: AI denied by budget")
+			}
+			return "ai_budget_denied"
+		}
+	}
+
 	req := w.buildRequest(eventSlug, summary, existing)
 	aiCtx, cancel := context.WithTimeout(ctx, w.cfg.AITimeout)
 	defer cancel()
@@ -261,6 +429,9 @@ func (w *Worker) processOne(ctx context.Context, eventSlug string) string {
 			w.log.Warn().Err(err).Str("event_slug", eventSlug).Msg("event catalyst importer: AI extraction failed")
 		}
 		return "ai_failed"
+	}
+	if w.budget != nil {
+		w.budget.Charge(aibudget.BucketCatalystImporter, res.EstimatedCostUSD)
 	}
 	switch res.Status {
 	case analysis.StatusSkipped:
@@ -453,7 +624,9 @@ func (w *Worker) selectEventSlugs(ctx context.Context) (slugs []string, selected
 	seen := map[string]struct{}{}
 	// Stable priority: alerts24h desc, then volume24h desc — done in
 	// SQL already by ListIntelligenceCandidates, so we iterate in
-	// source order.
+	// source order. The tier filter then drops events that aren't
+	// yet due based on per-tier cadence.
+	var skippedTierCooldown int
 	for _, r := range rows {
 		if !categoryAllowed(r.Category, wl) {
 			continue
@@ -467,11 +640,26 @@ func (w *Worker) selectEventSlugs(ctx context.Context) (slugs []string, selected
 		if _, dup := seen[m.EventSlug]; dup {
 			continue
 		}
+		// Tier filter — when enabled, only forward events whose
+		// last-fetch ts has aged past their tier's cadence.
+		if w.cfg.TieringEnabled {
+			tier := w.classifyTier(r)
+			if !w.dueByTier(m.EventSlug, tier) {
+				skippedTierCooldown++
+				continue
+			}
+		}
 		seen[m.EventSlug] = struct{}{}
 		slugs = append(slugs, m.EventSlug)
 		if len(slugs) >= w.cfg.BatchSize {
 			break
 		}
+	}
+	if w.cfg.TieringEnabled && skippedTierCooldown > 0 && w.log != nil {
+		w.log.Debug().
+			Int("skipped_tier_cooldown", skippedTierCooldown).
+			Int("forwarded", len(slugs)).
+			Msg("event catalyst importer: tier cooldown applied")
 	}
 	return slugs, selected, skippedNoSlug
 }

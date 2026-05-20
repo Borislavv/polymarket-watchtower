@@ -55,6 +55,46 @@ type EventPagePayload struct {
 	// state. Used by tests and observability so a future Polymarket
 	// payload addition is logged rather than silently dropped.
 	RawQueryKeys []string
+
+	// ParseStatus is "ok" when every queryable section decoded cleanly,
+	// "partial" when at least one sub-decoder hit a recoverable drift
+	// (e.g. one market's volume came as a string and we skipped that
+	// field), and "failed" only when the envelope itself was
+	// unreadable. "partial" is the operational hint to investigate;
+	// "failed" is only returned with err != nil from the client.
+	ParseStatus string
+
+	// ParseWarnings carries one entry per recoverable per-field
+	// drift the flex decoders had to fall through. The slice is
+	// nil on a clean parse. Capped to avoid runaway memory on a
+	// pathological payload.
+	ParseWarnings []ParseWarning
+}
+
+// ParseWarning describes a single recoverable parse drift. The
+// client emits one Prometheus increment per warning and a single
+// structured log line per fetch carrying the slice. Operators see
+// `watchtower_event_page_parse_failures_total{field="market.volume"}`
+// climb when Polymarket changes a field encoding.
+type ParseWarning struct {
+	// Section is the top-level query the warning came from:
+	// "event" | "market" | "annotation" | "similar_markets".
+	Section string
+	// Field is the JSON path that drifted, e.g. "market.volume",
+	// "market.outcomes", "market.lastTradePrice".
+	Field string
+	// Kind is the drift kind: "type_drift" (the canonical-but-
+	// permissive decoder accepted it), "decode_failed" (we had to
+	// skip the field), or "subobject_skipped" (a whole market /
+	// annotation row was dropped).
+	Kind string
+	// OffendingType is the JSON token type we observed when the
+	// canonical decoder expected something else (e.g. "string",
+	// "array", "null").
+	OffendingType string
+	// Sample is a short raw snippet (≤200 chars) for the operator
+	// log; never used for control flow.
+	Sample string
 }
 
 // EventPageEvent is the curated event metadata. Fields are populated

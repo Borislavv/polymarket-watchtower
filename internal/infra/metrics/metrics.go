@@ -219,6 +219,57 @@ type Metrics struct {
 	EventPageLagCandidates prometheus.Counter
 	// EventPageFetchLatency: end-to-end fetch + parse latency.
 	EventPageFetchLatency prometheus.Histogram
+	// EventPageParseFailures: one increment per recoverable per-field
+	// drift the parser had to fall through (labelled by JSON path).
+	// Operator-actionable: a sustained climb on a specific field
+	// means Polymarket changed encoding upstream.
+	EventPageParseFailures *prometheus.CounterVec
+	// EventPagePartialParse: counts whole-fetch outcomes where at
+	// least one section recorded a parse warning. Pair with
+	// EventPageParseFailures to see "how many fetches" vs "how many
+	// fields".
+	EventPagePartialParse prometheus.Counter
+	// EventPageMarketParse: per-market parse outcome, labelled by
+	// status ("ok" | "skipped"). A non-zero "skipped" rate means we
+	// dropped at least one drifted market row.
+	EventPageMarketParse *prometheus.CounterVec
+
+	// --- AI budget governance (single-process daily caps) ---
+	// AIBudgetCharged: cumulative USD charged per bucket (today).
+	AIBudgetCharged *prometheus.CounterVec
+	// AIBudgetSpent: current per-bucket spend (USD) today, gauge.
+	// Resets to 0 at UTC midnight.
+	AIBudgetSpent *prometheus.GaugeVec
+	// AIBudgetGlobalSpent: current global spend (USD) today, gauge.
+	AIBudgetGlobalSpent prometheus.Gauge
+	// AIBudgetDenied: denial counter labelled by bucket + reason
+	// (bucket_exhausted | global_exhausted). A sustained non-zero
+	// value on a high-priority bucket means caps are too tight.
+	AIBudgetDenied *prometheus.CounterVec
+
+	// --- v10.0 Prediction Creation worker ---
+	// PredictionCreationRuns: per-cycle outcome counter (status:
+	// ok | empty | candidates_failed | daily_cap_reached |
+	// all_deduped | ai_disabled | no_picks).
+	PredictionCreationRuns *prometheus.CounterVec
+	// PredictionCreationCandidates: cumulative deterministic
+	// shortlist size across cycles. Pair with Created to see
+	// shortlist-to-thesis conversion.
+	PredictionCreationCandidates prometheus.Counter
+	// PredictionCreationCreated: predictions persisted, labelled
+	// by category for spend / coverage analysis.
+	PredictionCreationCreated *prometheus.CounterVec
+	// PredictionCreationAIRequests: AI call outcomes labelled by
+	// status (ranker_ok | ranker_failed | creator_ok | creator_failed).
+	PredictionCreationAIRequests *prometheus.CounterVec
+	// PredictionCreationAISkipped: AI calls denied by the budget
+	// governor or gating layer, labelled by reason.
+	PredictionCreationAISkipped *prometheus.CounterVec
+	// PredictionCreationTelegram: send outcomes labelled by status
+	// (sent | failed).
+	PredictionCreationTelegram *prometheus.CounterVec
+	// PredictionCreationLatency: end-to-end Tick duration.
+	PredictionCreationLatency prometheus.Histogram
 
 	// --- v9.6 Political-Catalyst Intelligence importer ---
 	// EventCatalystImporterRuns: importer cycle outcomes, labelled
@@ -645,6 +696,67 @@ func New() *Metrics {
 		Help:    "End-to-end latency of one event page fetch + parse.",
 		Buckets: prometheus.ExponentialBuckets(0.05, 2, 9),
 	})
+	m.EventPageParseFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "parse_failures_total",
+		Help: "Recoverable per-field parse drifts, labelled by JSON path. Sustained climb on a specific field indicates upstream Polymarket encoding change.",
+	}, []string{"field"})
+	m.EventPagePartialParse = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "partial_parse_total",
+		Help: "Fetches that produced at least one parse warning. Paired with parse_failures_total to see fetch-level vs field-level drift.",
+	})
+	m.EventPageMarketParse = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_page", Name: "market_parse_total",
+		Help: "Per-market parse outcomes (ok / skipped). A non-zero skipped rate indicates one or more markets in the event were structurally unreadable and dropped.",
+	}, []string{"status"})
+
+	// AI budget governance (single-process daily caps)
+	m.AIBudgetCharged = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_budget", Name: "charged_usd_total",
+		Help: "Cumulative USD charged per AI bucket today. Resets at UTC midnight by counter rollover; the gauge below carries the live value.",
+	}, []string{"bucket"})
+	m.AIBudgetSpent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ai_budget", Name: "spent_usd",
+		Help: "Per-bucket spend today (USD). Resets to 0 at UTC midnight.",
+	}, []string{"bucket"})
+	m.AIBudgetGlobalSpent = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ai_budget", Name: "global_spent_usd",
+		Help: "Global AI spend today across all buckets (USD). Resets to 0 at UTC midnight.",
+	})
+	m.AIBudgetDenied = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai_budget", Name: "denied_total",
+		Help: "AI calls denied by the budget governor, labelled by bucket + reason (bucket_exhausted | global_exhausted). A persistent non-zero on alerts means the cap is too tight.",
+	}, []string{"bucket", "reason"})
+
+	// v10.0 Prediction Creation worker
+	m.PredictionCreationRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "runs_total",
+		Help: "Per-cycle outcome counter for the prediction creation worker.",
+	}, []string{"status"})
+	m.PredictionCreationCandidates = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "candidates_total",
+		Help: "Cumulative size of the deterministic shortlist the worker handed the AI ranker.",
+	})
+	m.PredictionCreationCreated = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "created_total",
+		Help: "Predictions persisted, labelled by category.",
+	}, []string{"category"})
+	m.PredictionCreationAIRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "ai_requests_total",
+		Help: "AI call outcomes (ranker_ok | ranker_failed | creator_ok | creator_failed).",
+	}, []string{"status"})
+	m.PredictionCreationAISkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "ai_skipped_total",
+		Help: "AI calls the gating layer or budget governor skipped, labelled by reason.",
+	}, []string{"reason"})
+	m.PredictionCreationTelegram = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "telegram_total",
+		Help: "Send outcomes (sent | failed) for the PREDICTION CREATED Telegram body.",
+	}, []string{"status"})
+	m.PredictionCreationLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "prediction_creation", Name: "latency_seconds",
+		Help:    "End-to-end Tick duration of the prediction creation worker.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 9),
+	})
 
 	// v9.6 Political-Catalyst Intelligence importer
 	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -805,6 +917,11 @@ func New() *Metrics {
 		m.EventPageFetch, m.EventPageBuildIDChanges, m.EventPageAnnotations,
 		m.EventPageContextUsed, m.EventPageAlerts, m.EventPageLagCandidates,
 		m.EventPageFetchLatency,
+		m.EventPageParseFailures, m.EventPagePartialParse, m.EventPageMarketParse,
+		m.AIBudgetCharged, m.AIBudgetSpent, m.AIBudgetGlobalSpent, m.AIBudgetDenied,
+		m.PredictionCreationRuns, m.PredictionCreationCandidates, m.PredictionCreationCreated,
+		m.PredictionCreationAIRequests, m.PredictionCreationAISkipped, m.PredictionCreationTelegram,
+		m.PredictionCreationLatency,
 		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,

@@ -248,6 +248,23 @@ func (r *RepricingPredictionsRepository) RecordStateTransition(ctx context.Conte
 	})
 }
 
+// CountPredictionsCreatedSince returns the number of predictions
+// created (created_at >= since). Used by the prediction-creation
+// worker to enforce its per-day cap.
+func (r *RepricingPredictionsRepository) CountPredictionsCreatedSince(ctx context.Context, since time.Time) (int64, error) {
+	return r.q.CountPredictionsCreatedSince(ctx, tsFromTime(since))
+}
+
+// CountPredictionsForEventSince supports the per-event dedupe window
+// in the prediction-creation worker. Counts every row (any state) so
+// a recent stale prediction still suppresses recreation.
+func (r *RepricingPredictionsRepository) CountPredictionsForEventSince(ctx context.Context, eventSlug string, since time.Time) (int64, error) {
+	return r.q.CountPredictionsForEventSince(ctx, sqlc.CountPredictionsForEventSinceParams{
+		EventSlug: eventSlug,
+		Since:     tsFromTime(since),
+	})
+}
+
 // ListPredictionsForEvolution returns the selection queue for the
 // evolution worker. maxAge is the latest last_evolved_at value a
 // row may have — anything stricter than that is "fresh enough" and

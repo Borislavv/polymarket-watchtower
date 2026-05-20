@@ -43,6 +43,8 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 )
@@ -158,6 +160,15 @@ type TelegramResult struct {
 	MessageID int64
 }
 
+// BudgetGuard is the subset of *aibudget.Manager the evolution
+// worker uses. Defined here so the evolution package doesn't take
+// a hard dependency on the budget package internals; nil is allowed
+// (fail-open).
+type BudgetGuard interface {
+	Allow(bucket string, estCost float64) (bool, string)
+	Charge(bucket string, actualCost float64)
+}
+
 // Worker is the long-running evolution loop.
 type Worker struct {
 	cfg         Config
@@ -167,6 +178,7 @@ type Worker struct {
 	flow        FlowLoader
 	repricing   RepricingComputer
 	aiGenerator analysis.PredictionEvolutionGenerator
+	budget      BudgetGuard
 	tg          Telegram
 	metrics     *metrics.Metrics
 	log         *zerolog.Logger
@@ -178,6 +190,12 @@ type Worker struct {
 	mu             sync.Mutex
 	lastTelegramAt map[int64]time.Time
 }
+
+// estPerEvolutionRefreshUSD is the conservative pre-flight estimate
+// per thesis-refresh AI call. ~12k input + 2k output tokens at
+// gpt-4.1 rates ($2/$8 per million) = ~$0.040. Charge() after the
+// call corrects with the real token count.
+const estPerEvolutionRefreshUSD = 0.05
 
 // New wires the worker.
 func New(
@@ -207,6 +225,10 @@ func New(
 		lastTelegramAt: map[int64]time.Time{},
 	}
 }
+
+// SetBudget attaches the global AI budget guard. nil is allowed
+// (fail-open). Called once at startup from app.go.
+func (w *Worker) SetBudget(b BudgetGuard) { w.budget = b }
 
 // Run blocks until ctx cancels, ticking every Interval. Immediate
 // first tick on startup so a freshly-deployed worker doesn't sit
@@ -499,12 +521,23 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 			// the analyses table downstream; for the evolution
 			// Telegram body we keep it deterministic for the MVP.
 		})
-		if _, err := w.tg.SendHTML(ctx, w.cfg.TelegramChatID, text); err != nil {
-			w.observeTelegram("failed")
-			if w.log != nil {
-				w.log.Warn().Err(err).Int64("id", pred.ID).Msg("prediction evolution: telegram send failed")
+		// SafeSplit caps each chunk at Telegram's 4000-char limit
+		// while preserving HTML tag pairs. Short bodies are passed
+		// through as a single chunk; long catalyst-dense bodies are
+		// split on paragraph boundaries.
+		chunks := alerting.SafeSplitForTelegram(text)
+		anySent := false
+		for _, chunk := range chunks {
+			if _, err := w.tg.SendHTML(ctx, w.cfg.TelegramChatID, chunk); err != nil {
+				w.observeTelegram("failed")
+				if w.log != nil {
+					w.log.Warn().Err(err).Int64("id", pred.ID).Msg("prediction evolution: telegram send failed")
+				}
+				break
 			}
-		} else {
+			anySent = true
+		}
+		if anySent {
 			w.observeTelegram("sent")
 			res.TelegramSent = true
 			w.mu.Lock()
@@ -603,6 +636,19 @@ func (w *Worker) refreshAI(
 	flow eventflow.EventFlowSummary,
 	matched []marketprediction.MatchedAlert,
 ) bool {
+	// Budget governor — block when today's evolution bucket (or
+	// global) is exhausted. State + decay still applied above; only
+	// the AI thesis refresh is skipped, exactly as if the gating
+	// layer had decided "no_strong_alerts".
+	if w.budget != nil {
+		if ok, reason := w.budget.Allow(aibudget.BucketPredictionEvolve, estPerEvolutionRefreshUSD); !ok {
+			w.observeAISkipped(reason)
+			if w.log != nil {
+				w.log.Warn().Int64("id", pred.ID).Str("reason", reason).Msg("prediction evolution: AI denied by budget")
+			}
+			return false
+		}
+	}
 	req := analysis.PredictionEvolutionRequest{
 		EventSlug:          pred.EventSlug,
 		ConditionID:        pred.ConditionID,
@@ -623,6 +669,9 @@ func (w *Worker) refreshAI(
 			w.log.Warn().Err(err).Int64("id", pred.ID).Msg("prediction evolution: AI refresh failed")
 		}
 		return false
+	}
+	if w.budget != nil {
+		w.budget.Charge(aibudget.BucketPredictionEvolve, res.EstimatedCostUSD)
 	}
 	w.observeAI("ok")
 	// Stamp the new thesis. Upsert preserves state (we don't change

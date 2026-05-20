@@ -604,6 +604,216 @@
         "expr": "sum(watchtower_alert_calibration_total{status=\"pending\"}) - sum(watchtower_alert_calibration_total{status=~\"resolved_correct|resolved_wrong|unknown|unavailable\"})",
         "refId": "A"
       }]
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Prediction Engine (v10.0)",
+      "gridPos": {"x": 0, "y": 150, "w": 24, "h": 1}
+    },
+    {
+      "id": 101,
+      "type": "timeseries",
+      "title": "Prediction evolution runs (rate / 15m)",
+      "description": "Per-status outcomes of the evolution worker. A persistent climb on failed indicates the deterministic refresh is broken — the AI gating layer should still skip on failure.",
+      "gridPos": {"x": 0, "y": 151, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_prediction_evolution_runs_total[15m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 102,
+      "type": "timeseries",
+      "title": "Prediction creation runs (rate / 30m)",
+      "description": "Per-status outcomes of the creation worker. ok = full cycle; daily_cap_reached = per-day cap hit; no_picks = AI ranker returned nothing.",
+      "gridPos": {"x": 12, "y": 151, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_prediction_creation_runs_total[30m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 103,
+      "type": "timeseries",
+      "title": "Prediction state transitions (rate / 15m)",
+      "description": "Deterministic state-machine transitions emitted by the evolution worker, labelled by from→to. Heatmap of the alerting health of the prediction layer.",
+      "gridPos": {"x": 0, "y": 159, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (from, to) (rate(watchtower_prediction_evolution_state_changes_total[15m]))",
+        "legendFormat": "{{from}}→{{to}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 104,
+      "type": "timeseries",
+      "title": "Prediction AI skipped reasons (rate / 1h)",
+      "description": "Why the AI thesis-refresh was skipped. budget_denied / cooldown_active / state_unchanged are healthy; failed = needs operator look.",
+      "gridPos": {"x": 12, "y": 159, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason) (rate(watchtower_prediction_evolution_ai_skipped_total[1h]))",
+        "legendFormat": "{{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 105,
+      "type": "timeseries",
+      "title": "Repricing signals (rate / 15m)",
+      "description": "Deterministic repricing classifier output by status + flow timing. underreacting / overreacting are actionable; unclear dominating means CurrentPrice is missing (parser bug? event-page broken?).",
+      "gridPos": {"x": 0, "y": 167, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_repricing_signals_total[15m]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 106,
+      "type": "timeseries",
+      "title": "Catalyst upserts by type (rate / 1h)",
+      "description": "AI-extracted catalyst rows persisted by status × type. A drop on expected/runoff/election_day means the importer is failing for political markets.",
+      "gridPos": {"x": 12, "y": 167, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (type) (rate(watchtower_event_catalyst_upserted_total{status=\"expected\"}[1h]))",
+        "legendFormat": "{{type}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 107,
+      "type": "stat",
+      "title": "Blocked-alert annotations attached (24h)",
+      "description": "Count of Telegram alerts where a catalyst-driven Blocked block was attached. Low = catalyst importer isn't finding relevant catalysts.",
+      "gridPos": {"x": 0, "y": 175, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_event_catalyst_blocked_alerts_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 108,
+      "type": "stat",
+      "title": "Event-page annotations / 1h",
+      "description": "Annotation ingest rate from polymarket.com event pages. Drops to zero = build_id rotated, parser failed, or polymarket changed shape.",
+      "gridPos": {"x": 6, "y": 175, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_event_page_annotations_total[1h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 109,
+      "type": "timeseries",
+      "title": "Event-page parse failures by field (rate / 15m)",
+      "description": "Per-field type-drift counter. A sustained climb on a specific JSON path means Polymarket changed encoding upstream and the tolerant parser took the fallback. Investigate the field.",
+      "gridPos": {"x": 12, "y": 175, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (field) (rate(watchtower_event_page_parse_failures_total[15m]))",
+        "legendFormat": "{{field}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 110,
+      "type": "stat",
+      "title": "Event-page market parse skipped (24h)",
+      "description": "Count of markets the parser dropped because their JSON was structurally broken. Non-zero = repricing for those markets is dead.",
+      "gridPos": {"x": 0, "y": 181, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}},
+      "targets": [{
+        "expr": "sum(increase(watchtower_event_page_market_parse_total{status=\"skipped\"}[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 111,
+      "type": "timeseries",
+      "title": "AI budget spend by bucket (USD, today)",
+      "description": "Live per-bucket AI spend today (resets at UTC midnight). When a bucket flatlines under its cap, AI denials should be ZERO for that bucket; look at the denials panel if not.",
+      "gridPos": {"x": 6, "y": 181, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{
+        "expr": "watchtower_ai_budget_spent_usd",
+        "legendFormat": "{{bucket}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 112,
+      "type": "stat",
+      "title": "AI budget global spend (USD, today)",
+      "description": "Cumulative AI spend today across every bucket. Compares against AI_GLOBAL_DAILY_BUDGET_USD.",
+      "gridPos": {"x": 18, "y": 181, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}},
+      "targets": [{
+        "expr": "watchtower_ai_budget_global_spent_usd",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 113,
+      "type": "timeseries",
+      "title": "AI budget denials (rate / 1h)",
+      "description": "AI calls denied by the budget governor, labelled by bucket + reason. bucket_exhausted = bucket cap hit; global_exhausted = global cap hit. A persistent denial on the alert_analysis bucket means the cap is too tight for production.",
+      "gridPos": {"x": 0, "y": 186, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (bucket, reason) (rate(watchtower_ai_budget_denied_total[1h]))",
+        "legendFormat": "{{bucket}} · {{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 114,
+      "type": "stat",
+      "title": "Predictions created (24h)",
+      "description": "Predictions inserted by the creation worker in the last 24h. 0 = workflow broken OR daily cap reached.",
+      "gridPos": {"x": 12, "y": 186, "w": 4, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_creation_created_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 115,
+      "type": "stat",
+      "title": "Predictions evolved (1h)",
+      "description": "Predictions touched by the evolution worker in the last hour. The worker stamps every processed row even when nothing changed, so 0 = worker is not running.",
+      "gridPos": {"x": 16, "y": 186, "w": 4, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_evolution_processed_total[1h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 116,
+      "type": "stat",
+      "title": "Prediction decay applications (24h)",
+      "description": "Confidence-decay applications. Healthy when the watchtower is observing many quiet predictions; alarmingly high means the deterministic state machine isn't catching meaningful changes.",
+      "gridPos": {"x": 20, "y": 186, "w": 4, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_evolution_decay_total[24h]))",
+        "refId": "A"
+      }]
     }
   ]
 }

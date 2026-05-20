@@ -158,3 +158,21 @@ SET confidence      = GREATEST(@floor, confidence - @delta),
     updated_at      = NOW(),
     state_reason    = @reason
 WHERE id = @id;
+
+-- name: CountPredictionsCreatedSince :one
+-- Used by the prediction creation worker to enforce its per-day cap.
+-- A simple COUNT against the partial index on created_at — cheap
+-- enough to run every cycle.
+SELECT COUNT(*)::bigint
+FROM polymarket_market_predictions
+WHERE created_at >= @since;
+
+-- name: CountPredictionsForEventSince :one
+-- Used by the prediction creation worker's per-event dedupe window:
+-- "did we already create a prediction for THIS event in the last
+-- DedupeWindow?". Includes rows in any state — a stale prediction
+-- still counts as "we touched this event recently".
+SELECT COUNT(*)::bigint
+FROM polymarket_market_predictions
+WHERE event_slug = @event_slug
+  AND created_at >= @since;

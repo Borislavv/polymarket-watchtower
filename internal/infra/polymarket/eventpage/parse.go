@@ -1,6 +1,7 @@
 package eventpage
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,12 @@ import (
 	"strings"
 	"time"
 )
+
+// maxParseWarnings caps the warning slice so a pathological payload
+// (e.g. Polymarket renames every field in a deploy) doesn't grow
+// memory unboundedly. The operator gets a representative sample;
+// metrics still increment for every drift.
+const maxParseWarnings = 64
 
 // parsePayload normalises the Next.js dehydrated state into our
 // EventPagePayload. The shape we accept:
@@ -50,11 +57,12 @@ func parsePayload(eventSlug string, raw []byte, now time.Time) (*EventPagePayloa
 		out.RawQueryKeys = append(out.RawQueryKeys, key)
 		switch {
 		case len(q.QueryKey) >= 1 && q.QueryKey[0].asString() == queryKeyEventSlug:
-			ev, markets, err := parseEventQuery(q.State.Data)
+			ev, markets, ws, err := parseEventQuery(q.State.Data)
 			if err == nil {
 				out.Event = ev
 				out.Markets = markets
 			}
+			out.ParseWarnings = appendCapped(out.ParseWarnings, ws)
 		case len(q.QueryKey) >= 3 &&
 			q.QueryKey[0].asString() == queryKeyAnnotations &&
 			q.QueryKey[1].asString() == "event":
@@ -69,7 +77,23 @@ func parsePayload(eventSlug string, raw []byte, now time.Time) (*EventPagePayloa
 			out.DerivativeData = append(json.RawMessage(nil), q.State.Data...)
 		}
 	}
+	if len(out.ParseWarnings) == 0 {
+		out.ParseStatus = "ok"
+	} else {
+		out.ParseStatus = "partial"
+	}
 	return out, nil
+}
+
+// appendCapped appends `add` to `dst` up to maxParseWarnings.
+func appendCapped(dst, add []ParseWarning) []ParseWarning {
+	for _, w := range add {
+		if len(dst) >= maxParseWarnings {
+			return dst
+		}
+		dst = append(dst, w)
+	}
+	return dst
 }
 
 // dehydratedQuery is the shape of one entry in queries[].
@@ -128,59 +152,91 @@ func stringifyQueryKey(parts []rawJSON) string {
 // ["/api/event/slug",<slug>] payload. Many fields are optional;
 // Polymarket adds new ones over time and we ignore everything we
 // don't consume.
+// eventQueryShape uses flex* numeric types so an event-level field
+// drift doesn't poison the whole event decode. Markets are
+// deliberately decoded as []json.RawMessage so a single broken market
+// row can be skipped without nuking the rest of the array — see
+// parseEventQuery.
 type eventQueryShape struct {
-	ID                 string  `json:"id"`
-	Slug               string  `json:"slug"`
-	Title              string  `json:"title"`
-	Description        string  `json:"description"`
-	ResolutionSource   string  `json:"resolutionSource"`
-	ResolutionRules    string  `json:"resolutionRules"`
-	Category           string  `json:"category"`
-	StartDate          string  `json:"startDate"`
-	EndDate            string  `json:"endDate"`
-	Active             bool    `json:"active"`
-	Closed             bool    `json:"closed"`
-	Volume             float64 `json:"volume"`
-	Volume24h          float64 `json:"volume24hr"`
-	Liquidity          float64 `json:"liquidity"`
-	ContextDescription string  `json:"context_description"`
-	ContextUpdatedAt   string  `json:"context_updated_at"`
-	Image              string  `json:"image"`
-
-	Markets []marketQueryShape `json:"markets"`
+	ID                 string            `json:"id"`
+	Slug               string            `json:"slug"`
+	Title              string            `json:"title"`
+	Description        string            `json:"description"`
+	ResolutionSource   string            `json:"resolutionSource"`
+	ResolutionRules    string            `json:"resolutionRules"`
+	Category           string            `json:"category"`
+	StartDate          string            `json:"startDate"`
+	EndDate            string            `json:"endDate"`
+	Active             bool              `json:"active"`
+	Closed             bool              `json:"closed"`
+	Volume             flexFloat64       `json:"volume"`
+	Volume24h          flexFloat64       `json:"volume24hr"`
+	Liquidity          flexFloat64       `json:"liquidity"`
+	ContextDescription string            `json:"context_description"`
+	ContextUpdatedAt   string            `json:"context_updated_at"`
+	Image              string            `json:"image"`
+	Markets            []json.RawMessage `json:"markets"`
 }
 
+// marketQueryShape uses the flex* tolerant types so that one market's
+// drifted field encoding never wins the race against the whole
+// markets[] decode. See flex.go for the per-field rationale; the
+// short version is Polymarket frequently mixes float/string and
+// array/json-encoded-string for the same field across markets.
 type marketQueryShape struct {
-	ID                 string   `json:"id"`
-	ConditionID        string   `json:"conditionId"`
-	Slug               string   `json:"slug"`
-	Question           string   `json:"question"`
-	GroupItemTitle     string   `json:"groupItemTitle"`
-	Outcomes           string   `json:"outcomes"`      // JSON-encoded array
-	OutcomePrices      string   `json:"outcomePrices"` // JSON-encoded array
-	Volume             float64  `json:"volume"`
-	Volume24h          float64  `json:"volume24hr"`
-	Liquidity          float64  `json:"liquidity"`
-	Active             bool     `json:"active"`
-	Closed             bool     `json:"closed"`
-	EndDate            string   `json:"endDate"`
-	OneHourPriceChange *float64 `json:"oneHourPriceChange"`
-	OneDayPriceChange  *float64 `json:"oneDayPriceChange"`
-	OneWeekPriceChange *float64 `json:"oneWeekPriceChange"`
-	LastTradePrice     *float64 `json:"lastTradePrice"`
-	BestBid            *float64 `json:"bestBid"`
-	BestAsk            *float64 `json:"bestAsk"`
-	ClobTokenIDs       string   `json:"clobTokenIds"` // JSON-encoded array
+	ID                 string         `json:"id"`
+	ConditionID        string         `json:"conditionId"`
+	Slug               string         `json:"slug"`
+	Question           string         `json:"question"`
+	GroupItemTitle     string         `json:"groupItemTitle"`
+	Outcomes           flexStringList `json:"outcomes"`
+	OutcomePrices      flexStringList `json:"outcomePrices"`
+	Volume             flexFloat64    `json:"volume"`
+	Volume24h          flexFloat64    `json:"volume24hr"`
+	Liquidity          flexFloat64    `json:"liquidity"`
+	Active             bool           `json:"active"`
+	Closed             bool           `json:"closed"`
+	EndDate            string         `json:"endDate"`
+	OneHourPriceChange flexFloat64Ptr `json:"oneHourPriceChange"`
+	OneDayPriceChange  flexFloat64Ptr `json:"oneDayPriceChange"`
+	OneWeekPriceChange flexFloat64Ptr `json:"oneWeekPriceChange"`
+	LastTradePrice     flexFloat64Ptr `json:"lastTradePrice"`
+	BestBid            flexFloat64Ptr `json:"bestBid"`
+	BestAsk            flexFloat64Ptr `json:"bestAsk"`
+	ClobTokenIDs       flexStringList `json:"clobTokenIds"`
 }
 
-func parseEventQuery(data json.RawMessage) (EventPageEvent, []EventPageMarket, error) {
+// parseEventQuery decodes the ["/api/event/slug",<slug>] payload.
+//
+// Markets are isolated: each market's RawJSON is unmarshalled
+// individually, so a single drifted field on market[3] does NOT
+// destroy markets[0..2,4..n]. Per-market failures append a
+// ParseWarning of kind "subobject_skipped"; per-field flex drifts
+// append "type_drift". The returned warning slice is appended to the
+// caller's accumulator at the parsePayload level.
+func parseEventQuery(data json.RawMessage) (EventPageEvent, []EventPageMarket, []ParseWarning, error) {
 	if len(data) == 0 {
-		return EventPageEvent{}, nil, nil
+		return EventPageEvent{}, nil, nil, nil
 	}
 	var ev eventQueryShape
 	if err := json.Unmarshal(data, &ev); err != nil {
-		return EventPageEvent{}, nil, fmt.Errorf("event slug parse: %w", err)
+		// The envelope itself is unreadable — surface a single
+		// section-level warning and return what we have. Annotations
+		// + similar markets remain available because they live in
+		// sibling queries.
+		return EventPageEvent{}, nil, []ParseWarning{{
+			Section:       "event",
+			Field:         "event",
+			Kind:          "decode_failed",
+			OffendingType: jsonTopType(data),
+			Sample:        sampleSnippet(data),
+		}}, fmt.Errorf("event slug parse: %w", err)
 	}
+	var warnings []ParseWarning
+	recordFlexFloat(&warnings, "event", "event.volume", ev.Volume, data, "volume")
+	recordFlexFloat(&warnings, "event", "event.volume24hr", ev.Volume24h, data, "volume24hr")
+	recordFlexFloat(&warnings, "event", "event.liquidity", ev.Liquidity, data, "liquidity")
+
 	out := EventPageEvent{
 		ID:                 ev.ID,
 		Slug:               ev.Slug,
@@ -192,44 +248,147 @@ func parseEventQuery(data json.RawMessage) (EventPageEvent, []EventPageMarket, e
 		EndDate:            parseTimeOrZero(ev.EndDate),
 		Active:             ev.Active,
 		Closed:             ev.Closed,
-		Volume:             ev.Volume,
-		Volume24h:          ev.Volume24h,
-		Liquidity:          ev.Liquidity,
+		Volume:             ev.Volume.Float64(),
+		Volume24h:          ev.Volume24h.Float64(),
+		Liquidity:          ev.Liquidity.Float64(),
 		ContextDescription: ev.ContextDescription,
 		ContextUpdatedAt:   parseTimeOrZero(ev.ContextUpdatedAt),
 		ImageURL:           ev.Image,
 	}
 	markets := make([]EventPageMarket, 0, len(ev.Markets))
-	for _, m := range ev.Markets {
-		mm := EventPageMarket{
-			MarketID:           m.ID,
-			ConditionID:        m.ConditionID,
-			Slug:               m.Slug,
-			Question:           m.Question,
-			GroupItemTitle:     m.GroupItemTitle,
-			Outcomes:           decodeStringArray(m.Outcomes),
-			OutcomePrices:      decodeStringArray(m.OutcomePrices),
-			Volume:             m.Volume,
-			Volume24h:          m.Volume24h,
-			Liquidity:          m.Liquidity,
-			Active:             m.Active,
-			Closed:             m.Closed,
-			EndDate:            parseTimeOrZero(m.EndDate),
-			OneHourPriceChange: m.OneHourPriceChange,
-			OneDayPriceChange:  m.OneDayPriceChange,
-			OneWeekPriceChange: m.OneWeekPriceChange,
-			LastTradePrice:     m.LastTradePrice,
-			BestBid:            m.BestBid,
-			BestAsk:            m.BestAsk,
-			CLOBTokenIDs:       decodeStringArray(m.ClobTokenIDs),
+	for i, raw := range ev.Markets {
+		mm, w, err := parseOneMarket(raw)
+		if err != nil {
+			warnings = append(warnings, ParseWarning{
+				Section:       "market",
+				Field:         fmt.Sprintf("markets[%d]", i),
+				Kind:          "subobject_skipped",
+				OffendingType: jsonTopType(raw),
+				Sample:        sampleSnippet(raw),
+			})
+			continue
 		}
-		// Preserve the raw market JSON for downstream consumers.
-		// Capped at write-time by the repository.
-		buf, _ := json.Marshal(m)
-		mm.RawJSON = buf
+		warnings = append(warnings, w...)
 		markets = append(markets, mm)
 	}
-	return out, markets, nil
+	return out, markets, warnings, nil
+}
+
+// parseOneMarket decodes a single market row in isolation. The
+// per-market RawJSON is preserved verbatim so downstream consumers
+// can re-parse if they need a field we don't surface yet.
+func parseOneMarket(raw json.RawMessage) (EventPageMarket, []ParseWarning, error) {
+	var m marketQueryShape
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return EventPageMarket{}, nil, err
+	}
+	var ws []ParseWarning
+	recordFlexFloat(&ws, "market", "market.volume", m.Volume, raw, "volume")
+	recordFlexFloat(&ws, "market", "market.volume24hr", m.Volume24h, raw, "volume24hr")
+	recordFlexFloat(&ws, "market", "market.liquidity", m.Liquidity, raw, "liquidity")
+	recordFlexStringList(&ws, "market", "market.outcomes", m.Outcomes, raw, "outcomes")
+	recordFlexStringList(&ws, "market", "market.outcomePrices", m.OutcomePrices, raw, "outcomePrices")
+	recordFlexStringList(&ws, "market", "market.clobTokenIds", m.ClobTokenIDs, raw, "clobTokenIds")
+	mm := EventPageMarket{
+		MarketID:           m.ID,
+		ConditionID:        m.ConditionID,
+		Slug:               m.Slug,
+		Question:           m.Question,
+		GroupItemTitle:     m.GroupItemTitle,
+		Outcomes:           m.Outcomes.Vals(),
+		OutcomePrices:      m.OutcomePrices.Vals(),
+		Volume:             m.Volume.Float64(),
+		Volume24h:          m.Volume24h.Float64(),
+		Liquidity:          m.Liquidity.Float64(),
+		Active:             m.Active,
+		Closed:             m.Closed,
+		EndDate:            parseTimeOrZero(m.EndDate),
+		OneHourPriceChange: m.OneHourPriceChange.Ptr(),
+		OneDayPriceChange:  m.OneDayPriceChange.Ptr(),
+		OneWeekPriceChange: m.OneWeekPriceChange.Ptr(),
+		LastTradePrice:     m.LastTradePrice.Ptr(),
+		BestBid:            m.BestBid.Ptr(),
+		BestAsk:            m.BestAsk.Ptr(),
+		CLOBTokenIDs:       m.ClobTokenIDs.Vals(),
+		RawJSON:            append(json.RawMessage(nil), raw...),
+	}
+	return mm, ws, nil
+}
+
+// recordFlexFloat appends a type_drift warning when the flexFloat64
+// took the string fallback. No-op on clean (number) decodes.
+func recordFlexFloat(ws *[]ParseWarning, section, field string, f flexFloat64, raw json.RawMessage, key string) {
+	if !f.Drifted() {
+		return
+	}
+	*ws = append(*ws, ParseWarning{
+		Section:       section,
+		Field:         field,
+		Kind:          "type_drift",
+		OffendingType: "string",
+		Sample:        snippetField(raw, key),
+	})
+}
+
+// recordFlexStringList appends a type_drift warning when the
+// flexStringList took the encoded-string fallback.
+func recordFlexStringList(ws *[]ParseWarning, section, field string, l flexStringList, raw json.RawMessage, key string) {
+	if !l.Drifted() {
+		return
+	}
+	*ws = append(*ws, ParseWarning{
+		Section:       section,
+		Field:         field,
+		Kind:          "type_drift",
+		OffendingType: "encoded_string",
+		Sample:        snippetField(raw, key),
+	})
+}
+
+// jsonTopType returns a short human label for the top-level JSON
+// token kind of `b`. Used only for warning telemetry.
+func jsonTopType(b json.RawMessage) string {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return "missing"
+	}
+	switch b[0] {
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	case 'n':
+		return "null"
+	default:
+		return "number"
+	}
+}
+
+// sampleSnippet returns up to 200 chars of raw JSON for the operator
+// log. Trimmed and best-effort; never used for control flow.
+func sampleSnippet(b json.RawMessage) string {
+	s := string(bytes.TrimSpace(b))
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
+}
+
+// snippetField pulls the raw value of one key from a JSON object for
+// the warning log. Best-effort — returns "" if the key isn't found.
+func snippetField(raw json.RawMessage, key string) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if v, ok := m[key]; ok {
+		return sampleSnippet(v)
+	}
+	return ""
 }
 
 // --- annotations ---------------------------------------------------------

@@ -69,6 +69,15 @@ type Querier interface {
 	// reclaims rows whose lease is older than the configured TTL.
 	ClaimUndetectedTrades(ctx context.Context, arg ClaimUndetectedTradesParams) ([]ClaimUndetectedTradesRow, error)
 	CompleteMarketBackfill(ctx context.Context, arg CompleteMarketBackfillParams) error
+	// Used by the prediction creation worker to enforce its per-day cap.
+	// A simple COUNT against the partial index on created_at — cheap
+	// enough to run every cycle.
+	CountPredictionsCreatedSince(ctx context.Context, since pgtype.Timestamptz) (int64, error)
+	// Used by the prediction creation worker's per-event dedupe window:
+	// "did we already create a prediction for THIS event in the last
+	// DedupeWindow?". Includes rows in any state — a stale prediction
+	// still counts as "we touched this event recently".
+	CountPredictionsForEventSince(ctx context.Context, arg CountPredictionsForEventSinceParams) (int64, error)
 	// /stats break-down: rows by terminal detection state. NULL status is
 	// reported as 'pending'.
 	DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error)

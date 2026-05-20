@@ -363,6 +363,7 @@ func (p *Provider) refresh(ctx context.Context, eventSlug string) {
 	_ = p.store.MarkFetch(ctx, eventSlug, startedAt, payload.BuildID, int32(len(payload.Annotations)), "")
 	p.observeFetch("success")
 	p.observeAnnotations(len(payload.Annotations))
+	p.observeParseWarnings(payload)
 	// Stash the event metadata so future buildSummary calls can
 	// render title / context_description / resolution_rules
 	// without re-fetching.
@@ -460,6 +461,65 @@ func (p *Provider) observeFetchLatency(d time.Duration) {
 		return
 	}
 	p.metrics.EventPageFetchLatency.Observe(d.Seconds())
+}
+
+// observeParseWarnings fans the parser's per-field drift signal out
+// into Prometheus + one structured log line. Called after a successful
+// fetch so the operator can correlate `parse_failures_total{field}`
+// climbs with the specific event_slug + buildId that exhibited drift.
+// Silent when the payload parsed cleanly.
+func (p *Provider) observeParseWarnings(payload *eventpage.EventPagePayload) {
+	if payload == nil {
+		return
+	}
+	// Count per-market outcomes regardless of warnings — the
+	// "ok" path is informative on its own (rate-of-markets-parsed).
+	if p.metrics != nil && p.metrics.EventPageMarketParse != nil {
+		p.metrics.EventPageMarketParse.WithLabelValues("ok").Add(float64(len(payload.Markets)))
+		var skipped int
+		for _, w := range payload.ParseWarnings {
+			if w.Kind == "subobject_skipped" {
+				skipped++
+			}
+		}
+		if skipped > 0 {
+			p.metrics.EventPageMarketParse.WithLabelValues("skipped").Add(float64(skipped))
+		}
+	}
+	if len(payload.ParseWarnings) == 0 {
+		return
+	}
+	if p.metrics != nil {
+		if p.metrics.EventPagePartialParse != nil {
+			p.metrics.EventPagePartialParse.Inc()
+		}
+		if p.metrics.EventPageParseFailures != nil {
+			for _, w := range payload.ParseWarnings {
+				p.metrics.EventPageParseFailures.WithLabelValues(w.Field).Inc()
+			}
+		}
+	}
+	if p.log != nil {
+		// Cap log payload at the first 8 warnings — the operator
+		// just needs to know which fields drifted; the prometheus
+		// counters carry the full count.
+		shown := payload.ParseWarnings
+		if len(shown) > 8 {
+			shown = shown[:8]
+		}
+		evt := p.log.Warn().
+			Str("event_slug", payload.EventSlug).
+			Str("build_id", payload.BuildID).
+			Int("warnings_total", len(payload.ParseWarnings)).
+			Int("markets_parsed", len(payload.Markets))
+		for i, w := range shown {
+			prefix := fmt.Sprintf("w%d_", i)
+			evt = evt.Str(prefix+"field", w.Field).
+				Str(prefix+"kind", w.Kind).
+				Str(prefix+"type", w.OffendingType)
+		}
+		evt.Msg("event page: partial parse")
+	}
 }
 
 // --- rendering ------------------------------------------------------------

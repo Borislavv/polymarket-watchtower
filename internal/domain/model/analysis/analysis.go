@@ -599,6 +599,130 @@ func (NoopPredictionEvolutionGenerator) RefreshPredictionThesis(_ context.Contex
 	return PredictionEvolutionResponse{Status: StatusSkipped, Model: "noop"}, nil
 }
 
+// --- Prediction Creation (v10.0) ------------------------------------------
+//
+// PART 1 of the operational-grade prediction engine. The creation
+// pipeline runs in two AI stages so we don't burn full-thesis tokens
+// on every shortlisted market:
+//
+//  1. Ranker: takes ~15–25 SHORT candidate summaries and answers
+//     "which deserve full deep-dive". One prompt per cycle.
+//  2. Predictor: for the top-N selected, generates a full
+//     market thesis (catalyst reasoning, repricing read, flow
+//     interpretation, risk factors, practical stance).
+//
+// Domain types live here so the worker depends only on the analysis
+// package, not on a specific AI provider.
+
+// PredictionCandidate is one short candidate the worker hands the
+// ranker. All fields are deterministic — populated by the worker
+// from DB queries, never invented by AI.
+type PredictionCandidate struct {
+	EventSlug          string
+	ConditionID        string
+	Question           string
+	Category           string
+	Outcome            string  // outcome label (e.g. "Ken Paxton")
+	LastTradePrice     float64 // current price 0–1
+	OneDayPriceChange  float64 // signed % change vs 24h ago
+	OneWeekPriceChange float64 // signed % change vs 1w ago
+	LifecyclePct       float64 // 0–100; how much of the market lifetime has elapsed
+	RecentAlerts24h    int
+	StrongestSide      string // "BUY" | "SELL" | ""
+	DirectionalSkew    float64
+	OpenCatalysts      int
+	NewAnnotations24h  int
+	VolumeUSD24h       float64
+	LiquidityUSD       float64
+	BaselineMedianUSD  float64
+}
+
+// PredictionRankingRequest is the input to the ranker. The worker
+// fills `Candidates` deterministically and asks for the top N.
+type PredictionRankingRequest struct {
+	AnalysisTimeUTC time.Time
+	Candidates      []PredictionCandidate
+	MaxSelected     int
+}
+
+// PredictionRankingPick is one row the AI returns. EventSlug must
+// match a candidate the worker sent — the worker rejects picks for
+// unknown slugs.
+type PredictionRankingPick struct {
+	EventSlug   string  `json:"event_slug"`
+	ConditionID string  `json:"condition_id,omitempty"`
+	Score       float64 `json:"score"`
+	Reason      string  `json:"reason,omitempty"`
+}
+
+// PredictionRankingResponse is the AI ranker's verdict.
+type PredictionRankingResponse struct {
+	Picks            []PredictionRankingPick
+	Status           Status
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	EstimatedCostUSD float64
+	LastError        string
+}
+
+// PredictionRanker is the AI seam for the first stage.
+type PredictionRanker interface {
+	RankCandidates(ctx context.Context, req PredictionRankingRequest) (PredictionRankingResponse, error)
+}
+
+// NoopPredictionRanker returns StatusSkipped + an empty pick set.
+type NoopPredictionRanker struct{}
+
+func (NoopPredictionRanker) RankCandidates(_ context.Context, _ PredictionRankingRequest) (PredictionRankingResponse, error) {
+	return PredictionRankingResponse{Status: StatusSkipped, Model: "noop"}, nil
+}
+
+// PredictionCreationRequest is the input to the deep-dive predictor
+// for ONE selected candidate. Fields mirror PredictionEvolutionRequest
+// for consistency — same render helpers feed both.
+type PredictionCreationRequest struct {
+	EventSlug          string
+	ConditionID        string
+	Outcome            string
+	Question           string
+	Category           string
+	MarketSnapshot     string
+	AnnotationsBlock   string
+	CatalystsBlock     string
+	RepricingBlock     string
+	FlowSummaryBlock   string
+	MatchedAlertsBlock string
+}
+
+// PredictionCreationResponse is the structured thesis the AI
+// produces. Rendered HTML-escaped into the initial prediction body
+// and persisted as polymarket_market_predictions.summary.
+type PredictionCreationResponse struct {
+	Summary          string  // free-text Russian thesis (renders into Telegram)
+	SideBias         string  // "bullish" | "bearish" | "neutral"
+	Confidence       float64 // 0..1
+	RiskFactors      string  // operator-facing bullet block
+	Status           Status
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	EstimatedCostUSD float64
+	LastError        string
+}
+
+// PredictionCreator is the AI seam for the second stage.
+type PredictionCreator interface {
+	CreatePrediction(ctx context.Context, req PredictionCreationRequest) (PredictionCreationResponse, error)
+}
+
+// NoopPredictionCreator returns StatusSkipped + empty summary.
+type NoopPredictionCreator struct{}
+
+func (NoopPredictionCreator) CreatePrediction(_ context.Context, _ PredictionCreationRequest) (PredictionCreationResponse, error) {
+	return PredictionCreationResponse{Status: StatusSkipped, Model: "noop"}, nil
+}
+
 // --- Analyzer interface ---------------------------------------------------
 
 // Analyzer is the single seam between the AI provider and the rest

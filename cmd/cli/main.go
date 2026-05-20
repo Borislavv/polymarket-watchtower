@@ -54,6 +54,8 @@ func main() {
 		// per-prediction summary (old/new state, AI refresh decision,
 		// repricing status, matched alerts, decay, Telegram).
 		runEvolvePredictions(os.Args[2:])
+	case "diag-eventpage":
+		runDiagEventPage(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)

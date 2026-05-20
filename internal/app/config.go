@@ -558,6 +558,7 @@ type Config struct {
 	EventFlow         EventFlowConfig
 	Repricing         RepricingConfig
 	Prediction        PredictionConfig
+	AIBudget          AIBudgetConfig
 }
 
 // EventFlowConfig drives the deterministic event-level flow
@@ -615,6 +616,40 @@ type PredictionConfig struct {
 
 	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"true"`
 	EvolutionTelegramCooldown time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
+
+	// --- v10.0 prediction creation worker (PART 1) ---
+	// The cold-start path. Without this loop, the evolution worker
+	// has nothing to evolve. Defaults are moderate / safe / non-
+	// spammy — the deterministic shortlist + AI ranking step keeps
+	// the AI bill bounded under the AI budget governor.
+	CreationEnabled      bool          `env:"MARKET_PREDICTION_CREATION_ENABLED" envDefault:"true"`
+	CreationInterval     time.Duration `env:"MARKET_PREDICTION_CREATION_INTERVAL" envDefault:"30m" validate:"gt=0"`
+	CreationBatchSize    int           `env:"MARKET_PREDICTION_CREATION_BATCH_SIZE" envDefault:"150" validate:"gte=10,lte=1000"`
+	CreationMaxSelected  int           `env:"MARKET_PREDICTION_CREATION_MAX_SELECTED" envDefault:"10" validate:"gte=1,lte=50"`
+	CreationMinScore     float64       `env:"MARKET_PREDICTION_CREATION_MIN_SCORE" envDefault:"0.55" validate:"gte=0,lte=1"`
+	CreationMaxPerDay    int           `env:"MARKET_PREDICTION_CREATION_MAX_PER_DAY" envDefault:"40" validate:"gte=1,lte=500"`
+	CreationDedupeWindow time.Duration `env:"MARKET_PREDICTION_CREATION_DEDUPE_WINDOW" envDefault:"24h" validate:"gt=0"`
+	CreationAIEnabled    bool          `env:"MARKET_PREDICTION_CREATION_AI_ENABLED" envDefault:"true"`
+	CreationAIModel      string        `env:"MARKET_PREDICTION_CREATION_AI_MODEL" envDefault:"gpt-4.1"`
+	CreationAITimeout    time.Duration `env:"MARKET_PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	CreationConcurrency  int           `env:"MARKET_PREDICTION_CREATION_CONCURRENCY" envDefault:"2" validate:"gte=1,lte=16"`
+	CreationSendTelegram bool          `env:"MARKET_PREDICTION_CREATION_SEND_TELEGRAM" envDefault:"true"`
+	CreationCategories   []string      `env:"MARKET_PREDICTION_CREATION_CATEGORIES" envDefault:"politics,geopolitics,elections" envSeparator:","`
+}
+
+// AIBudgetConfig wires the process-local AI budget governor (PART 5
+// of the v10.0 operational pass). 0 on any field disables that
+// specific cap; the recommended production values are the defaults
+// below and live in CLAUDE.md / .env.example.
+type AIBudgetConfig struct {
+	GlobalDailyUSD             float64 `env:"AI_GLOBAL_DAILY_BUDGET_USD" envDefault:"25" validate:"gte=0"`
+	AlertAnalysisDailyUSD      float64 `env:"AI_ANALYSIS_DAILY_BUDGET_USD_OVERRIDE" envDefault:"0" validate:"gte=0"`
+	CatalystImporterDailyUSD   float64 `env:"EVENT_CATALYST_IMPORTER_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
+	PredictionCreationDailyUSD float64 `env:"PREDICTION_CREATION_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
+	PredictionEvolveDailyUSD   float64 `env:"PREDICTION_EVOLUTION_DAILY_BUDGET_USD" envDefault:"5" validate:"gte=0"`
+	MarketIntelDailyUSD        float64 `env:"MARKET_INTEL_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
+	DailyIntelDailyUSD         float64 `env:"DAILY_INTEL_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
+	AnnotationRankDailyUSD     float64 `env:"ANNOTATION_RANKING_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
 }
 
 // DailyPoliticalIntelConfig wires the v9.7 once-per-day political /
@@ -659,6 +694,21 @@ type CatalystConfig struct {
 	ImporterMaxPromptChars int           `env:"EVENT_CATALYST_IMPORTER_MAX_PROMPT_CHARS" envDefault:"12000" validate:"gte=1000,lte=64000"`
 	ImporterMinConfidence  float64       `env:"EVENT_CATALYST_IMPORTER_MIN_CONFIDENCE" envDefault:"0.55" validate:"gte=0,lte=1"`
 	ImporterStaleAfter     time.Duration `env:"EVENT_CATALYST_IMPORTER_STALE_AFTER" envDefault:"168h" validate:"gt=0"`
+
+	// --- v10.0 tiering (PART 6 of operational pass) ---
+	// Per-tier cadence + threshold knobs. With TieringEnabled=true
+	// the worker stops hitting every market every Interval; tier-1
+	// (high-signal political races, big volume, multiple alerts)
+	// stays at 5m, tier-2 at 15m, tier-3 at 60m. Cuts AI calls by
+	// ~3× without losing freshness on load-bearing markets.
+	ImporterTieringEnabled       bool          `env:"EVENT_CATALYST_IMPORTER_TIERING_ENABLED" envDefault:"true"`
+	ImporterTier1Interval        time.Duration `env:"EVENT_CATALYST_IMPORTER_TIER1_INTERVAL" envDefault:"5m" validate:"gt=0"`
+	ImporterTier2Interval        time.Duration `env:"EVENT_CATALYST_IMPORTER_TIER2_INTERVAL" envDefault:"15m" validate:"gt=0"`
+	ImporterTier3Interval        time.Duration `env:"EVENT_CATALYST_IMPORTER_TIER3_INTERVAL" envDefault:"60m" validate:"gt=0"`
+	ImporterTier1MinVolume24hUSD float64       `env:"EVENT_CATALYST_IMPORTER_TIER1_MIN_VOLUME_24H_USD" envDefault:"100000" validate:"gte=0"`
+	ImporterTier1MinAlerts24h    int           `env:"EVENT_CATALYST_IMPORTER_TIER1_MIN_ALERTS_24H" envDefault:"3" validate:"gte=0,lte=100"`
+	ImporterTier2MinVolume24hUSD float64       `env:"EVENT_CATALYST_IMPORTER_TIER2_MIN_VOLUME_24H_USD" envDefault:"10000" validate:"gte=0"`
+	ImporterTier1CategoriesCSV   string        `env:"EVENT_CATALYST_IMPORTER_TIER1_CATEGORIES" envDefault:"Geopolitics,Elections"`
 }
 
 // EventPageContextConfig wires the Polymarket event-page narrative

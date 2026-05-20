@@ -42,6 +42,45 @@ func (q *Queries) ApplyPredictionDecay(ctx context.Context, arg ApplyPredictionD
 	return err
 }
 
+const countPredictionsCreatedSince = `-- name: CountPredictionsCreatedSince :one
+SELECT COUNT(*)::bigint
+FROM polymarket_market_predictions
+WHERE created_at >= $1
+`
+
+// Used by the prediction creation worker to enforce its per-day cap.
+// A simple COUNT against the partial index on created_at — cheap
+// enough to run every cycle.
+func (q *Queries) CountPredictionsCreatedSince(ctx context.Context, since pgtype.Timestamptz) (int64, error) {
+	row := q.db.QueryRow(ctx, countPredictionsCreatedSince, since)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countPredictionsForEventSince = `-- name: CountPredictionsForEventSince :one
+SELECT COUNT(*)::bigint
+FROM polymarket_market_predictions
+WHERE event_slug = $1
+  AND created_at >= $2
+`
+
+type CountPredictionsForEventSinceParams struct {
+	EventSlug string
+	Since     pgtype.Timestamptz
+}
+
+// Used by the prediction creation worker's per-event dedupe window:
+// "did we already create a prediction for THIS event in the last
+// DedupeWindow?". Includes rows in any state — a stale prediction
+// still counts as "we touched this event recently".
+func (q *Queries) CountPredictionsForEventSince(ctx context.Context, arg CountPredictionsForEventSinceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPredictionsForEventSince, arg.EventSlug, arg.Since)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const getMarketPrediction = `-- name: GetMarketPrediction :one
 SELECT
     id, event_slug, condition_id, outcome, side_bias, summary,
