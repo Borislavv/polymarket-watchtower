@@ -23,15 +23,18 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	sfdet "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/stablefavorite"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/annotationranking"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/dailypoliticalintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detection"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst"
 	catalystimporter "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst/importer"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventflow"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
@@ -55,6 +58,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	pg "github.com/Borislavv/polymarket-watchtower/internal/infra/postgres"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/postgres/sqlc"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	shutdown2 "github.com/Borislavv/polymarket-watchtower/internal/infra/shutdown"
@@ -90,6 +94,7 @@ type App struct {
 	outcomeAI        *outcomeai.Worker
 	marketIntel      *marketintel.Worker
 	catalystImporter *catalystimporter.Worker
+	dailyIntel       *dailypoliticalintel.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -720,6 +725,9 @@ func New() (*App, error) {
 		eventPageProvider = wireEventPageProvider(cfg, marketsRepo, met, logger)
 		if eventPageProvider != nil {
 			aiSvc.SetNarrativeLoader(eventPageProvider)
+			if senderWorker != nil {
+				senderWorker.SetAlertAnnotationStamper(eventPageProvider)
+			}
 			logger.Info().
 				Bool("enabled", cfg.EventPage.Enabled).
 				Dur("refresh_info", cfg.EventPage.RefreshInfo).
@@ -845,6 +853,27 @@ func New() (*App, error) {
 		if eventPageProvider != nil {
 			marketIntelWorker.SetNarrativeLoader(eventPageProvider)
 		}
+		// v9.7: annotation ranking hook. When the AI key is wired,
+		// the marketintel report appends a "Top important
+		// annotations" block ranked by the model.
+		if cfg.AIAnalysis.APIKey != "" && eventPageProvider != nil {
+			ranker := openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.AIAnalysis.Timeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+			annoRepoForHook := repository.NewAnnotationIntelRepository(pgPool)
+			hook := annotationranking.New(annotationranking.Config{},
+				marketsRepo, eventPageProvider, ranker, annoRepoForHook, met, logger)
+			marketIntelWorker.SetAnnotationRankingHook(hook)
+		}
 	}
 
 	// v9.6 Political-Catalyst Intelligence importer. Every Interval
@@ -902,6 +931,68 @@ func New() (*App, error) {
 			Msg("event catalyst importer: wired")
 	}
 
+	// v9.7 Daily Political Intelligence report worker. Runs once per
+	// day at DAILY_POLITICAL_INTEL_TIME in DAILY_POLITICAL_INTEL_TIMEZONE,
+	// selects 100 markets, calls AI, splits + sends Telegram.
+	var dailyIntelWorker *dailypoliticalintel.Worker
+	if cfg.Postgres.Enabled() && cfg.DailyIntel.Enabled && marketsRepo != nil && eventPageProvider != nil {
+		var dailyGen analysis.DailyPoliticalIntelGenerator = analysis.NoopDailyPoliticalIntelGenerator{}
+		if cfg.AIAnalysis.APIKey != "" && cfg.DailyIntel.AIEnabled {
+			dailyGen = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.DailyIntel.AITimeout,
+				MaxPromptChars:         cfg.DailyIntel.PromptMaxChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
+		catalystRepo := repository.NewEventCatalystRepository(pgPool)
+		annoRepo := repository.NewAnnotationIntelRepository(pgPool)
+		var tgAdapter dailypoliticalintel.Telegram
+		if bot != nil {
+			tgAdapter = dailyIntelTelegramAdapter{bot: bot}
+		}
+		dailyIntelWorker = dailypoliticalintel.New(dailypoliticalintel.Config{
+			Enabled:              cfg.DailyIntel.Enabled,
+			TimeOfDay:            cfg.DailyIntel.TimeOfDay,
+			Timezone:             cfg.DailyIntel.Timezone,
+			MarketLimit:          cfg.DailyIntel.MarketLimit,
+			AnnotationsPerMarket: cfg.DailyIntel.AnnotationsPerMarket,
+			AIEnabled:            cfg.DailyIntel.AIEnabled,
+			AITimeout:            cfg.DailyIntel.AITimeout,
+			PromptMaxChars:       cfg.DailyIntel.PromptMaxChars,
+			SendTelegram:         cfg.DailyIntel.SendTelegram,
+			ChatID:               cfg.Alerting.TelegramChatID,
+		}, intelRepo, marketsRepo, eventPageProvider, catalystRepo, annoRepo, dailyGen, tgAdapter, met, logger)
+		// v9.8: wire the deterministic flow aggregator so the daily
+		// AI sees real Watchtower context instead of empty fields.
+		if cfg.EventFlow.Enabled {
+			flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
+				Enabled:          true,
+				Lookback:         cfg.EventFlow.Lookback,
+				MaxAlerts:        cfg.EventFlow.MaxAlerts,
+				MaxTrades:        cfg.EventFlow.MaxTrades,
+				MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
+				TopItems:         cfg.EventFlow.TopItems,
+			}, met, logger)
+			dailyIntelWorker.SetFlowLoader(flowRepo)
+		}
+		logger.Info().
+			Bool("enabled", cfg.DailyIntel.Enabled).
+			Str("time_of_day", cfg.DailyIntel.TimeOfDay).
+			Str("timezone", cfg.DailyIntel.Timezone).
+			Int("market_limit", cfg.DailyIntel.MarketLimit).
+			Bool("ai_enabled", cfg.DailyIntel.AIEnabled).
+			Bool("send_telegram", cfg.DailyIntel.SendTelegram).
+			Msg("daily political intel: wired")
+	}
+
 	return &App{
 		cfg:              cfg,
 		logger:           logger,
@@ -924,8 +1015,21 @@ func New() (*App, error) {
 		outcomeAI:        outcomeAIWorker,
 		marketIntel:      marketIntelWorker,
 		catalystImporter: catalystImporterWorker,
+		dailyIntel:       dailyIntelWorker,
 		pgPool:           pgPool,
 	}, nil
+}
+
+// dailyIntelTelegramAdapter narrows *telegram.Bot to the small seam
+// the daily-intel worker expects. We keep the seam local to the
+// usecase package to avoid cross-importing infra/telegram.
+type dailyIntelTelegramAdapter struct {
+	bot *telegram.Bot
+}
+
+func (a dailyIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (dailypoliticalintel.TelegramResult, error) {
+	res, err := a.bot.SendHTML(ctx, chatID, text)
+	return dailypoliticalintel.TelegramResult{MessageID: res.MessageID}, err
 }
 
 // splitCSV trims and splits a comma-separated env value. Empty
@@ -1237,6 +1341,12 @@ func (a *App) Run() error {
 	if a.catalystImporter != nil {
 		execs = append(execs, shutdown2.Exec{Name: "catalyst-importer", Fn: func(ctx context.Context) error {
 			a.catalystImporter.Run(ctx)
+			return nil
+		}})
+	}
+	if a.dailyIntel != nil {
+		execs = append(execs, shutdown2.Exec{Name: "daily-political-intel", Fn: func(ctx context.Context) error {
+			a.dailyIntel.Run(ctx)
 			return nil
 		}})
 	}

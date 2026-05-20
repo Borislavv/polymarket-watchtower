@@ -379,6 +379,178 @@ func (NoopExtractor) ExtractCatalysts(_ context.Context, req CatalystExtractionR
 	}, nil
 }
 
+// --- v9.7 Annotation ranking + Daily political intel ----------------------
+
+// AnnotationRankingRequest is the input the 2h market-intelligence
+// path hands the AI when it needs to pick the most important
+// annotations from a candidate batch. The verbatim ranking prompt
+// (annotation_ranking_prompt.go) consumes the structured data block
+// built around this request.
+type AnnotationRankingRequest struct {
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	OutputLimit int
+	Markets     []RankingMarket
+	Annotations []RankingAnnotation
+	FlowSummary RankingFlowSummary
+}
+
+// RankingMarket is one market the ranker reasons about. We keep the
+// surface narrow — the ranker only needs market identity + current
+// price drift to decide what's "already priced in".
+type RankingMarket struct {
+	EventSlug         string
+	MarketSlug        string
+	ConditionID       string
+	Question          string
+	GroupItemTitle    string
+	LastPrice         float64
+	OneDayPriceChange *float64
+	Volume24hUSD      float64
+}
+
+// RankingAnnotation is one candidate annotation to rank.
+type RankingAnnotation struct {
+	EventSlug      string
+	MarketSlug     string
+	AnnotationHash string
+	Timestamp      time.Time
+	Title          string
+	Summary        string
+	Outcome        string
+	PriceBefore    *float64
+	PriceAfter     *float64
+	PriceChange    *float64
+}
+
+// RankingFlowSummary is the compact rollup the ranker sees so it can
+// reason about whether flow validates / contradicts an annotation.
+// v9.8 added Ownership/Cluster notes + LargestRecentTradeUSD so the
+// daily-intel + prediction prompts can see the same shape the
+// underlying eventflow.EventFlowSummary computes.
+type RankingFlowSummary struct {
+	RecentAlertsCount       int
+	StrongestSide           string
+	SameSideNotional24h     float64
+	OppositeSideNotional24h float64
+	LargestRecentTradeUSD   float64
+	AccumulationNote        string
+	OwnershipNote           string
+	ClusterNote             string
+}
+
+// AnnotationRankingResponse is the strict-JSON shape the AI returns.
+type AnnotationRankingResponse struct {
+	Selected []SelectedAnnotation `json:"selected"`
+	// Transport metadata stamped by the analyzer; not part of the
+	// JSON contract.
+	Status           Status  `json:"-"`
+	Model            string  `json:"-"`
+	PromptTokens     int     `json:"-"`
+	CompletionTokens int     `json:"-"`
+	EstimatedCostUSD float64 `json:"-"`
+	LastError        string  `json:"-"`
+}
+
+// SelectedAnnotation is one row from `selected`. Pointers + omit-empty
+// match the schema's `or null` semantics.
+type SelectedAnnotation struct {
+	EventSlug           string  `json:"event_slug"`
+	MarketSlug          *string `json:"market_slug"`
+	Rank                int     `json:"rank"`
+	Importance          float64 `json:"importance"`
+	VolatilityPotential float64 `json:"volatility_potential"`
+	ProbabilityImpact   string  `json:"probability_impact"`
+	AffectedOutcome     *string `json:"affected_outcome"`
+	Title               string  `json:"title"`
+	Reason              string  `json:"reason"`
+	MarketRead          string  `json:"market_read"`
+	// AnnotationHash is filled by the importer/marketintel worker
+	// when matching the ranked title back to the source annotation.
+	// Never populated by the AI; not exposed in JSON.
+	AnnotationHash string `json:"-"`
+}
+
+// AnnotationRanker is the seam used by the marketintel worker.
+// *openai.Client satisfies it for production; NoopAnnotationRanker
+// satisfies it in dev/test.
+type AnnotationRanker interface {
+	RankAnnotations(ctx context.Context, req AnnotationRankingRequest) (AnnotationRankingResponse, error)
+}
+
+// NoopAnnotationRanker returns an empty StatusSkipped response.
+type NoopAnnotationRanker struct{}
+
+func (NoopAnnotationRanker) RankAnnotations(_ context.Context, _ AnnotationRankingRequest) (AnnotationRankingResponse, error) {
+	return AnnotationRankingResponse{Status: StatusSkipped, Model: "noop"}, nil
+}
+
+// DailyPoliticalIntelRequest is the input for the daily intel report.
+// The verbatim PART 5 prompt consumes the structured data block
+// built around this request.
+type DailyPoliticalIntelRequest struct {
+	ReportDate         time.Time
+	PeriodStart        time.Time
+	PeriodEnd          time.Time
+	Markets            []DailyIntelMarket
+	FlowSummary        RankingFlowSummary
+	KnownCatalysts     []DailyIntelCatalyst
+	PreviousReportText string
+}
+
+// DailyIntelMarket is one of the 100 selected markets, with its 4
+// most relevant annotations attached.
+type DailyIntelMarket struct {
+	EventSlug         string
+	MarketSlug        string
+	ConditionID       string
+	Question          string
+	Category          string
+	LifecyclePct      float64
+	LastPrice         float64
+	OneDayPriceChange *float64
+	Volume24hUSD      float64
+	AlertsLast24h     int64
+	StrongestSide     string
+	ActiveCatalyst    string
+	Annotations       []RankingAnnotation
+}
+
+// DailyIntelCatalyst is one row passed to the daily prompt.
+type DailyIntelCatalyst struct {
+	EventSlug    string
+	CatalystType string
+	Title        string
+	ExpectedAt   time.Time
+	Status       string
+	Confidence   float64
+}
+
+// DailyPoliticalIntelResponse is the free-text Russian report the
+// daily prompt returns. No structured JSON — the model output is
+// rendered verbatim into Telegram (after section-aware splitting).
+type DailyPoliticalIntelResponse struct {
+	ReportText       string
+	Status           Status
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	EstimatedCostUSD float64
+	LastError        string
+}
+
+// DailyPoliticalIntelGenerator is the seam used by the daily worker.
+type DailyPoliticalIntelGenerator interface {
+	GenerateDailyPoliticalIntel(ctx context.Context, req DailyPoliticalIntelRequest) (DailyPoliticalIntelResponse, error)
+}
+
+// NoopDailyPoliticalIntelGenerator returns an empty StatusSkipped.
+type NoopDailyPoliticalIntelGenerator struct{}
+
+func (NoopDailyPoliticalIntelGenerator) GenerateDailyPoliticalIntel(_ context.Context, _ DailyPoliticalIntelRequest) (DailyPoliticalIntelResponse, error) {
+	return DailyPoliticalIntelResponse{Status: StatusSkipped, Model: "noop"}, nil
+}
+
 // --- Analyzer interface ---------------------------------------------------
 
 // Analyzer is the single seam between the AI provider and the rest

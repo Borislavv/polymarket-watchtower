@@ -140,6 +140,15 @@ type BlockedAlertStamper interface {
 	StampBlockedAlert(ctx context.Context, f *anomaly.Finding)
 }
 
+// AlertAnnotationStamper is the optional event-page hook that
+// attaches the latest Polymarket annotations to a Finding before
+// render. The Telegram formatter emits up to 3 entries below the AI
+// analysis block. Failures degrade silently — the alert ships
+// without the annotations block.
+type AlertAnnotationStamper interface {
+	StampRecentAnnotations(ctx context.Context, f *anomaly.Finding)
+}
+
 // Worker is the long-running sender loop.
 type Worker struct {
 	cfg         Config
@@ -147,6 +156,7 @@ type Worker struct {
 	tg          Telegram
 	enricher    AIEnricher
 	blocked     BlockedAlertStamper
+	annotator   AlertAnnotationStamper
 	attribution AttributionStore
 	metrics     *metrics.Metrics
 	log         *zerolog.Logger
@@ -210,6 +220,11 @@ func (w *Worker) SetAttributionStore(s AttributionStore) { w.attribution = s }
 // Intelligence stamper. Called once at boot; nil keeps the sender
 // catalyst-agnostic. Failures degrade silently.
 func (w *Worker) SetBlockedAlertStamper(s BlockedAlertStamper) { w.blocked = s }
+
+// SetAlertAnnotationStamper wires the optional event-page
+// annotation stamper. Called once at boot; nil keeps the sender
+// annotations-agnostic. Failures degrade silently.
+func (w *Worker) SetAlertAnnotationStamper(s AlertAnnotationStamper) { w.annotator = s }
 
 // Run blocks until ctx is cancelled. Fires an initial drain immediately
 // so alerts queued during startup don't wait one full interval.
@@ -283,6 +298,20 @@ func (w *Worker) send(ctx context.Context, a repository.Alert) {
 	// the AI analysis. Failures degrade silently.
 	if w.blocked != nil {
 		w.blocked.StampBlockedAlert(ctx, &f)
+	}
+	// Event-page annotations stamp: attach the latest 3 same-event
+	// annotations so the Telegram formatter renders a "Recent
+	// annotations" block BELOW the AI analysis. Failures degrade
+	// silently.
+	if w.annotator != nil {
+		w.annotator.StampRecentAnnotations(ctx, &f)
+		if w.metrics != nil && w.metrics.AlertAnnotationBlocks != nil {
+			status := "rendered"
+			if len(f.RecentAnnotations) == 0 {
+				status = "empty"
+			}
+			w.metrics.AlertAnnotationBlocks.WithLabelValues(status).Inc()
+		}
 	}
 	// AI enrichment: generate or refresh the analyst note BEFORE
 	// rendering. Failures here are non-fatal — the note will simply

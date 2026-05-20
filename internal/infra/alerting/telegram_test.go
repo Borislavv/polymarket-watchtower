@@ -863,6 +863,74 @@ func TestBlockedAlertRendersBeforeAIAnalysis(t *testing.T) {
 	}
 }
 
+// TestRecentAnnotationsBlock_RendersBelowAIWithEscaping pins the
+// v9.7 contract: the alertsender stamps up to 3 event-page
+// annotations onto Finding.RecentAnnotations; the formatter renders
+// a "Recent annotations" block BELOW the AI analysis with full HTML
+// escape of every field. Polymarket-authored text is DATA.
+func TestRecentAnnotationsBlock_RendersBelowAIWithEscaping(t *testing.T) {
+	pb := 0.54
+	pa := 0.61
+	pc := 0.07
+	f := sampleTradeFinding()
+	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = "Watchlist candidate."
+	f.RecentAnnotations = []anomaly.AnnotationRef{
+		{Title: "<script>alert(1)</script>", Outcome: "Ken Paxton",
+			Timestamp:   time.Date(2026, 5, 9, 14, 0, 0, 0, time.UTC),
+			PriceBefore: &pb, PriceAfter: &pa, PriceChange: &pc,
+			SourceName: "Texas Tribune"},
+		{Title: "Second item", Summary: "rogue & special <chars>",
+			Timestamp: time.Date(2026, 4, 28, 18, 0, 0, 0, time.UTC),
+			Outcome:   "John Cornyn"},
+		{Title: "Third item", Timestamp: time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC)},
+		// Fourth item must be dropped — formatter caps at 3.
+		{Title: "Fourth", Timestamp: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<script>alert(1)</script>") {
+		t.Errorf("HTML must be escaped:\n%s", msg)
+	}
+	if !strings.Contains(msg, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Errorf("expected escaped title in:\n%s", msg)
+	}
+	if !strings.Contains(msg, "rogue &amp; special &lt;chars&gt;") {
+		t.Errorf("expected escaped summary in:\n%s", msg)
+	}
+	if !strings.Contains(msg, "<b>Recent annotations</b>") {
+		t.Errorf("Recent annotations block missing:\n%s", msg)
+	}
+	if strings.Contains(msg, "Fourth") {
+		t.Errorf("annotation cap=3 not enforced:\n%s", msg)
+	}
+	// Order: AI analysis header before Recent annotations header.
+	iAI := strings.Index(msg, "<b>AI analysis</b>")
+	iAnno := strings.Index(msg, "<b>Recent annotations</b>")
+	if iAI < 0 || iAnno < 0 {
+		t.Fatalf("both blocks must render; iAI=%d iAnno=%d", iAI, iAnno)
+	}
+	if iAnno < iAI {
+		t.Errorf("Recent annotations must render BELOW AI analysis: %d vs %d", iAnno, iAI)
+	}
+	// Price drift rendering — 0.54→0.61 (+0.07).
+	if !strings.Contains(msg, "price 0.54→0.61") {
+		t.Errorf("price drift missing:\n%s", msg)
+	}
+}
+
+// TestRecentAnnotationsBlock_OmittedWhenEmpty pins that no block
+// renders when the Finding carries no annotations.
+func TestRecentAnnotationsBlock_OmittedWhenEmpty(t *testing.T) {
+	f := sampleTradeFinding()
+	f.DedupKey = "single:v1:trade-1"
+	f.AnalystNote = "Note text."
+	f.RecentAnnotations = nil
+	msg := FormatTelegramMessage(f)
+	if strings.Contains(msg, "<b>Recent annotations</b>") {
+		t.Errorf("Recent annotations must be elided when empty:\n%s", msg)
+	}
+}
+
 // TestBlockedAlertEscapesHTML pins the safety contract: Polymarket /
 // AI-authored fields are DATA, not markup. The formatter MUST
 // HTML-escape every Blocked Alert field so an annotation containing

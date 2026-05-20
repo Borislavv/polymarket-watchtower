@@ -152,6 +152,50 @@ func (p *Provider) LoadAndRenderForConditionID(ctx context.Context, conditionID 
 	return p.LoadAndRenderForEventSlug(ctx, slug, maxChars)
 }
 
+// StampRecentAnnotations satisfies the alertsender
+// AlertAnnotationStamper seam. Resolves the event_slug from the
+// Finding, loads up to 3 newest annotations (preferring the alert's
+// outcome side first), and attaches them to f.RecentAnnotations so
+// the Telegram formatter renders the "Recent annotations" block
+// below the AI body. Failures degrade silently — the alert ships
+// without the block.
+func (p *Provider) StampRecentAnnotations(ctx context.Context, f *anomaly.Finding) {
+	if f == nil || !p.cfg.Enabled || p.resolver == nil {
+		return
+	}
+	conditionID := findingMarketID(*f)
+	if conditionID == "" {
+		return
+	}
+	slug := p.resolver(ctx, conditionID)
+	if slug == "" {
+		return
+	}
+	rows, err := p.store.ListRecentAnnotations(ctx, slug, 12)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	side := findingSide(*f)
+	ordered := orderAnnotationsForSide(rows, side, 3)
+	if len(ordered) == 0 {
+		return
+	}
+	out := make([]anomaly.AnnotationRef, 0, len(ordered))
+	for _, a := range ordered {
+		out = append(out, anomaly.AnnotationRef{
+			Title:       a.Title,
+			Summary:     a.Summary,
+			Outcome:     a.Outcome,
+			Timestamp:   a.Timestamp,
+			PriceBefore: a.PriceBefore,
+			PriceAfter:  a.PriceAfter,
+			PriceChange: a.PriceChange,
+			SourceName:  a.Source,
+		})
+	}
+	f.RecentAnnotations = out
+}
+
 // LoadAndRenderForFinding is the convenience method aianalysis.Service
 // calls. Resolves the event slug, refreshes the cache per severity
 // TTL, and returns the rendered prompt slot. Empty result = no usable

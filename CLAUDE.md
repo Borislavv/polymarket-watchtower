@@ -717,6 +717,152 @@ Metrics (registered in `internal/infra/metrics/metrics.go`):
 - `watchtower_event_catalyst_import_latency_seconds`
 - `watchtower_event_catalyst_blocked_alerts_total`
 
+## Annotation rendering · ranking · daily intel (v9.7)
+
+Three independent surfaces consume the persisted event-page
+annotations:
+
+1. **Per-alert annotations block** — `alertsender.Worker` calls
+   `AlertAnnotationStamper.StampRecentAnnotations` (production:
+   `eventpagecontext.Provider`) which loads up to 3 newest
+   same-event annotations and attaches them to
+   `Finding.RecentAnnotations`. The Telegram formatter
+   (`writeRecentAnnotationsBlock`) emits a "Recent annotations"
+   block BELOW the AI analysis with full HTML escape. Block elides
+   when the slice is empty.
+
+2. **2h market-intelligence ranking** — when the AI key is wired,
+   `marketintel.Worker` calls `AnnotationRankingHook.RankAndRender`
+   after the intel report succeeds. The hook (`annotationranking.Hook`)
+   pulls event-page annotations for the candidate markets, calls
+   `openai.Client.RankAnnotations` (verbatim PART 1-3 ranking
+   prompt + JSON mode), persists picks to
+   `polymarket_event_annotation_rankings`, and appends a
+   "Top important annotations" block (top 10) to the Telegram body.
+
+3. **Daily political intelligence report** —
+   `internal/app/usecase/dailypoliticalintel.Worker` ticks every
+   minute and fires once per day at `DAILY_POLITICAL_INTEL_TIME`
+   in `DAILY_POLITICAL_INTEL_TIMEZONE` (Europe/Tallinn default).
+   Selects up to 100 candidate markets, hydrates each with 4
+   newest annotations, collects active catalysts, calls
+   `openai.Client.GenerateDailyPoliticalIntel` (verbatim PART 5
+   prompt; free-text Russian), persists the row to
+   `polymarket_daily_political_intel_reports` (UNIQUE on
+   `report_date`), splits the body on `\n\n` boundaries when
+   above the Telegram message cap (3500 default), and sends. The
+   row carries `delivery_status` (pending / sent / failed /
+   skipped / ai_failed) + `telegram_message_ids_json` for the
+   multi-message case + `last_delivery_error`.
+
+Failure semantics across all three surfaces: every layer is
+fail-open. Per-alert annotation stamping failure → block elides.
+2h ranking failure → empty appendix; intel report still ships.
+Daily AI failure → row stamped ai_failed; nothing sent; next
+schedule retries. Telegram failure on the daily worker → row
+stamped failed with `last_delivery_error`.
+
+Safety reaffirmation (v9.7): Polymarket-authored annotations and
+AI-authored ranking reasons / report text are DATA. Every renderer
+HTML-escapes at the boundary; the ranking JSON parser validates
+enum membership; bad enums collapse to `unclear`. No prompt
+injection surface — Polymarket strings are never re-fed to the
+model as instructions.
+
+Disable knobs:
+- `DAILY_POLITICAL_INTEL_ENABLED=false` — daily worker disabled.
+- `DAILY_POLITICAL_INTEL_AI_ENABLED=false` — daily worker still
+  runs but emits a `skipped` row instead of calling the AI.
+- `DAILY_POLITICAL_INTEL_SEND_TELEGRAM=false` — daily report
+  persisted without Telegram delivery (dry-run).
+- Removing the AI key disables both the ranking hook and the
+  daily AI generator without disabling the surrounding wiring.
+
+v9.7 metrics (registered in `internal/infra/metrics/metrics.go`):
+- `watchtower_alert_annotation_blocks_total{status}` (rendered / empty)
+- `watchtower_market_intel_annotation_ranking_requests_total{status}`
+- `watchtower_market_intel_annotations_selected_total`
+- `watchtower_daily_political_intel_reports_total{status}`
+- `watchtower_daily_political_intel_markets_selected_total`
+- `watchtower_daily_political_intel_annotations_total`
+- `watchtower_daily_political_intel_ai_latency_seconds`
+
+## Intelligence Hardening (v9.8)
+
+Three deterministic intel layers eliminate the "AI guesses without
+data" failure mode that v9.7 still had:
+
+1. **Event flow summary** (`internal/app/usecase/eventflow.EventFlowRepository`).
+   One DB roundtrip per event aggregates polymarket_alerts +
+   polymarket_trades over `EVENT_FLOW_SUMMARY_LOOKBACK` (default
+   24h). Produces severity / kind counts, strongest side, same-side
+   vs opposite-side notional + directional imbalance, largest trade,
+   top-N alert + trade lists, and per-kind operator notes. Renderer
+   emits the "Recent Watchtower flow:" prompt block; empty input
+   renders an explicit "No meaningful stored flow" sentence with a
+   "do not infer weak flow from missing data" directive so the AI
+   never confuses silence with weak signal.
+   Wired into `dailypoliticalintel.Worker.SetFlowLoader`; the same
+   loader will also be passed to the catalyst importer's prompt
+   path. NEVER blocks alerts; failure falls through silently.
+
+2. **Repricing intelligence** (`internal/app/usecase/repricing.Provider`).
+   Deterministic per-annotation features: annotation
+   priceBefore/priceAfter vs current event-page price, pre/post-
+   annotation flow USD via `SumConditionTradesInWindow`, flow timing
+   classifier (pre_event_positioning / post_event_chasing / mixed /
+   no_flow / unknown), repricing status classifier (underreacting /
+   overreacting / already_priced / still_repricing / reversed /
+   unclear) per `REPRICING_*` thresholds. Persisted in
+   `polymarket_repricing_signals` (UNIQUE on event+condition+
+   annotation_hash). Renderer emits the "Repricing intelligence:"
+   prompt slot. AI consumes the signal as evidence; the layer
+   itself is pure math — NO AI calls.
+
+3. **Market prediction state machine + match scoring**
+   (`internal/app/usecase/marketprediction`). Pure `Decide(...)`
+   transitions between the 11 documented states (new / watching /
+   blocked / active_catalyst / confirmed_by_flow / contradicted_by_flow
+   / repricing / already_priced / stale / resolved / invalidated).
+   Priority: resolution > invalidation > blocked > confirmed >
+   contradicted > repricing/already_priced > stale > watching.
+   `Applier` persists the prediction upsert + the transition audit
+   row in `polymarket_market_prediction_states`. Pure `Score(...)`
+   computes a deterministic alert↔prediction match score in [0,1]
+   plus direction_alignment (aligned / contradict / neutral) +
+   match_reason — a transparent weighted sum the operator can audit.
+   Telegram renderer (`RenderTelegramBlock`) emits the operator-
+   facing "Prediction state" block.
+
+A News & Prediction Telegram renderer
+(`internal/infra/alerting.RenderNewsPrediction`) composes Market /
+Prediction state / Blocked / Repricing / AI / Matched alerts /
+Latest annotations sections from the same data. Every Polymarket /
+AI / operator string is HTML-escaped at the boundary; sections elide
+when empty.
+
+Tables landed in migration 00019:
+- `polymarket_repricing_signals` — deterministic per-annotation
+  features. UNIQUE (event_slug, condition_id, annotation_hash).
+- `polymarket_market_predictions` — evolving (event, condition)
+  state snapshot. UNIQUE (event_slug, condition_id).
+- `polymarket_market_prediction_states` — append-only transition
+  audit log.
+
+v9.8 metrics:
+- `watchtower_event_flow_summary_load_total{status}` (ok / empty / alerts_failed)
+- `watchtower_event_flow_summary_empty_total` — counter
+- `watchtower_repricing_signals_total{status,flow_timing}`
+- `watchtower_market_prediction_state_transitions_total{from,to}`
+- `watchtower_market_prediction_matches_total{alignment}`
+- `watchtower_prediction_context_blocks_total{block,status}`
+
+Safety reaffirmation: every Polymarket-authored field
+(annotations, market questions, wallet addresses) is DATA.
+Repricing scenarios and prediction state reasons are likewise DATA.
+Renderers HTML-escape; the AI consumes the prompt block as
+evidence, never as instructions.
+
 ## Periodic Telegram stats summary
 
 - `internal/app/usecase/statsreport.Worker` posts a single aggregate

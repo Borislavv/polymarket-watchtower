@@ -134,6 +134,40 @@ type PolymarketCategories struct {
 	UpdatedAt  pgtype.Timestamptz
 }
 
+type PolymarketDailyPoliticalIntelReports struct {
+	ID                      int64
+	ReportDate              pgtype.Date
+	PeriodStart             pgtype.Timestamptz
+	PeriodEnd               pgtype.Timestamptz
+	SelectedMarketsJson     []byte
+	SelectedAnnotationsJson []byte
+	CatalystsJson           []byte
+	AiReportText            string
+	TelegramMessageIdsJson  []byte
+	DeliveryStatus          string
+	LastDeliveryError       string
+	CreatedAt               pgtype.Timestamptz
+	UpdatedAt               pgtype.Timestamptz
+}
+
+type PolymarketEventAnnotationRankings struct {
+	ID                  int64
+	PeriodStart         pgtype.Timestamptz
+	PeriodEnd           pgtype.Timestamptz
+	EventSlug           string
+	MarketSlug          *string
+	AnnotationHash      string
+	Rank                int32
+	Importance          float64
+	VolatilityPotential float64
+	ProbabilityImpact   string
+	AffectedOutcome     *string
+	Title               string
+	Reason              string
+	MarketRead          string
+	CreatedAt           pgtype.Timestamptz
+}
+
 type PolymarketEventAnnotations struct {
 	ID          int64
 	EventSlug   string
@@ -254,6 +288,35 @@ type PolymarketMarketOutcomes struct {
 	Label    string
 }
 
+type PolymarketMarketPredictionStates struct {
+	ID            int64
+	PredictionID  int64
+	PreviousState string
+	NewState      string
+	Reason        string
+	EvidenceJson  []byte
+	CreatedAt     pgtype.Timestamptz
+}
+
+type PolymarketMarketPredictions struct {
+	ID                        int64
+	EventSlug                 string
+	ConditionID               string
+	Outcome                   string
+	SideBias                  string
+	Summary                   string
+	CurrentState              string
+	StateReason               string
+	PreviousPredictionID      *int64
+	SupersedesPredictionID    *int64
+	LastRepricedAt            pgtype.Timestamptz
+	LastConfirmedByAlertAt    pgtype.Timestamptz
+	LastContradictedByAlertAt pgtype.Timestamptz
+	Confidence                float64
+	CreatedAt                 pgtype.Timestamptz
+	UpdatedAt                 pgtype.Timestamptz
+}
+
 type PolymarketMarkets struct {
 	ID                      int64
 	ConditionID             string
@@ -279,6 +342,32 @@ type PolymarketMarkets struct {
 	PurgedAt                pgtype.Timestamptz
 	// Cursor for the collect loop. MAX(traded_at) of trades the COLLECT path persisted. Backfill never updates this column.
 	LastCollectTradedAt pgtype.Timestamptz
+}
+
+type PolymarketRepricingSignals struct {
+	ID                      int64
+	EventSlug               string
+	ConditionID             string
+	Outcome                 string
+	AnnotationHash          string
+	AnnotationTime          pgtype.Timestamptz
+	AnnotationTitle         string
+	PriceBefore             *float64
+	PriceAfter              *float64
+	AnnotationPriceChange   *float64
+	CurrentPrice            *float64
+	CurrentVsPriceAfter     float64
+	DriftSinceAnnotation    float64
+	PreAnnotationFlowUsd    float64
+	PostAnnotationFlowUsd   float64
+	SameSidePostFlowUsd     float64
+	OppositeSidePostFlowUsd float64
+	FlowTiming              string
+	RepricingStatus         string
+	Confidence              float64
+	Explanation             string
+	CreatedAt               pgtype.Timestamptz
+	UpdatedAt               pgtype.Timestamptz
 }
 
 type PolymarketSignalReports struct {

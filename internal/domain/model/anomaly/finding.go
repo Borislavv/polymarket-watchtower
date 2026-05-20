@@ -455,6 +455,28 @@ type Finding struct {
 	// AI-authored fields are DATA: the formatter HTML-escapes them
 	// at render time.
 	Blocked *BlockedAlert
+
+	// RecentAnnotations are the latest event-page annotations the
+	// alertsender attaches before render. The Telegram formatter
+	// emits up to 3 entries BELOW the AI analysis under a
+	// "Recent annotations" header. Each row is operator-facing
+	// prose; the formatter HTML-escapes every field.
+	RecentAnnotations []AnnotationRef
+}
+
+// AnnotationRef is one Polymarket event-page chart annotation
+// surfaced beneath an alert. Source of truth lives in
+// polymarket_event_annotations; this projection carries only the
+// fields the Telegram renderer + AI prompt need.
+type AnnotationRef struct {
+	Title       string
+	Summary     string
+	Outcome     string
+	Timestamp   time.Time
+	PriceBefore *float64
+	PriceAfter  *float64
+	PriceChange *float64
+	SourceName  string
 }
 
 // BlockedAlert is the per-alert snapshot of the most relevant

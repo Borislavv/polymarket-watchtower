@@ -554,6 +554,59 @@ type Config struct {
 	AIAnalysis        AIAnalysisConfig
 	EventPage         EventPageContextConfig
 	Catalyst          CatalystConfig
+	DailyIntel        DailyPoliticalIntelConfig
+	EventFlow         EventFlowConfig
+	Repricing         RepricingConfig
+	Prediction        PredictionConfig
+}
+
+// EventFlowConfig drives the deterministic event-level flow
+// aggregation used by every AI prompt that needs real Watchtower
+// context (daily intel, prediction prompts). NEVER blocks alerts.
+type EventFlowConfig struct {
+	Enabled          bool          `env:"EVENT_FLOW_SUMMARY_ENABLED" envDefault:"true"`
+	Lookback         time.Duration `env:"EVENT_FLOW_SUMMARY_LOOKBACK" envDefault:"24h" validate:"gt=0"`
+	MaxAlerts        int           `env:"EVENT_FLOW_SUMMARY_MAX_ALERTS" envDefault:"25" validate:"gte=1,lte=500"`
+	MaxTrades        int           `env:"EVENT_FLOW_SUMMARY_MAX_TRADES" envDefault:"150" validate:"gte=1,lte=2000"`
+	MinLargeTradeUSD float64       `env:"EVENT_FLOW_SUMMARY_MIN_LARGE_TRADE_USD" envDefault:"10000" validate:"gte=0"`
+	TopItems         int           `env:"EVENT_FLOW_SUMMARY_TOP_ITEMS" envDefault:"10" validate:"gte=1,lte=50"`
+}
+
+// RepricingConfig drives the deterministic per-annotation repricing
+// signal. AI consumes the signal as evidence; the layer itself is
+// pure math.
+type RepricingConfig struct {
+	Enabled                bool          `env:"REPRICING_INTELLIGENCE_ENABLED" envDefault:"true"`
+	Lookback               time.Duration `env:"REPRICING_LOOKBACK" envDefault:"24h" validate:"gt=0"`
+	PreWindow              time.Duration `env:"REPRICING_PRE_WINDOW" envDefault:"2h" validate:"gt=0"`
+	PostWindow             time.Duration `env:"REPRICING_POST_WINDOW" envDefault:"2h" validate:"gt=0"`
+	MinAnnotationMove      float64       `env:"REPRICING_MIN_ANNOTATION_MOVE" envDefault:"0.05" validate:"gt=0,lte=1"`
+	MinFlowUSD             float64       `env:"REPRICING_MIN_FLOW_USD" envDefault:"5000" validate:"gte=0"`
+	UnderreactionThreshold float64       `env:"REPRICING_UNDERREACTION_THRESHOLD" envDefault:"0.03" validate:"gt=0,lte=1"`
+	OverreactionThreshold  float64       `env:"REPRICING_OVERREACTION_THRESHOLD" envDefault:"0.08" validate:"gt=0,lte=1"`
+}
+
+// PredictionConfig drives the prediction state machine.
+type PredictionConfig struct {
+	StateEnabled            bool          `env:"MARKET_PREDICTION_STATE_ENABLED" envDefault:"true"`
+	StaleAfter              time.Duration `env:"MARKET_PREDICTION_STALE_AFTER" envDefault:"24h" validate:"gt=0"`
+	ConfirmAlertScoreFloor  float64       `env:"MARKET_PREDICTION_CONFIRM_ALERT_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
+	ContradictFlowImbalance float64       `env:"MARKET_PREDICTION_CONTRADICT_FLOW_IMBALANCE" envDefault:"0.65" validate:"gte=0,lte=1"`
+}
+
+// DailyPoliticalIntelConfig wires the v9.7 once-per-day political /
+// geopolitical intelligence report. Failure NEVER blocks alerts;
+// the worker is fully decoupled from the alert pipeline.
+type DailyPoliticalIntelConfig struct {
+	Enabled              bool          `env:"DAILY_POLITICAL_INTEL_ENABLED" envDefault:"true"`
+	TimeOfDay            string        `env:"DAILY_POLITICAL_INTEL_TIME" envDefault:"08:00"`
+	Timezone             string        `env:"DAILY_POLITICAL_INTEL_TIMEZONE" envDefault:"Europe/Tallinn"`
+	MarketLimit          int           `env:"DAILY_POLITICAL_INTEL_MARKET_LIMIT" envDefault:"100" validate:"gte=10,lte=500"`
+	AnnotationsPerMarket int           `env:"DAILY_POLITICAL_INTEL_ANNOTATIONS_PER_MARKET" envDefault:"4" validate:"gte=1,lte=20"`
+	AIEnabled            bool          `env:"DAILY_POLITICAL_INTEL_AI_ENABLED" envDefault:"true"`
+	AITimeout            time.Duration `env:"DAILY_POLITICAL_INTEL_AI_TIMEOUT" envDefault:"90s" validate:"gt=0"`
+	PromptMaxChars       int           `env:"DAILY_POLITICAL_INTEL_PROMPT_MAX_CHARS" envDefault:"30000" validate:"gte=2000,lte=80000"`
+	SendTelegram         bool          `env:"DAILY_POLITICAL_INTEL_SEND_TELEGRAM" envDefault:"true"`
 }
 
 // CatalystConfig wires the Political-Catalyst Intelligence overlay.

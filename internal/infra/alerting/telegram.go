@@ -712,6 +712,9 @@ func writeAnalystNote(b *strings.Builder, f anomaly.Finding) {
 	writeBlockedAlertBlock(b, f)
 	note := strings.TrimSpace(f.AnalystNote)
 	if note == "" {
+		// Even with an empty AI body the annotations block can
+		// stand on its own — render it before returning.
+		writeRecentAnnotationsBlock(b, f)
 		return
 	}
 	b.WriteString("\n<b>AI analysis</b>\n")
@@ -729,6 +732,51 @@ func writeAnalystNote(b *strings.Builder, f anomaly.Finding) {
 			continue
 		}
 		fmt.Fprintf(b, "  %s\n", html.EscapeString(line))
+	}
+	writeRecentAnnotationsBlock(b, f)
+}
+
+// writeRecentAnnotationsBlock renders up to 3 Polymarket event-page
+// annotations BELOW the AI analysis. Polymarket-authored content is
+// DATA — every field is HTML-escaped. Block elides entirely when
+// f.RecentAnnotations is empty.
+func writeRecentAnnotationsBlock(b *strings.Builder, f anomaly.Finding) {
+	if len(f.RecentAnnotations) == 0 {
+		return
+	}
+	const cap = 3
+	b.WriteString("\n<b>Recent annotations</b>\n")
+	n := len(f.RecentAnnotations)
+	if n > cap {
+		n = cap
+	}
+	for _, a := range f.RecentAnnotations[:n] {
+		date := "—"
+		if !a.Timestamp.IsZero() {
+			date = a.Timestamp.UTC().Format("2006-01-02")
+		}
+		fmt.Fprintf(b, "• %s · <b>%s</b>", html.EscapeString(date), html.EscapeString(strings.TrimSpace(a.Title)))
+		if a.PriceBefore != nil && a.PriceAfter != nil {
+			fmt.Fprintf(b, " · price %.2f→%.2f", *a.PriceBefore, *a.PriceAfter)
+			if a.PriceChange != nil {
+				fmt.Fprintf(b, " (%+.2f)", *a.PriceChange)
+			}
+		} else if a.PriceChange != nil {
+			fmt.Fprintf(b, " · Δ%+.2f", *a.PriceChange)
+		}
+		if a.Outcome != "" {
+			fmt.Fprintf(b, " · outcome=%s", html.EscapeString(a.Outcome))
+		}
+		b.WriteString("\n")
+		if s := strings.TrimSpace(a.Summary); s != "" {
+			if len(s) > 220 {
+				s = s[:219] + "…"
+			}
+			fmt.Fprintf(b, "  %s\n", html.EscapeString(s))
+		}
+		if a.SourceName != "" {
+			fmt.Fprintf(b, "  source: %s\n", html.EscapeString(a.SourceName))
+		}
 	}
 }
 

@@ -241,6 +241,50 @@ type Metrics struct {
 	// EventCatalystBlockedAlerts: counts Telegram alerts stamped
 	// with a Blocked Alert block by the alertsender.
 	EventCatalystBlockedAlerts prometheus.Counter
+
+	// --- v9.7 Annotation rendering + ranking + daily intel ---
+	// AlertAnnotationBlocks: counts alerts where the annotation
+	// stamper ran, labelled by status (rendered / empty).
+	AlertAnnotationBlocks *prometheus.CounterVec
+	// MarketIntelAnnotationRankingRequests: AI ranking calls in
+	// the 2h marketintel cycle, by status (ok / skipped / failed).
+	MarketIntelAnnotationRankingRequests *prometheus.CounterVec
+	// MarketIntelAnnotationsSelected: cumulative ranked annotations
+	// selected across 2h cycles.
+	MarketIntelAnnotationsSelected prometheus.Counter
+	// DailyPoliticalIntelReports: daily-report outcomes, by status
+	// (sent / skipped / failed / ai_failed).
+	DailyPoliticalIntelReports *prometheus.CounterVec
+	// DailyPoliticalIntelMarketsSelected: cumulative markets the
+	// daily worker shortlisted.
+	DailyPoliticalIntelMarketsSelected prometheus.Counter
+	// DailyPoliticalIntelAnnotations: cumulative annotations the
+	// daily worker passed to the AI prompt.
+	DailyPoliticalIntelAnnotations prometheus.Counter
+	// DailyPoliticalIntelAILatency: AI generation latency.
+	DailyPoliticalIntelAILatency prometheus.Histogram
+
+	// --- v9.8 Intelligence Hardening ---
+	// EventFlowSummaryLoad: per-call status of the deterministic
+	// event-flow aggregator. Labels: status=ok|empty|alerts_failed.
+	EventFlowSummaryLoad *prometheus.CounterVec
+	// EventFlowSummaryEmpty: counts events where the loader found
+	// zero alerts + zero trades in the lookback. Useful for
+	// "intelligence dark" detection.
+	EventFlowSummaryEmpty prometheus.Counter
+	// RepricingSignals: deterministic repricing-signal writes,
+	// labelled by status (computed/failed) and flow_timing.
+	RepricingSignals *prometheus.CounterVec
+	// MarketPredictionStateTransitions: state machine transitions,
+	// labelled by from→to.
+	MarketPredictionStateTransitions *prometheus.CounterVec
+	// MarketPredictionMatches: per-match outcomes labelled by
+	// direction alignment (aligned/contradict/neutral).
+	MarketPredictionMatches *prometheus.CounterVec
+	// PredictionContextBlocks: counts per-prompt context block
+	// usage (flow / repricing / state / matched_alerts) and
+	// status (rendered / empty).
+	PredictionContextBlocks *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -604,6 +648,63 @@ func New() *Metrics {
 		Help: "Telegram alerts stamped with a Blocked Alert block.",
 	})
 
+	// v9.7 Annotation rendering + ranking + daily intel
+	m.AlertAnnotationBlocks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "alert", Name: "annotation_blocks_total",
+		Help: "Alerts where the annotation stamper ran, by status (rendered / empty).",
+	}, []string{"status"})
+	m.MarketIntelAnnotationRankingRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_intel", Name: "annotation_ranking_requests_total",
+		Help: "AI annotation-ranking calls in the 2h marketintel cycle, by status (ok / skipped / failed).",
+	}, []string{"status"})
+	m.MarketIntelAnnotationsSelected = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_intel", Name: "annotations_selected_total",
+		Help: "Cumulative ranked annotations selected across 2h cycles.",
+	})
+	m.DailyPoliticalIntelReports = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "daily_political_intel", Name: "reports_total",
+		Help: "Daily-report outcomes, by status (sent / skipped / failed / ai_failed).",
+	}, []string{"status"})
+	m.DailyPoliticalIntelMarketsSelected = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "daily_political_intel", Name: "markets_selected_total",
+		Help: "Cumulative markets the daily worker shortlisted.",
+	})
+	m.DailyPoliticalIntelAnnotations = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "daily_political_intel", Name: "annotations_total",
+		Help: "Cumulative annotations the daily worker passed to the AI prompt.",
+	})
+	m.DailyPoliticalIntelAILatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "daily_political_intel", Name: "ai_latency_seconds",
+		Help:    "Daily-report AI generation latency.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 9),
+	})
+
+	// v9.8 Intelligence Hardening
+	m.EventFlowSummaryLoad = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_flow_summary", Name: "load_total",
+		Help: "Per-call status of the deterministic event-flow aggregator (ok / empty / alerts_failed).",
+	}, []string{"status"})
+	m.EventFlowSummaryEmpty = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "event_flow_summary", Name: "empty_total",
+		Help: "Events for which the loader found zero alerts AND zero trades.",
+	})
+	m.RepricingSignals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "repricing", Name: "signals_total",
+		Help: "Deterministic repricing-signal writes, by status and flow_timing.",
+	}, []string{"status", "flow_timing"})
+	m.MarketPredictionStateTransitions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_prediction", Name: "state_transitions_total",
+		Help: "Prediction state machine transitions (from → to).",
+	}, []string{"from", "to"})
+	m.MarketPredictionMatches = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_prediction", Name: "matches_total",
+		Help: "Alert/prediction match outcomes by direction alignment.",
+	}, []string{"alignment"})
+	m.PredictionContextBlocks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction_context", Name: "blocks_total",
+		Help: "Per-prompt context block usage (block, status).",
+	}, []string{"block", "status"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -640,6 +741,13 @@ func New() *Metrics {
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,
 		m.EventCatalystBlockedAlerts,
+		m.AlertAnnotationBlocks,
+		m.MarketIntelAnnotationRankingRequests, m.MarketIntelAnnotationsSelected,
+		m.DailyPoliticalIntelReports, m.DailyPoliticalIntelMarketsSelected,
+		m.DailyPoliticalIntelAnnotations, m.DailyPoliticalIntelAILatency,
+		m.EventFlowSummaryLoad, m.EventFlowSummaryEmpty,
+		m.RepricingSignals, m.MarketPredictionStateTransitions,
+		m.MarketPredictionMatches, m.PredictionContextBlocks,
 	)
 	return m
 }

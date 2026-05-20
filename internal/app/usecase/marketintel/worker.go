@@ -88,16 +88,27 @@ type NarrativeLoader interface {
 	LoadAndRenderForConditionID(ctx context.Context, conditionID string, maxChars int) string
 }
 
+// AnnotationRankingHook is the optional seam that ranks the most
+// important Polymarket annotations within the 2h candidate set,
+// persists the AI choices to polymarket_event_annotation_rankings,
+// and returns an HTML-formatted "Top important annotations" block
+// for the Telegram body. Failure returns empty — the report still
+// ships. Set via SetAnnotationRankingHook; nil disables ranking.
+type AnnotationRankingHook interface {
+	RankAndRender(ctx context.Context, candidates []repository.IntelligenceCandidate, periodStart, periodEnd time.Time, limit int) string
+}
+
 // Worker is the periodic 2h intelligence loop.
 type Worker struct {
-	cfg        Config
-	candidates Candidates
-	store      Store
-	analyzer   Analyzer
-	narrative  NarrativeLoader
-	bot        Bot
-	metrics    *metrics.Metrics
-	log        *zerolog.Logger
+	cfg         Config
+	candidates  Candidates
+	store       Store
+	analyzer    Analyzer
+	narrative   NarrativeLoader
+	rankingHook AnnotationRankingHook
+	bot         Bot
+	metrics     *metrics.Metrics
+	log         *zerolog.Logger
 }
 
 // New wires the worker. All deps required. Pass analysis.NoopAnalyzer
@@ -116,6 +127,10 @@ func (w *Worker) SetMetrics(m *metrics.Metrics) { w.metrics = m }
 // SetNarrativeLoader wires the optional Polymarket event-page
 // context loader. nil keeps the slot empty.
 func (w *Worker) SetNarrativeLoader(loader NarrativeLoader) { w.narrative = loader }
+
+// SetAnnotationRankingHook wires the optional 2h annotation ranker.
+// nil disables the "Top important annotations" Telegram appendix.
+func (w *Worker) SetAnnotationRankingHook(h AnnotationRankingHook) { w.rankingHook = h }
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -261,6 +276,14 @@ func (w *Worker) tick(ctx context.Context) {
 	// Render the Telegram body AT SEND TIME from the request + the
 	// AI text. The rendered string is NOT persisted.
 	telegramBody := renderTelegramBody(req, res)
+	// v9.7: append the ranked annotations block (when wired). The
+	// hook performs its own persistence; failure returns empty and
+	// the report still ships.
+	if w.rankingHook != nil {
+		if extra := w.rankingHook.RankAndRender(ctx, candidates, periodStart, periodEnd, 10); extra != "" {
+			telegramBody += "\n\n" + extra
+		}
+	}
 	if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, telegramBody); err != nil {
 		w.log.Err(err).Str("period_key", periodKey).Msg("marketintel: telegram send failed")
 		return
