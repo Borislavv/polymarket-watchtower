@@ -560,6 +560,49 @@ type Config struct {
 	Prediction        PredictionConfig
 	AIBudget          AIBudgetConfig
 	AIPreflight       AIPreflightConfig
+	WS                WebSocketConfig
+}
+
+// WebSocketConfig wires the v10.4 hybrid WebSocket fast-lane.
+//
+// v10.6 flipped WS_ENABLED to true by default with conservative
+// "small hot" defaults (25 markets / 50 tokens). Polling + backfill +
+// alertsender remain the canonical pipeline; WS is strictly a low-
+// latency trigger accelerator. Operators who don't want any WS
+// traffic at all can still set WS_ENABLED=false.
+//
+// Safety belts:
+//   - WS_MAX_MARKETS > 250 requires WS_ALLOW_LARGE_SUBSCRIPTION=true.
+//   - WS_MAX_TOKENS must be >= WS_MAX_MARKETS (enforced in Validate).
+//   - WS_ENABLED=true requires WS_MAX_MARKETS > 0.
+type WebSocketConfig struct {
+	Enabled             bool   `env:"WS_ENABLED" envDefault:"true"`
+	MarketStreamEnabled bool   `env:"WS_MARKET_STREAM_ENABLED" envDefault:"true"`
+	SubscriptionMode    string `env:"WS_SUBSCRIPTION_MODE" envDefault:"hot"`
+	MaxMarkets          int    `env:"WS_MAX_MARKETS" envDefault:"25" validate:"gte=1,lte=5000"`
+	MaxTokens           int    `env:"WS_MAX_TOKENS" envDefault:"50" validate:"gte=1,lte=10000"`
+	// AllowLargeSubscription unlocks WS_MAX_MARKETS > 250. False by
+	// default — a typo of WS_MAX_MARKETS=2500 now fails Validate()
+	// rather than fanning out a 5000-token subscription.
+	AllowLargeSubscription    bool          `env:"WS_ALLOW_LARGE_SUBSCRIPTION" envDefault:"false"`
+	ReconnectMinBackoff       time.Duration `env:"WS_RECONNECT_MIN_BACKOFF" envDefault:"1s" validate:"gt=0"`
+	ReconnectMaxBackoff       time.Duration `env:"WS_RECONNECT_MAX_BACKOFF" envDefault:"30s" validate:"gt=0"`
+	PingInterval              time.Duration `env:"WS_PING_INTERVAL" envDefault:"10s" validate:"gt=0"`
+	ReadTimeout               time.Duration `env:"WS_READ_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	WriteTimeout              time.Duration `env:"WS_WRITE_TIMEOUT" envDefault:"10s" validate:"gt=0"`
+	EventBuffer               int           `env:"WS_EVENT_BUFFER" envDefault:"10000" validate:"gte=100"`
+	DropPolicy                string        `env:"WS_DROP_POLICY" envDefault:"drop_low_priority"`
+	RawCaptureEnabled         bool          `env:"WS_RAW_CAPTURE_ENABLED" envDefault:"false"`
+	RawCaptureMaxBytes        int           `env:"WS_RAW_CAPTURE_MAX_BYTES" envDefault:"4096" validate:"gte=128"`
+	ReconcileEnabled          bool          `env:"WS_RECONCILE_ENABLED" envDefault:"true"`
+	ReconcileInterval         time.Duration `env:"WS_RECONCILE_INTERVAL" envDefault:"2m" validate:"gt=0"`
+	GapRecoveryLookback       time.Duration `env:"WS_GAP_RECOVERY_LOOKBACK" envDefault:"10m" validate:"gt=0"`
+	HealthStaleAfter          time.Duration `env:"WS_HEALTH_STALE_AFTER" envDefault:"60s" validate:"gt=0"`
+	StartupSubscribeDelay     time.Duration `env:"WS_STARTUP_SUBSCRIBE_DELAY" envDefault:"10s" validate:"gte=0"`
+	PriceMoveTrigger          float64       `env:"WS_PRICE_MOVE_TRIGGER" envDefault:"0.03" validate:"gt=0,lte=1"`
+	RepricingTriggerCooldown  time.Duration `env:"WS_REPRICING_TRIGGER_COOLDOWN" envDefault:"60s" validate:"gt=0"`
+	PredictionRefreshCooldown time.Duration `env:"WS_PREDICTION_REFRESH_TRIGGER_COOLDOWN" envDefault:"5m" validate:"gt=0"`
+	Endpoint                  string        `env:"WS_ENDPOINT" envDefault:"wss://ws-subscriptions-clob.polymarket.com/ws/market"`
 }
 
 // EventFlowConfig drives the deterministic event-level flow
@@ -800,6 +843,11 @@ type EventPageContextConfig struct {
 	// HTMLBaseURL is the public Polymarket site. Override only for
 	// integration tests / staging.
 	HTMLBaseURL string `env:"POLYMARKET_EVENT_PAGE_HTML_BASE_URL" envDefault:"https://polymarket.com"`
+	// MaxRedirects bounds the redirect chain length the v10.5 client
+	// follows per fetch. Polymarket's data route emits exactly one
+	// 307 today (to either /event/<slug> HTML or another _next/data
+	// JSON URL); the cap is the safety belt against loops.
+	MaxRedirects int `env:"EVENT_PAGE_MAX_REDIRECTS" envDefault:"5" validate:"gte=1,lte=20"`
 }
 
 // AIAnalysisConfig wires the AI market-intelligence layer. The
@@ -815,7 +863,11 @@ type AIAnalysisConfig struct {
 	APIKey   string `env:"OPENAI_API_KEY"`
 	BaseURL  string `env:"OPENAI_BASE_URL" envDefault:"https://api.openai.com/v1"`
 
-	Timeout        time.Duration `env:"AI_ANALYSIS_TIMEOUT" envDefault:"8s" validate:"gt=0"`
+	// 8s was the legacy default and was too aggressive in prod —
+	// alert AI calls regularly landed in the 10-20s range and tripped
+	// the timeout cliff. 45s aligns with the operator-spec
+	// ALERT_AI_TIMEOUT default and gives the model real headroom.
+	Timeout        time.Duration `env:"AI_ANALYSIS_TIMEOUT" envDefault:"45s" validate:"gt=0"`
 	MaxOutputChars int           `env:"AI_ANALYSIS_MAX_OUTPUT_CHARS" envDefault:"700" validate:"gte=100,lte=4000"`
 	MaxPromptChars int           `env:"AI_ANALYSIS_MAX_PROMPT_CHARS" envDefault:"2500" validate:"gte=200,lte=20000"`
 
@@ -856,6 +908,48 @@ type AIAnalysisConfig struct {
 	MarketIntelligenceInterval       time.Duration `env:"AI_MARKET_INTELLIGENCE_INTERVAL" envDefault:"2h" validate:"gt=0"`
 	MarketIntelligenceMaxMarkets     int           `env:"AI_MARKET_INTELLIGENCE_MAX_MARKETS" envDefault:"50" validate:"gte=1,lte=500"`
 	MarketIntelligenceMaxOutputChars int           `env:"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS" envDefault:"2000" validate:"gte=200,lte=8000"`
+
+	// --- v9.7 per-surface timeout knobs ------------------------------------
+	// Market-intelligence prompts are heavier than alerts — separate
+	// timeout so the 2h scout does not piggy-back on the 45s alert
+	// budget. Defaults match the operator spec; observed prod calls
+	// land in the 20-45s range, so 60s is comfortable headroom.
+	MarketIntelAITimeout                  time.Duration `env:"MARKET_INTEL_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	MarketIntelAnnotationRankingAITimeout time.Duration `env:"MARKET_INTEL_ANNOTATION_RANKING_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	// Retry-once-on-timeout flag. true = single retry on
+	// CategoryTimeout with 1-3s jittered backoff; false = single-shot
+	// behaviour (legacy). Quota / rate-limit / 5xx routes through the
+	// existing error handling — those NEVER retry here.
+	MarketIntelRetryOnTimeout  bool          `env:"MARKET_INTEL_RETRY_ON_TIMEOUT" envDefault:"true"`
+	MarketIntelRetryBackoffMin time.Duration `env:"MARKET_INTEL_RETRY_BACKOFF_MIN" envDefault:"1s" validate:"gt=0"`
+	MarketIntelRetryBackoffMax time.Duration `env:"MARKET_INTEL_RETRY_BACKOFF_MAX" envDefault:"3s" validate:"gt=0"`
+	// Link / source-link rendering.
+	MarketIntelSourceLinksEnabled bool `env:"MARKET_INTEL_SOURCE_LINKS_ENABLED" envDefault:"true"`
+	MarketIntelMaxSourceLinks     int  `env:"MARKET_INTEL_MAX_SOURCE_LINKS" envDefault:"3" validate:"gte=0,lte=10"`
+	MarketIntelMaxLinksPerRow     int  `env:"MARKET_INTEL_MAX_LINKS_PER_ROW" envDefault:"5" validate:"gte=0,lte=20"`
+	// Deterministic-fallback knob. When true (default) the worker
+	// SHIPS a deterministic report with markets/links + "AI summary
+	// unavailable: <reason>" when the AI fails. Set to false to
+	// restore legacy "skip everything on AI failure" behaviour.
+	MarketIntelFallbackOnAIFailure bool `env:"MARKET_INTEL_FALLBACK_ON_AI_FAILURE" envDefault:"true"`
+	// Annotation listing cap per event for the "Important Polymarket
+	// events" section.
+	MarketIntelAnnotationsPerEvent int `env:"MARKET_INTEL_ANNOTATIONS_PER_EVENT" envDefault:"3" validate:"gte=0,lte=20"`
+	// Hard cap on visible candidate markets in the Telegram body.
+	// Anything beyond this remains in markets_json for audit.
+	MarketIntelVisibleMarkets int `env:"MARKET_INTEL_VISIBLE_MARKETS" envDefault:"8" validate:"gte=1,lte=50"`
+
+	// --- v9.7 alias timeouts for downstream surfaces -----------------------
+	// These let an operator pin per-surface timeouts under canonical
+	// names without forcing them to discover the legacy ones. The
+	// implementation prefers the canonical name when the env var is
+	// set; otherwise it falls back to the surface's existing
+	// `*_AI_TIMEOUT` (Timeout / ImporterAITimeout / etc.).
+	AlertAITimeout                time.Duration `env:"ALERT_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	CatalystAITimeout             time.Duration `env:"CATALYST_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	PredictionCreationAITimeoutV2 time.Duration `env:"PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	PredictionEvolutionAITimeout  time.Duration `env:"PREDICTION_EVOLUTION_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	OutcomeAITimeout              time.Duration `env:"OUTCOME_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
 }
 
 // DetectionConfig tunes the v6 detection worker that drains
@@ -926,5 +1020,31 @@ func LoadConfig() (*Config, error) {
 	if err := validator.New().Struct(cfg); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
+	if err := cfg.validateInvariants(); err != nil {
+		return nil, fmt.Errorf("validate config invariants: %w", err)
+	}
 	return cfg, nil
+}
+
+// validateInvariants applies cross-field rules the struct-tag
+// validator can't express. v10.6 added the WS subscription safety
+// belts here so an accidental WS_MAX_MARKETS=2500 fails fast at
+// boot instead of fanning out a 5000-token subscription.
+func (c *Config) validateInvariants() error {
+	const wsHardCap = 250
+	if c.WS.Enabled {
+		if c.WS.MaxMarkets <= 0 {
+			return fmt.Errorf("WS_ENABLED=true requires WS_MAX_MARKETS > 0 (got %d)", c.WS.MaxMarkets)
+		}
+		if c.WS.MaxTokens < c.WS.MaxMarkets {
+			return fmt.Errorf("WS_MAX_TOKENS (%d) must be >= WS_MAX_MARKETS (%d)",
+				c.WS.MaxTokens, c.WS.MaxMarkets)
+		}
+		if c.WS.MaxMarkets > wsHardCap && !c.WS.AllowLargeSubscription {
+			return fmt.Errorf("WS_MAX_MARKETS=%d exceeds the safety cap of %d; "+
+				"set WS_ALLOW_LARGE_SUBSCRIPTION=true to override",
+				c.WS.MaxMarkets, wsHardCap)
+		}
+	}
+	return nil
 }

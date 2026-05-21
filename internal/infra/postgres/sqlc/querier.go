@@ -62,6 +62,9 @@ type Querier interface {
 	// failed rows (status='failed' AND next_retry_at <= now()). The retry
 	// worker is the same alertsender; there is no separate retry path.
 	ClaimPendingAlertsForSend(ctx context.Context, limit int32) ([]PolymarketAlerts, error)
+	// Atomic claim of up to `limit_count` due rows. Uses SKIP LOCKED so
+	// multiple drainers can run side-by-side without deadlocks.
+	ClaimRealtimeWorkBatch(ctx context.Context, limitCount int32) ([]ClaimRealtimeWorkBatchRow, error)
 	// Atomically lease a batch of trades that need detection processing.
 	// The UPDATE flips detection_claimed_at to NOW() and stamps the
 	// worker id; the inner SELECT … FOR UPDATE SKIP LOCKED ensures
@@ -80,10 +83,17 @@ type Querier interface {
 	// DedupeWindow?". Includes rows in any state — a stale prediction
 	// still counts as "we touched this event recently".
 	CountPredictionsForEventSince(ctx context.Context, arg CountPredictionsForEventSinceParams) (int64, error)
+	// Periodic cleanup so the queue doesn't grow without bound.
+	DeleteOldRealtimeWork(ctx context.Context, olderThan pgtype.Timestamptz) error
 	// /stats break-down: rows by terminal detection state. NULL status is
 	// reported as 'pending'.
 	DetectionStatusBreakdown(ctx context.Context) ([]DetectionStatusBreakdownRow, error)
+	// Idempotent: dedupe_key = condition_id + reason + minute_bucket so a
+	// burst of WS events for the same market collapses to one queue row.
+	// Conflicts are silently swallowed via DO NOTHING.
+	EnqueueRealtimeWork(ctx context.Context, arg EnqueueRealtimeWorkParams) error
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
+	FinishGapRecovery(ctx context.Context, arg FinishGapRecoveryParams) error
 	// Single-row fetch used by the outcome-learning worker to reload
 	// the full row (payload, telegram_message_id, outcome_status, etc.)
 	// before invoking the AI postmortem path.
@@ -92,6 +102,8 @@ type Querier interface {
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
 	GetDailyPoliticalIntelReport(ctx context.Context, reportDate pgtype.Date) (PolymarketDailyPoliticalIntelReports, error)
 	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
+	GetEventSlugAlias(ctx context.Context, originalSlug string) (string, error)
+	GetLiveMarketState(ctx context.Context, conditionID string) (PolymarketLiveMarketState, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
 	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (GetMarketPredictionRow, error)
@@ -120,6 +132,7 @@ type Querier interface {
 	// Inserts a snapshot row. raw_json is capped by the writer before
 	// this call lands so the column stays bounded.
 	InsertEventPageSnapshot(ctx context.Context, arg InsertEventPageSnapshotParams) (int64, error)
+	InsertGapRecovery(ctx context.Context, arg InsertGapRecoveryParams) (int64, error)
 	// Persist one 2h report. period_key UNIQUE — two ticks landing in the
 	// same bucket (computed deterministically in the worker) collapse to
 	// a single row, eliminating the duplicate-Telegram-send class of bug
@@ -131,6 +144,9 @@ type Querier interface {
 	// constraint and exactly one wins. The caller maps pgx.ErrNoRows to
 	// "already existed".
 	InsertTrade(ctx context.Context, arg InsertTradeParams) (PolymarketTrades, error)
+	// Append-only audit/correlation row. Fail-open: the WS path
+	// handles a write error by logging + continuing — never blocks.
+	InsertWSEvent(ctx context.Context, arg InsertWSEventParams) error
 	// Returns the most recent traded_at for a (market, outcome) STRICTLY before
 	// the supplied timestamp. NULL when no prior trade exists. Powers the
 	// quiet-market wake-up detector — given the current trade's timestamp it
@@ -228,6 +244,11 @@ type Querier interface {
 	// philosophy: deep into lifecycle + recent activity + non-trivial
 	// liquidity. The query is intentionally simple — the AI does the
 	// ranking; we provide a generous shortlist.
+	//
+	// The event/market/category slugs are surfaced so the Telegram
+	// formatter can render Polymarket links per row (PART 5 of the v9.7
+	// timeout + links pass). Slug columns may be NULL on edge data; the
+	// renderer skips broken links via sanitizeLinkURL.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
 	ListMarketPredictionStates(ctx context.Context, arg ListMarketPredictionStatesParams) ([]PolymarketMarketPredictionStates, error)
 	// Powers the daily calibration report + CLI. Pulls evaluations
@@ -337,6 +358,7 @@ type Querier interface {
 	// to 'stale' on rows that had no annotation / catalyst update /
 	// material price move within StaleNoSignalAfter.
 	MarkPredictionStaleNoSignal(ctx context.Context, arg MarkPredictionStaleNoSignalParams) error
+	MarkRealtimeWorkFailed(ctx context.Context, arg MarkRealtimeWorkFailedParams) error
 	// Captures a send failure on the row. The scheduler treats failed rows
 	// as permanently failed for the period (idempotency over correctness:
 	// a flapping Telegram send is far worse than a missed report).
@@ -402,6 +424,9 @@ type Querier interface {
 	// on each tick (cheap when zero rows match).
 	ResetStaleSendingAlerts(ctx context.Context, updatedAt pgtype.Timestamptz) error
 	SetEventCatalystStatus(ctx context.Context, arg SetEventCatalystStatusParams) error
+	// Bulk-flip ws_connected on/off when the client connects/disconnects.
+	// Used by the realtime worker to surface "WS is alive for this market".
+	SetLiveMarketWSConnected(ctx context.Context, arg SetLiveMarketWSConnectedParams) error
 	// One-shot aggregate that powers the daily/weekly/monthly/quarterly/yearly
 	// reports. Returns total counts, resolved counts, success/failure
 	// counts, and the CLV-summary fields — all in a single roundtrip so
@@ -498,6 +523,12 @@ type Querier interface {
 	// Mutable fields refresh on conflict; created_at stays frozen.
 	UpsertEventCatalyst(ctx context.Context, arg UpsertEventCatalystParams) error
 	UpsertEventPageFetchState(ctx context.Context, arg UpsertEventPageFetchStateParams) error
+	// v10.5 canonical-slug alias persistence. Idempotent.
+	UpsertEventSlugAlias(ctx context.Context, arg UpsertEventSlugAliasParams) error
+	// Top-of-book / mid / last-price per condition_id. Updated from both
+	// WS events and the reconciliation sweep. Idempotent — every write
+	// bumps updated_at + last_ws_event_at.
+	UpsertLiveMarketState(ctx context.Context, arg UpsertLiveMarketStateParams) error
 	// Insert or update a market by condition_id. Backfill state fields are
 	// preserved on update — only discovery-sourced fields are touched. A
 	// market resurfacing after a soft-delete:

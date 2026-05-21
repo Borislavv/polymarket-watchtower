@@ -256,6 +256,28 @@ type PolymarketEventPageSnapshots struct {
 	CreatedAt pgtype.Timestamptz
 }
 
+type PolymarketEventSlugAliases struct {
+	OriginalSlug  string
+	CanonicalSlug string
+	Source        string
+	FirstSeenAt   pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+}
+
+type PolymarketLiveMarketState struct {
+	ConditionID   string
+	EventSlug     *string
+	MarketSlug    *string
+	BestBid       *float64
+	BestAsk       *float64
+	Mid           *float64
+	LastPrice     *float64
+	LastTradeAt   pgtype.Timestamptz
+	LastWsEventAt pgtype.Timestamptz
+	WsConnected   bool
+	UpdatedAt     pgtype.Timestamptz
+}
+
 type PolymarketMarketCategories struct {
 	MarketID   int64
 	CategoryID int64
@@ -383,6 +405,20 @@ type PolymarketPredictionUsefulnessScores struct {
 	UpdatedAt      pgtype.Timestamptz
 }
 
+type PolymarketRealtimeWorkQueue struct {
+	ID          int64
+	ConditionID *string
+	EventSlug   *string
+	Reason      string
+	Priority    int16
+	DedupeKey   string
+	AvailableAt pgtype.Timestamptz
+	ClaimedAt   pgtype.Timestamptz
+	Attempts    int32
+	LastError   *string
+	CreatedAt   pgtype.Timestamptz
+}
+
 type PolymarketRepricingSignals struct {
 	ID                      int64
 	EventSlug               string
@@ -453,4 +489,44 @@ type PolymarketTrades struct {
 	LastDetectionError  *string
 	DetectionClaimedAt  pgtype.Timestamptz
 	DetectionWorkerID   *string
+}
+
+type PolymarketWsEvents struct {
+	ID                int64
+	ReceivedAt        pgtype.Timestamptz
+	ExchangeTimestamp pgtype.Timestamptz
+	EventType         string
+	EventSlug         *string
+	ConditionID       *string
+	MarketSlug        *string
+	ClobTokenID       *string
+	Outcome           *string
+	Price             *float64
+	Size              *float64
+	Side              *string
+	SideSource        string
+	SideConfidence    float64
+	BestBid           *float64
+	BestAsk           *float64
+	Mid               *float64
+	TxHash            *string
+	TradeID           *string
+	Wallet            *string
+	Sequence          *string
+	RawJson           []byte
+	RawHash           *string
+	CreatedAt         pgtype.Timestamptz
+}
+
+type PolymarketWsGapRecoveries struct {
+	ID              int64
+	ConditionID     string
+	StartedAt       pgtype.Timestamptz
+	EndedAt         pgtype.Timestamptz
+	LookbackStart   pgtype.Timestamptz
+	LookbackEnd     pgtype.Timestamptz
+	RecoveredTrades int32
+	Status          string
+	LastError       *string
+	CreatedAt       pgtype.Timestamptz
 }

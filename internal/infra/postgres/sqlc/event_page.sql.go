@@ -34,6 +34,18 @@ func (q *Queries) GetEventPageFetchState(ctx context.Context, eventSlug string) 
 	return i, err
 }
 
+const getEventSlugAlias = `-- name: GetEventSlugAlias :one
+SELECT canonical_slug FROM polymarket_event_slug_aliases
+WHERE original_slug = $1
+`
+
+func (q *Queries) GetEventSlugAlias(ctx context.Context, originalSlug string) (string, error) {
+	row := q.db.QueryRow(ctx, getEventSlugAlias, originalSlug)
+	var canonical_slug string
+	err := row.Scan(&canonical_slug)
+	return canonical_slug, err
+}
+
 const insertEventPageMarket = `-- name: InsertEventPageMarket :exec
 INSERT INTO polymarket_event_page_markets (
     snapshot_id, event_slug, market_id, condition_id, market_slug,
@@ -364,5 +376,29 @@ func (q *Queries) UpsertEventPageFetchState(ctx context.Context, arg UpsertEvent
 		arg.LastBuildID,
 		arg.LastAnnotations,
 	)
+	return err
+}
+
+const upsertEventSlugAlias = `-- name: UpsertEventSlugAlias :exec
+INSERT INTO polymarket_event_slug_aliases (
+    original_slug, canonical_slug, source, first_seen_at, last_seen_at
+) VALUES (
+    $1, $2, $3, NOW(), NOW()
+)
+ON CONFLICT (original_slug) DO UPDATE SET
+    canonical_slug = EXCLUDED.canonical_slug,
+    source         = EXCLUDED.source,
+    last_seen_at   = NOW()
+`
+
+type UpsertEventSlugAliasParams struct {
+	OriginalSlug  string
+	CanonicalSlug string
+	Source        string
+}
+
+// v10.5 canonical-slug alias persistence. Idempotent.
+func (q *Queries) UpsertEventSlugAlias(ctx context.Context, arg UpsertEventSlugAliasParams) error {
+	_, err := q.db.Exec(ctx, upsertEventSlugAlias, arg.OriginalSlug, arg.CanonicalSlug, arg.Source)
 	return err
 }

@@ -60,6 +60,14 @@ func main() {
 		// v10.3 operator calibration report. Read-only; no AI; no
 		// Telegram. Same aggregation backs the daily report worker.
 		runPredictionCalibration(os.Args[2:])
+	case "ws-smoke":
+		// v10.4 hybrid WebSocket smoke. Connects to the Polymarket
+		// CLOB WS, subscribes to 1-3 token ids, prints the observed
+		// event stream for a bounded duration. --persist + --dsn
+		// optionally drive the same persistence path the production
+		// worker uses (polymarket_ws_events, polymarket_live_market_state,
+		// polymarket_realtime_work_queue). NO AI. NO Telegram.
+		runWSSmoke(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -73,6 +81,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  diagnose-ai      -dsn postgres://… [--limit 20]")
 	fmt.Fprintln(os.Stderr, "  import-catalysts --event <slug> [--persist] [--ai-key $OPENAI_API_KEY] [--model gpt-4.1-mini]")
 	fmt.Fprintln(os.Stderr, "  evolve-predictions --dsn postgres://… [--once] [--limit 10] [--dry-run]")
+	fmt.Fprintln(os.Stderr, "  ws-smoke         --tokens <id1,id2,…> [--duration 60s] [--persist --dsn postgres://…]")
 }
 
 func runMigrate(args []string) {

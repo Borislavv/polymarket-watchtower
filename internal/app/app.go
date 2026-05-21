@@ -45,6 +45,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionarchival"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionfeedback"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/realtime"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
@@ -63,6 +64,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/eventpage"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/ws"
 	pg "github.com/Borislavv/polymarket-watchtower/internal/infra/postgres"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/postgres/sqlc"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
@@ -105,6 +107,7 @@ type App struct {
 	predictionCreator *create.Worker
 	predictionFeedbk  *predictionfeedback.Worker
 	predictionArchive *predictionarchival.Worker
+	realtimeWS        *realtime.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -828,38 +831,67 @@ func New() (*App, error) {
 	// 2h market intelligence report worker. Same gating: Postgres
 	// + Telegram wired AND AIMarketIntelligenceEnabled=true. The
 	// candidate selection works even without the AI key — the
-	// worker stores a "skipped" row and posts the candidate list
-	// unranked. With the key, the AI summary lands inline.
+	// worker stores a "skipped" row and ships a deterministic
+	// fallback report with markets + annotation links. With the
+	// key, the AI summary lands inline.
 	var marketIntelWorker *marketintel.Worker
 	if cfg.Postgres.Enabled() && bot != nil && cfg.AIAnalysis.MarketIntelligenceEnabled {
 		var analyzerForReport analysis.Analyzer = analysis.NoopAnalyzer{}
+		var marketIntelOpenAIClient *openai.Client
 		if cfg.AIAnalysis.APIKey != "" {
-			analyzerForReport = openai.New(openai.Config{
-				APIKey:                 cfg.AIAnalysis.APIKey,
-				BaseURL:                cfg.AIAnalysis.BaseURL,
-				Model:                  cfg.AIAnalysis.Model,
-				Timeout:                cfg.AIAnalysis.Timeout,
+			marketIntelOpenAIClient = openai.New(openai.Config{
+				APIKey:  cfg.AIAnalysis.APIKey,
+				BaseURL: cfg.AIAnalysis.BaseURL,
+				Model:   cfg.AIAnalysis.Model,
+				// v9.7: dedicated per-surface timeout. Marketintel
+				// prompts are heavier than alerts and used to share
+				// the alert 8s budget — the prod timeout flood is
+				// caused by exactly that. 60s is the new default
+				// (operator override: MARKET_INTEL_AI_TIMEOUT).
+				Timeout:                cfg.AIAnalysis.MarketIntelAITimeout,
 				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
 				MaxOutputChars:         cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
 				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
 				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
 				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
 				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-				// Market intel prompt asks the model to scan fresh
-				// news for trend confirmation/invalidation; without
-				// web_search the section is dead.
-				WebSearchEnabled: cfg.AIAnalysis.WebSearchEnabled,
+				WebSearchEnabled:       cfg.AIAnalysis.WebSearchEnabled,
 			})
+			analyzerForReport = marketIntelOpenAIClient
 		}
 		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
 		marketIntelWorker = marketintel.New(marketintel.Config{
-			Enabled:        true,
-			Interval:       cfg.AIAnalysis.MarketIntelligenceInterval,
-			MaxMarkets:     cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
-			MaxOutputChars: cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
-			ChatID:         cfg.Alerting.TelegramChatID,
+			Enabled:           true,
+			Interval:          cfg.AIAnalysis.MarketIntelligenceInterval,
+			MaxMarkets:        cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
+			MaxOutputChars:    cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
+			ChatID:            cfg.Alerting.TelegramChatID,
+			AITimeout:         cfg.AIAnalysis.MarketIntelAITimeout,
+			RetryOnTimeout:    cfg.AIAnalysis.MarketIntelRetryOnTimeout,
+			RetryBackoffMin:   cfg.AIAnalysis.MarketIntelRetryBackoffMin,
+			RetryBackoffMax:   cfg.AIAnalysis.MarketIntelRetryBackoffMax,
+			FallbackOnFailure: cfg.AIAnalysis.MarketIntelFallbackOnAIFailure,
+			AnnotationsPerEvt: cfg.AIAnalysis.MarketIntelAnnotationsPerEvent,
+			VisibleMarkets:    cfg.AIAnalysis.MarketIntelVisibleMarkets,
+			MaxInputChars:     cfg.AIPreflight.MaxInputCharsMarketIntel,
+			Links: marketintel.LinkConfig{
+				PolymarketBase:     cfg.Polymarket.PublicBaseURL,
+				GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
+				GrafanaDashUID:     cfg.Alerting.GrafanaDashUID,
+				GrafanaContext:     cfg.Alerting.GrafanaContext,
+				SourceLinksEnabled: cfg.AIAnalysis.MarketIntelSourceLinksEnabled,
+				MaxSourceLinks:     cfg.AIAnalysis.MarketIntelMaxSourceLinks,
+				MaxLinksPerRow:     cfg.AIAnalysis.MarketIntelMaxLinksPerRow,
+			},
 		}, intelRepo, intelRepo, analyzerForReport, bot, logger)
 		marketIntelWorker.SetMetrics(met)
+		// Annotation lister for the deterministic "Important
+		// Polymarket events" section. Best-effort — failure NEVER
+		// blocks the report.
+		marketIntelWorker.SetAnnotationLister(repository.NewEventPageRepository(pgPool))
+		if marketIntelOpenAIClient != nil {
+			marketIntelWorker.SetPromptCharsLoader(marketIntelOpenAIClient)
+		}
 		if eventPageProvider != nil {
 			marketIntelWorker.SetNarrativeLoader(eventPageProvider)
 		}
@@ -868,10 +900,14 @@ func New() (*App, error) {
 		// annotations" block ranked by the model.
 		if cfg.AIAnalysis.APIKey != "" && eventPageProvider != nil {
 			ranker := openai.New(openai.Config{
-				APIKey:                 cfg.AIAnalysis.APIKey,
-				BaseURL:                cfg.AIAnalysis.BaseURL,
-				Model:                  cfg.AIAnalysis.Model,
-				Timeout:                cfg.AIAnalysis.Timeout,
+				APIKey:  cfg.AIAnalysis.APIKey,
+				BaseURL: cfg.AIAnalysis.BaseURL,
+				Model:   cfg.AIAnalysis.Model,
+				// v9.7: dedicated annotation-ranking timeout. The
+				// ranker call is lighter than the marketintel
+				// report itself but still benefits from breathing
+				// room over the alert default.
+				Timeout:                cfg.AIAnalysis.MarketIntelAnnotationRankingAITimeout,
 				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
 				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
 				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
@@ -880,8 +916,9 @@ func New() (*App, error) {
 				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
 			})
 			annoRepoForHook := repository.NewAnnotationIntelRepository(pgPool)
-			hook := annotationranking.New(annotationranking.Config{},
-				marketsRepo, eventPageProvider, ranker, annoRepoForHook, met, logger)
+			hook := annotationranking.New(annotationranking.Config{
+				AITimeout: cfg.AIAnalysis.MarketIntelAnnotationRankingAITimeout,
+			}, marketsRepo, eventPageProvider, ranker, annoRepoForHook, met, logger)
 			marketIntelWorker.SetAnnotationRankingHook(hook)
 		}
 	}
@@ -1071,6 +1108,10 @@ func New() (*App, error) {
 			SendTelegram:       cfg.Prediction.EvolutionSendTelegram,
 			TelegramCooldown:   cfg.Prediction.EvolutionTelegramCooldown,
 			TelegramChatID:     cfg.Alerting.TelegramChatID,
+			PolymarketBase:     cfg.Polymarket.PublicBaseURL,
+			GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
+			GrafanaDashUID:     cfg.Alerting.GrafanaDashUID,
+			GrafanaContext:     cfg.Alerting.GrafanaContext,
 		}, predsRepo, eventPageProvider, catalystRepoForEvolver, flowRepo, repricingComp, aiGen, tgAdapter, met, logger)
 		logger.Info().
 			Bool("enabled", cfg.Prediction.EvolutionEnabled).
@@ -1169,6 +1210,56 @@ func New() (*App, error) {
 			Dur("terminal_retention", cfg.Prediction.ArchivalTerminalRetention).
 			Dur("stale_no_signal_after", cfg.Prediction.ArchivalStaleNoSignalAfter).
 			Msg("prediction archival: wired")
+	}
+
+	// v10.4 Hybrid WebSocket realtime fast-lane. WS_ENABLED=false
+	// is the production default — the operator opts in per env.
+	// When disabled the worker short-circuits without goroutines.
+	var realtimeWorker *realtime.Worker
+	if cfg.Postgres.Enabled() && cfg.WS.Enabled {
+		realtimeStore := repository.NewRealtimeRepository(pgPool)
+		wsClient := ws.New(ws.Config{
+			Endpoint:     cfg.WS.Endpoint,
+			MaxTokens:    cfg.WS.MaxTokens,
+			PingInterval: cfg.WS.PingInterval,
+			ReadTimeout:  cfg.WS.ReadTimeout,
+			WriteTimeout: cfg.WS.WriteTimeout,
+			ReconnectMin: cfg.WS.ReconnectMinBackoff,
+			ReconnectMax: cfg.WS.ReconnectMaxBackoff,
+			EventBuffer:  cfg.WS.EventBuffer,
+		}, met, logger)
+		selector := realtime.NewPostgresSelector(pgPool)
+		realtimeWorker = realtime.New(realtime.Config{
+			Enabled:                   cfg.WS.Enabled,
+			MarketStreamEnabled:       cfg.WS.MarketStreamEnabled,
+			SubscriptionMode:          cfg.WS.SubscriptionMode,
+			MaxMarkets:                cfg.WS.MaxMarkets,
+			MaxTokens:                 cfg.WS.MaxTokens,
+			ReconnectMin:              cfg.WS.ReconnectMinBackoff,
+			ReconnectMax:              cfg.WS.ReconnectMaxBackoff,
+			PingInterval:              cfg.WS.PingInterval,
+			ReadTimeout:               cfg.WS.ReadTimeout,
+			WriteTimeout:              cfg.WS.WriteTimeout,
+			EventBuffer:               cfg.WS.EventBuffer,
+			DropPolicy:                cfg.WS.DropPolicy,
+			RawCaptureEnabled:         cfg.WS.RawCaptureEnabled,
+			RawCaptureMaxBytes:        cfg.WS.RawCaptureMaxBytes,
+			ReconcileEnabled:          cfg.WS.ReconcileEnabled,
+			ReconcileInterval:         cfg.WS.ReconcileInterval,
+			GapRecoveryLookback:       cfg.WS.GapRecoveryLookback,
+			HealthStaleAfter:          cfg.WS.HealthStaleAfter,
+			StartupSubscribeDelay:     cfg.WS.StartupSubscribeDelay,
+			PriceMoveTrigger:          cfg.WS.PriceMoveTrigger,
+			RepricingTriggerCooldown:  cfg.WS.RepricingTriggerCooldown,
+			PredictionRefreshCooldown: cfg.WS.PredictionRefreshCooldown,
+			Endpoint:                  cfg.WS.Endpoint,
+		}, realtimeStore, wsClient, selector.Select, met, logger)
+		logger.Info().
+			Bool("enabled", cfg.WS.Enabled).
+			Str("mode", cfg.WS.SubscriptionMode).
+			Int("max_markets", cfg.WS.MaxMarkets).
+			Str("endpoint", cfg.WS.Endpoint).
+			Msg("realtime ws: wired")
 	}
 
 	// v10.0 Prediction Creation Worker (cold-start path). Without
@@ -1286,6 +1377,7 @@ func New() (*App, error) {
 		predictionCreator: predictionCreator,
 		predictionFeedbk:  predictionFeedback,
 		predictionArchive: predictionArchiver,
+		realtimeWS:        realtimeWorker,
 		pgPool:            pgPool,
 	}, nil
 }
@@ -1516,16 +1608,19 @@ func wireEventPageProvider(cfg *Config, marketsRepo *repository.MarketRepository
 		TTL:         cfg.EventPage.BuildIDTTL,
 		Logger:      logger,
 	})
+	repo := repository.NewEventPageRepository(a_pgPool(marketsRepo))
 	client, err := eventpage.NewClient(eventpage.ClientConfig{
-		HTMLBaseURL: cfg.EventPage.HTMLBaseURL,
-		Resolver:    resolver,
-		Logger:      logger,
+		HTMLBaseURL:  cfg.EventPage.HTMLBaseURL,
+		Resolver:     resolver,
+		AliasStore:   repo, // v10.5: persistent canonical-slug aliases
+		Logger:       logger,
+		Metrics:      newEventPageMetricsSink(met),
+		MaxRedirects: cfg.EventPage.MaxRedirects,
 	})
 	if err != nil {
 		logger.Warn().Err(err).Msg("event page client: construction failed; narrative context disabled")
 		return nil
 	}
-	repo := repository.NewEventPageRepository(a_pgPool(marketsRepo))
 	// The slug resolver closes over the market repo; a missing
 	// market (purged, never seen) returns "" so the loader skips
 	// the call cleanly.
@@ -1681,6 +1776,12 @@ func (a *App) Run() error {
 	if a.predictionArchive != nil {
 		execs = append(execs, shutdown2.Exec{Name: "prediction-archival", Fn: func(ctx context.Context) error {
 			a.predictionArchive.Run(ctx)
+			return nil
+		}})
+	}
+	if a.realtimeWS != nil {
+		execs = append(execs, shutdown2.Exec{Name: "realtime-ws", Fn: func(ctx context.Context) error {
+			a.realtimeWS.Run(ctx)
 			return nil
 		}})
 	}

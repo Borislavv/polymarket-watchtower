@@ -359,3 +359,32 @@ func capRaw(b []byte, n int) []byte {
 	copy(out, b[:n])
 	return out
 }
+
+// --- v10.5 canonical-slug aliases ----------------------------------------
+
+// UpsertEventSlugAlias persists a (original → canonical) slug
+// mapping discovered by the eventpage client when Polymarket
+// 307-redirects an event JSON URL to a different /event/<slug> page.
+func (r *EventPageRepository) UpsertEventSlugAlias(ctx context.Context, original, canonical, source string) error {
+	return r.q.UpsertEventSlugAlias(ctx, sqlc.UpsertEventSlugAliasParams{
+		OriginalSlug:  original,
+		CanonicalSlug: canonical,
+		Source:        source,
+	})
+}
+
+// GetEventSlugAlias returns the canonical slug for `original` when
+// the client has previously observed a 307 → /event/<canonical>
+// redirect. (zero, false, nil) on miss; never returns a transport
+// error to the caller — fail-open is the contract.
+func (r *EventPageRepository) GetEventSlugAlias(ctx context.Context, original string) (string, bool, error) {
+	canonical, err := r.q.GetEventSlugAlias(ctx, original)
+	if err != nil {
+		// pgx.ErrNoRows / connection blip → fail-open.
+		return "", false, nil
+	}
+	if canonical == "" {
+		return "", false, nil
+	}
+	return canonical, true, nil
+}

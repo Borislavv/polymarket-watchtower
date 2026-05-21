@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -193,5 +194,94 @@ func TestConfigRejectsInvalidPort(t *testing.T) {
 func TestConfigRejectsBadURL(t *testing.T) {
 	if _, err := loadConfigWithEnv(t, map[string]string{"GAMMA_API_URL": "not-a-url"}); err == nil {
 		t.Fatal("expected error for bad URL")
+	}
+}
+
+// TestValidateInvariants_WSSafetyBelts pins the v10.6 cross-field
+// rules on WebSocketConfig. The struct-tag validator alone can't
+// express "MaxTokens must be >= MaxMarkets" or "MaxMarkets > 250
+// requires AllowLargeSubscription", so these live in
+// Config.validateInvariants().
+func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "happy path 25 markets / 50 tokens",
+			mutate: func(c *Config) {
+				c.WS.Enabled = true
+				c.WS.MaxMarkets = 25
+				c.WS.MaxTokens = 50
+			},
+			wantErr: "",
+		},
+		{
+			name: "ws disabled bypasses every belt",
+			mutate: func(c *Config) {
+				c.WS.Enabled = false
+				c.WS.MaxMarkets = 0
+				c.WS.MaxTokens = 0
+			},
+			wantErr: "",
+		},
+		{
+			name: "max_tokens < max_markets fails",
+			mutate: func(c *Config) {
+				c.WS.Enabled = true
+				c.WS.MaxMarkets = 25
+				c.WS.MaxTokens = 10
+			},
+			wantErr: "WS_MAX_TOKENS",
+		},
+		{
+			name: "ws enabled with zero max_markets fails",
+			mutate: func(c *Config) {
+				c.WS.Enabled = true
+				c.WS.MaxMarkets = 0
+				c.WS.MaxTokens = 100
+			},
+			wantErr: "WS_MAX_MARKETS > 0",
+		},
+		{
+			name: "large subscription without override flag fails",
+			mutate: func(c *Config) {
+				c.WS.Enabled = true
+				c.WS.MaxMarkets = 2500
+				c.WS.MaxTokens = 5000
+				c.WS.AllowLargeSubscription = false
+			},
+			wantErr: "WS_ALLOW_LARGE_SUBSCRIPTION",
+		},
+		{
+			name: "large subscription with override flag passes",
+			mutate: func(c *Config) {
+				c.WS.Enabled = true
+				c.WS.MaxMarkets = 2500
+				c.WS.MaxTokens = 5000
+				c.WS.AllowLargeSubscription = true
+			},
+			wantErr: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{}
+			tt.mutate(cfg)
+			err := cfg.validateInvariants()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("expected nil err, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }

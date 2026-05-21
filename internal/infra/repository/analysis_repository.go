@@ -232,11 +232,17 @@ func (r *MarketIntelligenceRepository) Insert(ctx context.Context, rpt NewMarket
 }
 
 // IntelligenceCandidate is the per-market row the worker hands the
-// AI analyzer.
+// AI analyzer. Slug fields are surfaced so the Telegram renderer can
+// emit Polymarket event/market/category links per row (v9.7 marketintel
+// link pass); empty slugs cascade through sanitizeLinkURL and the row
+// is elided to plain text without an orphan "links:" line.
 type IntelligenceCandidate struct {
 	ConditionID  string
 	Question     string
+	EventSlug    string
+	MarketSlug   string
 	Category     string
+	CategorySlug string
 	LifecyclePct float64
 	Trades24h    int64
 	Volume24hUSD float64
@@ -261,8 +267,15 @@ func (r *MarketIntelligenceRepository) ListIntelligenceCandidates(ctx context.Co
 			LastPrice:    row.LastPrice,
 			Alerts24h:    row.Alerts24h,
 		}
+		if row.EventSlug != nil {
+			c.EventSlug = *row.EventSlug
+		}
+		c.MarketSlug = row.MarketSlug
 		if row.Category != nil {
 			c.Category = *row.Category
+		}
+		if row.CategorySlug != nil {
+			c.CategorySlug = *row.CategorySlug
 		}
 		c.LifecyclePct = row.LifecyclePct
 		out = append(out, c)

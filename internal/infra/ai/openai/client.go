@@ -243,6 +243,14 @@ func statusForCategory(cat ErrorCategory) analysis.Status {
 	}
 }
 
+// PreviewMarketReportPrompt returns the rendered user message that
+// AnalyzeMarketReport would send to OpenAI for `req`. The worker
+// uses this purely for prompt_chars_before / _after observability;
+// the prompt builder remains the source of truth at call time.
+func (c *Client) PreviewMarketReportPrompt(req analysis.MarketReportRequest) string {
+	return buildMarketReportPrompt(req)
+}
+
 // AnalyzeMarketReport is implemented but the orchestrating worker
 // is staged behind a follow-up PR. The model call works end-to-end;
 // only the periodic top-N selection + dedup logic lives in the

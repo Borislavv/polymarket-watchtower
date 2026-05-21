@@ -75,6 +75,13 @@ type Config struct {
 	TelegramCooldown time.Duration
 	TelegramChatID   string
 
+	// v10.5 link config — passed to the renderer so PREDICTION UPDATE
+	// messages carry Polymarket + Grafana links.
+	PolymarketBase string
+	GrafanaBase    string
+	GrafanaDashUID string
+	GrafanaContext time.Duration
+
 	// Clock + clock-dependent overrides for tests.
 	Clock func() time.Time
 }
@@ -544,6 +551,19 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 			AIText:      "", // The AI refresh stores its own audit row in
 			// the analyses table downstream; for the evolution
 			// Telegram body we keep it deterministic for the MVP.
+
+			// v10.5 surface metadata for the universal header + links.
+			EventSlug:      pred.EventSlug,
+			MarketSlug:     marketSlugFromSummary(pageSummary, pred.ConditionID),
+			Price:          latestPriceFor(pageSummary, pred.ConditionID),
+			LifecyclePct:   lifecyclePctFromSummary(pageSummary, pred.ConditionID),
+			Volume24hUSD:   volume24hFromSummary(pageSummary, pred.ConditionID),
+			Now:            w.cfg.Clock(),
+			TriggeredBy:    "state_transition: " + dec.PreviousState + " → " + dec.NewState,
+			PolymarketBase: w.cfg.PolymarketBase,
+			GrafanaBase:    w.cfg.GrafanaBase,
+			GrafanaDashUID: w.cfg.GrafanaDashUID,
+			GrafanaContext: w.cfg.GrafanaContext,
 		})
 		// SafeSplit caps each chunk at Telegram's 4000-char limit
 		// while preserving HTML tag pairs. Short bodies are passed

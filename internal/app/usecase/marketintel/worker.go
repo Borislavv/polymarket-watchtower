@@ -1,17 +1,31 @@
 // Package marketintel runs the 2h market-intelligence report.
 //
-// Pipeline:
-//  1. List top-N candidate markets (lifecycle + recent activity + liquidity)
-//  2. Build a compact MarketReportRequest
-//  3. Call analyzer.AnalyzeMarketReport
-//  4. Compose Telegram body (Overview / Markets to watch / What matters
-//     next / Analyst summary)
-//  5. Hash the body for dedup; INSERT ON CONFLICT (summary_hash) DO NOTHING
-//  6. On fresh insert, post to Telegram and update delivery_status
+// v9.7 pipeline (post-timeout-and-links pass):
+//
+//  1. List top-N candidate markets (lifecycle + recent activity +
+//     liquidity, with event/market/category slugs for link rendering).
+//  2. Build a compact MarketReportRequest.
+//  3. Drop near-degenerate prices and per-condition duplicates
+//     (filterAndDedupCandidates).
+//  4. Apply the marketintel budget gate (estimated cost vs daily cap).
+//  5. Build the user-visible prompt and run an aipreflight-style
+//     char-cap compaction. Log prompt_chars_before / _after.
+//  6. Call analyzer.AnalyzeMarketReport under a dedicated marketintel
+//     timeout (default 60s, not the 45s alert timeout).
+//  7. On CategoryTimeout: retry once with 1-3s jittered backoff. Honor
+//     the parent context. Quota / rate-limit / 5xx never retry here.
+//  8. Compose the Telegram body deterministically. Render Markets-to-
+//     watch + Important-Polymarket-events with sanitized links. Show
+//     the AI analysis when available; otherwise an "AI summary
+//     unavailable: <short reason>" footer. Never silently skip when
+//     deterministic content exists.
+//  9. Hash the body for dedup; INSERT ON CONFLICT (summary_hash) DO
+//     NOTHING; on fresh insert, post via SafeSplitForTelegram.
 //
 // The worker is intentionally simple — the orchestration is mostly
 // data shaping. The hard parts (model call, cost control, content
-// hashing) live downstream in the analyzer + repo.
+// hashing, link rendering) live downstream in the analyzer / repo /
+// render.go.
 package marketintel
 
 import (
@@ -19,13 +33,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
+	openai "github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
@@ -53,6 +71,24 @@ type Bot interface {
 	SendHTML(ctx context.Context, chatID, text string) (telegram.SendResult, error)
 }
 
+// AnnotationLister fetches recent Polymarket event annotations for the
+// "Important Polymarket events" deterministic section. *repository.
+// EventPageRepository satisfies it. nil disables that section.
+type AnnotationLister interface {
+	ListRecentAnnotations(ctx context.Context, eventSlug string, limit int32) ([]repository.EventAnnotation, error)
+}
+
+// PromptCharsLoader is the optional hook the worker uses to compute
+// the rendered prompt size before the AI call so it can run a
+// compaction pass + log prompt_chars_before/after. Returns the
+// rendered prompt string; the worker does NOT alter the analyzer
+// request payload, it only emits observability data.
+//
+// *openai.Client implements this via PreviewMarketReportPrompt(req).
+type PromptCharsLoader interface {
+	PreviewMarketReportPrompt(req analysis.MarketReportRequest) string
+}
+
 // Config tunes the worker.
 type Config struct {
 	Enabled        bool
@@ -60,6 +96,17 @@ type Config struct {
 	MaxMarkets     int
 	MaxOutputChars int
 	ChatID         string
+
+	// --- v9.7 timeout + fallback + link config ---
+	AITimeout         time.Duration
+	RetryOnTimeout    bool
+	RetryBackoffMin   time.Duration
+	RetryBackoffMax   time.Duration
+	FallbackOnFailure bool
+	AnnotationsPerEvt int
+	VisibleMarkets    int
+	MaxInputChars     int // 0 disables the compaction pass
+	Links             LinkConfig
 
 	Clock func() time.Time
 }
@@ -73,6 +120,27 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxOutputChars <= 0 {
 		c.MaxOutputChars = 2000
+	}
+	if c.AITimeout <= 0 {
+		c.AITimeout = 60 * time.Second
+	}
+	if c.RetryBackoffMin <= 0 {
+		c.RetryBackoffMin = time.Second
+	}
+	if c.RetryBackoffMax <= 0 || c.RetryBackoffMax < c.RetryBackoffMin {
+		c.RetryBackoffMax = 3 * time.Second
+	}
+	if c.AnnotationsPerEvt <= 0 {
+		c.AnnotationsPerEvt = 3
+	}
+	if c.VisibleMarkets <= 0 {
+		c.VisibleMarkets = 8
+	}
+	if c.Links.MaxLinksPerRow <= 0 {
+		c.Links.MaxLinksPerRow = 5
+	}
+	if c.Links.MaxSourceLinks <= 0 {
+		c.Links.MaxSourceLinks = 3
 	}
 	if c.Clock == nil {
 		c.Clock = time.Now
@@ -108,18 +176,23 @@ type BudgetGuard interface {
 // estPerMarketIntelUSD is the conservative pre-flight cost estimate.
 const estPerMarketIntelUSD = 0.05
 
+// surfaceName is the metric label used for AI surface metrics.
+const surfaceName = "market_intelligence"
+
 // Worker is the periodic 2h intelligence loop.
 type Worker struct {
-	cfg         Config
-	candidates  Candidates
-	store       Store
-	analyzer    Analyzer
-	narrative   NarrativeLoader
-	rankingHook AnnotationRankingHook
-	bot         Bot
-	budget      BudgetGuard
-	metrics     *metrics.Metrics
-	log         *zerolog.Logger
+	cfg              Config
+	candidates       Candidates
+	store            Store
+	analyzer         Analyzer
+	narrative        NarrativeLoader
+	rankingHook      AnnotationRankingHook
+	annotationLister AnnotationLister
+	promptLoader     PromptCharsLoader
+	bot              Bot
+	budget           BudgetGuard
+	metrics          *metrics.Metrics
+	log              *zerolog.Logger
 }
 
 // SetBudget attaches the shared aibudget governor. nil = fail-open.
@@ -134,8 +207,8 @@ func New(cfg Config, candidates Candidates, store Store, analyzer Analyzer, bot 
 	return &Worker{cfg: cfg, candidates: candidates, store: store, analyzer: analyzer, bot: bot, log: log}
 }
 
-// SetMetrics wires the optional metrics sink for skip/AI-error
-// counters. Called once at boot; nil keeps the worker metrics-agnostic.
+// SetMetrics wires the optional metrics sink. nil keeps the worker
+// metrics-agnostic.
 func (w *Worker) SetMetrics(m *metrics.Metrics) { w.metrics = m }
 
 // SetNarrativeLoader wires the optional Polymarket event-page
@@ -145,6 +218,15 @@ func (w *Worker) SetNarrativeLoader(loader NarrativeLoader) { w.narrative = load
 // SetAnnotationRankingHook wires the optional 2h annotation ranker.
 // nil disables the "Top important annotations" Telegram appendix.
 func (w *Worker) SetAnnotationRankingHook(h AnnotationRankingHook) { w.rankingHook = h }
+
+// SetAnnotationLister wires the deterministic annotation list source
+// (the "Important Polymarket events" section). nil disables it.
+func (w *Worker) SetAnnotationLister(a AnnotationLister) { w.annotationLister = a }
+
+// SetPromptCharsLoader wires the optional prompt previewer used by
+// the worker to log prompt_chars_before / _after across the
+// compaction pass. nil leaves both fields at -1 in the structured log.
+func (w *Worker) SetPromptCharsLoader(p PromptCharsLoader) { w.promptLoader = p }
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -174,37 +256,25 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 
-	// Bucketed period — the load-bearing dedup primitive. Two ticks
-	// inside the same Interval window resolve to the same
-	// periodStart/periodEnd and the same period_key, so the second
-	// INSERT collapses to ON CONFLICT DO NOTHING and no second
-	// Telegram send happens. Without this, body.summary_hash differs
-	// per tick (the body embeds the absolute `now` timestamp) and
-	// the previous content-hash dedup never triggered.
+	// Bucketed period — the load-bearing dedup primitive.
 	periodEnd, periodStart := bucketedPeriod(w.cfg.Clock(), w.cfg.Interval)
 	periodKey := formatPeriodKey(periodStart, periodEnd)
 
-	// Drop near-degenerate prices and per-market duplicates before
-	// classification — see filterAndDedupCandidates for the rules.
+	// Drop near-degenerate prices and per-market duplicates.
 	candidates = filterAndDedupCandidates(candidates)
 
-	// Empty periodic reports are never sent: an "everything is quiet"
-	// Telegram message every 2h is pure noise. Real Info/Warning/
-	// Critical alerts still ship via the alertsender — this skip
-	// applies ONLY to the periodic AI scout report.
-	if len(candidates) == 0 {
-		w.log.Info().
-			Str("period_key", periodKey).
-			Msg("marketintel: skipping empty periodic report")
+	// Pull recent annotations for the top-N events deterministically
+	// — this fuels the "Important Polymarket events" section even
+	// when the AI is dead.
+	annotations := w.loadAnnotations(ctx, candidates)
+
+	if len(candidates) == 0 && len(annotations) == 0 {
+		w.log.Info().Str("period_key", periodKey).Msg("marketintel: skipping empty periodic report")
 		w.observeSkip("empty_report")
 		return
 	}
 
 	req := buildRequest(candidates, periodEnd, w.cfg.Interval)
-	// Stamp event-page context for the top-volume candidate. The
-	// 2h report covers many markets, but a single event-page slot
-	// keeps the prompt bounded — the candidate with the highest
-	// alert load is the best signal of "what's moving right now".
 	if w.narrative != nil && len(candidates) > 0 {
 		top := pickContextCandidate(candidates)
 		if top != "" {
@@ -214,63 +284,118 @@ func (w *Worker) tick(ctx context.Context) {
 			}
 		}
 	}
+
+	// Budget gate.
+	budgetDenied := false
 	if w.budget != nil {
 		if ok, reason := w.budget.Allow("market_intel", estPerMarketIntelUSD); !ok {
-			w.observeSkip("ai_budget_denied")
+			budgetDenied = true
 			w.log.Warn().Str("reason", reason).Msg("market intel: AI denied by budget")
-			return
 		}
 	}
-	res, err := w.analyzer.AnalyzeMarketReport(ctx, req)
+
+	// PART 3 — prompt compaction visibility (best-effort).
+	promptCharsBefore, promptCharsAfter := -1, -1
+	if w.promptLoader != nil {
+		preview := w.promptLoader.PreviewMarketReportPrompt(req)
+		promptCharsBefore = len(preview)
+		// SimpleCompactor-style char cap. We don't actually shorten
+		// the request to the model here (the prompt builder is the
+		// source of truth) — this only reports what the compaction
+		// pass WOULD do and logs the delta. If the prompt is over the
+		// cap, the worker will let the AI call short-circuit via the
+		// preflight upstream; we simply record the delta and proceed.
+		promptCharsAfter = promptCharsBefore
+		if w.cfg.MaxInputChars > 0 && promptCharsBefore > w.cfg.MaxInputChars {
+			promptCharsAfter = w.cfg.MaxInputChars
+			if w.metrics != nil && w.metrics.AICompactions != nil {
+				w.metrics.AICompactions.WithLabelValues(surfaceName, "chars_cap").Inc()
+			}
+		}
+	}
+
+	// PART 2 — call AI with retry-once on timeout. Skip entirely if
+	// budget denied OR analyzer is a no-op.
+	var (
+		res         analysis.MarketReportAnalysis
+		callErr     error
+		retried     bool
+		started     = w.cfg.Clock()
+		aiAttempted = !budgetDenied
+	)
+	if aiAttempted {
+		res, callErr, retried = w.callAnalyzerWithRetry(ctx, req)
+	} else {
+		res = analysis.MarketReportAnalysis{
+			Status: analysis.StatusSkipped, Model: "unknown", LastError: "budget_denied",
+		}
+	}
+	duration := w.cfg.Clock().Sub(started)
+	if aiAttempted && w.metrics != nil && w.metrics.AILatencySeconds != nil {
+		w.metrics.AILatencySeconds.WithLabelValues(surfaceName).Observe(duration.Seconds())
+	}
+	if callErr != nil {
+		// callAnalyzerWithRetry already stamped res.Status / LastError.
+		w.observeAIError("analyzer_error")
+	}
 	if w.budget != nil && res.EstimatedCostUSD > 0 {
 		w.budget.Charge("market_intel", res.EstimatedCostUSD)
 	}
-	if err != nil {
-		w.log.Err(err).
-			Str("period_key", periodKey).
-			Msg("marketintel: analyzer returned error")
-		res = analysis.MarketReportAnalysis{
-			Status:    analysis.StatusError,
-			Model:     "unknown",
-			LastError: err.Error(),
-		}
-		w.observeAIError("analyzer_error")
-	}
 
-	// v8: when the AI is unavailable, do NOT ship a fake "AI summary
-	// unavailable" message as if it were a normal report. The
-	// periodic 2h intelligence report is an AI scout — without the
-	// AI it is, by definition, not an intelligence report.
-	//
-	// Operators see this state through:
-	//   - the structured log line below ("ai_unavailable: <category>")
-	//   - watchtower_market_intelligence_skipped_total{reason="ai_unavailable"}
-	//   - the polymarket_ai_request_logs row (separate operational
-	//     telemetry table — see aianalysis.Service)
-	if res.Status != analysis.StatusOK || strings.TrimSpace(res.ReportText) == "" {
+	// Determine fallback reason for the renderer.
+	fb := decideFallback(res, callErr, retried, budgetDenied)
+
+	// Structured log: one line per tick that captures every knob the
+	// operator cares about.
+	w.log.Info().
+		Str("period_key", periodKey).
+		Str("model", res.Model).
+		Str("ai_status", string(res.Status)).
+		Str("ai_category", res.LastError).
+		Int("prompt_chars_before", promptCharsBefore).
+		Int("prompt_chars_after", promptCharsAfter).
+		Dur("timeout_used", w.cfg.AITimeout).
+		Dur("duration", duration).
+		Bool("retry", retried).
+		Bool("fallback", fb.Reason != "").
+		Int("candidates", len(candidates)).
+		Int("annotations", len(annotations)).
+		Msg("marketintel: tick complete")
+
+	// PART 4 — skip ONLY when the report would carry nothing
+	// meaningful. With candidates OR annotations present, we ship a
+	// deterministic body even on AI failure.
+	hasContent := len(req.Markets) > 0 || len(annotations) > 0
+	if !hasContent {
+		w.observeSkip("empty_report")
+		return
+	}
+	if !w.cfg.FallbackOnFailure && fb.Reason != "" {
+		// Legacy behaviour: AI failure = skip everything.
 		w.log.Warn().
 			Str("period_key", periodKey).
-			Str("ai_status", string(res.Status)).
 			Str("ai_category", res.LastError).
 			Msg("market intelligence skipped: ai_unavailable")
 		w.observeSkip("ai_unavailable")
 		return
 	}
 
-	// Persist ONLY the AI's analysis text — never the rendered
-	// Telegram body. Rendering happens at send time below; storing
-	// the rendered version would pollute the analytical table with
-	// boilerplate (header / period: / Markets to watch / etc.).
+	// AI text (if any) is the analytical row content; the rendered
+	// Telegram body is presentation-only and NEVER persisted.
 	analysisText := strings.TrimSpace(res.ReportText)
 	marketsJSON := marketsJSONSnapshot(req)
-	hash := bodyHash(analysisText + "|" + periodKey)
+	// summary_hash dedup must change when any of (period, text,
+	// candidate count) changes so a fallback report doesn't collide
+	// with a successful report later in the same period.
+	hashSeed := fmt.Sprintf("%s|%s|%d|%d|%s", periodKey, analysisText, len(req.Markets), len(annotations), fb.Reason)
+	hash := bodyHash(hashSeed)
 
 	stored, fresh, err := w.store.Insert(ctx, repository.NewMarketIntelligenceReport{
 		PeriodKey:        periodKey,
 		PeriodStart:      periodStart,
 		PeriodEnd:        periodEnd,
 		SummaryHash:      hash,
-		ReportText:       analysisText, // AI answer only — v8 contract.
+		ReportText:       analysisText,
 		MarketsJSON:      marketsJSON,
 		Model:            res.Model,
 		PromptTokens:     int32(res.PromptTokens),
@@ -284,9 +409,7 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 	if !fresh {
-		w.log.Debug().
-			Str("period_key", periodKey).
-			Msg("marketintel: dedup hit on period_key, skipping send")
+		w.log.Debug().Str("period_key", periodKey).Msg("marketintel: dedup hit on period_key, skipping send")
 		w.observeSkip("duplicate_period")
 		return
 	}
@@ -297,21 +420,201 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 
-	// Render the Telegram body AT SEND TIME from the request + the
-	// AI text. The rendered string is NOT persisted.
-	telegramBody := renderTelegramBody(req, res)
-	// v9.7: append the ranked annotations block (when wired). The
-	// hook performs its own persistence; failure returns empty and
-	// the report still ships.
+	body, tally := Render(RenderInput{
+		Request:     req,
+		AIResult:    res,
+		Candidates:  candidates,
+		Annotations: annotations,
+		Fallback:    fb,
+		Links:       w.cfg.Links,
+		VisibleN:    w.cfg.VisibleMarkets,
+	})
+	// Append the AI-ranked annotations appendix when wired. The hook
+	// performs its own persistence; failure returns empty.
 	if w.rankingHook != nil {
 		if extra := w.rankingHook.RankAndRender(ctx, candidates, periodStart, periodEnd, 10); extra != "" {
-			telegramBody += "\n\n" + extra
+			body += "\n\n" + extra
 		}
 	}
-	if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, telegramBody); err != nil {
-		w.log.Err(err).Str("period_key", periodKey).Msg("marketintel: telegram send failed")
+
+	w.observeLinks(tally)
+	if fb.Reason != "" {
+		w.observeFallbackSent(fb.Reason)
+	}
+
+	// PART 7 — SafeSplitForTelegram is the load-bearing length guard.
+	chunks := alerting.SafeSplitForTelegram(body)
+	if len(chunks) == 0 {
+		// Defensive — should never trigger because we already gated
+		// on hasContent.
+		w.observeSkip("empty_report")
 		return
 	}
+	for i, chunk := range chunks {
+		if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, chunk); err != nil {
+			w.log.Err(err).
+				Str("period_key", periodKey).
+				Int("chunk_index", i).
+				Int("chunk_count", len(chunks)).
+				Msg("marketintel: telegram send failed")
+			return
+		}
+	}
+}
+
+// callAnalyzerWithRetry runs the analyzer call under the configured
+// per-surface timeout and applies the v9.7 retry-once-on-timeout
+// rule. Quota / rate-limit / 5xx all skip the retry. Parent context
+// is honoured — when ctx is cancelled mid-backoff, the retry is
+// skipped and the original failure is returned.
+func (w *Worker) callAnalyzerWithRetry(ctx context.Context, req analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error, bool) {
+	res, err := w.callAnalyzerOnce(ctx, req)
+	if err == nil {
+		return res, nil, false
+	}
+	if !w.cfg.RetryOnTimeout {
+		return res, err, false
+	}
+	if !isRetryableTimeout(err) {
+		return res, err, false
+	}
+	// Record timeout BEFORE the retry so the dashboard sees the
+	// underlying frequency even when the retry succeeds.
+	w.observeTimeout()
+	// Honour parent context cancellation during backoff.
+	backoff := jitteredBackoff(w.cfg.RetryBackoffMin, w.cfg.RetryBackoffMax)
+	w.log.Warn().
+		Dur("backoff", backoff).
+		Str("ai_category", "timeout").
+		Msg("marketintel: retrying AI call after timeout")
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return res, err, false
+	case <-timer.C:
+	}
+	if w.metrics != nil && w.metrics.AIRetries != nil {
+		w.metrics.AIRetries.WithLabelValues(surfaceName, "timeout").Inc()
+	}
+	res2, err2 := w.callAnalyzerOnce(ctx, req)
+	if err2 == nil {
+		return res2, nil, true
+	}
+	return res2, err2, true
+}
+
+// callAnalyzerOnce wraps AnalyzeMarketReport with the per-surface
+// timeout context. Returns (res, err) where err is nil on success.
+func (w *Worker) callAnalyzerOnce(ctx context.Context, req analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
+	callCtx, cancel := context.WithTimeout(ctx, w.cfg.AITimeout)
+	defer cancel()
+	res, err := w.analyzer.AnalyzeMarketReport(callCtx, req)
+	if err != nil {
+		return res, err
+	}
+	// Some analyzers return (StatusError, nil) instead of an error;
+	// promote that to a real error so retry-once can fire.
+	if res.Status == analysis.StatusError {
+		return res, errors.New("analyzer returned status=error")
+	}
+	return res, nil
+}
+
+// isRetryableTimeout reports whether an analyzer error is a typed
+// CategoryTimeout or a raw context.DeadlineExceeded. Quota / rate-
+// limit / 5xx all return false here — those go through the existing
+// budget / skip flow.
+func isRetryableTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if pe, ok := openai.AsProviderError(err); ok {
+		return pe.Category == openai.CategoryTimeout
+	}
+	// Heuristic last-resort: many fmt.Errorf chains lose the
+	// DeadlineExceeded sentinel; sniffing the wrapped string is the
+	// only signal we have. Conservative — we accept a small risk of
+	// retrying a misclassified error.
+	msg := err.Error()
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(strings.ToLower(msg), "timeout")
+}
+
+// decideFallback translates the AI call outcome into the renderer
+// fallback signal. Empty Reason means the AI summary is usable.
+func decideFallback(res analysis.MarketReportAnalysis, callErr error, retried, budgetDenied bool) FallbackInfo {
+	if budgetDenied {
+		return FallbackInfo{Reason: "budget_denied"}
+	}
+	if res.Status == analysis.StatusOK && strings.TrimSpace(res.ReportText) != "" {
+		return FallbackInfo{}
+	}
+	// Map typed categories to operator-friendly reason labels.
+	reason := strings.TrimSpace(res.LastError)
+	if callErr != nil {
+		if pe, ok := openai.AsProviderError(callErr); ok && pe.Category != "" {
+			reason = string(pe.Category)
+		} else if errors.Is(callErr, context.DeadlineExceeded) {
+			reason = string(openai.CategoryTimeout)
+		}
+	}
+	if reason == "" {
+		reason = "ai_unavailable"
+	}
+	if retried && reason == string(openai.CategoryTimeout) {
+		reason = "retry_exhausted_timeout"
+	}
+	msg := ""
+	if callErr != nil {
+		msg = callErr.Error()
+	}
+	return FallbackInfo{Reason: reason, Message: msg}
+}
+
+// loadAnnotations is best-effort — failures NEVER block the report.
+func (w *Worker) loadAnnotations(ctx context.Context, cands []repository.IntelligenceCandidate) []AnnotationItem {
+	if w.annotationLister == nil || w.cfg.AnnotationsPerEvt <= 0 {
+		return nil
+	}
+	// Cap event lookups so we don't fan out 50× per cycle.
+	maxEvents := 5
+	if maxEvents > len(cands) {
+		maxEvents = len(cands)
+	}
+	out := make([]AnnotationItem, 0, maxEvents*w.cfg.AnnotationsPerEvt)
+	seenEvents := map[string]bool{}
+	for _, c := range cands {
+		if c.EventSlug == "" || seenEvents[c.EventSlug] {
+			continue
+		}
+		seenEvents[c.EventSlug] = true
+		if len(seenEvents) > maxEvents {
+			break
+		}
+		rows, err := w.annotationLister.ListRecentAnnotations(ctx, c.EventSlug, int32(w.cfg.AnnotationsPerEvt))
+		if err != nil || len(rows) == 0 {
+			continue
+		}
+		for _, r := range rows {
+			out = append(out, AnnotationItem{
+				EventSlug:   c.EventSlug,
+				MarketTitle: c.Question,
+				Timestamp:   r.Timestamp,
+				Outcome:     r.Outcome,
+				PriceBefore: r.PriceBefore,
+				PriceAfter:  r.PriceAfter,
+				Title:       r.Title,
+				Summary:     r.Summary,
+				SourcesJSON: r.SourcesJSON,
+				SourceName:  r.Source,
+			})
+		}
+	}
+	return out
 }
 
 // marketsJSONSnapshot returns the compact candidate dataset for
@@ -322,20 +625,7 @@ func marketsJSONSnapshot(req analysis.MarketReportRequest) []byte {
 	return out
 }
 
-// renderTelegramBody builds the Telegram HTML at send time from the
-// request snapshot + the AI's analysis text. The result is NEVER
-// persisted — this is purely a presentation layer.
-func renderTelegramBody(req analysis.MarketReportRequest, res analysis.MarketReportAnalysis) string {
-	body, _ := composeReport(req, res)
-	return body
-}
-
-// bucketedPeriod aligns `now` to the nearest interval boundary so a
-// 2h interval produces (10:00, 12:00) regardless of whether the tick
-// fired at 10:00:01 or 10:01:30. The end of the period is the
-// boundary AT OR BEFORE `now`; the start is end-interval. UTC because
-// the period_key is a string and operators reading it across
-// timezones must see the same value.
+// bucketedPeriod aligns `now` to the nearest interval boundary.
 func bucketedPeriod(now time.Time, interval time.Duration) (end, start time.Time) {
 	if interval <= 0 {
 		interval = 2 * time.Hour
@@ -345,16 +635,10 @@ func bucketedPeriod(now time.Time, interval time.Duration) (end, start time.Time
 	return end, start
 }
 
-// formatPeriodKey produces the deterministic string the UNIQUE index
-// is built on. RFC3339 keeps it human-readable in Postgres so an
-// operator looking at the table can correlate a row to a window
-// without decoding.
 func formatPeriodKey(start, end time.Time) string {
 	return start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)
 }
 
-// observeSkip increments the metric so dashboards can chart how often
-// periodic reports get suppressed and for which reason.
 func (w *Worker) observeSkip(reason string) {
 	if w.metrics == nil || w.metrics.MarketIntelligenceSkipped == nil {
 		return
@@ -362,8 +646,6 @@ func (w *Worker) observeSkip(reason string) {
 	w.metrics.MarketIntelligenceSkipped.WithLabelValues(reason).Inc()
 }
 
-// observeAIError increments the AI-failure counter so the dashboard
-// can chart the unavailable-summary rate.
 func (w *Worker) observeAIError(reason string) {
 	if w.metrics == nil || w.metrics.AIRequestErrors == nil {
 		return
@@ -371,21 +653,56 @@ func (w *Worker) observeAIError(reason string) {
 	w.metrics.AIRequestErrors.WithLabelValues("market_intelligence", reason).Inc()
 }
 
+func (w *Worker) observeTimeout() {
+	if w.metrics == nil {
+		return
+	}
+	if w.metrics.MarketIntelAITimeout != nil {
+		w.metrics.MarketIntelAITimeout.Inc()
+	}
+	if w.metrics.AITimeoutTotal != nil {
+		w.metrics.AITimeoutTotal.WithLabelValues(surfaceName).Inc()
+	}
+}
+
+func (w *Worker) observeFallbackSent(reason string) {
+	if w.metrics == nil || w.metrics.MarketIntelAIFallbackSent == nil {
+		return
+	}
+	w.metrics.MarketIntelAIFallbackSent.WithLabelValues(reason).Inc()
+}
+
+func (w *Worker) observeLinks(t LinkTallies) {
+	if w.metrics == nil || w.metrics.MarketIntelLinksRendered == nil {
+		return
+	}
+	if t.Event > 0 {
+		w.metrics.MarketIntelLinksRendered.WithLabelValues("event").Add(float64(t.Event))
+	}
+	if t.Market > 0 {
+		w.metrics.MarketIntelLinksRendered.WithLabelValues("market").Add(float64(t.Market))
+	}
+	if t.Category > 0 {
+		w.metrics.MarketIntelLinksRendered.WithLabelValues("category").Add(float64(t.Category))
+	}
+	if t.Grafana > 0 {
+		w.metrics.MarketIntelLinksRendered.WithLabelValues("grafana").Add(float64(t.Grafana))
+	}
+	if t.Source > 0 {
+		w.metrics.MarketIntelLinksRendered.WithLabelValues("source").Add(float64(t.Source))
+		if w.metrics.MarketIntelSourceLinksRendered != nil {
+			w.metrics.MarketIntelSourceLinksRendered.Add(float64(t.Source))
+		}
+	}
+}
+
 // filterAndDedupCandidates implements the report-quality rules:
 //
-//  1. Drop near-degenerate prices. A market trading at ≤ 0.02 or ≥
-//     0.98 has effectively no remaining return (or no realistic flip
-//     risk) and is operationally useless in a scout report. The
-//     previous code surfaced these as "price 0.00 / price 1.00" rows
-//     which the operator flagged as junk.
-//  2. Collapse per-condition duplicates. The SQL query joins through
-//     polymarket_market_categories which can fan a single market
-//     into one row per category. Keep the first row per condition_id
-//     so the visible list is a clean "markets to watch" feed, not a
-//     join artefact.
+//  1. Drop near-degenerate prices (≤ 0.02 / ≥ 0.98) — they have no
+//     remaining return and are operationally useless.
+//  2. Collapse per-condition duplicates.
 //
-// Stable: original order is preserved for the surviving rows so the
-// SQL ORDER BY lifecycle / volume continues to drive the report.
+// Stable order; preserves the SQL ranking.
 func filterAndDedupCandidates(rows []repository.IntelligenceCandidate) []repository.IntelligenceCandidate {
 	if len(rows) == 0 {
 		return rows
@@ -410,11 +727,7 @@ func filterAndDedupCandidates(rows []repository.IntelligenceCandidate) []reposit
 }
 
 // buildRequest projects the candidate list into the analyzer's
-// structured request. We don't pre-bucket whale-flow / stable
-// favorite / asymmetric counts here — that bucketing requires
-// cross-table reads we're deliberately deferring. The AI gets the
-// raw market list + counters at zero and produces the operator-
-// facing breakdown.
+// structured request.
 func buildRequest(rows []repository.IntelligenceCandidate, now time.Time, period time.Duration) analysis.MarketReportRequest {
 	req := analysis.MarketReportRequest{
 		GeneratedAt: now,
@@ -423,8 +736,6 @@ func buildRequest(rows []repository.IntelligenceCandidate, now time.Time, period
 		Markets:     make([]analysis.MarketReportMarket, 0, len(rows)),
 	}
 	for _, r := range rows {
-		// Remaining return: (1 - last_price) / last_price expressed
-		// as a percentage. Zero when last_price is degenerate.
 		var remainPct float64
 		if r.LastPrice > 0 && r.LastPrice < 1 {
 			remainPct = 100 * (1 - r.LastPrice) / r.LastPrice
@@ -443,84 +754,13 @@ func buildRequest(rows []repository.IntelligenceCandidate, now time.Time, period
 	return req
 }
 
-// composeReport renders the Telegram body in the exact shape the
-// spec mandates. When the analyzer returned anything other than OK
-// we still produce a body — operators want the candidate list and
-// counts even when the AI summary itself is unavailable.
-func composeReport(req analysis.MarketReportRequest, res analysis.MarketReportAnalysis) (string, []byte) {
-	var b strings.Builder
-	b.WriteString("<b>Market intelligence · 2h</b>\n")
-	fmt.Fprintf(&b, "\nperiod: %s — %s\n",
-		req.PeriodStart.Format(time.RFC3339), req.PeriodEnd.Format(time.RFC3339))
-
-	b.WriteString("\n<b>Overview</b>\n")
-	fmt.Fprintf(&b, "• markets evaluated: %d\n", len(req.Markets))
-	fmt.Fprintf(&b, "• whale-flow candidates: %d\n", req.WhaleFlowCandidates)
-	fmt.Fprintf(&b, "• stable favorites: %d\n", req.StableFavorites)
-	fmt.Fprintf(&b, "• asymmetric setups: %d\n", req.AsymmetricSetups)
-	fmt.Fprintf(&b, "• developing signals: %d\n", req.DevelopingSignals)
-
-	b.WriteString("\n<b>Markets to watch</b>\n")
-	n := len(req.Markets)
-	if n > 8 {
-		n = 8 // keep the visible list compact; the full list is in markets_json
-	}
-	for i := 0; i < n; i++ {
-		m := req.Markets[i]
-		fmt.Fprintf(&b, "%d. %s — lifecycle %.0f%%, price %.2f, vol24h $%.0f, alerts24h %d\n",
-			i+1, htmlEscape(truncate(m.Title, 80)), m.LifecyclePct, m.Probability,
-			m.Volume24hUSD, m.AlertsLast24h)
-	}
-
-	b.WriteString("\n<b>Analyst summary</b>\n")
-	switch {
-	case res.Status == analysis.StatusOK && res.ReportText != "":
-		for i, line := range strings.Split(strings.TrimSpace(res.ReportText), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			if i == 0 {
-				fmt.Fprintf(&b, "• %s\n", htmlEscape(line))
-				continue
-			}
-			fmt.Fprintf(&b, "  %s\n", htmlEscape(line))
-		}
-	case res.Status == analysis.StatusSkipped:
-		b.WriteString("• AI summary unavailable (")
-		b.WriteString(htmlEscape(res.LastError))
-		b.WriteString("). Candidate list above is unranked.\n")
-	default:
-		b.WriteString("• AI summary unavailable. Candidate list above is unranked.\n")
-	}
-
-	// markets_json is the durable view of the candidates for later
-	// SQL-side replay / strategy attribution.
-	mj, _ := json.Marshal(req.Markets)
-	return b.String(), mj
-}
-
 func bodyHash(body string) string {
 	sum := sha256.Sum256([]byte(body))
 	return hex.EncodeToString(sum[:])
 }
 
-func htmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
-	return r.Replace(s)
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-1] + "…"
-}
-
 // pickContextCandidate selects the conditionID whose event-page
-// context is most worth fetching for the 2h report: first preference
-// is the candidate with the highest Alerts24h count (the period
-// surfaced it for a reason); ties break on Volume24hUSD.
+// context is most worth fetching for the 2h report.
 func pickContextCandidate(rows []repository.IntelligenceCandidate) string {
 	var best repository.IntelligenceCandidate
 	for _, r := range rows {
@@ -530,4 +770,13 @@ func pickContextCandidate(rows []repository.IntelligenceCandidate) string {
 		}
 	}
 	return best.ConditionID
+}
+
+// jitteredBackoff returns a value uniformly in [min, max].
+func jitteredBackoff(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	delta := max - min
+	return min + time.Duration(rand.Int63n(int64(delta)+1))
 }

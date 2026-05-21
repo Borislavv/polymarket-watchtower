@@ -286,8 +286,34 @@ func (p *Provider) refresh(ctx context.Context, eventSlug string) {
 	if err != nil {
 		_ = p.store.MarkFetch(ctx, eventSlug, startedAt, "", 0, truncErr(err.Error()))
 		p.observeFetch("failed")
+		// v10.5: classify typed *FetchError so the operator sees the
+		// stable category (redirect_followed / stale_build_id /
+		// canonical_slug_failed / ...) rather than a free-text error.
+		// Existing annotation/catalyst rows are PRESERVED — refresh()
+		// only WRITES new rows on success; it NEVER deletes on
+		// failure. Downstream loaders fall back to whatever cached
+		// snapshot is still in DB.
+		fe, isTyped := eventpage.AsFetchError(err)
+		if isTyped {
+			p.observeContextStale(string(fe.Category))
+		} else {
+			p.observeContextStale("unknown")
+		}
 		if p.log != nil {
-			p.log.Warn().Err(err).Str("event_slug", eventSlug).Msg("event page: fetch failed")
+			ev := p.log.Warn().Err(err).Str("event_slug", eventSlug)
+			if isTyped {
+				ev = ev.
+					Str("category", string(fe.Category)).
+					Str("original_slug", fe.OriginalSlug).
+					Str("canonical_slug", fe.CanonicalSlug).
+					Str("build_id", fe.BuildID).
+					Int("status", fe.Status).
+					Str("location", fe.Location).
+					Str("final_url", fe.FinalURL).
+					Str("content_type", fe.ContentType).
+					Int("retry_count", fe.RetryCount)
+			}
+			ev.Msg("event page: fetch failed (cached snapshot preserved)")
 		}
 		return
 	}
@@ -447,6 +473,13 @@ func (p *Provider) observeFetch(status string) {
 		return
 	}
 	p.metrics.EventPageFetch.WithLabelValues(status).Inc()
+}
+
+func (p *Provider) observeContextStale(reason string) {
+	if p.metrics == nil || p.metrics.EventPageContextStale == nil {
+		return
+	}
+	p.metrics.EventPageContextStale.WithLabelValues(reason).Inc()
 }
 
 func (p *Provider) observeAnnotations(n int) {

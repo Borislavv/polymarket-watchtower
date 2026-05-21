@@ -1208,6 +1208,160 @@
           "refId": "B"
         }
       ]
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Realtime WebSocket (v10.4)",
+      "gridPos": {"x": 0, "y": 285, "w": 24, "h": 1}
+    },
+    {
+      "id": 401,
+      "type": "stat",
+      "title": "WS connected",
+      "description": "1 when the Polymarket CLOB WS client is connected, 0 otherwise.",
+      "gridPos": {"x": 0, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0.5}]}}},
+      "targets": [{"expr": "watchtower_ws_connected", "refId": "A"}]
+    },
+    {
+      "id": 402,
+      "type": "stat",
+      "title": "WS reconnects (24h)",
+      "description": "Reconnect attempts. Steady non-zero = backoff is working as designed.",
+      "gridPos": {"x": 4, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "sum(increase(watchtower_ws_reconnects_total[24h]))", "refId": "A"}]
+    },
+    {
+      "id": 403,
+      "type": "stat",
+      "title": "WS subscriptions",
+      "description": "Current count of subscribed CLOB token ids.",
+      "gridPos": {"x": 8, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "watchtower_ws_subscriptions_total", "refId": "A"}]
+    },
+    {
+      "id": 404,
+      "type": "stat",
+      "title": "Buffer depth",
+      "description": "Current depth of the WS output channel. Sustained climb = the worker can't keep up with the stream.",
+      "gridPos": {"x": 12, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "watchtower_ws_buffer_depth", "refId": "A"}]
+    },
+    {
+      "id": 405,
+      "type": "stat",
+      "title": "Last event age (s)",
+      "description": "Seconds since the last inbound WS message. Above WS_HEALTH_STALE_AFTER = degraded.",
+      "gridPos": {"x": 16, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{"expr": "watchtower_ws_last_event_age_seconds", "refId": "A"}]
+    },
+    {
+      "id": 406,
+      "type": "stat",
+      "title": "Decode errors (24h)",
+      "description": "Total inbound messages the decoder couldn't parse.",
+      "gridPos": {"x": 20, "y": 286, "w": 4, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{"expr": "sum(increase(watchtower_ws_decode_errors_total[24h]))", "refId": "A"}]
+    },
+    {
+      "id": 407,
+      "type": "timeseries",
+      "title": "WS events by type (rate / 5m)",
+      "description": "book / price_change / last_trade_price / best_bid_ask / tick_size_change / market_resolved / heartbeat / unknown.",
+      "gridPos": {"x": 0, "y": 291, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (type) (rate(watchtower_ws_events_total[5m]))",
+        "legendFormat": "{{type}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 408,
+      "type": "timeseries",
+      "title": "WS drops by reason (rate / 5m)",
+      "description": "Events dropped by the bounded output channel. Persistent buffer_full = increase WS_EVENT_BUFFER or reduce subscription scope.",
+      "gridPos": {"x": 12, "y": 291, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason, type) (rate(watchtower_ws_events_dropped_total[5m]))",
+        "legendFormat": "{{reason}} · {{type}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 409,
+      "type": "timeseries",
+      "title": "Realtime work enqueued by reason (rate / 5m)",
+      "description": "price_move / book_change / trade_seen / market_status / gap_recovered. price_move ⇒ repricing refresh trigger; book_change ⇒ prediction refresh.",
+      "gridPos": {"x": 0, "y": 298, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason) (rate(watchtower_realtime_work_enqueued_total[5m]))",
+        "legendFormat": "{{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 410,
+      "type": "timeseries",
+      "title": "Gap recoveries by status (rate / 1h)",
+      "description": "Reconciliation sweep outcomes (ok / no_trades / partial / failed).",
+      "gridPos": {"x": 12, "y": 298, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_ws_gap_recoveries_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 411,
+      "type": "timeseries",
+      "title": "Reconcile duration (p95)",
+      "description": "End-to-end duration of one reconciliation sweep.",
+      "gridPos": {"x": 0, "y": 305, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(watchtower_ws_reconcile_duration_seconds_bucket[1h])))",
+        "legendFormat": "p95",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 412,
+      "type": "timeseries",
+      "title": "Subscription refresh outcomes (rate / 1h)",
+      "description": "ok | unchanged | failed per WS_SUBSCRIPTION_REFRESH_EVERY cycle.",
+      "gridPos": {"x": 12, "y": 305, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_ws_subscription_refresh_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 413,
+      "type": "timeseries",
+      "title": "WS vs polling — realtime work claimed (rate / 1h)",
+      "description": "Work-queue claim rate by reason + status. Used to compare \"WS-triggered work\" vs polling's own pipeline.",
+      "gridPos": {"x": 0, "y": 311, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason, status) (rate(watchtower_realtime_work_claimed_total[1h]))",
+        "legendFormat": "{{reason}} · {{status}}",
+        "refId": "A"
+      }]
     }
   ]
 }

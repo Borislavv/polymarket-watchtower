@@ -105,3 +105,19 @@ ON CONFLICT (event_slug) DO UPDATE SET
     last_build_id    = COALESCE(NULLIF(EXCLUDED.last_build_id, ''), polymarket_event_page_fetches.last_build_id),
     last_annotations = EXCLUDED.last_annotations,
     updated_at       = NOW();
+
+-- name: UpsertEventSlugAlias :exec
+-- v10.5 canonical-slug alias persistence. Idempotent.
+INSERT INTO polymarket_event_slug_aliases (
+    original_slug, canonical_slug, source, first_seen_at, last_seen_at
+) VALUES (
+    @original_slug, @canonical_slug, @source, NOW(), NOW()
+)
+ON CONFLICT (original_slug) DO UPDATE SET
+    canonical_slug = EXCLUDED.canonical_slug,
+    source         = EXCLUDED.source,
+    last_seen_at   = NOW();
+
+-- name: GetEventSlugAlias :one
+SELECT canonical_slug FROM polymarket_event_slug_aliases
+WHERE original_slug = @original_slug;

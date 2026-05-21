@@ -110,10 +110,18 @@ WHERE alert_id = sqlc.arg(alert_id)::bigint;
 -- philosophy: deep into lifecycle + recent activity + non-trivial
 -- liquidity. The query is intentionally simple — the AI does the
 -- ranking; we provide a generous shortlist.
+--
+-- The event/market/category slugs are surfaced so the Telegram
+-- formatter can render Polymarket links per row (PART 5 of the v9.7
+-- timeout + links pass). Slug columns may be NULL on edge data; the
+-- renderer skips broken links via sanitizeLinkURL.
 SELECT
     m.condition_id,
     m.question,
+    m.event_slug AS event_slug,
+    m.slug      AS market_slug,
     c.name AS category,
+    c.slug AS category_slug,
     (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
             NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct,
     -- last 24h aggregates over polymarket_trades for this market

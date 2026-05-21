@@ -452,7 +452,10 @@ const listMarketIntelligenceCandidates = `-- name: ListMarketIntelligenceCandida
 SELECT
     m.condition_id,
     m.question,
+    m.event_slug AS event_slug,
+    m.slug      AS market_slug,
     c.name AS category,
+    c.slug AS category_slug,
     (100.0 * EXTRACT(EPOCH FROM (NOW() - m.start_date)) /
             NULLIF(EXTRACT(EPOCH FROM (m.end_date - m.start_date)), 0))::double precision AS lifecycle_pct,
     -- last 24h aggregates over polymarket_trades for this market
@@ -493,7 +496,10 @@ LIMIT $1::integer
 type ListMarketIntelligenceCandidatesRow struct {
 	ConditionID  string
 	Question     string
+	EventSlug    *string
+	MarketSlug   string
 	Category     *string
+	CategorySlug *string
 	LifecyclePct float64
 	Trades24h    int64
 	Volume24hUsd float64
@@ -505,6 +511,11 @@ type ListMarketIntelligenceCandidatesRow struct {
 // philosophy: deep into lifecycle + recent activity + non-trivial
 // liquidity. The query is intentionally simple — the AI does the
 // ranking; we provide a generous shortlist.
+//
+// The event/market/category slugs are surfaced so the Telegram
+// formatter can render Polymarket links per row (PART 5 of the v9.7
+// timeout + links pass). Slug columns may be NULL on edge data; the
+// renderer skips broken links via sanitizeLinkURL.
 func (q *Queries) ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listMarketIntelligenceCandidates, limitCount)
 	if err != nil {
@@ -517,7 +528,10 @@ func (q *Queries) ListMarketIntelligenceCandidates(ctx context.Context, limitCou
 		if err := rows.Scan(
 			&i.ConditionID,
 			&i.Question,
+			&i.EventSlug,
+			&i.MarketSlug,
 			&i.Category,
+			&i.CategorySlug,
 			&i.LifecyclePct,
 			&i.Trades24h,
 			&i.Volume24hUsd,

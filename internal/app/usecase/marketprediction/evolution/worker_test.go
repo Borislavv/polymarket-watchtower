@@ -361,8 +361,16 @@ func TestTelegram_OnStateChange(t *testing.T) {
 	if len(tg.sends) != 1 {
 		t.Fatalf("expected 1 telegram send, got %d", len(tg.sends))
 	}
-	if !strings.Contains(tg.sends[0], "PREDICTION UPDATE: blocked") {
+	// v10.5: title is "PREDICTION UPDATE · blocked" (no market title
+	// in the title line — market goes in its own section below).
+	if !strings.Contains(tg.sends[0], "<b>PREDICTION UPDATE</b> · blocked") {
 		t.Errorf("unexpected telegram body:\n%s", tg.sends[0])
+	}
+	// Universal v10.5 header MUST be present.
+	for _, want := range []string{"<b>Type:</b> prediction_update", "<b>Trigger:</b>", "<b>Strategy:</b>"} {
+		if !strings.Contains(tg.sends[0], want) {
+			t.Errorf("missing v10.5 header field %q:\n%s", want, tg.sends[0])
+		}
 	}
 }
 

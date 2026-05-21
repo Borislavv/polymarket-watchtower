@@ -140,9 +140,53 @@ type Metrics struct {
 
 	// --- Market intelligence worker ---
 	// MarketIntelligenceSkipped: labelled by reason (empty_report,
-	// duplicate_period). Increments every time the 2h scout report
-	// is suppressed without Telegram delivery.
+	// duplicate_period, ai_unavailable, ai_budget_denied). Increments
+	// every time the 2h scout report is suppressed without Telegram
+	// delivery. With v9.7 fallback wiring this counter should drop
+	// to ~zero for ai_unavailable in steady state — the report now
+	// ships a deterministic fallback when the AI times out.
 	MarketIntelligenceSkipped *prometheus.CounterVec
+
+	// MarketIntelAITimeout: per-AI-call timeout count for the 2h
+	// scout. Differs from the broader AIRequestErrors metric in that
+	// it ONLY counts CategoryTimeout failures (the noisy class we
+	// retry-once on). A persistent climb means the prompt is too
+	// heavy for the configured timeout.
+	MarketIntelAITimeout prometheus.Counter
+
+	// MarketIntelAIFallbackSent: number of reports that shipped the
+	// deterministic fallback (markets / annotations / links) WITHOUT
+	// an AI summary, by reason (timeout | retry_exhausted |
+	// rate_limited | quota_exceeded | other). Visibility for the
+	// silent-blindness fix in v9.7.
+	MarketIntelAIFallbackSent *prometheus.CounterVec
+
+	// MarketIntelLinksRendered: per-kind link counter so an operator
+	// can verify the link-rendering pass actually emitted entries.
+	// kind ∈ {event, market, category, grafana}. The renderer
+	// increments after sanitizeLinkURL passes; broken links never
+	// reach the metric.
+	MarketIntelLinksRendered *prometheus.CounterVec
+
+	// MarketIntelSourceLinksRendered: total annotation source links
+	// rendered across all sent reports.
+	MarketIntelSourceLinksRendered prometheus.Counter
+
+	// AIRetries: marketintel retry-once-on-timeout instrumentation
+	// (surface=market_intelligence; reason=timeout). Extra surfaces
+	// can register entries here as they adopt the same retry policy.
+	AIRetries *prometheus.CounterVec
+
+	// AITimeoutTotal: per-surface timeout counter. Differs from
+	// AIRequestErrors{reason=timeout} in that it captures the typed
+	// CategoryTimeout cleanly and is the dashboard primary signal for
+	// "the model is timing out on this surface".
+	AITimeoutTotal *prometheus.CounterVec
+
+	// AILatencySeconds: end-to-end latency of one AI call by surface,
+	// including retry waits.
+	AILatencySeconds *prometheus.HistogramVec
+
 	// AIRequestErrors: labelled by kind (alert_note, market_intelligence,
 	// outcome_postmortem) and reason (analyzer_error, budget_exhausted,
 	// rate_limited, timeout). The single AI-failure visibility metric.
@@ -233,6 +277,13 @@ type Metrics struct {
 	// status ("ok" | "skipped"). A non-zero "skipped" rate means we
 	// dropped at least one drifted market row.
 	EventPageMarketParse *prometheus.CounterVec
+
+	// --- v10.5 redirect + canonical-slug + stale-context metrics ---
+	EventPageRedirects        *prometheus.CounterVec // status
+	EventPageRedirectFailures *prometheus.CounterVec // reason
+	EventPageBuildIDRefresh   *prometheus.CounterVec // reason
+	EventPageSlugAlias        prometheus.Counter
+	EventPageContextStale     *prometheus.CounterVec // reason
 
 	// --- AI budget governance (single-process daily caps) ---
 	// AIBudgetCharged: cumulative USD charged per bucket (today).
@@ -343,6 +394,21 @@ type Metrics struct {
 	PredictionArchived   *prometheus.CounterVec
 	PredictionStaled     *prometheus.CounterVec
 	PredictionEvaluation *prometheus.CounterVec
+
+	// --- v10.4 WebSocket realtime ingestion ---
+	WSConnected           prometheus.Gauge
+	WSReconnects          prometheus.Counter
+	WSSubscriptions       prometheus.Gauge
+	WSEvents              *prometheus.CounterVec
+	WSDecodeErrors        *prometheus.CounterVec
+	WSEventsDropped       *prometheus.CounterVec
+	WSBufferDepth         prometheus.Gauge
+	WSLastEventAgeSeconds prometheus.Gauge
+	WSGapRecoveries       *prometheus.CounterVec
+	WSReconcileDuration   prometheus.Histogram
+	WSSubscriptionRefresh *prometheus.CounterVec
+	RealtimeWorkEnqueued  *prometheus.CounterVec
+	RealtimeWorkClaimed   *prometheus.CounterVec
 
 	// --- v9.6 Political-Catalyst Intelligence importer ---
 	// EventCatalystImporterRuns: importer cycle outcomes, labelled
@@ -716,8 +782,44 @@ func New() *Metrics {
 
 	m.MarketIntelligenceSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "market_intelligence", Name: "skipped_total",
-		Help: "Periodic 2h scout reports suppressed without Telegram delivery, by reason (empty_report, duplicate_period).",
+		Help: "Periodic 2h scout reports suppressed without Telegram delivery, by reason (empty_report, duplicate_period, ai_unavailable, ai_budget_denied).",
 	}, []string{"reason"})
+
+	m.MarketIntelAITimeout = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "marketintel", Name: "ai_timeout_total",
+		Help: "Number of marketintel AI calls that tripped a context_deadline_exceeded / typed timeout. Surfaces the noisy failure mode we retry-once on.",
+	})
+
+	m.MarketIntelAIFallbackSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "marketintel", Name: "ai_fallback_sent_total",
+		Help: "Reports delivered with the deterministic fallback (no AI summary) instead of being suppressed. Labelled by reason.",
+	}, []string{"reason"})
+
+	m.MarketIntelLinksRendered = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "marketintel", Name: "links_rendered_total",
+		Help: "Telegram links rendered in marketintel reports, by kind (event | market | category | grafana | source).",
+	}, []string{"kind"})
+
+	m.MarketIntelSourceLinksRendered = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "marketintel", Name: "source_links_rendered_total",
+		Help: "Annotation source links rendered in marketintel reports. Counter; matches the per-link {kind=source} entries above.",
+	})
+
+	m.AIRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "retries_total",
+		Help: "AI request retries by surface + reason (timeout). Bumped exactly once per retry-once attempt; does NOT include the original call.",
+	}, []string{"surface", "reason"})
+
+	m.AITimeoutTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "timeout_total",
+		Help: "Typed CategoryTimeout failures per AI surface. Distinct from request_errors_total in that it ONLY counts timeouts.",
+	}, []string{"surface"})
+
+	m.AILatencySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "latency_seconds",
+		Help:    "End-to-end AI call latency by surface (includes retry waits).",
+		Buckets: prometheus.ExponentialBuckets(0.5, 2, 9), // 0.5s .. ~256s
+	}, []string{"surface"})
 
 	m.AIRequestErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "ai", Name: "request_errors_total",
@@ -744,6 +846,26 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "event_page", Name: "fetch_total",
 		Help: "Polymarket event page fetch attempts, by status (success / failed / persist_failed).",
 	}, []string{"status"})
+	m.EventPageRedirects = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "eventpage", Name: "redirects_total",
+		Help: "Polymarket event page HTTP redirects observed, labelled by status code (307 is the v10.5 hot path).",
+	}, []string{"status"})
+	m.EventPageRedirectFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "eventpage", Name: "redirect_failures_total",
+		Help: "Redirect handling failures, by reason (missing_location, loop_or_cap, unsupported_target, html_no_next_data, non_200).",
+	}, []string{"reason"})
+	m.EventPageBuildIDRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "eventpage", Name: "buildid_refresh_total",
+		Help: "Forced buildId refreshes triggered by the fetch path, by reason (stale_build_id, json_parse_failed).",
+	}, []string{"reason"})
+	m.EventPageSlugAlias = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "eventpage", Name: "slug_alias_total",
+		Help: "Canonical-slug aliases recorded (original → canonical mappings persisted).",
+	})
+	m.EventPageContextStale = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "eventpage", Name: "context_stale_total",
+		Help: "AI / Telegram surfaces consumed stale event-page context (live fetch failed; cached snapshot served instead), by reason.",
+	}, []string{"reason"})
 	m.EventPageBuildIDChanges = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "event_page", Name: "build_id_changes_total",
 		Help: "Resolver observed a NEW Polymarket Next.js buildId (Vercel deploy rotated).",
@@ -927,6 +1049,61 @@ func New() *Metrics {
 		Help: "Prediction evaluations written, labelled by classifier output + horizon.",
 	}, []string{"evaluation", "horizon"})
 
+	// v10.4 WebSocket realtime ingestion.
+	m.WSConnected = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "connected",
+		Help: "1 when the Polymarket CLOB WS client is connected, 0 otherwise.",
+	})
+	m.WSReconnects = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "reconnects_total",
+		Help: "Cumulative WS reconnect attempts.",
+	})
+	m.WSSubscriptions = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "subscriptions_total",
+		Help: "Current count of subscribed CLOB token ids on the live connection.",
+	})
+	m.WSEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "events_total",
+		Help: "WS messages received, labelled by normalised event_type (book / price_change / last_trade_price / best_bid_ask / tick_size_change / market_resolved / heartbeat / unknown).",
+	}, []string{"type"})
+	m.WSDecodeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "decode_errors_total",
+		Help: "Decode failures on inbound WS messages, labelled by event_type (where parseable).",
+	}, []string{"type"})
+	m.WSEventsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "events_dropped_total",
+		Help: "Events dropped by the bounded output channel / drop policy, labelled by reason + event_type.",
+	}, []string{"reason", "type"})
+	m.WSBufferDepth = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "buffer_depth",
+		Help: "Current depth of the WS output channel.",
+	})
+	m.WSLastEventAgeSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "last_event_age_seconds",
+		Help: "Seconds since the last inbound WS message. Used for the health-stale check.",
+	})
+	m.WSGapRecoveries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "gap_recoveries_total",
+		Help: "Per-condition gap-recovery sweep outcomes (ok / no_trades / partial / failed).",
+	}, []string{"status"})
+	m.WSReconcileDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "reconcile_duration_seconds",
+		Help:    "End-to-end duration of one reconciliation sweep across the subscribed set.",
+		Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
+	})
+	m.WSSubscriptionRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ws", Name: "subscription_refresh_total",
+		Help: "Subscription-set refresh cycles, labelled by outcome (ok / unchanged / failed).",
+	}, []string{"status"})
+	m.RealtimeWorkEnqueued = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "realtime", Name: "work_enqueued_total",
+		Help: "polymarket_realtime_work_queue inserts, labelled by reason (price_move | book_change | trade_seen | market_status | gap_recovered).",
+	}, []string{"reason"})
+	m.RealtimeWorkClaimed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "realtime", Name: "work_claimed_total",
+		Help: "Realtime work-queue claim outcomes, labelled by reason + status (ok / failed).",
+	}, []string{"reason", "status"})
+
 	// v9.6 Political-Catalyst Intelligence importer
 	m.EventCatalystImporterRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "event_catalyst_importer", Name: "runs_total",
@@ -1078,6 +1255,9 @@ func New() *Metrics {
 		m.BackfillPagesFetched, m.BackfillRunsTotal,
 		m.StatsSummariesSent, m.StatsSummaryErrors,
 		m.MarketIntelligenceSkipped, m.AIRequestErrors,
+		m.MarketIntelAITimeout, m.MarketIntelAIFallbackSent,
+		m.MarketIntelLinksRendered, m.MarketIntelSourceLinksRendered,
+		m.AIRetries, m.AITimeoutTotal, m.AILatencySeconds,
 		m.AIAnalysisPersisted, m.AIAnalysisRejected, m.AIQuotaExceeded,
 		m.SignalReportsSent, m.TelegramReactions, m.AlertOutcomes,
 		m.AlertRealizedEdge,
@@ -1085,6 +1265,8 @@ func New() *Metrics {
 		m.AlertCalibrationTotal,
 		m.EventPageFetch, m.EventPageBuildIDChanges, m.EventPageAnnotations,
 		m.EventPageContextUsed, m.EventPageAlerts, m.EventPageLagCandidates,
+		m.EventPageRedirects, m.EventPageRedirectFailures, m.EventPageBuildIDRefresh,
+		m.EventPageSlugAlias, m.EventPageContextStale,
 		m.EventPageFetchLatency,
 		m.EventPageParseFailures, m.EventPagePartialParse, m.EventPageMarketParse,
 		m.AIBudgetCharged, m.AIBudgetSpent, m.AIBudgetGlobalSpent, m.AIBudgetDenied,
@@ -1099,6 +1281,10 @@ func New() *Metrics {
 		m.WorkerCycleDuration, m.WorkerCycleSkipped, m.WorkerCycleItems,
 		m.AIPromptChars, m.AICompactions, m.AISurfaceSkipped, m.AISurfaceEstimatedCost,
 		m.PredictionArchived, m.PredictionStaled, m.PredictionEvaluation,
+		m.WSConnected, m.WSReconnects, m.WSSubscriptions, m.WSEvents,
+		m.WSDecodeErrors, m.WSEventsDropped, m.WSBufferDepth,
+		m.WSLastEventAgeSeconds, m.WSGapRecoveries, m.WSReconcileDuration,
+		m.WSSubscriptionRefresh, m.RealtimeWorkEnqueued, m.RealtimeWorkClaimed,
 		m.EventCatalystImporterRuns, m.EventCatalystImporterSelected,
 		m.EventCatalystImporterProcessed, m.EventCatalystAIRequests,
 		m.EventCatalystUpserted, m.EventCatalystImportLatency,
