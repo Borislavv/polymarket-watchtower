@@ -849,7 +849,7 @@ func New() (*App, error) {
 	// fallback report with markets + annotation links. With the
 	// key, the AI summary lands inline.
 	var marketIntelWorker *marketintel.Worker
-	if cfg.Postgres.Enabled() && bot != nil && cfg.AIAnalysis.MarketIntelligenceEnabled {
+	if cfg.Postgres.Enabled() && bot != nil && cfg.AIAnalysis.MarketIntelligenceEnabled && cfg.AIAnalysis.MarketIntelLegacyEnabled {
 		var analyzerForReport analysis.Analyzer = analysis.NoopAnalyzer{}
 		var marketIntelOpenAIClient *openai.Client
 		if cfg.AIAnalysis.APIKey != "" {
@@ -1009,7 +1009,7 @@ func New() (*App, error) {
 	// day at DAILY_POLITICAL_INTEL_TIME in DAILY_POLITICAL_INTEL_TIMEZONE,
 	// selects 100 markets, calls AI, splits + sends Telegram.
 	var dailyIntelWorker *dailypoliticalintel.Worker
-	if cfg.Postgres.Enabled() && cfg.DailyIntel.Enabled && marketsRepo != nil && eventPageProvider != nil {
+	if cfg.Postgres.Enabled() && cfg.DailyIntel.Enabled && cfg.AIAnalysis.DailyIntelLegacyEnabled && marketsRepo != nil && eventPageProvider != nil {
 		var dailyGen analysis.DailyPoliticalIntelGenerator = analysis.NoopDailyPoliticalIntelGenerator{}
 		if cfg.AIAnalysis.APIKey != "" && cfg.DailyIntel.AIEnabled {
 			dailyGen = openai.New(openai.Config{
@@ -1090,7 +1090,7 @@ func New() (*App, error) {
 			OverreactionThreshold:  cfg.Repricing.OverreactionThreshold,
 		}, sqlc.New(pgPool), predsRepo, met, logger)
 		var aiGen analysis.PredictionEvolutionGenerator = analysis.NoopPredictionEvolutionGenerator{}
-		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.EvolutionAIEnabled {
+		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.EvolutionAIEnabled && cfg.AIAnalysis.PredictionAILegacyEnabled {
 			aiGen = openai.New(openai.Config{
 				APIKey:                 cfg.AIAnalysis.APIKey,
 				BaseURL:                cfg.AIAnalysis.BaseURL,

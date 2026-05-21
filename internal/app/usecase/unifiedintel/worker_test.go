@@ -237,6 +237,83 @@ func TestTick_InvalidFormatNeverShips(t *testing.T) {
 	}
 }
 
+// v10.9 PART 3 — market AI cache. Second cycle with same candidate
+// set MUST NOT invoke the analyzer; cache hit short-circuits.
+type fakeAICache struct {
+	mu      sync.Mutex
+	cached  map[string]repository.MarketAICacheEntry
+	upserts int
+	hits    int
+}
+
+func (c *fakeAICache) Get(_ context.Context, surface, key string) (repository.MarketAICacheEntry, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.cached[surface+"|"+key]
+	if ok {
+		c.hits++
+	}
+	return e, ok, nil
+}
+func (c *fakeAICache) Upsert(_ context.Context, in repository.MarketAICacheRow) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cached == nil {
+		c.cached = map[string]repository.MarketAICacheEntry{}
+	}
+	c.upserts++
+	c.cached[in.AISurface+"|"+in.MarketAIKey] = repository.MarketAICacheEntry{
+		AISurface:    in.AISurface,
+		MarketAIKey:  in.MarketAIKey,
+		AIStatus:     in.AIStatus,
+		SentinelCode: in.SentinelCode,
+		DecisionJSON: in.DecisionJSON,
+		SummaryText:  in.SummaryText,
+	}
+	return nil
+}
+func (c *fakeAICache) TouchReuse(_ context.Context, surface, key string) error { return nil }
+
+func TestTick_MarketAICacheReuseSkipsAI(t *testing.T) {
+	store := &fakeStore{}
+	bot := &fakeBot{}
+	cache := &fakeAICache{}
+	cands := &fakeCandidates{rows: sampleCandidates()}
+
+	calls := 0
+	analyzer := &countingAnalyzer{n: &calls, res: analysis.MarketReportAnalysis{
+		Status: analysis.StatusOK, Model: "gpt-4.1",
+		ReportText: `{"regime":"informed_flow","selected":[{"event_slug":"iran-peace","condition_id":"0xa","rank":1,"interest_score":0.9,"class":"informed_flow","why_now":"y","expected_direction":"YES_up"}]}`,
+	}}
+	w := New(baseCfg(), cands, &fakeAnnots{}, &fakeCatalysts{}, analyzer, store, bot, nil, nopLogger())
+	w.SetMarketAICache(cache)
+
+	w.Tick(context.Background())
+	if calls != 1 {
+		t.Fatalf("first tick must call AI once; got %d", calls)
+	}
+	// Same candidates → cache hit → no AI on second cycle.
+	w.Tick(context.Background())
+	if calls != 1 {
+		t.Errorf("second tick must hit cache; got %d analyzer calls", calls)
+	}
+	if cache.hits == 0 {
+		t.Errorf("expected cache hit on second tick")
+	}
+}
+
+// countingAnalyzer is a deterministic AI that increments a counter
+// each time AnalyzeMarketReport is called.
+type countingAnalyzer struct {
+	n   *int
+	res analysis.MarketReportAnalysis
+}
+
+func (c *countingAnalyzer) AnalyzeMarketReport(_ context.Context, _ analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
+	*c.n++
+	return c.res, nil
+}
+
 // PART 2: empty `selected` from the parser collapses to a sentinel
 // internally, suppressed identically to AiAnsweredNotFoundNoticeable.
 func TestTick_EmptySelectedTreatedAsSentinel(t *testing.T) {

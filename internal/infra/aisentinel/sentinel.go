@@ -47,6 +47,12 @@ const (
 	// prediction analysis paths.
 	CodeOnlyResolutionBlocked Code = "AI_ONLY_RESOLUTION_BLOCKED"
 
+	// CodeLowConfidenceSkip — v10.9: there is a weak hint of edge
+	// but confidence is below the surface's actionable threshold
+	// (typically 0.60). Treated as no-action so the operator isn't
+	// paged on low-confidence guesses.
+	CodeLowConfidenceSkip Code = "AI_LOW_CONFIDENCE_SKIP"
+
 	// v10.8 PascalCase aliases. The operator spec asked for these
 	// names (AiAnsweredNotFoundNoticeable etc.) — they are accepted
 	// AS ALTERNATIVE wire strings by the parser. The canonical
@@ -57,6 +63,7 @@ const (
 	codeAliasContextStale          Code = "AiAnsweredContextStale"
 	codeAliasInputInsufficient     Code = "AiAnsweredInsufficientData"
 	codeAliasOnlyResolutionBlocked Code = "AiAnsweredOnlyResolutionBlocked"
+	codeAliasLowConfidenceSkip     Code = "AiAnsweredLowConfidenceSkip"
 )
 
 // allCodes is the recognised set. Used by Parse() to detect a sentinel.
@@ -68,11 +75,13 @@ var allCodes = []Code{
 	CodeContextStale,
 	CodeInputInsufficient,
 	CodeOnlyResolutionBlocked,
+	CodeLowConfidenceSkip,
 	codeAliasNoNoticeableEdge,
 	codeAliasAlreadyPriced,
 	codeAliasContextStale,
 	codeAliasInputInsufficient,
 	codeAliasOnlyResolutionBlocked,
+	codeAliasLowConfidenceSkip,
 }
 
 // canonicalCode maps both wire forms (SCREAMING_SNAKE and v10.8
@@ -85,11 +94,13 @@ var canonicalCode = map[string]Code{
 	"AI_CONTEXT_STALE":                CodeContextStale,
 	"AI_INPUT_INSUFFICIENT":           CodeInputInsufficient,
 	"AI_ONLY_RESOLUTION_BLOCKED":      CodeOnlyResolutionBlocked,
+	"AI_LOW_CONFIDENCE_SKIP":          CodeLowConfidenceSkip,
 	"AiAnsweredNotFoundNoticeable":    CodeNoNoticeableEdge,
 	"AiAnsweredAlreadyPriced":         CodeAlreadyPriced,
 	"AiAnsweredContextStale":          CodeContextStale,
 	"AiAnsweredInsufficientData":      CodeInputInsufficient,
 	"AiAnsweredOnlyResolutionBlocked": CodeOnlyResolutionBlocked,
+	"AiAnsweredLowConfidenceSkip":     CodeLowConfidenceSkip,
 }
 
 // Kind enumerates the result classes the parser returns.
@@ -137,10 +148,14 @@ type Result struct {
 // JSONSelection is the strict shape the PART 9 batch-ranking prompt
 // promises. Extra fields are tolerated (we read what we need).
 type JSONSelection struct {
-	Regime                    string               `json:"regime"`
-	ShouldRequestFullAnalysis bool                 `json:"should_request_full_analysis"`
-	Reason                    string               `json:"reason"`
-	Selected                  []JSONSelectionEntry `json:"selected"`
+	Regime                    string `json:"regime"`
+	ShouldRequestFullAnalysis bool   `json:"should_request_full_analysis"`
+	Reason                    string `json:"reason"`
+	// v10.9 evaluator field — one-sentence summary the dashboard
+	// renders. Older prompts omit it; parses as empty string.
+	Summary  string               `json:"summary"`
+	Decision string               `json:"decision"`
+	Selected []JSONSelectionEntry `json:"selected"`
 }
 
 // JSONSelectionEntry is one ranked market row.
@@ -272,7 +287,8 @@ func previewOf(s string, n int) string {
 func (c Code) SuppressesTelegram() bool {
 	switch c {
 	case CodeNoNoticeableEdge, CodeAlreadyPriced, CodeContextStale,
-		CodeInputInsufficient, CodeOnlyResolutionBlocked:
+		CodeInputInsufficient, CodeOnlyResolutionBlocked,
+		CodeLowConfidenceSkip:
 		return true
 	}
 	return false

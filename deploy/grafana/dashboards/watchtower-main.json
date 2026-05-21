@@ -1457,6 +1457,78 @@
         "expr": "sum(increase(watchtower_concentration_suppressed_total[24h]))",
         "refId": "A"
       }]
+    },
+    {
+      "id": 600,
+      "type": "row",
+      "title": "v10.9 Unified Prediction Intelligence Engine",
+      "gridPos": {"x": 0, "y": 340, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 601,
+      "type": "timeseries",
+      "title": "Unified intel runs (rate / 1h)",
+      "description": "v10.9 unified evaluator cycles by status (ok / skipped / failed).",
+      "gridPos": {"x": 0, "y": 341, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_unified_intel_runs_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 602,
+      "type": "timeseries",
+      "title": "Market AI cache hits/misses (rate / 1h)",
+      "description": "v10.9 per-market AI cache. Hit = AI call skipped. Higher is better.",
+      "gridPos": {"x": 12, "y": 341, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum by (surface, status) (rate(watchtower_market_ai_cache_hit_total[1h]))", "legendFormat": "hit · {{surface}} · {{status}}", "refId": "A"},
+        {"expr": "sum by (surface, reason) (rate(watchtower_market_ai_cache_miss_total[1h]))", "legendFormat": "miss · {{surface}} · {{reason}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 603,
+      "type": "timeseries",
+      "title": "Telegram semantic dedupe (rate / 1h)",
+      "description": "v10.9 telegram suppressions by surface + reason.",
+      "gridPos": {"x": 0, "y": 348, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (surface, reason) (rate(watchtower_telegram_semantic_dedupe_total[1h]))",
+        "legendFormat": "{{surface}} · {{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 604,
+      "type": "timeseries",
+      "title": "Unified intel sentinels (rate / 1h)",
+      "description": "v10.9 PascalCase sentinel codes the AI returned.",
+      "gridPos": {"x": 12, "y": 348, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (code) (rate(watchtower_unified_intel_sentinel_total[1h]))",
+        "legendFormat": "{{code}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 605,
+      "type": "timeseries",
+      "title": "Repricing theses written (rate / 1h)",
+      "description": "v10.9 deterministic repricing thesis writes by direction + window.",
+      "gridPos": {"x": 0, "y": 355, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (direction, window) (rate(watchtower_unified_intel_repricing_thesis_total[1h]))",
+        "legendFormat": "{{direction}} · {{window}}",
+        "refId": "A"
+      }]
     }
   ]
 }

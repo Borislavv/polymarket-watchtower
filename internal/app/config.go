@@ -936,8 +936,19 @@ type AIAnalysisConfig struct {
 	LifecycleRefreshDeltaPct float64 `env:"AI_ANALYSIS_LIFECYCLE_REFRESH_DELTA_PCT" envDefault:"1" validate:"gte=0"`
 	CLVMaterialChange        float64 `env:"AI_ANALYSIS_CLV_MATERIAL_CHANGE" envDefault:"0.02" validate:"gte=0"`
 
-	// 2h market-intelligence schedule.
-	MarketIntelligenceEnabled bool `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
+	// 2h market-intelligence schedule. v10.9: superseded by the
+	// unified intelligence engine. Three kill switches gate the
+	// legacy surfaces so the operator can flip them off without
+	// touching code. Defaults keep legacy ON for backward compat;
+	// production deploys should set all three to false when the
+	// unified engine is wired.
+	MarketIntelLegacyEnabled     bool          `env:"MARKET_INTEL_LEGACY_ENABLED" envDefault:"true"`
+	DailyIntelLegacyEnabled      bool          `env:"DAILY_INTEL_LEGACY_ENABLED" envDefault:"true"`
+	PredictionAILegacyEnabled    bool          `env:"PREDICTION_AI_LEGACY_ENABLED" envDefault:"true"`
+	UnifiedIntelEnabled          bool          `env:"UNIFIED_INTEL_ENABLED" envDefault:"false"`
+	UnifiedIntelMinQueryInterval time.Duration `env:"UNIFIED_INTEL_MIN_QUERY_INTERVAL" envDefault:"4h" validate:"gt=0"`
+	UnifiedIntelMinSendInterval  time.Duration `env:"UNIFIED_INTEL_MIN_SEND_INTERVAL" envDefault:"4h" validate:"gt=0"`
+	MarketIntelligenceEnabled    bool          `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
 	// v10.8: bumped default 2h → 4h. The 4-day audit showed every
 	// 2h marketintel report shipped filler ("reactive crowding",
 	// "no fresh news") because there genuinely IS no fresh news on

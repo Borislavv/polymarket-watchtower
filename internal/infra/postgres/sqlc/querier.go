@@ -94,6 +94,7 @@ type Querier interface {
 	EnqueueRealtimeWork(ctx context.Context, arg EnqueueRealtimeWorkParams) error
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
 	FinishGapRecovery(ctx context.Context, arg FinishGapRecoveryParams) error
+	FinishUnifiedIntelRun(ctx context.Context, arg FinishUnifiedIntelRunParams) error
 	// Single-row fetch used by the outcome-learning worker to reload
 	// the full row (payload, telegram_message_id, outcome_status, etc.)
 	// before invoking the AI postmortem path.
@@ -105,10 +106,19 @@ type Querier interface {
 	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
 	GetEventSlugAlias(ctx context.Context, originalSlug string) (string, error)
 	GetLiveMarketState(ctx context.Context, conditionID string) (PolymarketLiveMarketState, error)
+	// v10.9 unified intel queries.
+	// =========================================================================
+	// Market AI cache (PART 3)
+	// =========================================================================
+	GetMarketAICache(ctx context.Context, arg GetMarketAICacheParams) (PolymarketMarketAiCache, error)
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
 	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (GetMarketPredictionRow, error)
 	GetPredictionUsefulnessScore(ctx context.Context, predictionID int64) (GetPredictionUsefulnessScoreRow, error)
+	// =========================================================================
+	// Telegram semantic dedupe (PART 4)
+	// =========================================================================
+	GetTelegramSemanticDedupe(ctx context.Context, arg GetTelegramSemanticDedupeParams) (PolymarketTelegramSemanticDedupe, error)
 	// Reverse of GetTraderByWallet — used by the detection worker to
 	// resolve a trader_id back to its wallet string when rebuilding a
 	// trade.Trade from polymarket_trades.
@@ -140,11 +150,24 @@ type Querier interface {
 	// that prompted migration 00014.
 	InsertMarketIntelligenceReport(ctx context.Context, arg InsertMarketIntelligenceReportParams) (PolymarketMarketIntelligenceReports, error)
 	InsertMarketPredictionStateTransition(ctx context.Context, arg InsertMarketPredictionStateTransitionParams) error
+	// =========================================================================
+	// Market price snapshots (PART 8)
+	// =========================================================================
+	InsertMarketPriceSnapshot(ctx context.Context, arg InsertMarketPriceSnapshotParams) error
+	// =========================================================================
+	// Repricing theses (PART 9)
+	// =========================================================================
+	InsertRepricingThesis(ctx context.Context, arg InsertRepricingThesisParams) error
 	// Insert a single trade. ON CONFLICT (dedup_key) DO NOTHING is the dedup
 	// primitive — concurrent inserters of the same trade race to the unique
 	// constraint and exactly one wins. The caller maps pgx.ErrNoRows to
 	// "already existed".
 	InsertTrade(ctx context.Context, arg InsertTradeParams) (PolymarketTrades, error)
+	InsertUnifiedIntelDecision(ctx context.Context, arg InsertUnifiedIntelDecisionParams) error
+	// =========================================================================
+	// Unified intel runs + decisions (PART 13)
+	// =========================================================================
+	InsertUnifiedIntelRun(ctx context.Context, arg InsertUnifiedIntelRunParams) (int64, error)
 	// Append-only audit/correlation row. Fail-open: the WS path
 	// handles a write error by logging + continuing — never blocks.
 	InsertWSEvent(ctx context.Context, arg InsertWSEventParams) error
@@ -396,6 +419,7 @@ type Querier interface {
 	// /stats and Grafana so operators can see whether the worker is
 	// keeping up.
 	PendingDetectionCount(ctx context.Context) (int64, error)
+	PriceSnapshotAtOrBefore(ctx context.Context, arg PriceSnapshotAtOrBeforeParams) (PriceSnapshotAtOrBeforeRow, error)
 	// Per-(market, outcome) price/volume stats over a lookback window.
 	// Powers the late-market stable-favorite worker — stability,
 	// adverse-drift, and liquidity gates all read from this one row.
@@ -463,6 +487,7 @@ type Querier interface {
 	// event. Drives the strongest-side + directional-imbalance fields.
 	SumEventTradesByConditionAndSide(ctx context.Context, arg SumEventTradesByConditionAndSideParams) ([]SumEventTradesByConditionAndSideRow, error)
 	TouchEventNewsAICalled(ctx context.Context, eventSlug string) error
+	TouchMarketAICacheReuse(ctx context.Context, arg TouchMarketAICacheReuseParams) error
 	// Bumps last_evolved_at without touching state/confidence — the
 	// worker calls this on EVERY processed prediction so the row drops
 	// to the back of the selection queue even when nothing material
@@ -562,6 +587,7 @@ type Querier interface {
 	// The next BackfillWorker tick picks up missing history because
 	// ApplyWhitelist callers re-stamp backfill_status='pending' on resume.
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error)
+	UpsertMarketAICache(ctx context.Context, arg UpsertMarketAICacheParams) error
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
 	UpsertMarketPrediction(ctx context.Context, arg UpsertMarketPredictionParams) (int64, error)
 	// v10.3 evaluation classifier output. One row per (prediction, horizon).
@@ -576,6 +602,7 @@ type Querier interface {
 	// Records the most recent semantic-fingerprint + code we shipped for
 	// this event so the cooldown check can suppress repeats.
 	UpsertSemanticFingerprint(ctx context.Context, arg UpsertSemanticFingerprintParams) error
+	UpsertTelegramSemanticDedupe(ctx context.Context, arg UpsertTelegramSemanticDedupeParams) error
 	// Insert a trader by wallet address; on conflict bump last_seen_at.
 	UpsertTrader(ctx context.Context, walletAddress string) (PolymarketTraders, error)
 }

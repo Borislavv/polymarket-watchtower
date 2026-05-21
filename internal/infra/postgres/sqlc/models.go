@@ -294,6 +294,28 @@ type PolymarketLiveMarketState struct {
 	UpdatedAt     pgtype.Timestamptz
 }
 
+type PolymarketMarketAiCache struct {
+	ID                  int64
+	EventSlug           string
+	ConditionID         string
+	AiSurface           string
+	MarketAiKey         string
+	NewsFingerprint     string
+	CatalystFingerprint string
+	RepricingBucket     string
+	FlowBucket          string
+	PriceBucket         string
+	AiStatus            string
+	SentinelCode        string
+	DecisionJson        []byte
+	SummaryText         string
+	LastAiAt            pgtype.Timestamptz
+	LastReusedAt        pgtype.Timestamptz
+	ReuseCount          int32
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
+}
+
 type PolymarketMarketCategories struct {
 	MarketID   int64
 	CategoryID int64
@@ -356,6 +378,20 @@ type PolymarketMarketPredictions struct {
 	LastEvolvedAt             pgtype.Timestamptz
 	ArchivedAt                pgtype.Timestamptz
 	TerminalReason            *string
+}
+
+type PolymarketMarketPriceSnapshots struct {
+	ID          int64
+	ConditionID string
+	EventSlug   string
+	MarketSlug  string
+	Price       *float64
+	BestBid     *float64
+	BestAsk     *float64
+	Mid         *float64
+	Source      string
+	SampledAt   pgtype.Timestamptz
+	CreatedAt   pgtype.Timestamptz
 }
 
 type PolymarketMarkets struct {
@@ -461,6 +497,24 @@ type PolymarketRepricingSignals struct {
 	UpdatedAt               pgtype.Timestamptz
 }
 
+type PolymarketRepricingTheses struct {
+	ID                int64
+	RunID             *int64
+	EventSlug         string
+	ConditionID       string
+	CurrentPrice      float64
+	ExpectedDirection string
+	ExpectedPriceMin  *float64
+	ExpectedPriceMax  *float64
+	ExpectedWindow    string
+	TriggerCondition  string
+	Confidence        float64
+	Reason            string
+	InvalidatesIf     string
+	Source            string
+	CreatedAt         pgtype.Timestamptz
+}
+
 type PolymarketSignalReports struct {
 	ID                int64
 	PeriodType        string
@@ -475,6 +529,23 @@ type PolymarketSignalReports struct {
 	DedupKey          string
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
+}
+
+type PolymarketTelegramSemanticDedupe struct {
+	ID                  int64
+	Surface             string
+	DedupeKey           string
+	SemanticFingerprint string
+	EventSlug           string
+	ConditionID         string
+	Wallet              string
+	LastSentAt          pgtype.Timestamptz
+	SendCount           int32
+	LastNotional        *float64
+	LastSeverity        string
+	LastReason          string
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
 }
 
 type PolymarketTraders struct {
@@ -505,6 +576,48 @@ type PolymarketTrades struct {
 	LastDetectionError  *string
 	DetectionClaimedAt  pgtype.Timestamptz
 	DetectionWorkerID   *string
+}
+
+type PolymarketUnifiedIntelDecisions struct {
+	ID                       int64
+	RunID                    int64
+	EventSlug                string
+	ConditionID              string
+	Decision                 string
+	Regime                   string
+	Class                    string
+	InterestScore            float64
+	Confidence               float64
+	CurrentPrice             *float64
+	ExpectedDirection        string
+	ExpectedPriceMin         *float64
+	ExpectedPriceMax         *float64
+	ExpectedWindow           string
+	WhyMarketMisprices       string
+	WhatMarketWillUnderstand string
+	TriggerCondition         string
+	InvalidatesIf            string
+	TradeStance              string
+	TelegramWorthy           bool
+	CreatedAt                pgtype.Timestamptz
+}
+
+type PolymarketUnifiedIntelRuns struct {
+	ID               int64
+	StartedAt        pgtype.Timestamptz
+	FinishedAt       pgtype.Timestamptz
+	Status           string
+	TriggerReason    string
+	InputFingerprint string
+	NewsChangedCount int32
+	CandidatesCount  int32
+	SelectedCount    int32
+	AiCalled         bool
+	AiStatus         string
+	SentinelCode     string
+	AiCostUsd        float64
+	TelegramSent     bool
+	CreatedAt        pgtype.Timestamptz
 }
 
 type PolymarketWsEvents struct {

@@ -532,6 +532,29 @@ type Metrics struct {
 	// per-wallet gate, labelled by reason
 	// (wallet_escalation_failed / event_concentration_cap).
 	ConcentrationSuppressed *prometheus.CounterVec
+
+	// --- v10.9 unified intelligence engine ---
+	// MarketAICacheHit: cache hits per AI surface, labelled by
+	// status (actionable / sentinel) — drives the AI-cost
+	// reduction dashboard.
+	MarketAICacheHit *prometheus.CounterVec
+	// MarketAICacheMiss: cache misses per AI surface + reason
+	// (first_or_invalidated / news_changed / price_move).
+	MarketAICacheMiss *prometheus.CounterVec
+	// MarketAICacheReuse: full reuse counter (incremented on hit
+	// alongside MarketAICacheHit but kept separate for clarity).
+	MarketAICacheReuse *prometheus.CounterVec
+	// TelegramSemanticDedupe: Telegram sends suppressed by the
+	// v10.9 semantic dedupe layer.
+	TelegramSemanticDedupe *prometheus.CounterVec
+	// UnifiedIntelRuns: one increment per evaluation cycle by
+	// status (ok / skipped / failed).
+	UnifiedIntelRuns *prometheus.CounterVec
+	// UnifiedIntelSentinel: per-code sentinel counter.
+	UnifiedIntelSentinel *prometheus.CounterVec
+	// RepricingThesisTotal: theses written, labelled by
+	// expected_direction + expected_window.
+	RepricingThesisTotal *prometheus.CounterVec
 	// PredictionEvolutionLatency: end-to-end Tick duration.
 	PredictionEvolutionLatency prometheus.Histogram
 	// PredictionEvolutionDecay: decay applications, labelled by
@@ -1294,6 +1317,36 @@ func New() *Metrics {
 		Namespace: "watchtower", Subsystem: "concentration", Name: "suppressed_total",
 		Help: "Alerts dropped by the per-event / per-wallet concentration gate, by reason (wallet_escalation_failed / event_concentration_cap).",
 	}, []string{"reason"})
+
+	// v10.9 unified intelligence engine.
+	m.MarketAICacheHit = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_ai_cache", Name: "hit_total",
+		Help: "Market-level AI cache hits, by surface + status (actionable / sentinel).",
+	}, []string{"surface", "status"})
+	m.MarketAICacheMiss = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_ai_cache", Name: "miss_total",
+		Help: "Market-level AI cache misses, by surface + reason.",
+	}, []string{"surface", "reason"})
+	m.MarketAICacheReuse = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_ai_cache", Name: "reuse_total",
+		Help: "Market-level AI cache reuse, by surface + kind (actionable / sentinel).",
+	}, []string{"surface", "kind"})
+	m.TelegramSemanticDedupe = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "semantic_dedupe_total",
+		Help: "Telegram messages suppressed by the v10.9 semantic dedupe layer, by surface + reason.",
+	}, []string{"surface", "reason"})
+	m.UnifiedIntelRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "unified_intel", Name: "runs_total",
+		Help: "Unified intelligence evaluation cycles, by status.",
+	}, []string{"status"})
+	m.UnifiedIntelSentinel = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "unified_intel", Name: "sentinel_total",
+		Help: "Unified intelligence sentinel responses, by code.",
+	}, []string{"code"})
+	m.RepricingThesisTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "unified_intel", Name: "repricing_thesis_total",
+		Help: "Deterministic repricing theses written, by direction + window.",
+	}, []string{"direction", "window"})
 	m.PredictionEvolutionLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "latency_seconds",
 		Help:    "End-to-end Tick duration.",
@@ -1377,6 +1430,9 @@ func New() *Metrics {
 		m.DedupeSuppressed, m.MarketIntelNoEdgeSuppressed, m.AIWorkflowAntiPattern,
 		m.NewsFingerprintChanged, m.NewsFingerprintUnchanged,
 		m.ConcentrationSuppressed,
+		m.MarketAICacheHit, m.MarketAICacheMiss, m.MarketAICacheReuse,
+		m.TelegramSemanticDedupe, m.UnifiedIntelRuns, m.UnifiedIntelSentinel,
+		m.RepricingThesisTotal,
 		m.PredictionEvolutionDecay,
 	)
 	return m
