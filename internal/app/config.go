@@ -372,6 +372,25 @@ type AnomalyConfig struct {
 	TraderBaselineWindow   time.Duration `env:"TRADER_BASELINE_WINDOW" envDefault:"2160h" validate:"gte=0"`
 	MinTraderHistoryTrades int           `env:"TRADER_MIN_HISTORY_TRADES" envDefault:"5" validate:"gte=0"`
 
+	// --- v10.8 concentration / escalation gate ---
+	// The audit found 17/57 alerts (30%) came from a single event +
+	// one wallet generated 4 same-event alerts in 17 minutes. These
+	// knobs throttle that pattern at the alert-persistence layer:
+	//   * EventAlertConcentrationLimit: alerts allowed per event in
+	//     EventAlertConcentrationWindow before escalation kicks in.
+	//   * RepeatedEventThresholdMultiplier: the (limit+1)th alert
+	//     must clear `prev_event_max_notional * multiplier`.
+	//   * WalletAlertCooldown: per-(wallet,event) cooldown.
+	//   * AccumulationEscalationFactor: subsequent same-wallet
+	//     alerts in the cooldown need `prev_notional * factor` to
+	//     pass.
+	// Set EventAlertConcentrationLimit=0 to disable the gate.
+	EventAlertConcentrationLimit     int           `env:"EVENT_ALERT_CONCENTRATION_LIMIT" envDefault:"3" validate:"gte=0,lte=100"`
+	EventAlertConcentrationWindow    time.Duration `env:"EVENT_ALERT_CONCENTRATION_WINDOW" envDefault:"24h" validate:"gt=0"`
+	RepeatedEventThresholdMultiplier float64       `env:"REPEATED_EVENT_THRESHOLD_MULTIPLIER" envDefault:"2.0" validate:"gte=1"`
+	WalletAlertCooldown              time.Duration `env:"WALLET_ALERT_COOLDOWN" envDefault:"6h" validate:"gt=0"`
+	AccumulationEscalationFactor     float64       `env:"ACCUMULATION_ESCALATION_FACTOR" envDefault:"2.0" validate:"gte=1"`
+
 	// Market-maker / arbitrage suppression (v2). When a wallet has been
 	// running balanced two-sided BUY+SELL activity on the same (market,
 	// outcome) over the lookback, single-trade alerts on that wallet are
@@ -661,6 +680,20 @@ type PredictionConfig struct {
 	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"true"`
 	EvolutionTelegramCooldown time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
 
+	// --- v10.7 noise-suppression knobs ---
+	//
+	// SendResolutionOnlyBlocked=false (default) → DROP Telegram for
+	// watching→blocked transitions whose only blocker is an
+	// election-day / runoff / primary / certification catalyst with
+	// no pre-event edge. The operator can flip to true to restore
+	// legacy "send every state change" behaviour.
+	//
+	// SendSentinelResults=false (default) → DROP Telegram for runs
+	// where the AI returned a sentinel code. The sentinel result is
+	// still persisted for audit; only the Telegram is suppressed.
+	SendResolutionOnlyBlocked bool `env:"PREDICTION_SEND_RESOLUTION_ONLY_BLOCKED" envDefault:"false"`
+	SendSentinelResults       bool `env:"PREDICTION_SEND_SENTINEL_RESULTS" envDefault:"false"`
+
 	// --- v10.0 prediction creation worker (PART 1) ---
 	// The cold-start path. Without this loop, the evolution worker
 	// has nothing to evolve. Defaults are moderate / safe / non-
@@ -904,10 +937,20 @@ type AIAnalysisConfig struct {
 	CLVMaterialChange        float64 `env:"AI_ANALYSIS_CLV_MATERIAL_CHANGE" envDefault:"0.02" validate:"gte=0"`
 
 	// 2h market-intelligence schedule.
-	MarketIntelligenceEnabled        bool          `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
-	MarketIntelligenceInterval       time.Duration `env:"AI_MARKET_INTELLIGENCE_INTERVAL" envDefault:"2h" validate:"gt=0"`
-	MarketIntelligenceMaxMarkets     int           `env:"AI_MARKET_INTELLIGENCE_MAX_MARKETS" envDefault:"50" validate:"gte=1,lte=500"`
-	MarketIntelligenceMaxOutputChars int           `env:"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS" envDefault:"2000" validate:"gte=200,lte=8000"`
+	MarketIntelligenceEnabled bool `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
+	// v10.8: bumped default 2h → 4h. The 4-day audit showed every
+	// 2h marketintel report shipped filler ("reactive crowding",
+	// "no fresh news") because there genuinely IS no fresh news on
+	// most 2h windows. 4h matches the operator-target cadence.
+	// Operators may override; this is the new safe floor.
+	MarketIntelligenceInterval time.Duration `env:"AI_MARKET_INTELLIGENCE_INTERVAL" envDefault:"4h" validate:"gt=0"`
+	// MarketIntelligenceMinSendInterval enforces a hard floor on
+	// Telegram send cadence INDEPENDENT of the AI query cadence.
+	// Set equal to MarketIntelligenceInterval by default (one send
+	// per query). Set higher to query more often than you send.
+	MarketIntelligenceMinSendInterval time.Duration `env:"MARKET_INTEL_MIN_SEND_INTERVAL" envDefault:"4h" validate:"gt=0"`
+	MarketIntelligenceMaxMarkets      int           `env:"AI_MARKET_INTELLIGENCE_MAX_MARKETS" envDefault:"50" validate:"gte=1,lte=500"`
+	MarketIntelligenceMaxOutputChars  int           `env:"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS" envDefault:"2000" validate:"gte=200,lte=8000"`
 
 	// --- v9.7 per-surface timeout knobs ------------------------------------
 	// Market-intelligence prompts are heavier than alerts — separate
@@ -932,6 +975,13 @@ type AIAnalysisConfig struct {
 	// unavailable: <reason>" when the AI fails. Set to false to
 	// restore legacy "skip everything on AI failure" behaviour.
 	MarketIntelFallbackOnAIFailure bool `env:"MARKET_INTEL_FALLBACK_ON_AI_FAILURE" envDefault:"true"`
+	// v10.7: when true (default), an AI response that exactly matches
+	// one of the sentinel codes (AI_NO_NOTICEABLE_EDGE,
+	// AI_ALREADY_PRICED, AI_CONTEXT_STALE, AI_INPUT_INSUFFICIENT,
+	// AI_ONLY_RESOLUTION_BLOCKED) is persisted as a skipped_sentinel
+	// row AND the Telegram send is suppressed. The 12h cooldown for
+	// repeated no-edge outputs lives in the news fingerprint table.
+	MarketIntelSuppressOnSentinel bool `env:"MARKET_INTEL_SUPPRESS_ON_SENTINEL" envDefault:"true"`
 	// Annotation listing cap per event for the "Important Polymarket
 	// events" section.
 	MarketIntelAnnotationsPerEvent int `env:"MARKET_INTEL_ANNOTATIONS_PER_EVENT" envDefault:"3" validate:"gte=0,lte=20"`

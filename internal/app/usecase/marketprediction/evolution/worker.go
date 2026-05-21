@@ -45,6 +45,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/aibudget"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/aisentinel"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
@@ -81,6 +82,23 @@ type Config struct {
 	GrafanaBase    string
 	GrafanaDashUID string
 	GrafanaContext time.Duration
+
+	// v10.7 noise-suppression knobs.
+	//
+	// SendResolutionOnlyBlocked: when false (the v10.7 default), the
+	// worker DROPS Telegram for watching→blocked transitions whose
+	// only blocker is an election-day / runoff / primary /
+	// certification catalyst with NO pre-event edge. Set to true to
+	// restore the legacy "send every state change" behaviour.
+	//
+	// SendSentinelResults: when false (the v10.7 default), the
+	// worker DROPS Telegram for runs where AI returned a sentinel
+	// code (AI_NO_NOTICEABLE_EDGE / AI_ALREADY_PRICED /
+	// AI_ONLY_RESOLUTION_BLOCKED / AI_CONTEXT_STALE /
+	// AI_INPUT_INSUFFICIENT). The sentinel result is still persisted
+	// for audit; only Telegram is suppressed.
+	SendResolutionOnlyBlocked bool
+	SendSentinelResults       bool
 
 	// Clock + clock-dependent overrides for tests.
 	Clock func() time.Time
@@ -536,8 +554,13 @@ func (w *Worker) processOne(ctx context.Context, pred repository.MarketPredictio
 		w.observeAISkipped(res.AISkipReason)
 	}
 
-	// 10. Telegram update (gated on meaningful change + cooldown).
-	if !dryRun && w.cfg.SendTelegram && w.tg != nil && w.shouldTelegram(pred, dec) {
+	// 10. Telegram update (gated on meaningful change + cooldown + v10.7 edge gate).
+	probe := repricingSignalProbeFromSignal(topSignal)
+	sendOK, sendReason := w.shouldTelegramWithEdge(pred, dec, cats, probe, "" /* AI body not in v10.5 evolution body */, len(matches))
+	if !sendOK {
+		w.observeTelegram("skipped_" + sendReason)
+	}
+	if !dryRun && w.cfg.SendTelegram && w.tg != nil && sendOK {
 		text := RenderEvolutionUpdate(EvolutionRenderInput{
 			OldState:    dec.PreviousState,
 			NewState:    dec.NewState,
@@ -788,6 +811,30 @@ func (w *Worker) refreshAI(
 		}
 		return false
 	}
+	// v10.7: parse the AI body through the sentinel contract. When
+	// the model returns a sentinel code (AI_NO_NOTICEABLE_EDGE,
+	// AI_ALREADY_PRICED, AI_ONLY_RESOLUTION_BLOCKED, AI_CONTEXT_STALE,
+	// AI_INPUT_INSUFFICIENT) we DO NOT overwrite the prediction with
+	// the sentinel string — the existing thesis stays, and the
+	// surface persists "no_action" for audit. Telegram suppression is
+	// handled at the call site (shouldTelegramWithEdge sees an empty
+	// AI body and falls back to the catalyst rule).
+	parsed := aisentinel.New(false).Parse(res.ThesisUpdate)
+	if parsed.Kind == aisentinel.KindSentinel {
+		if w.budget != nil {
+			w.budget.Charge(aibudget.BucketPredictionEvolve, res.EstimatedCostUSD)
+		}
+		w.observeAI("sentinel_" + strings.ToLower(string(parsed.Code)))
+		w.observeSentinel(string(parsed.Code))
+		if w.log != nil {
+			w.log.Info().
+				Int64("id", pred.ID).
+				Str("event_slug", pred.EventSlug).
+				Str("sentinel_code", string(parsed.Code)).
+				Msg("prediction evolution: AI returned sentinel; thesis preserved, no_action persisted")
+		}
+		return false
+	}
 	if w.budget != nil {
 		w.budget.Charge(aibudget.BucketPredictionEvolve, res.EstimatedCostUSD)
 	}
@@ -846,6 +893,102 @@ func (w *Worker) shouldTelegram(pred repository.MarketPrediction, dec marketpred
 	return true
 }
 
+// shouldTelegramWithEdge is the v10.7 gate: the standard
+// shouldTelegram MUST pass, AND when the transition is
+// watching → blocked the worker MUST have some pre-event edge to
+// surface. Without that edge (the canonical "wait for election day"
+// case the operator flagged as noise) the worker drops the message.
+//
+// "Pre-event edge" today means at least one of:
+//   - any catalyst on the event whose type is NOT a resolution-day
+//     blocker (election_day / runoff / primary / certification);
+//   - a non-empty AI body (the AI returned actual prediction text,
+//     not a sentinel);
+//   - a non-empty repricing signal flow_timing that is not "no_flow"
+//     or "unknown" (paired with a non-quiet repricing_status);
+//   - at least one matched alert (flow confirmation).
+//
+// The operator can flip PREDICTION_SEND_RESOLUTION_ONLY_BLOCKED=true
+// to bypass and restore the legacy behaviour.
+func (w *Worker) shouldTelegramWithEdge(pred repository.MarketPrediction, dec marketprediction.Decision, cats []repository.EventCatalyst, repricingSig *repricingSignalProbe, aiText string, matchedCount int) (bool, string) {
+	if !w.shouldTelegram(pred, dec) {
+		return false, "cooldown_or_unchanged"
+	}
+	if w.cfg.SendResolutionOnlyBlocked {
+		return true, "legacy_send_all"
+	}
+	if dec.PreviousState != "watching" || dec.NewState != "blocked" {
+		return true, "non_resolution_transition"
+	}
+	if hasPreEventCatalyst(cats) {
+		return true, "pre_event_catalyst"
+	}
+	if strings.TrimSpace(aiText) != "" {
+		return true, "ai_body_present"
+	}
+	if matchedCount > 0 {
+		return true, "flow_confirmation"
+	}
+	if repricingSig != nil && repricingSig.hasEdge() {
+		return true, "repricing_edge"
+	}
+	return false, "resolution_only_blocker"
+}
+
+// repricingSignalProbeFromSignal projects the small slice of
+// repricing.Signal the v10.7 gate consumes. nil-safe.
+func repricingSignalProbeFromSignal(sig *repricing.Signal) *repricingSignalProbe {
+	if sig == nil {
+		return nil
+	}
+	return &repricingSignalProbe{
+		flowTiming:      sig.FlowTiming,
+		repricingStatus: sig.RepricingStatus,
+	}
+}
+
+// hasPreEventCatalyst returns true when at least one expected/active
+// catalyst is NOT a resolution-day type. Resolution-day types
+// (election_day / runoff / primary / certification) by themselves
+// only mean "the market resolves at that time" — they don't carry
+// pre-event intelligence, so a Telegram with only that information
+// is the canonical v10.7 noise pattern.
+func hasPreEventCatalyst(cats []repository.EventCatalyst) bool {
+	for _, c := range cats {
+		if c.Status != "active" && c.Status != "expected" {
+			continue
+		}
+		switch c.CatalystType {
+		case "election_day", "runoff", "primary", "certification":
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// repricingSignalProbe wraps the small slice of repricing.Signal the
+// gate needs without taking the full dependency.
+type repricingSignalProbe struct {
+	flowTiming      string
+	repricingStatus string
+}
+
+func (p *repricingSignalProbe) hasEdge() bool {
+	if p == nil {
+		return false
+	}
+	switch p.flowTiming {
+	case "pre_event_positioning", "post_event_chasing":
+		return true
+	}
+	switch p.repricingStatus {
+	case "underreacting", "overreacting", "still_repricing", "reversed":
+		return true
+	}
+	return false
+}
+
 // --- metric helpers -----------------------------------------------------
 
 func (w *Worker) observeRun(status string) {
@@ -895,6 +1038,20 @@ func (w *Worker) observeTelegram(status string) {
 		return
 	}
 	w.metrics.PredictionEvolutionTelegram.WithLabelValues(status).Inc()
+}
+
+// observeSentinel records the v10.7 AI sentinel result counter so
+// dashboards can show how often the AI returned a no-action code.
+func (w *Worker) observeSentinel(code string) {
+	if w.metrics == nil {
+		return
+	}
+	if w.metrics.AISentinelTotal != nil {
+		w.metrics.AISentinelTotal.WithLabelValues("prediction_evolution", code).Inc()
+	}
+	if w.metrics.PredictionSentinelSuppressed != nil {
+		w.metrics.PredictionSentinelSuppressed.WithLabelValues(code).Inc()
+	}
 }
 
 func (w *Worker) observeLatency(d time.Duration) {

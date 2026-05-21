@@ -101,6 +101,7 @@ type Querier interface {
 	GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (PolymarketAlertOutcomeAnalyses, error)
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
 	GetDailyPoliticalIntelReport(ctx context.Context, reportDate pgtype.Date) (PolymarketDailyPoliticalIntelReports, error)
+	GetEventNewsFingerprint(ctx context.Context, eventSlug string) (PolymarketEventNewsFingerprints, error)
 	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
 	GetEventSlugAlias(ctx context.Context, originalSlug string) (string, error)
 	GetLiveMarketState(ctx context.Context, conditionID string) (PolymarketLiveMarketState, error)
@@ -404,6 +405,23 @@ type Querier interface {
 	// population for stability purposes; the worker enforces a minimum
 	// sample count upstream.
 	PriceWindowStats(ctx context.Context, arg PriceWindowStatsParams) (PriceWindowStatsRow, error)
+	// v10.8 alert-concentration queries.
+	//
+	// These are the two seam queries the concentration.Gate calls before
+	// an alert is persisted. Both intentionally scan only the recent
+	// window so they stay cheap; the existing
+	// idx_alerts_created_at + idx_alerts_market_id indexes already cover
+	// them.
+	// Returns the recent alerts on an event, oldest-first. The caller
+	// (concentration.Gate) sorts internally; row order isn't load-bearing.
+	// Only `status='sent'` rows count — pending/failed rows didn't reach
+	// the operator and shouldn't constrain future emits.
+	RecentAlertsForEventConcentration(ctx context.Context, arg RecentAlertsForEventConcentrationParams) ([]RecentAlertsForEventConcentrationRow, error)
+	// Returns the wallet's recent alerts on the event. Same shape; the
+	// wallet column comes from polymarket_alerts.payload (Pascal-case
+	// key `Wallet`). The check is operator-targeted, so unsent rows
+	// don't count here either.
+	RecentAlertsForWalletConcentration(ctx context.Context, arg RecentAlertsForWalletConcentrationParams) ([]RecentAlertsForWalletConcentrationRow, error)
 	// Called by the sanity worker (or future supervised paths) when a market
 	// is resumed: clears deleted_at, flips active, resets backfill to pending
 	// so the BackfillWorker picks up missing history on the next tick.
@@ -444,6 +462,7 @@ type Querier interface {
 	// Per-(condition_id, outcome_token, side) sums + counts for the
 	// event. Drives the strongest-side + directional-imbalance fields.
 	SumEventTradesByConditionAndSide(ctx context.Context, arg SumEventTradesByConditionAndSideParams) ([]SumEventTradesByConditionAndSideRow, error)
+	TouchEventNewsAICalled(ctx context.Context, eventSlug string) error
 	// Bumps last_evolved_at without touching state/confidence — the
 	// worker calls this on EVERY processed prediction so the row drops
 	// to the back of the selection queue even when nothing material
@@ -522,6 +541,9 @@ type Querier interface {
 	// Idempotent insert keyed on (event_slug, catalyst_type, title).
 	// Mutable fields refresh on conflict; created_at stays frozen.
 	UpsertEventCatalyst(ctx context.Context, arg UpsertEventCatalystParams) error
+	// Idempotent. Flips changed_at only when the fingerprint string
+	// actually moved. last_seen_at refreshes every call.
+	UpsertEventNewsFingerprint(ctx context.Context, arg UpsertEventNewsFingerprintParams) error
 	UpsertEventPageFetchState(ctx context.Context, arg UpsertEventPageFetchStateParams) error
 	// v10.5 canonical-slug alias persistence. Idempotent.
 	UpsertEventSlugAlias(ctx context.Context, arg UpsertEventSlugAliasParams) error
@@ -551,6 +573,9 @@ type Querier interface {
 	// Single live score per prediction; insert-or-replace.
 	UpsertPredictionUsefulnessScore(ctx context.Context, arg UpsertPredictionUsefulnessScoreParams) (int64, error)
 	UpsertRepricingSignal(ctx context.Context, arg UpsertRepricingSignalParams) error
+	// Records the most recent semantic-fingerprint + code we shipped for
+	// this event so the cooldown check can suppress repeats.
+	UpsertSemanticFingerprint(ctx context.Context, arg UpsertSemanticFingerprintParams) error
 	// Insert a trader by wallet address; on conflict bump last_seen_at.
 	UpsertTrader(ctx context.Context, walletAddress string) (PolymarketTraders, error)
 }

@@ -136,17 +136,18 @@ func sampleCandidates() []repository.IntelligenceCandidate {
 
 func baseConfig() Config {
 	return Config{
-		Enabled:           true,
-		MaxMarkets:        50,
-		ChatID:            "42",
-		Interval:          time.Hour,
-		AITimeout:         60 * time.Second,
-		RetryOnTimeout:    true,
-		RetryBackoffMin:   10 * time.Millisecond,
-		RetryBackoffMax:   20 * time.Millisecond,
-		FallbackOnFailure: true,
-		AnnotationsPerEvt: 3,
-		VisibleMarkets:    8,
+		Enabled:            true,
+		MaxMarkets:         50,
+		ChatID:             "42",
+		Interval:           time.Hour,
+		AITimeout:          60 * time.Second,
+		RetryOnTimeout:     true,
+		RetryBackoffMin:    10 * time.Millisecond,
+		RetryBackoffMax:    20 * time.Millisecond,
+		FallbackOnFailure:  true,
+		SuppressOnSentinel: true,
+		AnnotationsPerEvt:  3,
+		VisibleMarkets:     8,
 		Links: LinkConfig{
 			PolymarketBase:     "https://polymarket.com",
 			SourceLinksEnabled: true,
@@ -556,6 +557,134 @@ func TestTick_FallbackDisabledRevertsToSkip(t *testing.T) {
 	w.Tick(context.Background())
 	if len(bot.sends) != 0 {
 		t.Errorf("FallbackOnFailure=false must skip on AI failure; got %d sends", len(bot.sends))
+	}
+}
+
+// PART 17 test 13 — AI_NO_NOTICEABLE_EDGE suppresses Telegram.
+func TestTick_SentinelNoEdgeSuppressesTelegram(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := okAnalyzer("AI_NO_NOTICEABLE_EDGE")
+	bot := &fakeBot{}
+	w := New(baseConfig(), cand, st, an, bot, nopLogger())
+	w.Tick(context.Background())
+	if len(bot.sends) != 0 {
+		t.Errorf("AI_NO_NOTICEABLE_EDGE must suppress Telegram; got %d sends", len(bot.sends))
+	}
+	if len(st.inserted) != 1 {
+		t.Errorf("sentinel result must STILL persist for audit; got %d rows", len(st.inserted))
+	}
+	if st.inserted[0].DeliveryStatus != "skipped_sentinel" {
+		t.Errorf("persisted row delivery_status: got %q want skipped_sentinel", st.inserted[0].DeliveryStatus)
+	}
+	if st.inserted[0].ReportText != "" {
+		t.Errorf("sentinel must NOT persist as analysis text; got %q", st.inserted[0].ReportText)
+	}
+}
+
+// PART 17 test 14 — AI_ALREADY_PRICED suppresses Telegram.
+func TestTick_SentinelAlreadyPricedSuppressesTelegram(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := okAnalyzer("AI_ALREADY_PRICED")
+	bot := &fakeBot{}
+	w := New(baseConfig(), cand, st, an, bot, nopLogger())
+	w.Tick(context.Background())
+	if len(bot.sends) != 0 {
+		t.Errorf("AI_ALREADY_PRICED must suppress Telegram; got %d sends", len(bot.sends))
+	}
+}
+
+// PART 17 test 16 — AI_CONTEXT_STALE does not produce a "no fresh news"
+// claim in the Telegram body.
+func TestTick_SentinelContextStaleDoesNotShipNoNewsClaim(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := okAnalyzer("AI_CONTEXT_STALE")
+	bot := &fakeBot{}
+	w := New(baseConfig(), cand, st, an, bot, nopLogger())
+	w.Tick(context.Background())
+	if len(bot.sends) != 0 {
+		t.Errorf("stale context must NOT ship a 'no fresh news' Telegram; got %d sends", len(bot.sends))
+	}
+}
+
+// PART 17 test 17 — no-edge result persisted but not sent.
+func TestTick_SentinelPersistedButNotSent(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := okAnalyzer("AI_NO_NOTICEABLE_EDGE")
+	bot := &fakeBot{}
+	w := New(baseConfig(), cand, st, an, bot, nopLogger())
+	w.Tick(context.Background())
+	if len(st.inserted) != 1 {
+		t.Fatalf("expected persisted sentinel row; got %d", len(st.inserted))
+	}
+	if len(bot.sends) != 0 {
+		t.Errorf("expected zero sends; got %d", len(bot.sends))
+	}
+}
+
+// PART 9: news-fingerprint gating — unchanged annotation set skips AI.
+type fakeFingerprintStore struct {
+	mu      sync.Mutex
+	current repository.NewsFingerprint
+	upserts int
+	gets    int
+}
+
+func (f *fakeFingerprintStore) Get(_ context.Context, _ string) (repository.NewsFingerprint, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gets++
+	if f.current.Fingerprint == "" {
+		return repository.NewsFingerprint{}, false, nil
+	}
+	return f.current, true, nil
+}
+func (f *fakeFingerprintStore) Upsert(_ context.Context, in repository.NewsFingerprint) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upserts++
+	f.current = in
+	return nil
+}
+func (f *fakeFingerprintStore) TouchAICalled(_ context.Context, _ string) error { return nil }
+
+// PART 9 — wired news-fingerprint gating: when annotations unchanged
+// between two cycles, the second cycle MUST NOT invoke the analyzer.
+func TestTick_NewsGateSkipsAIWhenUnchanged(t *testing.T) {
+	cand := &fakeCandidates{rows: sampleCandidates()}
+	st := &fakeStore{}
+	an := &fakeAnalyzer{scripts: []scriptedAIResult{{out: analysis.MarketReportAnalysis{
+		Status: analysis.StatusOK, Model: "t", ReportText: "ok",
+	}}}}
+	bot := &fakeBot{}
+	fp := &fakeFingerprintStore{}
+	// Lister returns the same annotation set every call.
+	lister := &fakeAnnotationLister{byEvent: map[string][]repository.EventAnnotation{
+		"x-event": {{
+			Title:     "stable annotation",
+			Outcome:   "Yes",
+			Timestamp: time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC),
+		}},
+	}}
+	w := New(baseConfig(), cand, st, an, bot, nopLogger())
+	w.SetAnnotationLister(lister)
+	w.SetNewsFingerprintStore(fp)
+
+	// First tick: no prior fingerprint → AI runs, fingerprint stored.
+	w.Tick(context.Background())
+	if an.CallCount() != 1 {
+		t.Errorf("first tick must invoke AI; got %d", an.CallCount())
+	}
+	if fp.upserts == 0 {
+		t.Error("first tick must persist fingerprint")
+	}
+	// Second tick: same annotations → gate must skip AI.
+	w.Tick(context.Background())
+	if an.CallCount() != 1 {
+		t.Errorf("second tick with unchanged news must skip AI; got %d AI calls total", an.CallCount())
 	}
 }
 

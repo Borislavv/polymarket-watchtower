@@ -43,6 +43,7 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	openai "github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/aisentinel"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/alerting"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
@@ -78,6 +79,25 @@ type AnnotationLister interface {
 	ListRecentAnnotations(ctx context.Context, eventSlug string, limit int32) ([]repository.EventAnnotation, error)
 }
 
+// AggregateNewsFingerprintStore is the v10.8 news-gating seam.
+// Production wires `*repository.NewsFingerprintRepository`; tests pass
+// an in-memory implementation. nil disables the gate (legacy
+// behaviour — AI runs every cycle).
+//
+// The gate uses ONE synthetic event_slug ("__marketintel_aggregate__")
+// because the marketintel surface evaluates the whole candidate set,
+// not a single event. The fingerprint hashes every candidate's
+// annotation set.
+type AggregateNewsFingerprintStore interface {
+	Get(ctx context.Context, eventSlug string) (repository.NewsFingerprint, bool, error)
+	Upsert(ctx context.Context, in repository.NewsFingerprint) error
+	TouchAICalled(ctx context.Context, eventSlug string) error
+}
+
+// aggregateFingerprintKey is the synthetic event_slug the marketintel
+// gate keys its row on. Stable across processes / restarts.
+const aggregateFingerprintKey = "__marketintel_aggregate__"
+
 // PromptCharsLoader is the optional hook the worker uses to compute
 // the rendered prompt size before the AI call so it can run a
 // compaction pass + log prompt_chars_before/after. Returns the
@@ -107,6 +127,15 @@ type Config struct {
 	VisibleMarkets    int
 	MaxInputChars     int // 0 disables the compaction pass
 	Links             LinkConfig
+
+	// v10.7 sentinel suppression: when true (default), an AI
+	// response that matches a sentinel code (AI_NO_NOTICEABLE_EDGE /
+	// AI_ALREADY_PRICED / AI_CONTEXT_STALE / AI_INPUT_INSUFFICIENT /
+	// AI_ONLY_RESOLUTION_BLOCKED) PERSISTS a skipped_sentinel row for
+	// audit and SKIPS the Telegram send. Setting to false restores
+	// the legacy behaviour of rendering the sentinel as a fallback
+	// message (not recommended in production).
+	SuppressOnSentinel bool
 
 	Clock func() time.Time
 }
@@ -189,6 +218,7 @@ type Worker struct {
 	rankingHook      AnnotationRankingHook
 	annotationLister AnnotationLister
 	promptLoader     PromptCharsLoader
+	newsFingerprint  AggregateNewsFingerprintStore
 	bot              Bot
 	budget           BudgetGuard
 	metrics          *metrics.Metrics
@@ -227,6 +257,12 @@ func (w *Worker) SetAnnotationLister(a AnnotationLister) { w.annotationLister = 
 // the worker to log prompt_chars_before / _after across the
 // compaction pass. nil leaves both fields at -1 in the structured log.
 func (w *Worker) SetPromptCharsLoader(p PromptCharsLoader) { w.promptLoader = p }
+
+// SetNewsFingerprintStore wires the v10.8 news-gating store. nil
+// disables the gate (legacy behaviour — AI runs every cycle).
+func (w *Worker) SetNewsFingerprintStore(s AggregateNewsFingerprintStore) {
+	w.newsFingerprint = s
+}
 
 // Run blocks until ctx cancels.
 func (w *Worker) Run(ctx context.Context) {
@@ -294,6 +330,30 @@ func (w *Worker) tick(ctx context.Context) {
 		}
 	}
 
+	// v10.8: news-fingerprint gate. When the aggregate annotation
+	// set across candidates is unchanged since the last cycle, skip
+	// the AI call entirely — no fresh news, no edge to find.
+	// Computed AFTER annotations are loaded so the hash reflects what
+	// the AI WOULD have seen. The gate is fail-open: any error here
+	// proceeds with the AI call.
+	newsGateSkip := false
+	newsFingerprint := ""
+	if w.newsFingerprint != nil {
+		newsFingerprint = w.computeAggregateNewsFingerprint(annotations)
+		prev, prevFound, _ := w.newsFingerprint.Get(ctx, aggregateFingerprintKey)
+		if prevFound && prev.Fingerprint == newsFingerprint && newsFingerprint != "" {
+			newsGateSkip = true
+			w.observeNewsUnchanged()
+			w.log.Info().
+				Str("period_key", periodKey).
+				Str("fingerprint", newsFingerprint[:12]).
+				Msg("marketintel: news fingerprint unchanged; skipping AI cycle")
+			w.observeAIPrecallSkipped("news_unchanged")
+		} else if newsFingerprint != "" {
+			w.observeNewsChanged()
+		}
+	}
+
 	// PART 3 — prompt compaction visibility (best-effort).
 	promptCharsBefore, promptCharsAfter := -1, -1
 	if w.promptLoader != nil {
@@ -315,19 +375,36 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 
 	// PART 2 — call AI with retry-once on timeout. Skip entirely if
-	// budget denied OR analyzer is a no-op.
+	// budget denied OR v10.8 news gate said skip OR analyzer is a no-op.
 	var (
 		res         analysis.MarketReportAnalysis
 		callErr     error
 		retried     bool
 		started     = w.cfg.Clock()
-		aiAttempted = !budgetDenied
+		aiAttempted = !budgetDenied && !newsGateSkip
 	)
 	if aiAttempted {
 		res, callErr, retried = w.callAnalyzerWithRetry(ctx, req)
+	} else if newsGateSkip {
+		res = analysis.MarketReportAnalysis{
+			Status: analysis.StatusSkipped, Model: "unknown", LastError: "news_unchanged",
+		}
 	} else {
 		res = analysis.MarketReportAnalysis{
 			Status: analysis.StatusSkipped, Model: "unknown", LastError: "budget_denied",
+		}
+	}
+	// Update fingerprint AFTER the AI call (whether it ran or not).
+	// Same fingerprint will skip the next cycle. New fingerprint
+	// resets the gate.
+	if w.newsFingerprint != nil && newsFingerprint != "" {
+		_ = w.newsFingerprint.Upsert(ctx, repository.NewsFingerprint{
+			EventSlug:       aggregateFingerprintKey,
+			Fingerprint:     newsFingerprint,
+			AnnotationCount: int32(len(annotations)),
+		})
+		if aiAttempted {
+			_ = w.newsFingerprint.TouchAICalled(ctx, aggregateFingerprintKey)
 		}
 	}
 	duration := w.cfg.Clock().Sub(started)
@@ -383,6 +460,52 @@ func (w *Worker) tick(ctx context.Context) {
 	// AI text (if any) is the analytical row content; the rendered
 	// Telegram body is presentation-only and NEVER persisted.
 	analysisText := strings.TrimSpace(res.ReportText)
+
+	// v10.7 sentinel contract: if the AI returned a recognised
+	// sentinel code, persist the row (audit) but DO NOT send
+	// Telegram. The fallback Reason is filled so downstream
+	// dashboards see why a marketintel period went silent.
+	if analysisText != "" {
+		parsed := aisentinel.New(false).Parse(analysisText)
+		if parsed.Kind == aisentinel.KindSentinel {
+			fb = FallbackInfo{
+				Reason:  "sentinel_" + strings.ToLower(string(parsed.Code)),
+				Message: string(parsed.Code),
+			}
+			// Strip the sentinel string from the analytical text —
+			// we DO NOT want the literal code rendered into
+			// marketintel reports if the suppression path doesn't
+			// gate everything.
+			analysisText = ""
+			w.observeSentinel(string(parsed.Code))
+			if w.cfg.SuppressOnSentinel {
+				w.log.Info().
+					Str("period_key", periodKey).
+					Str("sentinel_code", string(parsed.Code)).
+					Msg("marketintel: AI sentinel; persisting no_action row, skipping Telegram")
+				w.observeSkip("ai_sentinel_" + strings.ToLower(string(parsed.Code)))
+				w.observeNoEdgeSuppressed()
+				// Persist the row with delivery_status='skipped' so
+				// the audit table records the AI verdict. Then
+				// return — no Telegram, no chunk split.
+				_, _, _ = w.store.Insert(ctx, repository.NewMarketIntelligenceReport{
+					PeriodKey:        periodKey,
+					PeriodStart:      periodStart,
+					PeriodEnd:        periodEnd,
+					SummaryHash:      bodyHash(periodKey + "|sentinel:" + string(parsed.Code)),
+					ReportText:       "", // sentinel never stored as analysis prose
+					MarketsJSON:      marketsJSONSnapshot(req),
+					Model:            res.Model,
+					PromptTokens:     int32(res.PromptTokens),
+					CompletionTokens: int32(res.CompletionTokens),
+					EstimatedCostUSD: res.EstimatedCostUSD,
+					TelegramChatID:   w.cfg.ChatID,
+					DeliveryStatus:   "skipped_sentinel",
+				})
+				return
+			}
+		}
+	}
 	marketsJSON := marketsJSONSnapshot(req)
 	// summary_hash dedup must change when any of (period, text,
 	// candidate count) changes so a fallback report doesn't collide
@@ -663,6 +786,86 @@ func (w *Worker) observeTimeout() {
 	if w.metrics.AITimeoutTotal != nil {
 		w.metrics.AITimeoutTotal.WithLabelValues(surfaceName).Inc()
 	}
+}
+
+// computeAggregateNewsFingerprint hashes every annotation's stable
+// fields (item_hash, title, outcome, timestamp, price_before/after,
+// source) across the candidate set. Order-independent. Empty input
+// yields "" so the gate disables itself when there are no annotations
+// (a fresh boot would otherwise skip the FIRST cycle).
+func (w *Worker) computeAggregateNewsFingerprint(annots []AnnotationItem) string {
+	if len(annots) == 0 {
+		return ""
+	}
+	rows := make([]string, 0, len(annots))
+	for _, a := range annots {
+		row := fmt.Sprintf("%s|%s|%s|%d|%.4f|%.4f|%s",
+			strings.TrimSpace(a.EventSlug),
+			strings.ToLower(strings.TrimSpace(a.Title)),
+			strings.ToLower(strings.TrimSpace(a.Outcome)),
+			a.Timestamp.UTC().Unix(),
+			derefF(a.PriceBefore), derefF(a.PriceAfter),
+			strings.ToLower(strings.TrimSpace(a.SourceName)),
+		)
+		rows = append(rows, row)
+	}
+	sortStrings(rows)
+	sum := sha256.Sum256([]byte(strings.Join(rows, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+func derefF(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// sortStrings is the tiny local sort used by the fingerprint —
+// keeps imports minimal.
+func sortStrings(xs []string) {
+	for i := 1; i < len(xs); i++ {
+		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
+			xs[j-1], xs[j] = xs[j], xs[j-1]
+		}
+	}
+}
+
+func (w *Worker) observeNewsUnchanged() {
+	if w.metrics == nil || w.metrics.NewsFingerprintUnchanged == nil {
+		return
+	}
+	w.metrics.NewsFingerprintUnchanged.WithLabelValues(surfaceName).Inc()
+}
+
+func (w *Worker) observeNewsChanged() {
+	if w.metrics == nil || w.metrics.NewsFingerprintChanged == nil {
+		return
+	}
+	w.metrics.NewsFingerprintChanged.WithLabelValues(surfaceName).Inc()
+}
+
+func (w *Worker) observeAIPrecallSkipped(reason string) {
+	if w.metrics == nil || w.metrics.AIPrecallSkipped == nil {
+		return
+	}
+	w.metrics.AIPrecallSkipped.WithLabelValues(surfaceName, reason).Inc()
+}
+
+// observeSentinel — v10.7 AI sentinel counter for marketintel.
+func (w *Worker) observeSentinel(code string) {
+	if w.metrics == nil || w.metrics.AISentinelTotal == nil {
+		return
+	}
+	w.metrics.AISentinelTotal.WithLabelValues("market_intelligence", code).Inc()
+}
+
+// observeNoEdgeSuppressed — v10.7 quality-gate counter.
+func (w *Worker) observeNoEdgeSuppressed() {
+	if w.metrics == nil || w.metrics.MarketIntelNoEdgeSuppressed == nil {
+		return
+	}
+	w.metrics.MarketIntelNoEdgeSuppressed.Inc()
 }
 
 func (w *Worker) observeFallbackSent(reason string) {

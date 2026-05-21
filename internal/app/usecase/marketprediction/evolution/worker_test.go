@@ -337,7 +337,18 @@ func TestDecay_NotAppliedWhenBlocked(t *testing.T) {
 	}
 }
 
-func TestTelegram_OnStateChange(t *testing.T) {
+// TestTelegram_OnStateChange — v10.7 update:
+//
+// In v10.5, ANY watching→blocked transition shipped a Telegram. The
+// v10.7 contract specifically suppresses watching→blocked when the
+// only blocker is a resolution-day catalyst (runoff / election_day /
+// primary / certification) — the operator flagged these as noise
+// because they only tell the recipient "wait for election day".
+//
+// This test pins the v10.7 default behaviour: a "runoff"-only
+// catalyst → SUPPRESS. The opt-in flag SendResolutionOnlyBlocked=true
+// restores legacy behaviour.
+func TestTelegram_ResolutionOnlyBlockerSuppressed_v107(t *testing.T) {
 	pred := repository.MarketPrediction{
 		ID: 1, EventSlug: "tx", ConditionID: "0xa", CurrentState: "watching", UpdatedAt: time.Now(),
 		Summary: "Will Paxton win?",
@@ -350,27 +361,85 @@ func TestTelegram_OnStateChange(t *testing.T) {
 	w := New(Config{
 		Enabled: true, BatchSize: 100, Concurrency: 1, Timeout: time.Second, AIEnabled: false,
 		SendTelegram: true, TelegramChatID: "42", TelegramCooldown: time.Hour,
+		// SendResolutionOnlyBlocked stays at the v10.7 default (false).
+	},
+		store, &fakePages{bySlug: map[string]eventpagecontext.Summary{}},
+		cats, &fakeFlow{bySlug: map[string]eventflow.EventFlowSummary{}},
+		&fakeRepricing{}, analysis.NoopPredictionEvolutionGenerator{}, tg, nil, nopLogger())
+	res := w.TickOne(context.Background(), pred, false)
+	if res.TelegramSent {
+		t.Errorf("v10.7: resolution-only blocked transition must NOT Telegram")
+	}
+	if len(tg.sends) != 0 {
+		t.Errorf("expected zero telegram sends, got %d", len(tg.sends))
+	}
+}
+
+// PART 17 test 21 — sibling: when a pre-event catalyst exists (e.g.
+// official_statement / filing_deadline / news_event) the same
+// transition SHIPS Telegram. The "wait for election day" gate is
+// the only suppression rule; real catalysts pass through.
+func TestTelegram_PreEventCatalystSends_v107(t *testing.T) {
+	pred := repository.MarketPrediction{
+		ID: 1, EventSlug: "tx", ConditionID: "0xa", CurrentState: "watching", UpdatedAt: time.Now(),
+		Summary: "Will Paxton win?",
+	}
+	store := &fakePredictionStore{predictions: []repository.MarketPrediction{pred}}
+	cats := &fakeCatalysts{bySlug: map[string][]repository.EventCatalyst{
+		"tx": {
+			{Status: repository.CatalystStatusExpected, Title: "TX runoff", CatalystType: "runoff"},
+			{Status: repository.CatalystStatusExpected, Title: "Trump endorsement", CatalystType: "official_statement"},
+		},
+	}}
+	tg := &fakeTelegram{}
+	w := New(Config{
+		Enabled: true, BatchSize: 100, Concurrency: 1, Timeout: time.Second, AIEnabled: false,
+		SendTelegram: true, TelegramChatID: "42", TelegramCooldown: time.Hour,
 	},
 		store, &fakePages{bySlug: map[string]eventpagecontext.Summary{}},
 		cats, &fakeFlow{bySlug: map[string]eventflow.EventFlowSummary{}},
 		&fakeRepricing{}, analysis.NoopPredictionEvolutionGenerator{}, tg, nil, nopLogger())
 	res := w.TickOne(context.Background(), pred, false)
 	if !res.TelegramSent {
-		t.Errorf("Telegram must send on state change")
+		t.Errorf("pre-event catalyst must not suppress; expected Telegram sent")
 	}
 	if len(tg.sends) != 1 {
 		t.Fatalf("expected 1 telegram send, got %d", len(tg.sends))
 	}
-	// v10.5: title is "PREDICTION UPDATE · blocked" (no market title
-	// in the title line — market goes in its own section below).
+	// v10.5 header + title invariants still hold.
 	if !strings.Contains(tg.sends[0], "<b>PREDICTION UPDATE</b> · blocked") {
-		t.Errorf("unexpected telegram body:\n%s", tg.sends[0])
+		t.Errorf("unexpected body:\n%s", tg.sends[0])
 	}
-	// Universal v10.5 header MUST be present.
 	for _, want := range []string{"<b>Type:</b> prediction_update", "<b>Trigger:</b>", "<b>Strategy:</b>"} {
 		if !strings.Contains(tg.sends[0], want) {
-			t.Errorf("missing v10.5 header field %q:\n%s", want, tg.sends[0])
+			t.Errorf("missing v10.5 header %q:\n%s", want, tg.sends[0])
 		}
+	}
+}
+
+// Operator-opt-in: SendResolutionOnlyBlocked=true restores the
+// legacy v10.5 send-everything behaviour.
+func TestTelegram_LegacySendAll_OptIn(t *testing.T) {
+	pred := repository.MarketPrediction{
+		ID: 1, EventSlug: "tx", ConditionID: "0xa", CurrentState: "watching", UpdatedAt: time.Now(),
+		Summary: "Will Paxton win?",
+	}
+	store := &fakePredictionStore{predictions: []repository.MarketPrediction{pred}}
+	cats := &fakeCatalysts{bySlug: map[string][]repository.EventCatalyst{
+		"tx": {{Status: repository.CatalystStatusExpected, Title: "TX runoff", CatalystType: "runoff"}},
+	}}
+	tg := &fakeTelegram{}
+	w := New(Config{
+		Enabled: true, BatchSize: 100, Concurrency: 1, Timeout: time.Second, AIEnabled: false,
+		SendTelegram: true, TelegramChatID: "42", TelegramCooldown: time.Hour,
+		SendResolutionOnlyBlocked: true,
+	},
+		store, &fakePages{bySlug: map[string]eventpagecontext.Summary{}},
+		cats, &fakeFlow{bySlug: map[string]eventflow.EventFlowSummary{}},
+		&fakeRepricing{}, analysis.NoopPredictionEvolutionGenerator{}, tg, nil, nopLogger())
+	res := w.TickOne(context.Background(), pred, false)
+	if !res.TelegramSent {
+		t.Errorf("opt-in legacy path must send")
 	}
 }
 
@@ -421,6 +490,58 @@ func TestDryRun_NoWrites(t *testing.T) {
 	// State decision still computed.
 	if res.NewState == "" {
 		t.Errorf("dry-run still computes state: %+v", res)
+	}
+}
+
+// PART 17 test 15 — AI_ONLY_RESOLUTION_BLOCKED suppresses
+// prediction update.
+//
+// When the AI generator returns a sentinel-only result, the existing
+// thesis is preserved and no Telegram fires from the AI body path.
+// The catalyst-only-blocker suppression on watching→blocked still
+// applies (covered by TestTelegram_ResolutionOnlyBlockerSuppressed_v107).
+// This test pins that the AI sentinel itself does not overwrite the
+// prediction summary with the literal "AI_ONLY_RESOLUTION_BLOCKED"
+// string.
+func TestAIRefresh_SentinelResultPreservesThesis(t *testing.T) {
+	pred := repository.MarketPrediction{
+		ID: 1, EventSlug: "tx", ConditionID: "0xa", CurrentState: "watching", UpdatedAt: time.Now(),
+		Summary: "Existing thesis — paxton ahead of poll spike.",
+	}
+	store := &fakePredictionStore{predictions: []repository.MarketPrediction{pred}}
+	// Catalyst forces watching→blocked transition (resolution-only,
+	// will suppress Telegram by default).
+	cats := &fakeCatalysts{bySlug: map[string][]repository.EventCatalyst{
+		"tx": {{Status: repository.CatalystStatusExpected, CatalystType: "runoff", Title: "TX runoff"}},
+	}}
+	ai := &fakeAIGen{res: analysis.PredictionEvolutionResponse{
+		Status:       analysis.StatusOK,
+		Model:        "gpt-4.1",
+		ThesisUpdate: "AI_ONLY_RESOLUTION_BLOCKED",
+	}}
+	tg := &fakeTelegram{}
+	w := New(Config{
+		Enabled: true, BatchSize: 100, Concurrency: 1, Timeout: time.Second,
+		AIEnabled: true, AIMinInterval: time.Nanosecond, AIMaxPerRun: 10,
+		SendTelegram: true, TelegramChatID: "42", TelegramCooldown: time.Hour,
+	},
+		store, &fakePages{bySlug: map[string]eventpagecontext.Summary{}},
+		cats, &fakeFlow{bySlug: map[string]eventflow.EventFlowSummary{}},
+		&fakeRepricing{}, ai, tg, nil, nopLogger())
+	res := w.TickOne(context.Background(), pred, false)
+	// The sentinel must NOT overwrite the existing thesis — UpsertPrediction
+	// should NOT have been called with the literal sentinel string.
+	if res.AIRefreshed {
+		t.Errorf("sentinel result must NOT count as refreshed thesis")
+	}
+	for _, u := range store.upserts {
+		if strings.Contains(u.Summary, "AI_ONLY_RESOLUTION_BLOCKED") {
+			t.Errorf("sentinel string leaked into persisted summary: %q", u.Summary)
+		}
+	}
+	// Resolution-only blocker suppression applies → no Telegram.
+	if res.TelegramSent || len(tg.sends) != 0 {
+		t.Errorf("resolution-only + sentinel must NOT Telegram; got %d sends", len(tg.sends))
 	}
 }
 

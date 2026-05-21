@@ -497,8 +497,41 @@ type Metrics struct {
 	// dropped (reason label).
 	PredictionEvolutionAISkipped *prometheus.CounterVec
 	// PredictionEvolutionTelegram: Telegram deliveries per cycle
-	// (sent / failed / suppressed_cooldown).
+	// (sent / failed / suppressed_cooldown / skipped_<reason>).
 	PredictionEvolutionTelegram *prometheus.CounterVec
+
+	// --- v10.7 AI sentinel + gating metrics ---
+	// AISentinelTotal: count of sentinel codes returned across every
+	// surface (prediction_evolution / market_intel / prediction_creation
+	// / daily_intel). Labels: surface, code.
+	AISentinelTotal *prometheus.CounterVec
+	// PredictionSentinelSuppressed: per-code count of prediction
+	// updates suppressed because the AI returned a sentinel.
+	PredictionSentinelSuppressed *prometheus.CounterVec
+	// AIPrecallSkipped: pre-call gating decisions (news_unchanged /
+	// semantic_cooldown / stale_context / no_price_move).
+	AIPrecallSkipped *prometheus.CounterVec
+	// DedupeSuppressed: duplicate output suppressed (by surface +
+	// reason: semantic_cooldown / period_dedupe / news_unchanged).
+	DedupeSuppressed *prometheus.CounterVec
+	// MarketIntelNoEdgeSuppressed: marketintel reports persisted but
+	// NOT sent because the AI/quality gate determined "no edge".
+	MarketIntelNoEdgeSuppressed prometheus.Counter
+	// AIWorkflowAntiPattern: increments when the orchestrator
+	// detects a 5+1-style anti-pattern (per-item AI call + aggregator).
+	AIWorkflowAntiPattern *prometheus.CounterVec
+	// NewsFingerprintChanged: per-surface count of fingerprint flips
+	// (signals fresh news arrived for an event).
+	NewsFingerprintChanged *prometheus.CounterVec
+	// NewsFingerprintUnchanged: per-surface count of fingerprint
+	// matches (no fresh news; gating suppresses AI by default).
+	NewsFingerprintUnchanged *prometheus.CounterVec
+
+	// --- v10.8 concentration / escalation gate ---
+	// ConcentrationSuppressed: alerts dropped by the per-event /
+	// per-wallet gate, labelled by reason
+	// (wallet_escalation_failed / event_concentration_cap).
+	ConcentrationSuppressed *prometheus.CounterVec
 	// PredictionEvolutionLatency: end-to-end Tick duration.
 	PredictionEvolutionLatency prometheus.Histogram
 	// PredictionEvolutionDecay: decay applications, labelled by
@@ -1219,8 +1252,48 @@ func New() *Metrics {
 	}, []string{"reason"})
 	m.PredictionEvolutionTelegram = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "telegram_total",
-		Help: "Telegram deliveries per cycle (sent / failed / suppressed_cooldown).",
+		Help: "Telegram deliveries per cycle (sent / failed / suppressed_cooldown / skipped_<reason>).",
 	}, []string{"status"})
+
+	// v10.7 AI sentinel + gating metrics.
+	m.AISentinelTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "sentinel_total",
+		Help: "AI returned a sentinel code instead of analytical output, by surface + code.",
+	}, []string{"surface", "code"})
+	m.PredictionSentinelSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "prediction", Name: "sentinel_suppressed_total",
+		Help: "Prediction updates suppressed because the AI returned a sentinel code.",
+	}, []string{"code"})
+	m.AIPrecallSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "precall_skipped_total",
+		Help: "AI calls skipped before the HTTP roundtrip, by surface + reason (news_unchanged / semantic_cooldown / stale_context / no_price_move / no_secondary_trigger).",
+	}, []string{"surface", "reason"})
+	m.DedupeSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "dedupe", Name: "suppressed_total",
+		Help: "Duplicate outputs suppressed, by surface + reason.",
+	}, []string{"surface", "reason"})
+	m.MarketIntelNoEdgeSuppressed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "marketintel", Name: "no_edge_suppressed_total",
+		Help: "Marketintel reports persisted but NOT sent because the AI/quality gate determined no edge.",
+	})
+	m.AIWorkflowAntiPattern = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "ai", Name: "workflow_anti_pattern_total",
+		Help: "Detected 5+1-style anti-patterns (per-item AI + aggregator). Should stay zero.",
+	}, []string{"workflow", "reason"})
+	m.NewsFingerprintChanged = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_fingerprint", Name: "changed_total",
+		Help: "Per-surface count of news fingerprint flips (fresh news observed).",
+	}, []string{"surface"})
+	m.NewsFingerprintUnchanged = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_fingerprint", Name: "unchanged_total",
+		Help: "Per-surface count of fingerprint matches (no fresh news; AI gating suppresses).",
+	}, []string{"surface"})
+
+	// v10.8 concentration gate.
+	m.ConcentrationSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "concentration", Name: "suppressed_total",
+		Help: "Alerts dropped by the per-event / per-wallet concentration gate, by reason (wallet_escalation_failed / event_concentration_cap).",
+	}, []string{"reason"})
 	m.PredictionEvolutionLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "watchtower", Subsystem: "prediction_evolution", Name: "latency_seconds",
 		Help:    "End-to-end Tick duration.",
@@ -1300,6 +1373,10 @@ func New() *Metrics {
 		m.PredictionEvolutionProcessed, m.PredictionEvolutionStateChanges,
 		m.PredictionEvolutionAIRequests, m.PredictionEvolutionAISkipped,
 		m.PredictionEvolutionTelegram, m.PredictionEvolutionLatency,
+		m.AISentinelTotal, m.PredictionSentinelSuppressed, m.AIPrecallSkipped,
+		m.DedupeSuppressed, m.MarketIntelNoEdgeSuppressed, m.AIWorkflowAntiPattern,
+		m.NewsFingerprintChanged, m.NewsFingerprintUnchanged,
+		m.ConcentrationSuppressed,
 		m.PredictionEvolutionDecay,
 	)
 	return m

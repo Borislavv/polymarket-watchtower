@@ -1362,6 +1362,101 @@
         "legendFormat": "{{reason}} · {{status}}",
         "refId": "A"
       }]
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Alert quality + AI governance (v10.7 / v10.8)",
+      "gridPos": {"x": 0, "y": 319, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 501,
+      "type": "timeseries",
+      "title": "Concentration suppressed (rate / 1h)",
+      "description": "v10.8 per-event + per-wallet gate. wallet_escalation_failed = same wallet alerts in cooldown without 2x notional. event_concentration_cap = same event > N alerts/24h without 2x prev max.",
+      "gridPos": {"x": 0, "y": 320, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (reason) (rate(watchtower_concentration_suppressed_total[1h]))",
+        "legendFormat": "{{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 502,
+      "type": "timeseries",
+      "title": "AI sentinels by surface + code (rate / 1h)",
+      "description": "v10.7 sentinel contract.",
+      "gridPos": {"x": 12, "y": 320, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (surface, code) (rate(watchtower_ai_sentinel_total[1h]))",
+        "legendFormat": "{{surface}} · {{code}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 503,
+      "type": "timeseries",
+      "title": "News fingerprint changes (rate / 1h)",
+      "description": "v10.8 news gating. changed = fresh annotations, AI allowed. unchanged = AI gated off.",
+      "gridPos": {"x": 0, "y": 327, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum by (surface) (rate(watchtower_news_fingerprint_changed_total[1h]))", "legendFormat": "changed · {{surface}}", "refId": "A"},
+        {"expr": "sum by (surface) (rate(watchtower_news_fingerprint_unchanged_total[1h]))", "legendFormat": "unchanged · {{surface}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 504,
+      "type": "timeseries",
+      "title": "AI precall skipped (rate / 1h)",
+      "description": "v10.8 per-surface skip counter. Reasons: news_unchanged | semantic_cooldown | budget_denied | no_secondary_trigger.",
+      "gridPos": {"x": 12, "y": 327, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (surface, reason) (rate(watchtower_ai_precall_skipped_total[1h]))",
+        "legendFormat": "{{surface}} · {{reason}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 505,
+      "type": "stat",
+      "title": "Prediction sentinel suppressions (24h)",
+      "description": "v10.7 prediction-evolution suppressions where the AI returned a sentinel and the existing thesis was preserved without shipping a prediction_update Telegram.",
+      "gridPos": {"x": 0, "y": 334, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_prediction_sentinel_suppressed_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 506,
+      "type": "stat",
+      "title": "Marketintel no-edge suppressed (24h)",
+      "description": "v10.7 marketintel quality gate. Reports persisted with delivery_status='skipped_sentinel' instead of Telegram.",
+      "gridPos": {"x": 8, "y": 334, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_marketintel_no_edge_suppressed_total[24h]))",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 507,
+      "type": "stat",
+      "title": "Concentration suppressions (24h)",
+      "description": "v10.8 concentration gate.",
+      "gridPos": {"x": 16, "y": 334, "w": 8, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum(increase(watchtower_concentration_suppressed_total[24h]))",
+        "refId": "A"
+      }]
     }
   ]
 }

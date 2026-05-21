@@ -208,6 +208,22 @@ type PolymarketEventCatalysts struct {
 	UpdatedAt            pgtype.Timestamptz
 }
 
+type PolymarketEventNewsFingerprints struct {
+	EventSlug               string
+	NewsFingerprint         string
+	AnnotationCount         int32
+	LatestAnnotationAt      pgtype.Timestamptz
+	FirstSeenAt             pgtype.Timestamptz
+	LastSeenAt              pgtype.Timestamptz
+	ChangedAt               pgtype.Timestamptz
+	LastSeenUnchangedAt     pgtype.Timestamptz
+	LastAiCalledAt          pgtype.Timestamptz
+	LastSemanticFingerprint *string
+	LastSemanticAt          pgtype.Timestamptz
+	LastSemanticCode        *string
+	RepeatedCount           int32
+}
+
 type PolymarketEventPageFetches struct {
 	EventSlug       string
 	LastFetchedAt   pgtype.Timestamptz

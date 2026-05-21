@@ -33,6 +33,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/concentration"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
@@ -126,6 +127,57 @@ type MarketResolver interface {
 // detector treats that as "no trader fk" rather than an error.
 type TraderResolver interface {
 	GetByWallet(ctx context.Context, wallet string) (repository.Trader, error)
+}
+
+// ConcentrationGate is the v10.8 per-event + per-wallet concentration
+// gate. Satisfied by *concentration.Gate. nil disables.
+type ConcentrationGate interface {
+	Evaluate(ctx context.Context, in concentration.Candidate, history concentration.AlertHistory) (concentration.Decision, error)
+}
+
+// ConcentrationHistory is the seam the gate uses to look up recent
+// alerts. Satisfied by *repository.AlertRepository — its
+// ConcentrationAlert type maps 1:1 to concentration.Alert.
+type ConcentrationHistory interface {
+	RecentAlertsForEvent(ctx context.Context, eventSlug string, since time.Time) ([]repository.ConcentrationAlert, error)
+	RecentAlertsForWallet(ctx context.Context, wallet, eventSlug string, since time.Time) ([]repository.ConcentrationAlert, error)
+}
+
+// concentrationHistoryAdapter projects repository.ConcentrationAlert
+// rows onto concentration.Alert so the pure gate package never
+// imports the repository package.
+type concentrationHistoryAdapter struct {
+	hist ConcentrationHistory
+}
+
+func (a concentrationHistoryAdapter) RecentAlertsForEvent(ctx context.Context, eventSlug string, since time.Time) ([]concentration.Alert, error) {
+	rows, err := a.hist.RecentAlertsForEvent(ctx, eventSlug, since)
+	if err != nil {
+		return nil, err
+	}
+	return toConcentrationAlerts(rows), nil
+}
+
+func (a concentrationHistoryAdapter) RecentAlertsForWallet(ctx context.Context, wallet, eventSlug string, since time.Time) ([]concentration.Alert, error) {
+	rows, err := a.hist.RecentAlertsForWallet(ctx, wallet, eventSlug, since)
+	if err != nil {
+		return nil, err
+	}
+	return toConcentrationAlerts(rows), nil
+}
+
+func toConcentrationAlerts(rows []repository.ConcentrationAlert) []concentration.Alert {
+	out := make([]concentration.Alert, len(rows))
+	for i, r := range rows {
+		out[i] = concentration.Alert{
+			CreatedAt:   r.CreatedAt,
+			EventSlug:   r.EventSlug,
+			Wallet:      r.Wallet,
+			NotionalUSD: r.NotionalUSD,
+			Severity:    r.Severity,
+		}
+	}
+	return out
 }
 
 // Config wires the detector. Defaults fill in for zero-valued fields.
@@ -227,6 +279,14 @@ type Config struct {
 	// before being handed to the realtime Emitter. Conflicts suppress the
 	// emit entirely so log/webhook stay in sync with the DB queue.
 	Alerts AlertCreator
+	// Concentration is the v10.8 per-event + per-wallet concentration
+	// gate. nil disables the gate entirely (legacy behaviour). When
+	// set, the gate runs BEFORE TryCreatePending so a suppressed
+	// alert leaves no DB row, no dedup key, no audit trail.
+	Concentration ConcentrationGate
+	// ConcentrationHistory is the seam to the recent-alerts window
+	// used by the gate. nil also disables the gate.
+	ConcentrationHistory ConcentrationHistory
 	// Markets resolves condition_id → DB market id for the alerts row.
 	Markets MarketResolver
 	// Traders resolves wallet → DB trader id for the alerts row.
@@ -786,6 +846,37 @@ func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedu
 	if l.cfg.Alerts == nil {
 		return true
 	}
+	// v10.8 concentration gate. Runs BEFORE TryCreatePending so a
+	// suppressed alert leaves no DB row, no dedup key, no audit
+	// trail. The gate is fail-open: any error is logged and the
+	// alert proceeds.
+	if l.cfg.Concentration != nil && l.cfg.ConcentrationHistory != nil {
+		notional := t.NotionalUSD()
+		dec, err := l.cfg.Concentration.Evaluate(ctx,
+			concentration.Candidate{
+				EventSlug:   m.EventSlug,
+				Wallet:      t.Taker,
+				NotionalUSD: notional,
+				Severity:    string(f.Severity),
+				Now:         t.Timestamp,
+			},
+			concentrationHistoryAdapter{hist: l.cfg.ConcentrationHistory},
+		)
+		if err == nil && !dec.Allow {
+			l.log.Info().
+				Str("event_slug", m.EventSlug).
+				Str("wallet", t.Taker).
+				Str("severity", string(f.Severity)).
+				Float64("notional_usd", notional).
+				Float64("required", dec.RequiredNotional).
+				Int("priors", dec.PriorAlertsInWindow).
+				Float64("max_prev", dec.MaxPriorNotional).
+				Str("reason", dec.Reason).
+				Msg("detect: concentration gate suppressed alert")
+			l.observeConcentrationSuppressed(dec.Reason)
+			return false
+		}
+	}
 	payload, err := json.Marshal(f)
 	if err != nil {
 		l.log.Err(err).Msg("detect: marshal alert payload failed")
@@ -807,6 +898,15 @@ func (l *Loop) persistAlert(ctx context.Context, kind repository.AlertKind, dedu
 		return false
 	}
 	return created
+}
+
+// observeConcentrationSuppressed bumps the v10.8 suppression metric.
+// Reason label values: wallet_escalation_failed | event_concentration_cap.
+func (l *Loop) observeConcentrationSuppressed(reason string) {
+	if l.metrics == nil || l.metrics.ConcentrationSuppressed == nil {
+		return
+	}
+	l.metrics.ConcentrationSuppressed.WithLabelValues(reason).Inc()
 }
 
 // evaluateAccumulationWindow runs the same-trader accumulation detector

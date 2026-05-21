@@ -431,3 +431,82 @@ func alertFromSQLC(row sqlc.PolymarketAlerts) Alert {
 		LastReactionAt:      tsTime(row.LastReactionAt),
 	}
 }
+
+// --- v10.8 concentration / escalation gate -------------------------------
+
+// ConcentrationAlert is the slim projection the v10.8 concentration
+// gate consumes. Mirrors internal/app/usecase/concentration.Alert
+// shape so the gate can be wired without a repository import.
+type ConcentrationAlert struct {
+	CreatedAt   time.Time
+	EventSlug   string
+	Wallet      string
+	NotionalUSD float64
+	Severity    string
+}
+
+// RecentAlertsForEvent returns sent alerts on `eventSlug` newer than
+// `since`. The query is index-backed by idx_alerts_created_at and
+// scans only the recent window (default 24h), so it stays cheap even
+// under load.
+func (r *AlertRepository) RecentAlertsForEvent(ctx context.Context, eventSlug string, since time.Time) ([]ConcentrationAlert, error) {
+	slug := eventSlug
+	rows, err := r.q.RecentAlertsForEventConcentration(ctx, sqlc.RecentAlertsForEventConcentrationParams{
+		EventSlug: &slug,
+		Since:     tsFromTime(since),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConcentrationAlert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ConcentrationAlert{
+			CreatedAt:   row.CreatedAt.Time,
+			EventSlug:   derefStr(row.EventSlug),
+			Wallet:      jsonbStr(row.Wallet),
+			NotionalUSD: row.NotionalUsd,
+			Severity:    row.Severity,
+		})
+	}
+	return out, nil
+}
+
+// RecentAlertsForWallet returns sent alerts by `wallet` on
+// `eventSlug` newer than `since`.
+func (r *AlertRepository) RecentAlertsForWallet(ctx context.Context, wallet, eventSlug string, since time.Time) ([]ConcentrationAlert, error) {
+	slug := eventSlug
+	rows, err := r.q.RecentAlertsForWalletConcentration(ctx, sqlc.RecentAlertsForWalletConcentrationParams{
+		EventSlug: &slug,
+		Wallet:    []byte(wallet),
+		Since:     tsFromTime(since),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConcentrationAlert, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ConcentrationAlert{
+			CreatedAt:   row.CreatedAt.Time,
+			EventSlug:   derefStr(row.EventSlug),
+			Wallet:      jsonbStr(row.Wallet),
+			NotionalUSD: row.NotionalUsd,
+			Severity:    row.Severity,
+		})
+	}
+	return out, nil
+}
+
+// jsonbStr extracts a string from a sqlc-typed `interface{}` produced
+// by a `payload->'Trade'->>'Wallet'` projection. nil → "".
+func jsonbStr(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return ""
+}

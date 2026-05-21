@@ -27,6 +27,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/concentration"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/dailypoliticalintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detection"
@@ -518,6 +519,19 @@ func New() (*App, error) {
 		detectCfg.Markets = marketsRepo
 		detectCfg.Traders = tradersRepo
 		detectCfg.TraderBaseliner = traderBaseline
+		// v10.8 concentration gate. Default-on; the operator can
+		// disable by setting EVENT_ALERT_CONCENTRATION_LIMIT=0.
+		if cfg.Anomaly.EventAlertConcentrationLimit > 0 {
+			detectCfg.Concentration = concentration.New(concentration.Config{
+				EventConcentrationLimit:          cfg.Anomaly.EventAlertConcentrationLimit,
+				EventConcentrationWindow:         cfg.Anomaly.EventAlertConcentrationWindow,
+				RepeatedEventThresholdMultiplier: cfg.Anomaly.RepeatedEventThresholdMultiplier,
+				WalletAlertCooldown:              cfg.Anomaly.WalletAlertCooldown,
+				AccumulationEscalationFactor:     cfg.Anomaly.AccumulationEscalationFactor,
+				SeverityFloor:                    "info",
+			})
+			detectCfg.ConcentrationHistory = alertsRepo
+		}
 		detectCfg.MinTraderHistoryTrades = cfg.Anomaly.MinTraderHistoryTrades
 		if mmFilter != nil {
 			detectCfg.MMFilter = mmFilter
@@ -861,19 +875,20 @@ func New() (*App, error) {
 		}
 		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
 		marketIntelWorker = marketintel.New(marketintel.Config{
-			Enabled:           true,
-			Interval:          cfg.AIAnalysis.MarketIntelligenceInterval,
-			MaxMarkets:        cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
-			MaxOutputChars:    cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
-			ChatID:            cfg.Alerting.TelegramChatID,
-			AITimeout:         cfg.AIAnalysis.MarketIntelAITimeout,
-			RetryOnTimeout:    cfg.AIAnalysis.MarketIntelRetryOnTimeout,
-			RetryBackoffMin:   cfg.AIAnalysis.MarketIntelRetryBackoffMin,
-			RetryBackoffMax:   cfg.AIAnalysis.MarketIntelRetryBackoffMax,
-			FallbackOnFailure: cfg.AIAnalysis.MarketIntelFallbackOnAIFailure,
-			AnnotationsPerEvt: cfg.AIAnalysis.MarketIntelAnnotationsPerEvent,
-			VisibleMarkets:    cfg.AIAnalysis.MarketIntelVisibleMarkets,
-			MaxInputChars:     cfg.AIPreflight.MaxInputCharsMarketIntel,
+			Enabled:            true,
+			Interval:           cfg.AIAnalysis.MarketIntelligenceInterval,
+			MaxMarkets:         cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
+			MaxOutputChars:     cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
+			ChatID:             cfg.Alerting.TelegramChatID,
+			AITimeout:          cfg.AIAnalysis.MarketIntelAITimeout,
+			RetryOnTimeout:     cfg.AIAnalysis.MarketIntelRetryOnTimeout,
+			RetryBackoffMin:    cfg.AIAnalysis.MarketIntelRetryBackoffMin,
+			RetryBackoffMax:    cfg.AIAnalysis.MarketIntelRetryBackoffMax,
+			FallbackOnFailure:  cfg.AIAnalysis.MarketIntelFallbackOnAIFailure,
+			SuppressOnSentinel: cfg.AIAnalysis.MarketIntelSuppressOnSentinel,
+			AnnotationsPerEvt:  cfg.AIAnalysis.MarketIntelAnnotationsPerEvent,
+			VisibleMarkets:     cfg.AIAnalysis.MarketIntelVisibleMarkets,
+			MaxInputChars:      cfg.AIPreflight.MaxInputCharsMarketIntel,
 			Links: marketintel.LinkConfig{
 				PolymarketBase:     cfg.Polymarket.PublicBaseURL,
 				GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
@@ -889,6 +904,10 @@ func New() (*App, error) {
 		// Polymarket events" section. Best-effort — failure NEVER
 		// blocks the report.
 		marketIntelWorker.SetAnnotationLister(repository.NewEventPageRepository(pgPool))
+		// v10.8 news-fingerprint gating. When the aggregate
+		// annotation set across candidates is unchanged since the
+		// last cycle, marketintel skips the AI call entirely.
+		marketIntelWorker.SetNewsFingerprintStore(repository.NewNewsFingerprintRepository(pgPool))
 		if marketIntelOpenAIClient != nil {
 			marketIntelWorker.SetPromptCharsLoader(marketIntelOpenAIClient)
 		}
@@ -1112,6 +1131,12 @@ func New() (*App, error) {
 			GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
 			GrafanaDashUID:     cfg.Alerting.GrafanaDashUID,
 			GrafanaContext:     cfg.Alerting.GrafanaContext,
+			// v10.7 noise suppression — defaults to FALSE so the
+			// worker drops watching→blocked Telegrams whose only
+			// blocker is a resolution-day catalyst (the canonical
+			// noise pattern in prod). Operator opt-in via env.
+			SendResolutionOnlyBlocked: cfg.Prediction.SendResolutionOnlyBlocked,
+			SendSentinelResults:       cfg.Prediction.SendSentinelResults,
 		}, predsRepo, eventPageProvider, catalystRepoForEvolver, flowRepo, repricingComp, aiGen, tgAdapter, met, logger)
 		logger.Info().
 			Bool("enabled", cfg.Prediction.EvolutionEnabled).
