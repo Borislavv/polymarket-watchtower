@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -658,14 +660,18 @@ type PredictionConfig struct {
 	ConfirmAlertScoreFloor  float64       `env:"MARKET_PREDICTION_CONFIRM_ALERT_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
 	ContradictFlowImbalance float64       `env:"MARKET_PREDICTION_CONTRADICT_FLOW_IMBALANCE" envDefault:"0.65" validate:"gte=0,lte=1"`
 
-	// v9.9 Evolution worker (heartbeat).
-	EvolutionEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_ENABLED" envDefault:"true"`
+	// v11.0: prediction system DEFAULT-OFF. The whole "predictions"
+	// product has been replaced by the Hourly News Intelligence
+	// surface (internal/app/usecase/newsintel). Operators can set
+	// these knobs back to true to revive the legacy path, but no
+	// worker starts on a fresh boot.
+	EvolutionEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_ENABLED" envDefault:"false"`
 	EvolutionInterval    time.Duration `env:"MARKET_PREDICTION_EVOLUTION_INTERVAL" envDefault:"15m" validate:"gt=0"`
 	EvolutionBatchSize   int           `env:"MARKET_PREDICTION_EVOLUTION_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
 	EvolutionConcurrency int           `env:"MARKET_PREDICTION_EVOLUTION_CONCURRENCY" envDefault:"4" validate:"gte=1,lte=32"`
 	EvolutionTimeout     time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TIMEOUT" envDefault:"60s" validate:"gt=0"`
 
-	EvolutionAIEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_AI_ENABLED" envDefault:"true"`
+	EvolutionAIEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_AI_ENABLED" envDefault:"false"`
 	EvolutionAIMinInterval time.Duration `env:"MARKET_PREDICTION_EVOLUTION_AI_MIN_INTERVAL" envDefault:"6h" validate:"gt=0"`
 	EvolutionAIMaxPerRun   int           `env:"MARKET_PREDICTION_EVOLUTION_AI_MAX_PER_RUN" envDefault:"10" validate:"gte=0,lte=200"`
 
@@ -677,7 +683,7 @@ type PredictionConfig struct {
 	EvolutionMajorPriceMove     float64       `env:"MARKET_PREDICTION_EVOLUTION_MAJOR_PRICE_MOVE" envDefault:"0.08" validate:"gte=0,lte=1"`
 	EvolutionCatalystNearWindow time.Duration `env:"MARKET_PREDICTION_EVOLUTION_CATALYST_NEAR_WINDOW" envDefault:"12h" validate:"gt=0"`
 
-	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"true"`
+	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"false"`
 	EvolutionTelegramCooldown time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
 
 	// --- v10.7 noise-suppression knobs ---
@@ -699,14 +705,14 @@ type PredictionConfig struct {
 	// has nothing to evolve. Defaults are moderate / safe / non-
 	// spammy — the deterministic shortlist + AI ranking step keeps
 	// the AI bill bounded under the AI budget governor.
-	CreationEnabled      bool          `env:"MARKET_PREDICTION_CREATION_ENABLED" envDefault:"true"`
+	CreationEnabled      bool          `env:"MARKET_PREDICTION_CREATION_ENABLED" envDefault:"false"`
 	CreationInterval     time.Duration `env:"MARKET_PREDICTION_CREATION_INTERVAL" envDefault:"30m" validate:"gt=0"`
 	CreationBatchSize    int           `env:"MARKET_PREDICTION_CREATION_BATCH_SIZE" envDefault:"150" validate:"gte=10,lte=1000"`
 	CreationMaxSelected  int           `env:"MARKET_PREDICTION_CREATION_MAX_SELECTED" envDefault:"10" validate:"gte=1,lte=50"`
 	CreationMinScore     float64       `env:"MARKET_PREDICTION_CREATION_MIN_SCORE" envDefault:"0.55" validate:"gte=0,lte=1"`
 	CreationMaxPerDay    int           `env:"MARKET_PREDICTION_CREATION_MAX_PER_DAY" envDefault:"40" validate:"gte=1,lte=500"`
 	CreationDedupeWindow time.Duration `env:"MARKET_PREDICTION_CREATION_DEDUPE_WINDOW" envDefault:"24h" validate:"gt=0"`
-	CreationAIEnabled    bool          `env:"MARKET_PREDICTION_CREATION_AI_ENABLED" envDefault:"true"`
+	CreationAIEnabled    bool          `env:"MARKET_PREDICTION_CREATION_AI_ENABLED" envDefault:"false"`
 	CreationAIModel      string        `env:"MARKET_PREDICTION_CREATION_AI_MODEL" envDefault:"gpt-4.1"`
 	CreationAITimeout    time.Duration `env:"MARKET_PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
 	CreationConcurrency  int           `env:"MARKET_PREDICTION_CREATION_CONCURRENCY" envDefault:"2" validate:"gte=1,lte=16"`
@@ -741,7 +747,7 @@ type PredictionConfig struct {
 	UsefulnessHighPriority float64 `env:"PREDICTION_USEFULNESS_HIGH_PRIORITY_SCORE" envDefault:"0.80" validate:"gte=0,lte=1"`
 
 	// --- v10.2 feedback worker (PART 4) ---------------------------
-	FeedbackEnabled     bool          `env:"PREDICTION_FEEDBACK_ENABLED" envDefault:"true"`
+	FeedbackEnabled     bool          `env:"PREDICTION_FEEDBACK_ENABLED" envDefault:"false"`
 	FeedbackInterval    time.Duration `env:"PREDICTION_FEEDBACK_INTERVAL" envDefault:"15m" validate:"gt=0"`
 	FeedbackHorizonsCSV string        `env:"PREDICTION_FEEDBACK_HORIZONS" envDefault:"1h,6h,24h"`
 	FeedbackBatchSize   int           `env:"PREDICTION_FEEDBACK_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
@@ -802,12 +808,12 @@ type AIBudgetConfig struct {
 // geopolitical intelligence report. Failure NEVER blocks alerts;
 // the worker is fully decoupled from the alert pipeline.
 type DailyPoliticalIntelConfig struct {
-	Enabled              bool          `env:"DAILY_POLITICAL_INTEL_ENABLED" envDefault:"true"`
+	Enabled              bool          `env:"DAILY_POLITICAL_INTEL_ENABLED" envDefault:"false"`
 	TimeOfDay            string        `env:"DAILY_POLITICAL_INTEL_TIME" envDefault:"08:00"`
 	Timezone             string        `env:"DAILY_POLITICAL_INTEL_TIMEZONE" envDefault:"Europe/Tallinn"`
 	MarketLimit          int           `env:"DAILY_POLITICAL_INTEL_MARKET_LIMIT" envDefault:"100" validate:"gte=10,lte=500"`
 	AnnotationsPerMarket int           `env:"DAILY_POLITICAL_INTEL_ANNOTATIONS_PER_MARKET" envDefault:"4" validate:"gte=1,lte=20"`
-	AIEnabled            bool          `env:"DAILY_POLITICAL_INTEL_AI_ENABLED" envDefault:"true"`
+	AIEnabled            bool          `env:"DAILY_POLITICAL_INTEL_AI_ENABLED" envDefault:"false"`
 	AITimeout            time.Duration `env:"DAILY_POLITICAL_INTEL_AI_TIMEOUT" envDefault:"90s" validate:"gt=0"`
 	PromptMaxChars       int           `env:"DAILY_POLITICAL_INTEL_PROMPT_MAX_CHARS" envDefault:"30000" validate:"gte=2000,lte=80000"`
 	SendTelegram         bool          `env:"DAILY_POLITICAL_INTEL_SEND_TELEGRAM" envDefault:"true"`
@@ -942,12 +948,21 @@ type AIAnalysisConfig struct {
 	// touching code. Defaults keep legacy ON for backward compat;
 	// production deploys should set all three to false when the
 	// unified engine is wired.
-	MarketIntelLegacyEnabled     bool          `env:"MARKET_INTEL_LEGACY_ENABLED" envDefault:"true"`
-	DailyIntelLegacyEnabled      bool          `env:"DAILY_INTEL_LEGACY_ENABLED" envDefault:"true"`
-	PredictionAILegacyEnabled    bool          `env:"PREDICTION_AI_LEGACY_ENABLED" envDefault:"true"`
+	MarketIntelLegacyEnabled     bool          `env:"MARKET_INTEL_LEGACY_ENABLED" envDefault:"false"`
+	DailyIntelLegacyEnabled      bool          `env:"DAILY_INTEL_LEGACY_ENABLED" envDefault:"false"`
+	PredictionAILegacyEnabled    bool          `env:"PREDICTION_AI_LEGACY_ENABLED" envDefault:"false"`
+	// v11.0: annotation ranking AI is gated independently. It used
+	// to feed the marketintel surface; with that surface dead, the
+	// ranker has no consumer and stays off.
+	AnnotationRankingAIEnabled bool `env:"ANNOTATION_RANKING_AI_ENABLED" envDefault:"false"`
 	UnifiedIntelEnabled          bool          `env:"UNIFIED_INTEL_ENABLED" envDefault:"false"`
 	UnifiedIntelMinQueryInterval time.Duration `env:"UNIFIED_INTEL_MIN_QUERY_INTERVAL" envDefault:"4h" validate:"gt=0"`
 	UnifiedIntelMinSendInterval  time.Duration `env:"UNIFIED_INTEL_MIN_SEND_INTERVAL" envDefault:"4h" validate:"gt=0"`
+	// v11.0: market intel surface killed — default off. Canonical env
+	// is AI_MARKET_INTELLIGENCE_ENABLED; the v11.0 spec's
+	// MARKET_INTEL_ENABLED is honoured via a post-parse fallback in
+	// LoadConfig (env library v11 does not support comma-separated
+	// aliases in struct tags).
 	MarketIntelligenceEnabled    bool          `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
 	// v10.8: bumped default 2h → 4h. The 4-day audit showed every
 	// 2h marketintel report shipped filler ("reactive crowding",
@@ -1011,6 +1026,32 @@ type AIAnalysisConfig struct {
 	PredictionCreationAITimeoutV2 time.Duration `env:"PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
 	PredictionEvolutionAITimeout  time.Duration `env:"PREDICTION_EVOLUTION_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
 	OutcomeAITimeout              time.Duration `env:"OUTCOME_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+
+	// --- v11.0 Hourly News Intelligence ---
+	// One AI call per hour over NEW Polymarket annotations/news.
+	// Replaces the killed prediction + market-intel surfaces.
+	// AI is silent (sentinel) when no new news or nothing
+	// actionable — operator gets messages ONLY when there is
+	// real underpriced/repricing intelligence.
+	NewsIntelEnabled         bool          `env:"NEWS_INTEL_ENABLED" envDefault:"true"`
+	NewsIntelStartupRun      bool          `env:"NEWS_INTEL_STARTUP_RUN" envDefault:"true"`
+	NewsIntelInterval        time.Duration `env:"NEWS_INTEL_INTERVAL" envDefault:"1h" validate:"gt=0"`
+	NewsIntelLookback        time.Duration `env:"NEWS_INTEL_LOOKBACK" envDefault:"1h" validate:"gt=0"`
+	NewsIntelMaxItems        int           `env:"NEWS_INTEL_MAX_ITEMS" envDefault:"100" validate:"gte=1,lte=500"`
+	NewsIntelMaxMarketsPerItem int         `env:"NEWS_INTEL_MAX_MARKETS_PER_ITEM" envDefault:"5" validate:"gte=1,lte=20"`
+	NewsIntelMaxSelected     int           `env:"NEWS_INTEL_MAX_SELECTED" envDefault:"8" validate:"gte=1,lte=50"`
+	NewsIntelAIEnabled       bool          `env:"NEWS_INTEL_AI_ENABLED" envDefault:"true"`
+	NewsIntelAITimeout       time.Duration `env:"NEWS_INTEL_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	NewsIntelSendTelegram    bool          `env:"NEWS_INTEL_SEND_TELEGRAM" envDefault:"true"`
+	NewsIntelSuppressNoEdge  bool          `env:"NEWS_INTEL_SUPPRESS_NO_EDGE" envDefault:"true"`
+	NewsIntelDedupeEnabled   bool          `env:"NEWS_INTEL_DEDUPE_ENABLED" envDefault:"true"`
+	NewsIntelSemanticCooldown time.Duration `env:"NEWS_INTEL_SEMANTIC_COOLDOWN" envDefault:"12h" validate:"gt=0"`
+	NewsIntelMinConfidence   float64       `env:"NEWS_INTEL_MIN_CONFIDENCE" envDefault:"0.60" validate:"gte=0,lte=1"`
+
+	// v11.0 hard lock — even if the legacy prediction-evolution
+	// worker is somehow re-enabled, this final gate blocks the
+	// "PREDICTION UPDATE · blocked" Telegram surface entirely.
+	PredictionBlockedTelegramEnabled bool `env:"PREDICTION_BLOCKED_TELEGRAM_ENABLED" envDefault:"false"`
 }
 
 // DetectionConfig tunes the v6 detection worker that drains
@@ -1077,6 +1118,19 @@ func LoadConfig() (*Config, error) {
 	cfg := &Config{}
 	if err := env.Parse(cfg); err != nil {
 		return nil, fmt.Errorf("parse env: %w", err)
+	}
+	// v11.0 spec alias: MARKET_INTEL_ENABLED is the operator-facing
+	// name for the legacy AI_MARKET_INTELLIGENCE_ENABLED switch. When
+	// either is set true, the legacy market-intel surface re-enables.
+	// caarlos0/env v11 doesn't support comma-separated env tag
+	// aliases, so we apply the OR here.
+	if v := os.Getenv("MARKET_INTEL_ENABLED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.AIAnalysis.MarketIntelligenceEnabled = true
+		case "0", "false", "no", "off":
+			cfg.AIAnalysis.MarketIntelligenceEnabled = false
+		}
 	}
 	if err := validator.New().Struct(cfg); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)

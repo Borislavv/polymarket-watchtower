@@ -41,6 +41,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/create"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/evolution"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/newsintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
@@ -104,6 +105,7 @@ type App struct {
 	marketIntel       *marketintel.Worker
 	catalystImporter  *catalystimporter.Worker
 	dailyIntel        *dailypoliticalintel.Worker
+	newsIntel         *newsintel.Worker
 	predictionEvolver *evolution.Worker
 	predictionCreator *create.Worker
 	predictionFeedbk  *predictionfeedback.Worker
@@ -1067,6 +1069,63 @@ func New() (*App, error) {
 			Msg("daily political intel: wired")
 	}
 
+	// v11.0 Hourly News Intelligence Worker — the v11.0 product.
+	// One AI call per hour over NEW Polymarket annotations attached
+	// to whitelisted markets. Replaces the v10.x prediction +
+	// market-intel surfaces. Silent when no new news or no edge.
+	var newsIntelWorker *newsintel.Worker
+	if cfg.Postgres.Enabled() && cfg.AIAnalysis.NewsIntelEnabled {
+		eventPageRepo := repository.NewEventPageRepository(pgPool)
+		newsIntelRepo := repository.NewNewsIntelRepository(pgPool)
+		var newsAnalyzer newsintel.Analyzer
+		if cfg.AIAnalysis.NewsIntelAIEnabled && cfg.AIAnalysis.APIKey != "" {
+			newsAnalyzer = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  cfg.AIAnalysis.Model,
+				Timeout:                cfg.AIAnalysis.NewsIntelAITimeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		var newsTG newsintel.TelegramSender
+		if bot != nil && cfg.AIAnalysis.NewsIntelSendTelegram {
+			newsTG = newsIntelTelegramAdapter{bot: bot}
+		}
+		newsIntelWorker = newsintel.New(newsintel.Config{
+			Enabled:            cfg.AIAnalysis.NewsIntelEnabled,
+			StartupRun:         cfg.AIAnalysis.NewsIntelStartupRun,
+			Interval:           cfg.AIAnalysis.NewsIntelInterval,
+			Lookback:           cfg.AIAnalysis.NewsIntelLookback,
+			MaxItems:           cfg.AIAnalysis.NewsIntelMaxItems,
+			MaxMarketsPerItem:  cfg.AIAnalysis.NewsIntelMaxMarketsPerItem,
+			MaxSelected:        cfg.AIAnalysis.NewsIntelMaxSelected,
+			AIEnabled:          cfg.AIAnalysis.NewsIntelAIEnabled,
+			AITimeout:          cfg.AIAnalysis.NewsIntelAITimeout,
+			SendTelegram:       cfg.AIAnalysis.NewsIntelSendTelegram,
+			SuppressNoEdge:     cfg.AIAnalysis.NewsIntelSuppressNoEdge,
+			DedupeEnabled:      cfg.AIAnalysis.NewsIntelDedupeEnabled,
+			SemanticCooldown:   cfg.AIAnalysis.NewsIntelSemanticCooldown,
+			MinConfidence:      cfg.AIAnalysis.NewsIntelMinConfidence,
+			ChatID:             cfg.Alerting.TelegramChatID,
+			TelegramMessageCap: 3500,
+		}, eventPageRepo, eventPageRepo, newsIntelRepo, newsAnalyzer, newsTG, met, logger)
+		logger.Info().
+			Bool("enabled", cfg.AIAnalysis.NewsIntelEnabled).
+			Bool("startup_run", cfg.AIAnalysis.NewsIntelStartupRun).
+			Dur("interval", cfg.AIAnalysis.NewsIntelInterval).
+			Dur("lookback", cfg.AIAnalysis.NewsIntelLookback).
+			Int("max_items", cfg.AIAnalysis.NewsIntelMaxItems).
+			Int("max_selected", cfg.AIAnalysis.NewsIntelMaxSelected).
+			Bool("ai_enabled", cfg.AIAnalysis.NewsIntelAIEnabled && cfg.AIAnalysis.APIKey != "").
+			Bool("send_telegram", cfg.AIAnalysis.NewsIntelSendTelegram && bot != nil).
+			Msg("news intelligence: wired (v11.0)")
+	}
+
 	// v9.9 Prediction Evolution Worker (the heartbeat).
 	var evolutionWorker *evolution.Worker
 	if cfg.Postgres.Enabled() && cfg.Prediction.EvolutionEnabled && marketsRepo != nil && eventPageProvider != nil {
@@ -1398,6 +1457,7 @@ func New() (*App, error) {
 		marketIntel:       marketIntelWorker,
 		catalystImporter:  catalystImporterWorker,
 		dailyIntel:        dailyIntelWorker,
+		newsIntel:         newsIntelWorker,
 		predictionEvolver: evolutionWorker,
 		predictionCreator: predictionCreator,
 		predictionFeedbk:  predictionFeedback,
@@ -1435,6 +1495,17 @@ func (a evolutionTelegramAdapter) SendHTML(ctx context.Context, chatID, text str
 // usecase package to avoid cross-importing infra/telegram.
 type dailyIntelTelegramAdapter struct {
 	bot *telegram.Bot
+}
+
+// newsIntelTelegramAdapter narrows *telegram.Bot to the v11.0 news
+// intel worker's seam — same pattern as the daily-intel adapter.
+type newsIntelTelegramAdapter struct {
+	bot *telegram.Bot
+}
+
+func (a newsIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (int64, error) {
+	res, err := a.bot.SendHTML(ctx, chatID, text)
+	return res.MessageID, err
 }
 
 func (a dailyIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (dailypoliticalintel.TelegramResult, error) {
@@ -1777,6 +1848,12 @@ func (a *App) Run() error {
 	if a.dailyIntel != nil {
 		execs = append(execs, shutdown2.Exec{Name: "daily-political-intel", Fn: func(ctx context.Context) error {
 			a.dailyIntel.Run(ctx)
+			return nil
+		}})
+	}
+	if a.newsIntel != nil {
+		execs = append(execs, shutdown2.Exec{Name: "news-intel", Fn: func(ctx context.Context) error {
+			a.newsIntel.Run(ctx)
 			return nil
 		}})
 	}

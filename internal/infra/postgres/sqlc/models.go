@@ -421,6 +421,61 @@ type PolymarketMarkets struct {
 	LastCollectTradedAt pgtype.Timestamptz
 }
 
+type PolymarketNewsIntelDecisions struct {
+	ID                     int64
+	RunID                  int64
+	NewsItemHash           string
+	EventSlug              string
+	ConditionID            string
+	MarketTitle            string
+	Rank                   int32
+	Decision               string
+	Confidence             float64
+	ImpactDirection        string
+	ExpectedPriceImpactMin *float64
+	ExpectedPriceImpactMax *float64
+	ExpectedWindow         string
+	WhyItMatters           string
+	WhatMarketMayMiss      string
+	TriggerCondition       string
+	InvalidatesIf          string
+	TradeStance            string
+	TelegramWorthy         bool
+	AffectedMarketsJson    []byte
+	CreatedAt              pgtype.Timestamptz
+}
+
+type PolymarketNewsIntelProcessedItems struct {
+	ItemHash    string
+	EventSlug   string
+	Title       string
+	FirstSeenAt pgtype.Timestamptz
+	LastSeenAt  pgtype.Timestamptz
+	ProcessedAt pgtype.Timestamptz
+	LastRunID   *int64
+	CreatedAt   pgtype.Timestamptz
+}
+
+type PolymarketNewsIntelRuns struct {
+	ID                int64
+	StartedAt         pgtype.Timestamptz
+	FinishedAt        pgtype.Timestamptz
+	Status            string
+	LookbackStart     pgtype.Timestamptz
+	LookbackEnd       pgtype.Timestamptz
+	NewsItemsCount    int32
+	SelectedCount     int32
+	AiCalled          bool
+	AiStatus          string
+	SentinelCode      string
+	AiCostUsd         float64
+	InputFingerprint  string
+	OutputFingerprint string
+	TelegramSent      bool
+	LastError         string
+	CreatedAt         pgtype.Timestamptz
+}
+
 type PolymarketPredictionEvaluations struct {
 	ID           int64
 	PredictionID int64

@@ -94,6 +94,7 @@ type Querier interface {
 	EnqueueRealtimeWork(ctx context.Context, arg EnqueueRealtimeWorkParams) error
 	FailMarketBackfill(ctx context.Context, arg FailMarketBackfillParams) error
 	FinishGapRecovery(ctx context.Context, arg FinishGapRecoveryParams) error
+	FinishNewsIntelRun(ctx context.Context, arg FinishNewsIntelRunParams) error
 	FinishUnifiedIntelRun(ctx context.Context, arg FinishUnifiedIntelRunParams) error
 	// Single-row fetch used by the outcome-learning worker to reload
 	// the full row (payload, telegram_message_id, outcome_status, etc.)
@@ -114,6 +115,10 @@ type Querier interface {
 	GetMarketByConditionID(ctx context.Context, conditionID string) (PolymarketMarkets, error)
 	GetMarketByID(ctx context.Context, id int64) (PolymarketMarkets, error)
 	GetMarketPrediction(ctx context.Context, arg GetMarketPredictionParams) (GetMarketPredictionRow, error)
+	// =========================================================================
+	// News intel processed items (dedupe ledger)
+	// =========================================================================
+	GetNewsIntelProcessedItem(ctx context.Context, itemHash string) (PolymarketNewsIntelProcessedItems, error)
 	GetPredictionUsefulnessScore(ctx context.Context, predictionID int64) (GetPredictionUsefulnessScoreRow, error)
 	// =========================================================================
 	// Telegram semantic dedupe (PART 4)
@@ -154,6 +159,15 @@ type Querier interface {
 	// Market price snapshots (PART 8)
 	// =========================================================================
 	InsertMarketPriceSnapshot(ctx context.Context, arg InsertMarketPriceSnapshotParams) error
+	// =========================================================================
+	// News intel decisions
+	// =========================================================================
+	InsertNewsIntelDecision(ctx context.Context, arg InsertNewsIntelDecisionParams) error
+	// v11.0 Hourly News Intelligence queries (PART 6).
+	// =========================================================================
+	// News intel runs
+	// =========================================================================
+	InsertNewsIntelRun(ctx context.Context, arg InsertNewsIntelRunParams) (int64, error)
 	// =========================================================================
 	// Repricing theses (PART 9)
 	// =========================================================================
@@ -227,6 +241,13 @@ type Querier interface {
 	// recent reactions appear before historical backfill.
 	ListAlertsForReaction(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
 	ListAllCategories(ctx context.Context) ([]PolymarketCategories, error)
+	// =========================================================================
+	// Cross-event annotation feed
+	// =========================================================================
+	// Pulls all annotations newer than a threshold across every event. The
+	// v11.0 news intel worker uses this to enumerate the candidate pool in
+	// a single roundtrip rather than per-event_slug.
+	ListAnnotationsSince(ctx context.Context, arg ListAnnotationsSinceParams) ([]PolymarketEventAnnotations, error)
 	// Per-(market, outcome) baseline samples within the lookback window.
 	// Returned newest-first; callers compute median/mean/p95 in domain code
 	// (deliberately not in SQL so the same statistics live next to the score
@@ -275,6 +296,8 @@ type Querier interface {
 	// renderer skips broken links via sanitizeLinkURL.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
 	ListMarketPredictionStates(ctx context.Context, arg ListMarketPredictionStatesParams) ([]PolymarketMarketPredictionStates, error)
+	ListNewsIntelDecisionsByRun(ctx context.Context, runID int64) ([]PolymarketNewsIntelDecisions, error)
+	ListNewsIntelProcessedHashes(ctx context.Context, itemHashes []string) ([]string, error)
 	// Powers the daily calibration report + CLI. Pulls evaluations
 	// newer than `since`, joined with the prediction row so the
 	// aggregator sees side_bias, current_state, confidence in one go.
@@ -298,6 +321,7 @@ type Querier interface {
 	// further (annotations, catalysts) before flipping state.
 	ListPredictionsForStaleSignal(ctx context.Context, arg ListPredictionsForStaleSignalParams) ([]ListPredictionsForStaleSignalRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
+	ListRecentNewsIntelRuns(ctx context.Context, rowLimit int32) ([]PolymarketNewsIntelRuns, error)
 	ListRepricingSignalsForEvent(ctx context.Context, arg ListRepricingSignalsForEventParams) ([]PolymarketRepricingSignals, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
 	// yet have an outcome-analysis row. The LEFT JOIN keeps the query
@@ -488,6 +512,7 @@ type Querier interface {
 	SumEventTradesByConditionAndSide(ctx context.Context, arg SumEventTradesByConditionAndSideParams) ([]SumEventTradesByConditionAndSideRow, error)
 	TouchEventNewsAICalled(ctx context.Context, eventSlug string) error
 	TouchMarketAICacheReuse(ctx context.Context, arg TouchMarketAICacheReuseParams) error
+	TouchNewsIntelProcessedItem(ctx context.Context, itemHash string) error
 	// Bumps last_evolved_at without touching state/confidence — the
 	// worker calls this on EVERY processed prediction so the row drops
 	// to the back of the selection queue even when nothing material
@@ -590,6 +615,7 @@ type Querier interface {
 	UpsertMarketAICache(ctx context.Context, arg UpsertMarketAICacheParams) error
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
 	UpsertMarketPrediction(ctx context.Context, arg UpsertMarketPredictionParams) (int64, error)
+	UpsertNewsIntelProcessedItem(ctx context.Context, arg UpsertNewsIntelProcessedItemParams) error
 	// v10.3 evaluation classifier output. One row per (prediction, horizon).
 	UpsertPredictionEvaluation(ctx context.Context, arg UpsertPredictionEvaluationParams) error
 	// One row per (prediction_id, horizon). Re-runs with the same key

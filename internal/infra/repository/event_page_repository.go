@@ -281,6 +281,25 @@ func (r *EventPageRepository) ListRecentAnnotations(ctx context.Context, eventSl
 	return out, nil
 }
 
+// ListAnnotationsSince returns every annotation across every event
+// whose first_seen_at or last_seen_at is >= since, capped at limit.
+// Used by the v11.0 Hourly News Intelligence worker to enumerate the
+// candidate pool in a single roundtrip.
+func (r *EventPageRepository) ListAnnotationsSince(ctx context.Context, since time.Time, limit int32) ([]EventAnnotation, error) {
+	rows, err := r.q.ListAnnotationsSince(ctx, sqlc.ListAnnotationsSinceParams{
+		Since:    tsFromTime(since),
+		RowLimit: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list annotations since: %w", err)
+	}
+	out := make([]EventAnnotation, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, eventAnnotationFromSQLC(row))
+	}
+	return out, nil
+}
+
 // ListLatestEventMarkets returns the newest market row per market_id
 // for the event. Used by the AI context renderer + lag detector.
 func (r *EventPageRepository) ListLatestEventMarkets(ctx context.Context, eventSlug string) ([]EventPageMarketRow, error) {

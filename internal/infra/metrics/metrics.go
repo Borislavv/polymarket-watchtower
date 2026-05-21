@@ -560,6 +560,30 @@ type Metrics struct {
 	// PredictionEvolutionDecay: decay applications, labelled by
 	// the state the prediction is in when decayed.
 	PredictionEvolutionDecay *prometheus.CounterVec
+
+	// --- v11.0 Hourly News Intelligence -----------------------------
+	// NewsIntelRuns: one increment per hourly cycle by status
+	// (started / ok / skipped / failed).
+	NewsIntelRuns *prometheus.CounterVec
+	// NewsIntelItemsTotal: news items observed per cycle, by status
+	// (new / duplicate / processed).
+	NewsIntelItemsTotal *prometheus.CounterVec
+	// NewsIntelAIRequests: AI dispatch outcomes (ok / skipped / failed).
+	NewsIntelAIRequests *prometheus.CounterVec
+	// NewsIntelSentinel: per-code sentinel responses (mirrors the
+	// v10.9 UnifiedIntelSentinel surface for the v11.0 product).
+	NewsIntelSentinel *prometheus.CounterVec
+	// NewsIntelDecisions: per-(decision, telegram_worthy) breakdown
+	// of selected rows that actually landed in the DB.
+	NewsIntelDecisions *prometheus.CounterVec
+	// NewsIntelTelegramChunks: Telegram send outcomes per chunk
+	// (sent / failed).
+	NewsIntelTelegramChunks *prometheus.CounterVec
+	// NewsIntelAILatency: AI call duration histogram.
+	NewsIntelAILatency prometheus.Histogram
+	// NewsIntelCycleLatency: full Tick duration including AI + DB +
+	// Telegram.
+	NewsIntelCycleLatency prometheus.Histogram
 }
 
 func New() *Metrics {
@@ -1357,6 +1381,42 @@ func New() *Metrics {
 		Help: "Decay applications by state.",
 	}, []string{"state"})
 
+	// --- v11.0 Hourly News Intelligence --------------------------------
+	m.NewsIntelRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "runs_total",
+		Help: "Hourly news intelligence cycles, by status (started/ok/skipped/failed).",
+	}, []string{"status"})
+	m.NewsIntelItemsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "items_total",
+		Help: "News items observed per cycle, by status (new/duplicate/processed).",
+	}, []string{"status"})
+	m.NewsIntelAIRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "ai_requests_total",
+		Help: "AI dispatch outcomes (ok/skipped/failed/sentinel).",
+	}, []string{"status"})
+	m.NewsIntelSentinel = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "sentinel_total",
+		Help: "Per-code sentinel responses (AiAnswered* / legacy AI_*).",
+	}, []string{"code"})
+	m.NewsIntelDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "decisions_total",
+		Help: "Selected decision rows persisted, by decision + telegram_worthy.",
+	}, []string{"decision", "telegram_worthy"})
+	m.NewsIntelTelegramChunks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "telegram_chunks_total",
+		Help: "Per-chunk Telegram send outcomes (sent/failed).",
+	}, []string{"status"})
+	m.NewsIntelAILatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "ai_latency_seconds",
+		Help:    "AI call duration for the hourly news intel cycle.",
+		Buckets: prometheus.ExponentialBuckets(0.5, 2, 9),
+	})
+	m.NewsIntelCycleLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "news_intel", Name: "cycle_latency_seconds",
+		Help:    "Full Tick duration including candidate scan, AI, DB writes, Telegram.",
+		Buckets: prometheus.ExponentialBuckets(0.5, 2, 10),
+	})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -1434,6 +1494,9 @@ func New() *Metrics {
 		m.TelegramSemanticDedupe, m.UnifiedIntelRuns, m.UnifiedIntelSentinel,
 		m.RepricingThesisTotal,
 		m.PredictionEvolutionDecay,
+		m.NewsIntelRuns, m.NewsIntelItemsTotal, m.NewsIntelAIRequests,
+		m.NewsIntelSentinel, m.NewsIntelDecisions, m.NewsIntelTelegramChunks,
+		m.NewsIntelAILatency, m.NewsIntelCycleLatency,
 	)
 	return m
 }

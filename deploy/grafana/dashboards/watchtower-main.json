@@ -1529,6 +1529,116 @@
         "legendFormat": "{{direction}} · {{window}}",
         "refId": "A"
       }]
+    },
+    {
+      "id": 700,
+      "type": "row",
+      "title": "v11.0 Hourly News Intelligence",
+      "gridPos": {"x": 0, "y": 362, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 701,
+      "type": "timeseries",
+      "title": "News intel runs (rate / 1h)",
+      "description": "v11.0 hourly news intelligence cycles by status (started/ok/skipped/failed). The only AI surface alive in v11.0.",
+      "gridPos": {"x": 0, "y": 363, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_news_intel_runs_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 702,
+      "type": "timeseries",
+      "title": "News intel item volume (rate / 1h)",
+      "description": "Annotations observed per cycle, split into new vs duplicate vs total processed. New > 0 is the precondition for any AI call.",
+      "gridPos": {"x": 12, "y": 363, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_news_intel_items_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 703,
+      "type": "timeseries",
+      "title": "News intel AI dispatch (rate / 1h)",
+      "description": "AI dispatch outcomes (ok / skipped / failed). Skipped = rate-limit or budget guard. Failed = provider/timeout/parse error.",
+      "gridPos": {"x": 0, "y": 370, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_news_intel_ai_requests_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 704,
+      "type": "timeseries",
+      "title": "News intel sentinels (rate / 1h)",
+      "description": "v11.0 PascalCase sentinel codes the AI returned (AiAnsweredNotFoundNoticeable / AlreadyPriced / ContextStale / InsufficientData / LowConfidenceSkip). Sentinel cycles never Telegram.",
+      "gridPos": {"x": 12, "y": 370, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (code) (rate(watchtower_news_intel_sentinel_total[1h]))",
+        "legendFormat": "{{code}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 705,
+      "type": "timeseries",
+      "title": "News intel decisions (rate / 1h)",
+      "description": "Selected decision rows persisted, labelled by decision (actionable/watch/ignore) + telegram_worthy.",
+      "gridPos": {"x": 0, "y": 377, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (decision, telegram_worthy) (rate(watchtower_news_intel_decisions_total[1h]))",
+        "legendFormat": "{{decision}} · tg={{telegram_worthy}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 706,
+      "type": "timeseries",
+      "title": "News intel Telegram chunks (rate / 1h)",
+      "description": "Per-chunk Telegram send outcomes (sent / failed). One cycle may produce multiple chunks via SafeSplit.",
+      "gridPos": {"x": 12, "y": 377, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "expr": "sum by (status) (rate(watchtower_news_intel_telegram_chunks_total[1h]))",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 707,
+      "type": "timeseries",
+      "title": "News intel AI latency (p50/p95)",
+      "description": "Hourly AI call duration. p95 spiking past ~30s typically means a model retry; over 60s means the cycle is hitting the AITimeout.",
+      "gridPos": {"x": 0, "y": 384, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(watchtower_news_intel_ai_latency_seconds_bucket[1h])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(watchtower_news_intel_ai_latency_seconds_bucket[1h])))", "legendFormat": "p95", "refId": "B"}
+      ]
+    },
+    {
+      "id": 708,
+      "type": "timeseries",
+      "title": "News intel cycle latency (p50/p95)",
+      "description": "Full Tick duration including candidate scan, AI, DB writes, Telegram. Should be roughly AI latency + a few seconds of DB.",
+      "gridPos": {"x": 12, "y": 384, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(watchtower_news_intel_cycle_latency_seconds_bucket[1h])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(watchtower_news_intel_cycle_latency_seconds_bucket[1h])))", "legendFormat": "p95", "refId": "B"}
+      ]
     }
   ]
 }
