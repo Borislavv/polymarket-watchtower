@@ -13,7 +13,26 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
+
+// withTestRouter is a small test helper that builds a router-wired
+// Sender for the v11.4 TelegramSink. Mirrors the production wiring
+// from app.go but targets the supplied httptest server. All test
+// sinks need this — an enabled sink without a Sender is a no-op.
+func withTestRouter(t *testing.T, s *TelegramSink, baseURL, chatID string) *TelegramSink {
+	t.Helper()
+	bot, err := telegram.New(telegram.Config{BotToken: "fake", BaseURL: baseURL})
+	if err != nil {
+		t.Fatalf("telegram bot: %v", err)
+	}
+	router := telegram.NewRouter(
+		telegram.RouterConfig{SignalEnabled: true, SignalChatID: chatID},
+		bot,
+		nil,
+	)
+	return s.WithSender(router)
+}
 
 func sampleTradeFinding() anomaly.Finding {
 	return anomaly.Finding{
@@ -396,6 +415,7 @@ func TestTelegramHTMLParseMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
+	s = withTestRouter(t, s, srv.URL, "1")
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -427,6 +447,7 @@ func TestTelegramAcceptsChannelUsername(t *testing.T) {
 	s, _ := NewTelegramSink(TelegramConfig{
 		Enabled: true, BotToken: "t", ChatID: "@watchtower-alerts", BaseURL: srv.URL,
 	})
+	s = withTestRouter(t, s, srv.URL, "@watchtower-alerts")
 	_ = s.Notify(context.Background(), sampleTradeFinding())
 	raw, _ := received.Load().([]byte)
 	var body map[string]any
@@ -485,6 +506,7 @@ func TestTelegramReturnsErrorOnBadStatus(t *testing.T) {
 	s, _ := NewTelegramSink(TelegramConfig{
 		Enabled: true, BotToken: "t", ChatID: "1", BaseURL: srv.URL,
 	})
+	s = withTestRouter(t, s, srv.URL, "1")
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err == nil {
 		t.Fatal("expected error for 400")
 	}
@@ -503,6 +525,7 @@ func TestTelegramSendsExactlyOncePerNotify(t *testing.T) {
 	s, _ := NewTelegramSink(TelegramConfig{
 		Enabled: true, BotToken: "t", ChatID: "42", BaseURL: srv.URL,
 	})
+	s = withTestRouter(t, s, srv.URL, "42")
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -589,6 +612,7 @@ func TestGrafanaLinkClickableInWirePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTelegramSink: %v", err)
 	}
+	s = withTestRouter(t, s, srv.URL, "1")
 	if err := s.Notify(context.Background(), sampleTradeFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}

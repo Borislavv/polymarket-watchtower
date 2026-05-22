@@ -27,6 +27,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/gamma"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 	"github.com/rs/zerolog"
 )
 
@@ -207,6 +208,19 @@ func TestPipelineDetectsWhalesAndCategoryWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("telegram sink: %v", err)
 	}
+	// v11.4: TelegramSink dispatches via the typed Router. Build a
+	// dev-mode router with the test bot as the inner transport so the
+	// httptest server receives the calls.
+	telegramBot, err := telegram.New(telegram.Config{BotToken: "test", BaseURL: telegramSrv.URL})
+	if err != nil {
+		t.Fatalf("telegram bot: %v", err)
+	}
+	telegramRouter := telegram.NewRouter(
+		telegram.RouterConfig{SignalEnabled: true, SignalChatID: "1"},
+		telegramBot,
+		nil,
+	)
+	tg = tg.WithSender(telegramRouter)
 	cap := &capturingSink{}
 	fanout := &alerting2.Fanout{Sinks: []alerting2.Channel{cap, tg}, Logger: &log}
 
