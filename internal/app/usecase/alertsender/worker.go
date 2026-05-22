@@ -45,12 +45,31 @@ type AlertStore interface {
 	ResetStaleSending(ctx context.Context, cutoff time.Time) error
 }
 
-// Telegram is the transport contract — internal/infra/telegram.Bot
-// satisfies it. The sender depends on the interface, never the concrete
-// type, so tests can fake the network round-trip and so the Telegram
-// package can evolve without dragging alertsender along.
+// Telegram is the typed transport contract — *telegram.Router
+// satisfies it. v11.3: the worker no longer picks a chat id; the
+// router resolves it from the message Surface so a flow alert
+// always routes to the signal chat regardless of what the worker
+// has been told.
 type Telegram interface {
-	SendHTML(ctx context.Context, chatID, text string) (telegram.SendResult, error)
+	Send(ctx context.Context, msg telegram.Message) (telegram.SendResult, error)
+}
+
+// surfaceFromKind maps a Finding.Kind onto its typed Telegram
+// Surface. Used by the worker to label every outgoing flow alert
+// for router + metric attribution. Unknown kinds fall back to the
+// generic SurfaceFlowAlert.
+func surfaceFromKind(kind string) telegram.Surface {
+	switch kind {
+	case "trade_anomaly":
+		return telegram.SurfaceFlowAlert
+	case "accumulation":
+		return telegram.SurfaceAccumulationAlert
+	case "category_watch":
+		return telegram.SurfaceClusterAlert
+	case "ownership_concentration":
+		return telegram.SurfaceOwnershipAlert
+	}
+	return telegram.SurfaceFlowAlert
 }
 
 // RetryPolicy controls how MarkFailed schedules subsequent attempts. Zero-
@@ -322,7 +341,10 @@ func (w *Worker) send(ctx context.Context, a repository.Alert) {
 	// Best-effort; failures are logged but never block.
 	w.writeAttribution(ctx, a.ID, f, aiVerdict)
 	text := alerting.FormatTelegramMessage(f)
-	res, err := w.tg.SendHTML(ctx, w.cfg.ChatID, text)
+	res, err := w.tg.Send(ctx, telegram.Message{
+		Surface: surfaceFromKind(string(f.Kind)),
+		HTML:    text,
+	})
 	if err != nil {
 		// Context cancellation is graceful: leave the row pending. Any
 		// other error bumps send_attempts and stays pending for retry.

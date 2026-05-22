@@ -3,7 +3,6 @@ package app
 import (
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -486,10 +485,19 @@ type AnomalyConfig struct {
 	OwnershipMinNotionalUSD float64 `env:"OWNERSHIP_MIN_NOTIONAL_USD" envDefault:"10000" validate:"gte=0"`
 }
 
-// AlertingConfig wires sinks. The Telegram sink sends to a single configured
-// chat — there is no subscriber discovery, no /getUpdates polling, no
-// dynamic broadcast. Set TELEGRAM_CHAT_ID once and that's the only chat
-// that will ever receive alerts.
+// AlertingConfig wires sinks.
+//
+// v11.3 typed routing:
+//   - TELEGRAM_CHAT_ID         — customer-facing SIGNAL chat. Only
+//     real flow alerts and actionable hourly news intelligence
+//     reach it.
+//   - TELEGRAM_ADMIN_CHAT_ID   — internal ADMIN telemetry chat.
+//     Signal-quality reports, stats, scorecards, etc. NEVER
+//     receives the signal feed; admin messages NEVER fall back to
+//     the signal chat when the admin destination is missing.
+//
+// The single *telegram.Bot client serves both chats; the
+// *telegram.Router resolves chat id from the message Surface.
 type AlertingConfig struct {
 	WebhookURL       string        `env:"ALERT_WEBHOOK_URL"`
 	TelegramEnabled  bool          `env:"TELEGRAM_ENABLED" envDefault:"false"`
@@ -497,6 +505,63 @@ type AlertingConfig struct {
 	TelegramChatID   string        `env:"TELEGRAM_CHAT_ID"`
 	TelegramBaseURL  string        `env:"TELEGRAM_BASE_URL"`
 	TelegramTimeout  time.Duration `env:"TELEGRAM_TIMEOUT" envDefault:"5s"`
+
+	// --- v11.3 admin chat ---
+	TelegramAdminEnabled       bool   `env:"TELEGRAM_ADMIN_ENABLED" envDefault:"false"`
+	TelegramAdminChatID        string `env:"TELEGRAM_ADMIN_CHAT_ID"`
+	TelegramAllowSameChatAdmin bool   `env:"TELEGRAM_ALLOW_SAME_CHAT_FOR_ADMIN" envDefault:"false"`
+
+	// Per-surface admin toggles. Each one gates a specific admin
+	// surface even when the admin chat is configured; useful for
+	// rolling new admin reports one at a time.
+	TelegramAdminSignalQualityReports bool `env:"TELEGRAM_ADMIN_SIGNAL_QUALITY_REPORTS_ENABLED" envDefault:"false"`
+	TelegramAdminStats                bool `env:"TELEGRAM_ADMIN_STATS_ENABLED" envDefault:"false"`
+	TelegramAdminStrategyScorecard    bool `env:"TELEGRAM_ADMIN_STRATEGY_SCORECARD_ENABLED" envDefault:"false"`
+	TelegramAdminOperationalHealth    bool `env:"TELEGRAM_ADMIN_OPERATIONAL_HEALTH_ENABLED" envDefault:"false"`
+	TelegramAdminBudgetReports        bool `env:"TELEGRAM_ADMIN_BUDGET_REPORTS_ENABLED" envDefault:"false"`
+	TelegramAdminSuppressionReports   bool `env:"TELEGRAM_ADMIN_SUPPRESSION_REPORTS_ENABLED" envDefault:"false"`
+
+	// --- v11.4 bounded signal-quality report ---
+	// SIGNAL_QUALITY_LOOKBACK is the default fallback. The
+	// per-period lookbacks below are used when the worker fires
+	// the Daily/Weekly/Monthly/Quarterly/Yearly variant.
+	// SIGNAL_QUALITY_MAX_ALERTS caps the bounded SQL scan; when
+	// eligible rows exceed it the renderer surfaces a "Scan
+	// truncated" banner with the eligible count + the cap.
+	SignalQualityLookback          time.Duration `env:"SIGNAL_QUALITY_LOOKBACK" envDefault:"8760h"`
+	SignalQualityDailyLookback     time.Duration `env:"SIGNAL_QUALITY_DAILY_LOOKBACK" envDefault:"24h"`
+	SignalQualityWeeklyLookback    time.Duration `env:"SIGNAL_QUALITY_WEEKLY_LOOKBACK" envDefault:"168h"`
+	SignalQualityMonthlyLookback   time.Duration `env:"SIGNAL_QUALITY_MONTHLY_LOOKBACK" envDefault:"720h"`
+	SignalQualityQuarterlyLookback time.Duration `env:"SIGNAL_QUALITY_QUARTERLY_LOOKBACK" envDefault:"2160h"`
+	SignalQualityYearlyLookback    time.Duration `env:"SIGNAL_QUALITY_YEARLY_LOOKBACK" envDefault:"8760h"`
+	SignalQualityMaxAlerts         int           `env:"SIGNAL_QUALITY_MAX_ALERTS" envDefault:"5000"`
+
+	// --- v11.4 Market Close Review learning loop ---
+	// Reviews recently-closed markets, asks the AI whether
+	// Watchtower's alerts caught real informed flow, persists
+	// the verdict + tuning recommendations, and posts a compact
+	// admin Telegram body. Admin destination only. AI gated by
+	// the market_close_review budget bucket.
+	MarketCloseReviewEnabled                bool          `env:"MARKET_CLOSE_REVIEW_ENABLED" envDefault:"true"`
+	MarketCloseReviewInterval               time.Duration `env:"MARKET_CLOSE_REVIEW_INTERVAL" envDefault:"30m"`
+	MarketCloseReviewLookback               time.Duration `env:"MARKET_CLOSE_REVIEW_LOOKBACK" envDefault:"24h"`
+	MarketCloseReviewMarketMaxAgeAfterClose time.Duration `env:"MARKET_CLOSE_REVIEW_MARKET_MAX_AGE_AFTER_CLOSE" envDefault:"72h"`
+	MarketCloseReviewHistoryLookback        time.Duration `env:"MARKET_CLOSE_REVIEW_HISTORY_LOOKBACK" envDefault:"8760h"`
+	MarketCloseReviewMinAlerts              int           `env:"MARKET_CLOSE_REVIEW_MIN_ALERTS" envDefault:"1"`
+	MarketCloseReviewRequireAlertOrNews     bool          `env:"MARKET_CLOSE_REVIEW_REQUIRE_ALERT_OR_NEWS" envDefault:"true"`
+	MarketCloseReviewMaxMarketsPerRun       int           `env:"MARKET_CLOSE_REVIEW_MAX_MARKETS_PER_RUN" envDefault:"10"`
+	MarketCloseReviewMaxAlertsPerMarket     int           `env:"MARKET_CLOSE_REVIEW_MAX_ALERTS_PER_MARKET" envDefault:"50"`
+	MarketCloseReviewMaxEventsPerMarket     int           `env:"MARKET_CLOSE_REVIEW_MAX_EVENTS_PER_MARKET" envDefault:"30"`
+	MarketCloseReviewAIEnabled              bool          `env:"MARKET_CLOSE_REVIEW_AI_ENABLED" envDefault:"true"`
+	MarketCloseReviewAITimeout              time.Duration `env:"MARKET_CLOSE_REVIEW_AI_TIMEOUT" envDefault:"60s"`
+	MarketCloseReviewAIModel                string        `env:"MARKET_CLOSE_REVIEW_AI_MODEL" envDefault:""`
+	MarketCloseReviewDailyBudgetUSD         float64       `env:"MARKET_CLOSE_REVIEW_DAILY_BUDGET_USD" envDefault:"3"`
+	MarketCloseReviewSendAdminTelegram      bool          `env:"MARKET_CLOSE_REVIEW_SEND_ADMIN_TELEGRAM" envDefault:"true"`
+	MarketCloseReviewSetReactions           bool          `env:"MARKET_CLOSE_REVIEW_SET_REACTIONS" envDefault:"true"`
+	MarketCloseReviewReactionSuccess        string        `env:"MARKET_CLOSE_REVIEW_REACTION_SUCCESS" envDefault:"👍"`
+	MarketCloseReviewReactionFailure        string        `env:"MARKET_CLOSE_REVIEW_REACTION_FAILURE" envDefault:"👎"`
+	MarketCloseReviewReactionAmbiguous      string        `env:"MARKET_CLOSE_REVIEW_REACTION_AMBIGUOUS" envDefault:"🤔"`
+	MarketCloseReviewReactionSkipAmbiguous  bool          `env:"MARKET_CLOSE_REVIEW_REACTION_SKIP_AMBIGUOUS" envDefault:"false"`
 
 	// GrafanaBaseURL: empty by default to avoid shipping the
 	// docker-compose default (http://localhost:3000), which renders as
@@ -515,28 +580,6 @@ type StatsReportConfig struct {
 	Enabled      bool          `env:"TELEGRAM_STATS_ENABLED" envDefault:"false"`
 	Interval     time.Duration `env:"TELEGRAM_STATS_INTERVAL" envDefault:"2h"`
 	StartupGrace time.Duration `env:"TELEGRAM_STATS_STARTUP_GRACE" envDefault:"0"`
-}
-
-// SignalReportConfig wires the scheduled signal-quality reports
-// (daily / weekly / monthly / quarterly / yearly). Decisions:
-//
-//   - Timezone is operator-controlled. Etc/GMT-3 = UTC+3 in the IANA
-//     database (the sign is inverted by historical convention).
-//   - Send time is per-period because the daily report at 08:00 and a
-//     yearly report at 09:00 might be reasonable for a different team.
-//     Defaults are all 08:00 to match the spec.
-//   - YearlyDelay (72h default) gives late upstream resolution one
-//     business cycle to settle before the year-end report locks in.
-type SignalReportConfig struct {
-	Enabled      bool          `env:"SIGNAL_REPORTS_ENABLED" envDefault:"false"`
-	Timezone     string        `env:"SIGNAL_REPORTS_TIMEZONE" envDefault:"Etc/GMT-3"`
-	DailyAt      string        `env:"SIGNAL_REPORTS_DAILY_AT" envDefault:"08:00"`
-	WeeklyAt     string        `env:"SIGNAL_REPORTS_WEEKLY_AT" envDefault:"08:00"`
-	MonthlyAt    string        `env:"SIGNAL_REPORTS_MONTHLY_AT" envDefault:"08:00"`
-	QuarterlyAt  string        `env:"SIGNAL_REPORTS_QUARTERLY_AT" envDefault:"08:00"`
-	YearlyAt     string        `env:"SIGNAL_REPORTS_YEARLY_AT" envDefault:"08:00"`
-	YearlyDelay  time.Duration `env:"SIGNAL_REPORTS_YEARLY_DELAY" envDefault:"72h"`
-	TickInterval time.Duration `env:"SIGNAL_REPORTS_TICK_INTERVAL" envDefault:"1m"`
 }
 
 // TelegramReactionsConfig wires the outcome-reaction pass on the
@@ -561,7 +604,6 @@ type Config struct {
 	Outcomes          OutcomesConfig
 	Drift             DriftConfig
 	AlertSender       AlertSenderConfig
-	SignalReport      SignalReportConfig
 	TelegramReactions TelegramReactionsConfig
 	Polymarket        PolymarketConfig
 	RateLimit         RateLimitConfig
@@ -571,14 +613,10 @@ type Config struct {
 	Alerting          AlertingConfig
 	StatsReport       StatsReportConfig
 	Detection         DetectionConfig
-	StableFavorite    StableFavoriteConfig
 	AIAnalysis        AIAnalysisConfig
 	EventPage         EventPageContextConfig
 	Catalyst          CatalystConfig
-	DailyIntel        DailyPoliticalIntelConfig
 	EventFlow         EventFlowConfig
-	Repricing         RepricingConfig
-	Prediction        PredictionConfig
 	AIBudget          AIBudgetConfig
 	AIPreflight       AIPreflightConfig
 	WS                WebSocketConfig
@@ -638,155 +676,15 @@ type EventFlowConfig struct {
 	TopItems         int           `env:"EVENT_FLOW_SUMMARY_TOP_ITEMS" envDefault:"10" validate:"gte=1,lte=50"`
 }
 
-// RepricingConfig drives the deterministic per-annotation repricing
-// signal. AI consumes the signal as evidence; the layer itself is
-// pure math.
-type RepricingConfig struct {
-	Enabled                bool          `env:"REPRICING_INTELLIGENCE_ENABLED" envDefault:"true"`
-	Lookback               time.Duration `env:"REPRICING_LOOKBACK" envDefault:"24h" validate:"gt=0"`
-	PreWindow              time.Duration `env:"REPRICING_PRE_WINDOW" envDefault:"2h" validate:"gt=0"`
-	PostWindow             time.Duration `env:"REPRICING_POST_WINDOW" envDefault:"2h" validate:"gt=0"`
-	MinAnnotationMove      float64       `env:"REPRICING_MIN_ANNOTATION_MOVE" envDefault:"0.05" validate:"gt=0,lte=1"`
-	MinFlowUSD             float64       `env:"REPRICING_MIN_FLOW_USD" envDefault:"5000" validate:"gte=0"`
-	UnderreactionThreshold float64       `env:"REPRICING_UNDERREACTION_THRESHOLD" envDefault:"0.03" validate:"gt=0,lte=1"`
-	OverreactionThreshold  float64       `env:"REPRICING_OVERREACTION_THRESHOLD" envDefault:"0.08" validate:"gt=0,lte=1"`
-}
-
-// PredictionConfig drives the prediction state machine + evolution
-// worker.
-type PredictionConfig struct {
-	StateEnabled            bool          `env:"MARKET_PREDICTION_STATE_ENABLED" envDefault:"true"`
-	StaleAfter              time.Duration `env:"MARKET_PREDICTION_STALE_AFTER" envDefault:"24h" validate:"gt=0"`
-	ConfirmAlertScoreFloor  float64       `env:"MARKET_PREDICTION_CONFIRM_ALERT_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
-	ContradictFlowImbalance float64       `env:"MARKET_PREDICTION_CONTRADICT_FLOW_IMBALANCE" envDefault:"0.65" validate:"gte=0,lte=1"`
-
-	// v11.0: prediction system DEFAULT-OFF. The whole "predictions"
-	// product has been replaced by the Hourly News Intelligence
-	// surface (internal/app/usecase/newsintel). Operators can set
-	// these knobs back to true to revive the legacy path, but no
-	// worker starts on a fresh boot.
-	EvolutionEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_ENABLED" envDefault:"false"`
-	EvolutionInterval    time.Duration `env:"MARKET_PREDICTION_EVOLUTION_INTERVAL" envDefault:"15m" validate:"gt=0"`
-	EvolutionBatchSize   int           `env:"MARKET_PREDICTION_EVOLUTION_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
-	EvolutionConcurrency int           `env:"MARKET_PREDICTION_EVOLUTION_CONCURRENCY" envDefault:"4" validate:"gte=1,lte=32"`
-	EvolutionTimeout     time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-
-	EvolutionAIEnabled     bool          `env:"MARKET_PREDICTION_EVOLUTION_AI_ENABLED" envDefault:"false"`
-	EvolutionAIMinInterval time.Duration `env:"MARKET_PREDICTION_EVOLUTION_AI_MIN_INTERVAL" envDefault:"6h" validate:"gt=0"`
-	EvolutionAIMaxPerRun   int           `env:"MARKET_PREDICTION_EVOLUTION_AI_MAX_PER_RUN" envDefault:"10" validate:"gte=0,lte=200"`
-
-	EvolutionStaleAfter    time.Duration `env:"MARKET_PREDICTION_EVOLUTION_STALE_AFTER" envDefault:"24h" validate:"gt=0"`
-	EvolutionDecayEnabled  bool          `env:"MARKET_PREDICTION_EVOLUTION_DECAY_ENABLED" envDefault:"true"`
-	EvolutionDecayPerDay   float64       `env:"MARKET_PREDICTION_EVOLUTION_DECAY_PER_DAY" envDefault:"0.15" validate:"gte=0,lte=1"`
-	EvolutionMinConfidence float64       `env:"MARKET_PREDICTION_EVOLUTION_MIN_CONFIDENCE" envDefault:"0.10" validate:"gte=0,lte=1"`
-
-	EvolutionMajorPriceMove     float64       `env:"MARKET_PREDICTION_EVOLUTION_MAJOR_PRICE_MOVE" envDefault:"0.08" validate:"gte=0,lte=1"`
-	EvolutionCatalystNearWindow time.Duration `env:"MARKET_PREDICTION_EVOLUTION_CATALYST_NEAR_WINDOW" envDefault:"12h" validate:"gt=0"`
-
-	EvolutionSendTelegram     bool          `env:"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM" envDefault:"false"`
-	EvolutionTelegramCooldown time.Duration `env:"MARKET_PREDICTION_EVOLUTION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
-
-	// --- v10.7 noise-suppression knobs ---
-	//
-	// SendResolutionOnlyBlocked=false (default) → DROP Telegram for
-	// watching→blocked transitions whose only blocker is an
-	// election-day / runoff / primary / certification catalyst with
-	// no pre-event edge. The operator can flip to true to restore
-	// legacy "send every state change" behaviour.
-	//
-	// SendSentinelResults=false (default) → DROP Telegram for runs
-	// where the AI returned a sentinel code. The sentinel result is
-	// still persisted for audit; only the Telegram is suppressed.
-	SendResolutionOnlyBlocked bool `env:"PREDICTION_SEND_RESOLUTION_ONLY_BLOCKED" envDefault:"false"`
-	SendSentinelResults       bool `env:"PREDICTION_SEND_SENTINEL_RESULTS" envDefault:"false"`
-
-	// --- v10.0 prediction creation worker (PART 1) ---
-	// The cold-start path. Without this loop, the evolution worker
-	// has nothing to evolve. Defaults are moderate / safe / non-
-	// spammy — the deterministic shortlist + AI ranking step keeps
-	// the AI bill bounded under the AI budget governor.
-	CreationEnabled      bool          `env:"MARKET_PREDICTION_CREATION_ENABLED" envDefault:"false"`
-	CreationInterval     time.Duration `env:"MARKET_PREDICTION_CREATION_INTERVAL" envDefault:"30m" validate:"gt=0"`
-	CreationBatchSize    int           `env:"MARKET_PREDICTION_CREATION_BATCH_SIZE" envDefault:"150" validate:"gte=10,lte=1000"`
-	CreationMaxSelected  int           `env:"MARKET_PREDICTION_CREATION_MAX_SELECTED" envDefault:"10" validate:"gte=1,lte=50"`
-	CreationMinScore     float64       `env:"MARKET_PREDICTION_CREATION_MIN_SCORE" envDefault:"0.55" validate:"gte=0,lte=1"`
-	CreationMaxPerDay    int           `env:"MARKET_PREDICTION_CREATION_MAX_PER_DAY" envDefault:"40" validate:"gte=1,lte=500"`
-	CreationDedupeWindow time.Duration `env:"MARKET_PREDICTION_CREATION_DEDUPE_WINDOW" envDefault:"24h" validate:"gt=0"`
-	CreationAIEnabled    bool          `env:"MARKET_PREDICTION_CREATION_AI_ENABLED" envDefault:"false"`
-	CreationAIModel      string        `env:"MARKET_PREDICTION_CREATION_AI_MODEL" envDefault:"gpt-4.1"`
-	CreationAITimeout    time.Duration `env:"MARKET_PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-	CreationConcurrency  int           `env:"MARKET_PREDICTION_CREATION_CONCURRENCY" envDefault:"2" validate:"gte=1,lte=16"`
-	CreationSendTelegram bool          `env:"MARKET_PREDICTION_CREATION_SEND_TELEGRAM" envDefault:"true"`
-	CreationCategories   []string      `env:"MARKET_PREDICTION_CREATION_CATEGORIES" envDefault:"politics,geopolitics,elections" envSeparator:","`
-
-	// --- v10.1 Telegram polish (PART 1/3/5/7) ---------------------
-	// Annotations + Links blocks under the AI thesis.
-	TelegramAnnotationsEnabled        bool `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_ENABLED" envDefault:"true"`
-	TelegramAnnotationsLimit          int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_LIMIT" envDefault:"5" validate:"gte=0,lte=20"`
-	TelegramAnnotationsMaxTitleChars  int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_MAX_TITLE_CHARS" envDefault:"160" validate:"gte=20,lte=512"`
-	TelegramAnnotationsMaxSourceNames int  `env:"MARKET_PREDICTION_TELEGRAM_ANNOTATIONS_MAX_SOURCE_NAMES" envDefault:"3" validate:"gte=0,lte=10"`
-	TelegramLinksEnabled              bool `env:"MARKET_PREDICTION_TELEGRAM_LINKS_ENABLED" envDefault:"true"`
-
-	// Per-event Telegram cooldown for the creation worker (PART 5).
-	// In-memory map + a deterministic skip-reason log line.
-	CreationTelegramCooldown  time.Duration `env:"MARKET_PREDICTION_CREATION_TELEGRAM_COOLDOWN" envDefault:"6h" validate:"gt=0"`
-	CreationMaxTelegramPerRun int           `env:"MARKET_PREDICTION_CREATION_MAX_TELEGRAM_PER_RUN" envDefault:"3" validate:"gte=0,lte=50"`
-	CreationSendOnStartup     bool          `env:"MARKET_PREDICTION_CREATION_SEND_ON_STARTUP" envDefault:"false"`
-
-	// Quality gate (PART 7). Persist always (if PersistLowQuality);
-	// gate Telegram send strictly.
-	CreationSendNeutral       bool    `env:"MARKET_PREDICTION_CREATION_SEND_NEUTRAL" envDefault:"false"`
-	CreationPersistLowQuality bool    `env:"MARKET_PREDICTION_CREATION_PERSIST_LOW_QUALITY" envDefault:"true"`
-	CreationMinConfidence     float64 `env:"MARKET_PREDICTION_CREATION_MIN_CONFIDENCE" envDefault:"0.55" validate:"gte=0,lte=1"`
-	CreationRequireSignal     bool    `env:"MARKET_PREDICTION_CREATION_REQUIRE_SIGNAL" envDefault:"true"`
-	CreationMinSummaryChars   int     `env:"MARKET_PREDICTION_CREATION_MIN_SUMMARY_CHARS" envDefault:"300" validate:"gte=0,lte=10000"`
-
-	// --- v10.2 usefulness scoring (PART 3) ------------------------
-	UsefulnessEnabled      bool    `env:"PREDICTION_USEFULNESS_ENABLED" envDefault:"true"`
-	UsefulnessMinTelegram  float64 `env:"PREDICTION_USEFULNESS_MIN_TELEGRAM_SCORE" envDefault:"0.60" validate:"gte=0,lte=1"`
-	UsefulnessHighPriority float64 `env:"PREDICTION_USEFULNESS_HIGH_PRIORITY_SCORE" envDefault:"0.80" validate:"gte=0,lte=1"`
-
-	// --- v10.2 feedback worker (PART 4) ---------------------------
-	FeedbackEnabled     bool          `env:"PREDICTION_FEEDBACK_ENABLED" envDefault:"false"`
-	FeedbackInterval    time.Duration `env:"PREDICTION_FEEDBACK_INTERVAL" envDefault:"15m" validate:"gt=0"`
-	FeedbackHorizonsCSV string        `env:"PREDICTION_FEEDBACK_HORIZONS" envDefault:"1h,6h,24h"`
-	FeedbackBatchSize   int           `env:"PREDICTION_FEEDBACK_BATCH_SIZE" envDefault:"100" validate:"gte=1,lte=1000"`
-
-	// --- v10.3 evaluation classifier knobs (PART 2) -------------
-	EvaluationEnabled           bool    `env:"PREDICTION_EVALUATION_ENABLED" envDefault:"true"`
-	EvaluationHorizonsCSV       string  `env:"PREDICTION_EVALUATION_HORIZONS" envDefault:"1h,6h,24h"`
-	EvaluationMinPriceDelta     float64 `env:"PREDICTION_EVALUATION_MIN_PRICE_DELTA" envDefault:"0.03" validate:"gte=0,lte=1"`
-	EvaluationUsefulEarlyWindow string  `env:"PREDICTION_EVALUATION_USEFUL_EARLY_WINDOW" envDefault:"6h"`
-
-	// --- v10.3 archival worker knobs (PART 4) -------------------
-	ArchivalEnabled            bool          `env:"PREDICTION_ARCHIVAL_ENABLED" envDefault:"true"`
-	ArchivalInterval           time.Duration `env:"PREDICTION_ARCHIVAL_INTERVAL" envDefault:"1h" validate:"gt=0"`
-	ArchivalTerminalRetention  time.Duration `env:"PREDICTION_ARCHIVAL_TERMINAL_RETENTION" envDefault:"72h" validate:"gt=0"`
-	ArchivalStaleNoSignalAfter time.Duration `env:"PREDICTION_STALE_NO_SIGNAL_AFTER" envDefault:"18h" validate:"gt=0"`
-	ArchivalBlockedRevalidate  time.Duration `env:"PREDICTION_BLOCKED_REVALIDATE_INTERVAL" envDefault:"6h" validate:"gt=0"`
-	ArchivalBatchSize          int           `env:"PREDICTION_ARCHIVAL_BATCH_SIZE" envDefault:"200" validate:"gte=1,lte=2000"`
-
-	// --- v10.3 calibration report (PART 7) ----------------------
-	CalibrationReportEnabled      bool   `env:"PREDICTION_CALIBRATION_REPORT_ENABLED" envDefault:"true"`
-	CalibrationReportTime         string `env:"PREDICTION_CALIBRATION_REPORT_TIME" envDefault:"09:00"`
-	CalibrationReportSendTelegram bool   `env:"PREDICTION_CALIBRATION_REPORT_SEND_TELEGRAM" envDefault:"true"`
-}
 
 // AIPreflightConfig wires the v10.3 per-surface preflight caps.
 // Every AI surface routes its prompt through aipreflight.Preflight
 // which enforces these caps + the AIBudgetConfig daily budgets.
 type AIPreflightConfig struct {
-	MaxInputCharsAlert              int `env:"AI_MAX_INPUT_CHARS_ALERT" envDefault:"18000" validate:"gte=1000"`
-	MaxInputCharsCatalyst           int `env:"AI_MAX_INPUT_CHARS_CATALYST" envDefault:"18000" validate:"gte=1000"`
-	MaxInputCharsPredictionCreate   int `env:"AI_MAX_INPUT_CHARS_PREDICTION_CREATE" envDefault:"22000" validate:"gte=1000"`
-	MaxInputCharsPredictionEvolve   int `env:"AI_MAX_INPUT_CHARS_PREDICTION_EVOLUTION" envDefault:"18000" validate:"gte=1000"`
-	MaxInputCharsDailyIntel         int `env:"AI_MAX_INPUT_CHARS_DAILY_INTEL" envDefault:"35000" validate:"gte=1000"`
-	MaxInputCharsMarketIntel        int `env:"AI_MAX_INPUT_CHARS_MARKET_INTEL" envDefault:"20000" validate:"gte=1000"`
-	MaxOutputTokensAlert            int `env:"AI_MAX_OUTPUT_TOKENS_ALERT" envDefault:"1200" validate:"gte=200"`
-	MaxOutputTokensPredictionCreate int `env:"AI_MAX_OUTPUT_TOKENS_PREDICTION" envDefault:"1200" validate:"gte=200"`
-	MaxOutputTokensPredictionEvolve int `env:"AI_MAX_OUTPUT_TOKENS_EVOLUTION" envDefault:"1000" validate:"gte=200"`
-	MaxOutputTokensCatalyst         int `env:"AI_MAX_OUTPUT_TOKENS_CATALYST" envDefault:"1200" validate:"gte=200"`
-	MaxOutputTokensDailyIntel       int `env:"AI_MAX_OUTPUT_TOKENS_DAILY_INTEL" envDefault:"2500" validate:"gte=200"`
+	MaxInputCharsAlert       int `env:"AI_MAX_INPUT_CHARS_ALERT" envDefault:"18000" validate:"gte=1000"`
+	MaxInputCharsCatalyst    int `env:"AI_MAX_INPUT_CHARS_CATALYST" envDefault:"18000" validate:"gte=1000"`
+	MaxOutputTokensAlert     int `env:"AI_MAX_OUTPUT_TOKENS_ALERT" envDefault:"1200" validate:"gte=200"`
+	MaxOutputTokensCatalyst  int `env:"AI_MAX_OUTPUT_TOKENS_CATALYST" envDefault:"1200" validate:"gte=200"`
 }
 
 // AIBudgetConfig wires the process-local AI budget governor (PART 5
@@ -794,30 +692,11 @@ type AIPreflightConfig struct {
 // specific cap; the recommended production values are the defaults
 // below and live in CLAUDE.md / .env.example.
 type AIBudgetConfig struct {
-	GlobalDailyUSD             float64 `env:"AI_GLOBAL_DAILY_BUDGET_USD" envDefault:"25" validate:"gte=0"`
-	AlertAnalysisDailyUSD      float64 `env:"AI_ANALYSIS_DAILY_BUDGET_USD_OVERRIDE" envDefault:"0" validate:"gte=0"`
-	CatalystImporterDailyUSD   float64 `env:"EVENT_CATALYST_IMPORTER_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
-	PredictionCreationDailyUSD float64 `env:"PREDICTION_CREATION_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
-	PredictionEvolveDailyUSD   float64 `env:"PREDICTION_EVOLUTION_DAILY_BUDGET_USD" envDefault:"5" validate:"gte=0"`
-	MarketIntelDailyUSD        float64 `env:"MARKET_INTEL_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
-	DailyIntelDailyUSD         float64 `env:"DAILY_INTEL_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
-	AnnotationRankDailyUSD     float64 `env:"ANNOTATION_RANKING_DAILY_BUDGET_USD" envDefault:"2" validate:"gte=0"`
+	GlobalDailyUSD           float64 `env:"AI_GLOBAL_DAILY_BUDGET_USD" envDefault:"25" validate:"gte=0"`
+	AlertAnalysisDailyUSD    float64 `env:"AI_ANALYSIS_DAILY_BUDGET_USD_OVERRIDE" envDefault:"0" validate:"gte=0"`
+	CatalystImporterDailyUSD float64 `env:"EVENT_CATALYST_IMPORTER_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
 }
 
-// DailyPoliticalIntelConfig wires the v9.7 once-per-day political /
-// geopolitical intelligence report. Failure NEVER blocks alerts;
-// the worker is fully decoupled from the alert pipeline.
-type DailyPoliticalIntelConfig struct {
-	Enabled              bool          `env:"DAILY_POLITICAL_INTEL_ENABLED" envDefault:"false"`
-	TimeOfDay            string        `env:"DAILY_POLITICAL_INTEL_TIME" envDefault:"08:00"`
-	Timezone             string        `env:"DAILY_POLITICAL_INTEL_TIMEZONE" envDefault:"Europe/Tallinn"`
-	MarketLimit          int           `env:"DAILY_POLITICAL_INTEL_MARKET_LIMIT" envDefault:"100" validate:"gte=10,lte=500"`
-	AnnotationsPerMarket int           `env:"DAILY_POLITICAL_INTEL_ANNOTATIONS_PER_MARKET" envDefault:"4" validate:"gte=1,lte=20"`
-	AIEnabled            bool          `env:"DAILY_POLITICAL_INTEL_AI_ENABLED" envDefault:"false"`
-	AITimeout            time.Duration `env:"DAILY_POLITICAL_INTEL_AI_TIMEOUT" envDefault:"90s" validate:"gt=0"`
-	PromptMaxChars       int           `env:"DAILY_POLITICAL_INTEL_PROMPT_MAX_CHARS" envDefault:"30000" validate:"gte=2000,lte=80000"`
-	SendTelegram         bool          `env:"DAILY_POLITICAL_INTEL_SEND_TELEGRAM" envDefault:"true"`
-}
 
 // CatalystConfig wires the Political-Catalyst Intelligence overlay.
 // Catalyst rows are stored in polymarket_event_catalysts and modify
@@ -933,7 +812,6 @@ type AIAnalysisConfig struct {
 	WebSearchEnabled            bool          `env:"AI_ANALYSIS_WEB_SEARCH_ENABLED" envDefault:"true"`
 	WebContextMinSeverity       string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
 	WebContextForHotInfo        bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
-	WebContextForStableFavorite bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_STABLE_FAVORITE" envDefault:"true"`
 	WebContextForPolitics       bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_POLITICS" envDefault:"true"`
 	WebContextMaxResults        int           `env:"AI_ANALYSIS_WEB_CONTEXT_MAX_RESULTS" envDefault:"5" validate:"gte=1,lte=20"`
 	WebContextTimeout           time.Duration `env:"AI_ANALYSIS_WEB_CONTEXT_TIMEOUT" envDefault:"12s" validate:"gt=0"`
@@ -942,90 +820,13 @@ type AIAnalysisConfig struct {
 	LifecycleRefreshDeltaPct float64 `env:"AI_ANALYSIS_LIFECYCLE_REFRESH_DELTA_PCT" envDefault:"1" validate:"gte=0"`
 	CLVMaterialChange        float64 `env:"AI_ANALYSIS_CLV_MATERIAL_CHANGE" envDefault:"0.02" validate:"gte=0"`
 
-	// 2h market-intelligence schedule. v10.9: superseded by the
-	// unified intelligence engine. Three kill switches gate the
-	// legacy surfaces so the operator can flip them off without
-	// touching code. Defaults keep legacy ON for backward compat;
-	// production deploys should set all three to false when the
-	// unified engine is wired.
-	MarketIntelLegacyEnabled     bool          `env:"MARKET_INTEL_LEGACY_ENABLED" envDefault:"false"`
-	DailyIntelLegacyEnabled      bool          `env:"DAILY_INTEL_LEGACY_ENABLED" envDefault:"false"`
-	PredictionAILegacyEnabled    bool          `env:"PREDICTION_AI_LEGACY_ENABLED" envDefault:"false"`
-	// v11.0: annotation ranking AI is gated independently. It used
-	// to feed the marketintel surface; with that surface dead, the
-	// ranker has no consumer and stays off.
-	AnnotationRankingAIEnabled bool `env:"ANNOTATION_RANKING_AI_ENABLED" envDefault:"false"`
-	UnifiedIntelEnabled          bool          `env:"UNIFIED_INTEL_ENABLED" envDefault:"false"`
-	UnifiedIntelMinQueryInterval time.Duration `env:"UNIFIED_INTEL_MIN_QUERY_INTERVAL" envDefault:"4h" validate:"gt=0"`
-	UnifiedIntelMinSendInterval  time.Duration `env:"UNIFIED_INTEL_MIN_SEND_INTERVAL" envDefault:"4h" validate:"gt=0"`
-	// v11.0: market intel surface killed — default off. Canonical env
-	// is AI_MARKET_INTELLIGENCE_ENABLED; the v11.0 spec's
-	// MARKET_INTEL_ENABLED is honoured via a post-parse fallback in
-	// LoadConfig (env library v11 does not support comma-separated
-	// aliases in struct tags).
-	MarketIntelligenceEnabled    bool          `env:"AI_MARKET_INTELLIGENCE_ENABLED" envDefault:"false"`
-	// v10.8: bumped default 2h → 4h. The 4-day audit showed every
-	// 2h marketintel report shipped filler ("reactive crowding",
-	// "no fresh news") because there genuinely IS no fresh news on
-	// most 2h windows. 4h matches the operator-target cadence.
-	// Operators may override; this is the new safe floor.
-	MarketIntelligenceInterval time.Duration `env:"AI_MARKET_INTELLIGENCE_INTERVAL" envDefault:"4h" validate:"gt=0"`
-	// MarketIntelligenceMinSendInterval enforces a hard floor on
-	// Telegram send cadence INDEPENDENT of the AI query cadence.
-	// Set equal to MarketIntelligenceInterval by default (one send
-	// per query). Set higher to query more often than you send.
-	MarketIntelligenceMinSendInterval time.Duration `env:"MARKET_INTEL_MIN_SEND_INTERVAL" envDefault:"4h" validate:"gt=0"`
-	MarketIntelligenceMaxMarkets      int           `env:"AI_MARKET_INTELLIGENCE_MAX_MARKETS" envDefault:"50" validate:"gte=1,lte=500"`
-	MarketIntelligenceMaxOutputChars  int           `env:"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS" envDefault:"2000" validate:"gte=200,lte=8000"`
-
-	// --- v9.7 per-surface timeout knobs ------------------------------------
-	// Market-intelligence prompts are heavier than alerts — separate
-	// timeout so the 2h scout does not piggy-back on the 45s alert
-	// budget. Defaults match the operator spec; observed prod calls
-	// land in the 20-45s range, so 60s is comfortable headroom.
-	MarketIntelAITimeout                  time.Duration `env:"MARKET_INTEL_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-	MarketIntelAnnotationRankingAITimeout time.Duration `env:"MARKET_INTEL_ANNOTATION_RANKING_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
-	// Retry-once-on-timeout flag. true = single retry on
-	// CategoryTimeout with 1-3s jittered backoff; false = single-shot
-	// behaviour (legacy). Quota / rate-limit / 5xx routes through the
-	// existing error handling — those NEVER retry here.
-	MarketIntelRetryOnTimeout  bool          `env:"MARKET_INTEL_RETRY_ON_TIMEOUT" envDefault:"true"`
-	MarketIntelRetryBackoffMin time.Duration `env:"MARKET_INTEL_RETRY_BACKOFF_MIN" envDefault:"1s" validate:"gt=0"`
-	MarketIntelRetryBackoffMax time.Duration `env:"MARKET_INTEL_RETRY_BACKOFF_MAX" envDefault:"3s" validate:"gt=0"`
-	// Link / source-link rendering.
-	MarketIntelSourceLinksEnabled bool `env:"MARKET_INTEL_SOURCE_LINKS_ENABLED" envDefault:"true"`
-	MarketIntelMaxSourceLinks     int  `env:"MARKET_INTEL_MAX_SOURCE_LINKS" envDefault:"3" validate:"gte=0,lte=10"`
-	MarketIntelMaxLinksPerRow     int  `env:"MARKET_INTEL_MAX_LINKS_PER_ROW" envDefault:"5" validate:"gte=0,lte=20"`
-	// Deterministic-fallback knob. When true (default) the worker
-	// SHIPS a deterministic report with markets/links + "AI summary
-	// unavailable: <reason>" when the AI fails. Set to false to
-	// restore legacy "skip everything on AI failure" behaviour.
-	MarketIntelFallbackOnAIFailure bool `env:"MARKET_INTEL_FALLBACK_ON_AI_FAILURE" envDefault:"true"`
-	// v10.7: when true (default), an AI response that exactly matches
-	// one of the sentinel codes (AI_NO_NOTICEABLE_EDGE,
-	// AI_ALREADY_PRICED, AI_CONTEXT_STALE, AI_INPUT_INSUFFICIENT,
-	// AI_ONLY_RESOLUTION_BLOCKED) is persisted as a skipped_sentinel
-	// row AND the Telegram send is suppressed. The 12h cooldown for
-	// repeated no-edge outputs lives in the news fingerprint table.
-	MarketIntelSuppressOnSentinel bool `env:"MARKET_INTEL_SUPPRESS_ON_SENTINEL" envDefault:"true"`
-	// Annotation listing cap per event for the "Important Polymarket
-	// events" section.
-	MarketIntelAnnotationsPerEvent int `env:"MARKET_INTEL_ANNOTATIONS_PER_EVENT" envDefault:"3" validate:"gte=0,lte=20"`
-	// Hard cap on visible candidate markets in the Telegram body.
-	// Anything beyond this remains in markets_json for audit.
-	MarketIntelVisibleMarkets int `env:"MARKET_INTEL_VISIBLE_MARKETS" envDefault:"8" validate:"gte=1,lte=50"`
-
 	// --- v9.7 alias timeouts for downstream surfaces -----------------------
-	// These let an operator pin per-surface timeouts under canonical
-	// names without forcing them to discover the legacy ones. The
-	// implementation prefers the canonical name when the env var is
-	// set; otherwise it falls back to the surface's existing
-	// `*_AI_TIMEOUT` (Timeout / ImporterAITimeout / etc.).
-	AlertAITimeout                time.Duration `env:"ALERT_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
-	CatalystAITimeout             time.Duration `env:"CATALYST_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-	PredictionCreationAITimeoutV2 time.Duration `env:"PREDICTION_CREATION_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-	PredictionEvolutionAITimeout  time.Duration `env:"PREDICTION_EVOLUTION_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
-	OutcomeAITimeout              time.Duration `env:"OUTCOME_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	// Per-surface timeouts. The alert + outcome paths are the only
+	// AI surfaces left; the catalyst importer uses its own timeout
+	// (configured under CatalystConfig).
+	AlertAITimeout    time.Duration `env:"ALERT_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
+	CatalystAITimeout time.Duration `env:"CATALYST_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	OutcomeAITimeout  time.Duration `env:"OUTCOME_AI_TIMEOUT" envDefault:"45s" validate:"gt=0"`
 
 	// --- v11.0 Hourly News Intelligence ---
 	// One AI call per hour over NEW Polymarket annotations/news.
@@ -1052,6 +853,19 @@ type AIAnalysisConfig struct {
 	// worker is somehow re-enabled, this final gate blocks the
 	// "PREDICTION UPDATE · blocked" Telegram surface entirely.
 	PredictionBlockedTelegramEnabled bool `env:"PREDICTION_BLOCKED_TELEGRAM_ENABLED" envDefault:"false"`
+
+	// v11.1 — fine-grained Telegram surface kill switches, enforced
+	// by the central telegram.Guard layer. Each flag is a hard "do
+	// not deliver" gate that operates AT THE SENDER, independently
+	// of whichever worker generated the body. Even if a worker is
+	// accidentally re-enabled upstream, these flags suppress its
+	// output and emit watchtower_telegram_suppressed_total{surface}.
+	//
+	// Defaults are FALSE — disabled. This is the production state
+	// the operator wants after the v11.x cleanup.
+	WatchtowerStatsTelegramEnabled            bool `env:"WATCHTOWER_STATS_TELEGRAM_ENABLED" envDefault:"false"`
+	PredictionUpdateTelegramEnabled           bool `env:"PREDICTION_UPDATE_TELEGRAM_ENABLED" envDefault:"false"`
+	PredictionStateTransitionTelegramEnabled  bool `env:"PREDICTION_STATE_TRANSITION_TELEGRAM_ENABLED" envDefault:"false"`
 }
 
 // DetectionConfig tunes the v6 detection worker that drains
@@ -1068,69 +882,19 @@ type DetectionConfig struct {
 	ClaimTTL time.Duration `env:"DETECTION_CLAIM_TTL" envDefault:"5m" validate:"gt=0"`
 }
 
-// StableFavoriteConfig configures the late-market-stable-favorite
-// strategy. SEPARATE from whale-flow knobs — must be toggled
-// independently. The strategy looks for late-stage markets with a
-// stable favorite in a defined probability band; it never represents
-// itself as risk-free or guaranteed.
-type StableFavoriteConfig struct {
-	Enabled bool `env:"STABLE_FAVORITE_ENABLED" envDefault:"false"`
-
-	// Lifecycle gates.
-	MinLifecyclePct float64 `env:"STABLE_FAVORITE_MIN_LIFECYCLE_PCT" envDefault:"92" validate:"gte=0,lte=100"`
-	HotLifecyclePct float64 `env:"STABLE_FAVORITE_HOT_LIFECYCLE_PCT" envDefault:"97" validate:"gte=0,lte=100"`
-
-	// Favorite-probability band — we want neither a coinflip nor a
-	// near-certain side (no payout).
-	MinProbability float64 `env:"STABLE_FAVORITE_MIN_PROBABILITY" envDefault:"0.55" validate:"gt=0,lt=1"`
-	MaxProbability float64 `env:"STABLE_FAVORITE_MAX_PROBABILITY" envDefault:"0.85" validate:"gt=0,lt=1"`
-
-	// Remaining-return floor expressed as a percentage.
-	MinReturnPct float64 `env:"STABLE_FAVORITE_MIN_RETURN_PCT" envDefault:"20" validate:"gte=0"`
-
-	// Stability window. v7 relaxation: shortened to 6h (was 24h) so
-	// the stability read reflects the most-recent regime, and the
-	// stddev / drawdown / adverse-move caps loosened to admit markets
-	// that breathe a little without flapping. Cross-market is NOT a
-	// hard gate (see pickSeverity in the detector).
-	StabilityWindow    time.Duration `env:"STABLE_FAVORITE_STABILITY_WINDOW" envDefault:"6h" validate:"gt=0"`
-	MaxPriceStddev     float64       `env:"STABLE_FAVORITE_MAX_PRICE_STDDEV" envDefault:"0.10" validate:"gt=0"`
-	MaxDrawdown        float64       `env:"STABLE_FAVORITE_MAX_DRAWDOWN" envDefault:"0.25" validate:"gt=0"`
-	MaxAdverseMove6h   float64       `env:"STABLE_FAVORITE_MAX_ADVERSE_MOVE_6H" envDefault:"0.15" validate:"gt=0"`
-	MaxNegativeDrift6h float64       `env:"STABLE_FAVORITE_MAX_NEGATIVE_DRIFT_6H" envDefault:"0.10" validate:"gte=0"`
-
-	// Liquidity gates.
-	MinMarketVolumeUSD float64 `env:"STABLE_FAVORITE_MIN_MARKET_VOLUME_USD" envDefault:"25000" validate:"gte=0"`
-	MinRecentTrades    int     `env:"STABLE_FAVORITE_MIN_RECENT_TRADES" envDefault:"20" validate:"gte=0"`
-
-	// Cross-market (optional; no upstream wired in v6). Effect is
-	// confidence-only — see detector.pickSeverity.
-	CrossMarketEnabled         bool    `env:"STABLE_FAVORITE_CROSS_MARKET_ENABLED" envDefault:"true"`
-	MaxCrossMarketDisagreement float64 `env:"STABLE_FAVORITE_MAX_CROSS_MARKET_DISAGREEMENT" envDefault:"0.15" validate:"gte=0,lt=1"`
-
-	// Worker cadence. 15m (was 5m) tracks the slower-moving state
-	// view appropriate for the relaxed stability window.
-	Interval       time.Duration `env:"STABLE_FAVORITE_INTERVAL" envDefault:"15m" validate:"gt=0"`
-	CandidateLimit int           `env:"STABLE_FAVORITE_CANDIDATE_LIMIT" envDefault:"200" validate:"gte=1,lte=10000"`
-}
 
 func LoadConfig() (*Config, error) {
+	// v11.2: reject stale env keys at startup. Every surface listed
+	// below was removed in v11.x and re-introducing it via env would
+	// silently do nothing. Failing loud at boot tells the operator
+	// "drop these from your environment" before we ship a release
+	// that ignores them.
+	if err := rejectStaleEnvKeys(); err != nil {
+		return nil, err
+	}
 	cfg := &Config{}
 	if err := env.Parse(cfg); err != nil {
 		return nil, fmt.Errorf("parse env: %w", err)
-	}
-	// v11.0 spec alias: MARKET_INTEL_ENABLED is the operator-facing
-	// name for the legacy AI_MARKET_INTELLIGENCE_ENABLED switch. When
-	// either is set true, the legacy market-intel surface re-enables.
-	// caarlos0/env v11 doesn't support comma-separated env tag
-	// aliases, so we apply the OR here.
-	if v := os.Getenv("MARKET_INTEL_ENABLED"); v != "" {
-		switch strings.ToLower(strings.TrimSpace(v)) {
-		case "1", "true", "yes", "on":
-			cfg.AIAnalysis.MarketIntelligenceEnabled = true
-		case "0", "false", "no", "off":
-			cfg.AIAnalysis.MarketIntelligenceEnabled = false
-		}
 	}
 	if err := validator.New().Struct(cfg); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
@@ -1139,6 +903,117 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("validate config invariants: %w", err)
 	}
 	return cfg, nil
+}
+
+// staleEnvKeys names every env var the v11.2 cleanup retired. Listed
+// keys are exact (no prefix matching) — operators that just want to
+// disable a surface should remove the variable entirely; "=false"
+// won't satisfy the guard. Each entry is one of:
+//   - the variable that gated a deleted surface;
+//   - a legacy alias for a current variable;
+//   - a tuning knob whose backing field is gone.
+var staleEnvKeys = []string{
+	// v11.0 surfaces fully retired in v11.2.
+	"AI_MARKET_INTELLIGENCE_ENABLED",
+	"AI_MARKET_INTELLIGENCE_INTERVAL",
+	"AI_MARKET_INTELLIGENCE_MAX_MARKETS",
+	"AI_MARKET_INTELLIGENCE_MAX_OUTPUT_CHARS",
+	"MARKET_INTEL_ENABLED",
+	"MARKET_INTEL_LEGACY_ENABLED",
+	"MARKET_INTEL_MIN_SEND_INTERVAL",
+	"MARKET_INTEL_AI_TIMEOUT",
+	"MARKET_INTEL_ANNOTATION_RANKING_AI_TIMEOUT",
+	"MARKET_INTEL_RETRY_ON_TIMEOUT",
+	"MARKET_INTEL_RETRY_BACKOFF_MIN",
+	"MARKET_INTEL_RETRY_BACKOFF_MAX",
+	"MARKET_INTEL_SOURCE_LINKS_ENABLED",
+	"MARKET_INTEL_MAX_SOURCE_LINKS",
+	"MARKET_INTEL_MAX_LINKS_PER_ROW",
+	"MARKET_INTEL_FALLBACK_ON_AI_FAILURE",
+	"MARKET_INTEL_SUPPRESS_ON_SENTINEL",
+	"MARKET_INTEL_ANNOTATIONS_PER_EVENT",
+	"MARKET_INTEL_VISIBLE_MARKETS",
+	"MARKET_INTEL_DAILY_BUDGET_USD",
+	"DAILY_POLITICAL_INTEL_ENABLED",
+	"DAILY_POLITICAL_INTEL_TIME",
+	"DAILY_POLITICAL_INTEL_TIMEZONE",
+	"DAILY_POLITICAL_INTEL_MARKET_LIMIT",
+	"DAILY_POLITICAL_INTEL_ANNOTATIONS_PER_MARKET",
+	"DAILY_POLITICAL_INTEL_AI_ENABLED",
+	"DAILY_POLITICAL_INTEL_AI_TIMEOUT",
+	"DAILY_POLITICAL_INTEL_PROMPT_MAX_CHARS",
+	"DAILY_POLITICAL_INTEL_SEND_TELEGRAM",
+	"DAILY_INTEL_LEGACY_ENABLED",
+	"DAILY_INTEL_DAILY_BUDGET_USD",
+	"AI_MAX_INPUT_CHARS_DAILY_INTEL",
+	"AI_MAX_INPUT_CHARS_MARKET_INTEL",
+	"AI_MAX_OUTPUT_TOKENS_DAILY_INTEL",
+	"ANNOTATION_RANKING_AI_ENABLED",
+	"ANNOTATION_RANKING_DAILY_BUDGET_USD",
+	"UNIFIED_INTEL_ENABLED",
+	"UNIFIED_INTEL_MIN_QUERY_INTERVAL",
+	"UNIFIED_INTEL_MIN_SEND_INTERVAL",
+	// Prediction surfaces.
+	"PREDICTION_CREATION_ENABLED",
+	"PREDICTION_EVOLUTION_ENABLED",
+	"PREDICTION_FEEDBACK_ENABLED",
+	"PREDICTION_ARCHIVAL_ENABLED",
+	"MARKET_PREDICTION_CREATION_ENABLED",
+	"MARKET_PREDICTION_EVOLUTION_ENABLED",
+	"MARKET_PREDICTION_CREATION_SEND_TELEGRAM",
+	"MARKET_PREDICTION_EVOLUTION_SEND_TELEGRAM",
+	"PREDICTION_CREATION_DAILY_BUDGET_USD",
+	"PREDICTION_EVOLUTION_DAILY_BUDGET_USD",
+	"PREDICTION_AI_LEGACY_ENABLED",
+	"PREDICTION_CALIBRATION_REPORT_ENABLED",
+	"PREDICTION_CREATION_AI_TIMEOUT",
+	"PREDICTION_EVOLUTION_AI_TIMEOUT",
+	"AI_MAX_INPUT_CHARS_PREDICTION_CREATE",
+	"AI_MAX_INPUT_CHARS_PREDICTION_EVOLUTION",
+	"AI_MAX_OUTPUT_TOKENS_PREDICTION",
+	"AI_MAX_OUTPUT_TOKENS_EVOLUTION",
+	"PREDICTION_BLOCKED_TELEGRAM_ENABLED",
+	"PREDICTION_UPDATE_TELEGRAM_ENABLED",
+	"PREDICTION_STATE_TRANSITION_TELEGRAM_ENABLED",
+	// Signal-report Telegram scheduler.
+	"SIGNAL_REPORTS_ENABLED",
+	"SIGNAL_REPORTS_TIMEZONE",
+	"SIGNAL_REPORTS_DAILY_AT",
+	"SIGNAL_REPORTS_WEEKLY_AT",
+	"SIGNAL_REPORTS_MONTHLY_AT",
+	"SIGNAL_REPORTS_QUARTERLY_AT",
+	"SIGNAL_REPORTS_YEARLY_AT",
+	"SIGNAL_REPORTS_YEARLY_DELAY",
+	"SIGNAL_REPORTS_TICK_INTERVAL",
+	// Stable-favorite strategy.
+	"STABLE_FAVORITE_ENABLED",
+	"AI_ANALYSIS_WEB_CONTEXT_FOR_STABLE_FAVORITE",
+	// Repricing module (only used by deleted prediction worker).
+	"REPRICING_ENABLED",
+	"REPRICING_LOOKBACK",
+	"REPRICING_PRE_WINDOW",
+	"REPRICING_POST_WINDOW",
+	"REPRICING_MIN_ANNOTATION_MOVE",
+	"REPRICING_MIN_FLOW_USD",
+	"REPRICING_UNDERREACTION_THRESHOLD",
+	"REPRICING_OVERREACTION_THRESHOLD",
+	// Watchtower stats Telegram alias (the underlying
+	// TELEGRAM_STATS_ENABLED switch is kept for the metrics path).
+	"WATCHTOWER_STATS_TELEGRAM_ENABLED",
+	// Pre-v11 narrative-context surfaces.
+	"MARKET_ACTIVITY_CONTEXT_ENABLED",
+	"MARKET_ACTIVITY_CONTEXT_LOOKBACK",
+	"EVENT_NARRATIVE_CONTEXT_ENABLED",
+	"EVENT_NARRATIVE_CONTEXT_LOOKBACK",
+}
+
+func rejectStaleEnvKeys() error {
+	for _, k := range staleEnvKeys {
+		if _, present := os.LookupEnv(k); present {
+			return fmt.Errorf("unsupported legacy env key %s; this surface was removed in the v11.x cleanup. Remove it from the environment.", k)
+		}
+	}
+	return nil
 }
 
 // validateInvariants applies cross-field rules the struct-tag

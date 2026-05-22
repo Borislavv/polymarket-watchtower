@@ -35,21 +35,33 @@ type TelegramConfig struct {
 	Timeout time.Duration
 }
 
-// TelegramSink delivers every Finding to a single Telegram chat as an HTML
-// message. It is a thin adapter on top of internal/infra/telegram.Bot: this
-// type owns the alerting-domain Channel interface and the per-severity
-// metrics, the Bot owns the HTTP transport.
+// TelegramSink is the dev-mode synchronous fanout sink. Production
+// alert delivery flows through the DB queue → alertsender worker →
+// *telegram.Router. This sink only matters when Postgres is
+// unwired (developer laptop / tests).
+//
+// v11.4: the sink now dispatches through a typed telegram.Sender
+// (the Router) instead of touching *Bot directly. The legacy
+// constructor that takes a token + chat id is retained so the
+// "Enabled=false" no-op behaviour is preserved, but every
+// outbound message carries an explicit Surface so the router can
+// route, log, and metric-attribute it.
 type TelegramSink struct {
 	cfg     TelegramConfig
-	bot     *telegram.Bot
+	sender  telegram.Sender
 	metrics *metrics.Metrics
 }
 
-// NewTelegramSink validates the config and returns a ready sink.
+// NewTelegramSink validates the config and returns a disabled sink
+// when Enabled=false. The legacy bot-token / chat-id fields are
+// kept on the config struct for backward compatibility but are no
+// longer used to construct a transport — callers MUST pass a typed
+// Sender via WithSender().
 //
-//   - Enabled=false → returns a no-op sink (Notify always returns nil).
-//   - Enabled=true requires BotToken AND ChatID. Either missing is a startup
-//     error — operators get an immediate signal, not a silent no-op.
+// Practical wiring: in dev mode the app boots without Postgres and
+// the realtime fanout calls NewTelegramSink(...).WithSender(router).
+// In production the alertsender path is used instead and this sink
+// is left disabled.
 func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if !cfg.Enabled {
 		return &TelegramSink{cfg: cfg}, nil
@@ -60,15 +72,15 @@ func NewTelegramSink(cfg TelegramConfig) (*TelegramSink, error) {
 	if cfg.ChatID == "" {
 		return nil, errors.New("telegram: chat id required when enabled (TELEGRAM_CHAT_ID)")
 	}
-	bot, err := telegram.New(telegram.Config{
-		BotToken: cfg.BotToken,
-		BaseURL:  cfg.BaseURL,
-		Timeout:  cfg.Timeout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("telegram sink: %w", err)
-	}
-	return &TelegramSink{cfg: cfg, bot: bot}, nil
+	return &TelegramSink{cfg: cfg}, nil
+}
+
+// WithSender attaches the typed Telegram Sender. Production passes
+// the *telegram.Router; tests pass a recording fake. Without a
+// Sender the enabled sink is inert (Notify returns nil).
+func (s *TelegramSink) WithSender(sender telegram.Sender) *TelegramSink {
+	s.sender = sender
+	return s
 }
 
 // WithMetrics attaches a Prometheus metrics handle and returns the sink for
@@ -81,20 +93,51 @@ func (s *TelegramSink) WithMetrics(m *metrics.Metrics) *TelegramSink {
 // Name is the sink identifier used by the fanout for logging.
 func (s *TelegramSink) Name() string { return "telegram" }
 
-// Notify renders the finding and delivers it to the configured chat. When
-// the sink is disabled this is a no-op (no error). Delivery errors are
-// surfaced to the fanout for logging; the sink never retries.
+// Notify renders the finding and dispatches it through the typed
+// Sender with a Finding.Kind-derived Surface. When the sink is
+// disabled OR no Sender has been attached, this is a no-op
+// (no error). Delivery errors propagate to the fanout for logging;
+// the sink never retries.
+//
+// v11.4: the chat id is resolved by the Router from the Surface —
+// the sink no longer carries a static ChatID through to the
+// transport. This guarantees a flow alert can never accidentally
+// land on an admin chat even if cfg.ChatID is misconfigured.
 func (s *TelegramSink) Notify(ctx context.Context, f anomaly.Finding) error {
-	if !s.cfg.Enabled || s.bot == nil {
+	if !s.cfg.Enabled || s.sender == nil {
 		return nil
 	}
 	text := FormatTelegramMessage(f)
-	if _, err := s.bot.SendHTML(ctx, s.cfg.ChatID, text); err != nil {
+	if _, err := s.sender.Send(ctx, telegram.Message{
+		Surface: SurfaceForFindingKind(f.Kind),
+		HTML:    text,
+	}); err != nil {
 		s.observeErr(f.Severity)
 		return err
 	}
 	s.observeOK(f.Severity)
 	return nil
+}
+
+// SurfaceForFindingKind maps a Finding.Kind onto the typed Telegram
+// surface used by the v11.3 Router. Mirrors the alertsender helper
+// so the two send paths assign the same surface label to identical
+// alert types.
+//
+// Exported for the dev-mode fanout wiring + tests that need to
+// assert which surface a Finding produces.
+func SurfaceForFindingKind(kind anomaly.Kind) telegram.Surface {
+	switch kind {
+	case anomaly.KindTradeAnomaly:
+		return telegram.SurfaceFlowAlert
+	case anomaly.KindAccumulation:
+		return telegram.SurfaceAccumulationAlert
+	case anomaly.KindCategoryWatch:
+		return telegram.SurfaceClusterAlert
+	case anomaly.KindOwnership:
+		return telegram.SurfaceOwnershipAlert
+	}
+	return telegram.SurfaceFlowAlert
 }
 
 func (s *TelegramSink) observeOK(sev anomaly.Severity) {

@@ -76,11 +76,16 @@ type fakeBot struct {
 }
 
 type sendCall struct {
-	ChatID string
-	Text   string
+	ChatID  string
+	Text    string
+	Surface telegram.Surface
 }
 
-func (b *fakeBot) SendHTML(_ context.Context, chatID, text string) (telegram.SendResult, error) {
+// Send implements the v11.3 typed Sender interface. The fake bot
+// no longer cares about the chat id (the router would resolve it
+// in production) — it records the surface + body so the tests can
+// assert that flow alerts emit the expected typed surface.
+func (b *fakeBot) Send(_ context.Context, msg telegram.Message) (telegram.SendResult, error) {
 	b.count.Add(1)
 	if b.delay > 0 {
 		time.Sleep(b.delay)
@@ -89,7 +94,7 @@ func (b *fakeBot) SendHTML(_ context.Context, chatID, text string) (telegram.Sen
 		return telegram.SendResult{}, b.err
 	}
 	b.mu.Lock()
-	b.calls = append(b.calls, sendCall{ChatID: chatID, Text: text})
+	b.calls = append(b.calls, sendCall{Text: msg.HTML, Surface: msg.Surface})
 	b.mu.Unlock()
 	return telegram.SendResult{MessageID: int64(b.count.Load() + 100)}, nil
 }

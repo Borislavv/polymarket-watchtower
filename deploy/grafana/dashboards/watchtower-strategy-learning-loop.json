@@ -1,0 +1,279 @@
+{
+  "uid": "watchtower-strategy-learning-loop",
+  "title": "Watchtower — Strategy Learning Loop",
+  "tags": ["watchtower", "learning-loop", "v11.4"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 0,
+  "time": {"from": "now-30d", "to": "now"},
+  "refresh": "5m",
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Executive",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Reviewed markets (lookback)",
+      "gridPos": {"x": 0, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT COUNT(*) AS reviewed FROM watchtower_market_close_review_quality_v WHERE reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Confirmed signal (count)",
+      "gridPos": {"x": 4, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT COUNT(*) FROM watchtower_market_close_review_quality_v WHERE verdict = 'confirmed_signal' AND reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "False positive (count)",
+      "gridPos": {"x": 8, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT COUNT(*) FROM watchtower_market_close_review_quality_v WHERE verdict = 'false_positive' AND reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Inconclusive (count)",
+      "gridPos": {"x": 12, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT COUNT(*) FROM watchtower_market_close_review_quality_v WHERE verdict IN ('inconclusive','no_edge','missed_signal') AND reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Avg AI cost / review ($)",
+      "gridPos": {"x": 16, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT AVG(estimated_cost_usd) FROM watchtower_market_close_review_quality_v WHERE reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Total AI cost ($, lookback)",
+      "gridPos": {"x": 20, "y": 1, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM watchtower_market_close_review_quality_v WHERE reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo()"
+      }]
+    },
+
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Strategy quality",
+      "gridPos": {"x": 0, "y": 5, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Strategy verdicts (tuning candidates)",
+      "gridPos": {"x": 0, "y": 6, "w": 24, "h": 10},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT strategy, alert_kind, severity, strategy_version, reviewed_alert_count, confirmed_count, false_positive_count, inconclusive_count, ROUND(market_close_confirmed_rate::numeric, 3) AS confirmed_rate, ROUND(avg_clv_6h::numeric, 4) AS avg_clv_6h, verdict, verdict_reason FROM watchtower_strategy_quality_v ORDER BY reviewed_alert_count DESC LIMIT 100"
+      }]
+    },
+
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Market close reviews",
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Reviews by verdict (24h buckets)",
+      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 8},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "time_series",
+        "rawSql": "SELECT date_trunc('day', reviewed_at) AS time, verdict AS metric, COUNT(*) AS value FROM watchtower_market_close_review_quality_v WHERE reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo() GROUP BY 1, 2 ORDER BY 1"
+      }]
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Top confirmed markets (lookback)",
+      "gridPos": {"x": 0, "y": 25, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT reviewed_at, title, confidence, alert_count, ROUND(avg_clv_6h::numeric,4) AS avg_clv_6h FROM watchtower_market_close_review_quality_v WHERE verdict = 'confirmed_signal' AND reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo() ORDER BY confidence DESC, reviewed_at DESC LIMIT 20"
+      }]
+    },
+    {
+      "id": 23,
+      "type": "table",
+      "title": "Top false-positive markets (lookback)",
+      "gridPos": {"x": 12, "y": 25, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT reviewed_at, title, confidence, alert_count, ROUND(avg_clv_6h::numeric,4) AS avg_clv_6h FROM watchtower_market_close_review_quality_v WHERE verdict = 'false_positive' AND reviewed_at >= $__timeFrom() AND reviewed_at <= $__timeTo() ORDER BY confidence DESC, reviewed_at DESC LIMIT 20"
+      }]
+    },
+
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Telegram reactions",
+      "gridPos": {"x": 0, "y": 33, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Reactions (sent / failed / unsupported)",
+      "gridPos": {"x": 0, "y": 34, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (status) (rate(watchtower_market_close_review_reactions_total[1h]))",
+        "legendFormat": "{{status}}"
+      }]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Reaction labels (success / failure / ambiguous)",
+      "gridPos": {"x": 12, "y": 34, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (reaction) (rate(watchtower_market_close_review_reactions_total[1h]))",
+        "legendFormat": "{{reaction}}"
+      }]
+    },
+
+    {
+      "id": 40,
+      "type": "row",
+      "title": "AI cost",
+      "gridPos": {"x": 0, "y": 42, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "AI cost by surface / day ($)",
+      "gridPos": {"x": 0, "y": 43, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "time_series",
+        "rawSql": "SELECT day AS time, surface AS metric, SUM(estimated_cost_usd) AS value FROM watchtower_ai_cost_quality_v WHERE day >= $__timeFrom() AND day <= $__timeTo() GROUP BY 1, 2 ORDER BY 1"
+      }]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "AI cost by model / day ($)",
+      "gridPos": {"x": 12, "y": 43, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "time_series",
+        "rawSql": "SELECT day AS time, model AS metric, SUM(estimated_cost_usd) AS value FROM watchtower_ai_cost_quality_v WHERE day >= $__timeFrom() AND day <= $__timeTo() GROUP BY 1, 2 ORDER BY 1"
+      }]
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "AI failures by reason (last hour rate)",
+      "gridPos": {"x": 0, "y": 51, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (reason) (rate(watchtower_market_close_review_failures_total[1h]))",
+        "legendFormat": "{{reason}}"
+      }]
+    },
+
+    {
+      "id": 50,
+      "type": "row",
+      "title": "Reason / context tag quality",
+      "gridPos": {"x": 0, "y": 58, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 51,
+      "type": "table",
+      "title": "Reason tags (booster quality)",
+      "gridPos": {"x": 0, "y": 59, "w": 24, "h": 10},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT reason, base_strategy, alert_count, ROUND(confirmed_rate::numeric, 3) AS confirmed_rate, ROUND(avg_clv_6h::numeric, 4) AS avg_clv_6h, verdict, verdict_reason FROM watchtower_strategy_reason_quality_v ORDER BY alert_count DESC LIMIT 50"
+      }]
+    },
+
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Examples",
+      "gridPos": {"x": 0, "y": 69, "w": 24, "h": 1},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 61,
+      "type": "table",
+      "title": "Latest Market Close Review summaries",
+      "gridPos": {"x": 0, "y": 70, "w": 24, "h": 10},
+      "datasource": {"type": "postgres", "uid": "watchtower-postgres"},
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawSql": "SELECT reviewed_at, market, verdict, ROUND(confidence::numeric,2) AS confidence, ROUND(estimated_cost_usd::numeric,4) AS cost, admin_summary FROM watchtower_market_close_review_examples_v"
+      }]
+    }
+  ]
+}

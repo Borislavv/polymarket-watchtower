@@ -14,6 +14,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
 // --- Seams (interfaces over infra) ----------------------------------------
@@ -50,11 +51,12 @@ type Analyzer interface {
 	EvaluateHourlyNewsIntel(ctx context.Context, req openai.NewsIntelAIRequest) (openai.NewsIntelAIResult, error)
 }
 
-// TelegramSender delivers HTML-parse-mode chunks. Implemented by a
-// thin closure over *telegram.Bot.SendHTML in the wiring layer so
-// this package has no infra/telegram import.
+// TelegramSender delivers HTML-parse-mode chunks via the v11.3 typed
+// router. The worker passes SurfaceNewsIntelActionable on every send
+// so the router maps it to the signal chat regardless of what other
+// config the wiring layer may have.
 type TelegramSender interface {
-	SendHTML(ctx context.Context, chatID, text string) (int64, error)
+	Send(ctx context.Context, msg telegram.Message) (telegram.SendResult, error)
 }
 
 // --- Worker ---------------------------------------------------------------
@@ -537,9 +539,11 @@ func (w *Worker) finishRun(ctx context.Context, runID int64, in repository.NewsI
 }
 
 // sendTelegram renders the message + SafeSplits + sends. Returns
-// true when at least one chunk landed.
+// true when at least one chunk landed. The router resolves the
+// destination from SurfaceNewsIntelActionable — the worker no longer
+// keeps a ChatID, it just labels the surface.
 func (w *Worker) sendTelegram(ctx context.Context, result openai.NewsIntelAIResult, selected []openai.NewsIntelAIDecision, affected map[string][]openai.NewsAffectedMarketForAI) bool {
-	if w.tg == nil || strings.TrimSpace(w.cfg.ChatID) == "" {
+	if w.tg == nil {
 		return false
 	}
 	body := RenderTelegramMessage(result, selected, affected)
@@ -549,7 +553,10 @@ func (w *Worker) sendTelegram(ctx context.Context, result openai.NewsIntelAIResu
 	chunks := safeSplit(body, w.cfg.TelegramMessageCap)
 	anySent := false
 	for _, chunk := range chunks {
-		if _, err := w.tg.SendHTML(ctx, w.cfg.ChatID, chunk); err != nil {
+		if _, err := w.tg.Send(ctx, telegram.Message{
+			Surface: telegram.SurfaceNewsIntelActionable,
+			HTML:    chunk,
+		}); err != nil {
 			if w.met != nil {
 				w.met.NewsIntelTelegramChunks.WithLabelValues("failed").Inc()
 			}

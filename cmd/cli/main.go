@@ -48,18 +48,8 @@ func main() {
 		// extracted catalysts. Defaults to DRY RUN — no DB writes —
 		// unless --persist is set.
 		runImportCatalysts(os.Args[2:])
-	case "evolve-predictions":
-		// One-shot Prediction Evolution dry-run. Runs ONE cycle of
-		// the evolution worker against a Postgres DSN, printing the
-		// per-prediction summary (old/new state, AI refresh decision,
-		// repricing status, matched alerts, decay, Telegram).
-		runEvolvePredictions(os.Args[2:])
 	case "diag-eventpage":
 		runDiagEventPage(os.Args[2:])
-	case "prediction-calibration":
-		// v10.3 operator calibration report. Read-only; no AI; no
-		// Telegram. Same aggregation backs the daily report worker.
-		runPredictionCalibration(os.Args[2:])
 	case "ws-smoke":
 		// v10.4 hybrid WebSocket smoke. Connects to the Polymarket
 		// CLOB WS, subscribes to 1-3 token ids, prints the observed
@@ -80,7 +70,6 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  diagnose-alerts  -dsn postgres://… [--lookback 24h]")
 	fmt.Fprintln(os.Stderr, "  diagnose-ai      -dsn postgres://… [--limit 20]")
 	fmt.Fprintln(os.Stderr, "  import-catalysts --event <slug> [--persist] [--ai-key $OPENAI_API_KEY] [--model gpt-4.1-mini]")
-	fmt.Fprintln(os.Stderr, "  evolve-predictions --dsn postgres://… [--once] [--limit 10] [--dry-run]")
 	fmt.Fprintln(os.Stderr, "  ws-smoke         --tokens <id1,id2,…> [--duration 60s] [--persist --dsn postgres://…]")
 }
 

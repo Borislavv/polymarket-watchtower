@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: Watchtower-Postgres
+    type: postgres
+    uid: watchtower-postgres
+    access: proxy
+    url: postgres:5432
+    user: watchtower
+    database: watchtower
+    secureJsonData:
+      password: watchtower
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+    editable: true

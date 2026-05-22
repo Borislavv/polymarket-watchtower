@@ -243,53 +243,8 @@ func statusForCategory(cat ErrorCategory) analysis.Status {
 	}
 }
 
-// PreviewMarketReportPrompt returns the rendered user message that
-// AnalyzeMarketReport would send to OpenAI for `req`. The worker
-// uses this purely for prompt_chars_before / _after observability;
-// the prompt builder remains the source of truth at call time.
-func (c *Client) PreviewMarketReportPrompt(req analysis.MarketReportRequest) string {
-	return buildMarketReportPrompt(req)
-}
-
-// AnalyzeMarketReport is implemented but the orchestrating worker
-// is staged behind a follow-up PR. The model call works end-to-end;
-// only the periodic top-N selection + dedup logic lives in the
-// usecase layer. Honours Config.WebSearchEnabled the same way as
-// AnalyzeAlert.
-func (c *Client) AnalyzeMarketReport(ctx context.Context, req analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
-	prompt := buildMarketReportPrompt(req) // reports are bigger
-	if c.cfg.APIKey == "" {
-		return analysis.MarketReportAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "no_api_key"}, nil
-	}
-	if !c.bucket.allow() {
-		return analysis.MarketReportAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "rate_limited"}, nil
-	}
-	if !c.ledger.allow() {
-		return analysis.MarketReportAnalysis{Status: analysis.StatusSkipped, Model: c.cfg.Model, LastError: "daily_budget_exhausted"}, nil
-	}
-	resp, err := c.callModel(ctx, prompt, 2000)
-	if err != nil {
-		pe, ok := AsProviderError(err)
-		if !ok {
-			pe = &ProviderError{Category: CategoryUnknown, Message: err.Error()}
-		}
-		return analysis.MarketReportAnalysis{
-			Status:    statusForCategory(pe.Category),
-			Model:     c.cfg.Model,
-			LastError: string(pe.Category),
-		}, err
-	}
-	cost := c.estimateCost(resp.PromptTokens, resp.CompletionTokens)
-	c.ledger.consume(cost)
-	return analysis.MarketReportAnalysis{
-		Status:           analysis.StatusOK,
-		Model:            c.cfg.Model,
-		ReportText:       resp.Text,
-		PromptTokens:     resp.PromptTokens,
-		CompletionTokens: resp.CompletionTokens,
-		EstimatedCostUSD: cost,
-	}, nil
-}
+// v11.2: PreviewMarketReportPrompt + AnalyzeMarketReport removed
+// with the 2h market intelligence surface.
 
 // AnalyzeOutcome — postmortem path. Always uses Chat Completions;
 // the outcome is already resolved so live news adds nothing.

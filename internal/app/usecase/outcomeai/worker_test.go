@@ -85,19 +85,28 @@ type reactionCall struct {
 	Emoji     string
 }
 
-func (b *fakeBot) EditMessageText(_ context.Context, chatID string, messageID int64, text string) error {
+// EditOutcomeMessage satisfies the v11.4 typed Annotator
+// interface. The test fakeBot now plays two roles: typed Sender +
+// typed Annotator. The legacy raw-bot signature is gone.
+func (b *fakeBot) EditOutcomeMessage(_ context.Context, _ telegram.Surface, chatID string, messageID int64, text string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.edits = append(b.edits, editCall{chatID, messageID, text})
 	return b.editErr
 }
-func (b *fakeBot) SendHTML(_ context.Context, chatID, text string) (telegram.SendResult, error) {
+
+// Send satisfies the v11.4 typed Sender interface. The fakeBot
+// records every dispatched body — both Surface and HTML — so tests
+// can assert routing decisions.
+func (b *fakeBot) Send(_ context.Context, msg telegram.Message) (telegram.SendResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.sends = append(b.sends, sendCall{chatID, text})
+	b.sends = append(b.sends, sendCall{string(msg.Surface), msg.HTML})
 	return telegram.SendResult{MessageID: 999}, b.sendErr
 }
-func (b *fakeBot) SetMessageReaction(_ context.Context, chatID string, messageID int64, emoji string) error {
+
+// SetOutcomeReaction satisfies the v11.4 typed Annotator interface.
+func (b *fakeBot) SetOutcomeReaction(_ context.Context, _ telegram.Surface, chatID string, messageID int64, emoji string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.reactions = append(b.reactions, reactionCall{chatID, messageID, emoji})
@@ -160,7 +169,7 @@ func TestProcessOne_EditsMessageAndReacts(t *testing.T) {
 	bot := &fakeBot{}
 	w := New(Config{Enabled: true, ChatID: "42",
 		SuccessReaction: "✅", FailureReaction: "❌"},
-		al, st, an, bot, nopLogger())
+		al, st, an, bot, bot, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -197,7 +206,7 @@ func TestProcessOne_WrongOutcomeReactsFailure(t *testing.T) {
 	bot := &fakeBot{}
 	w := New(Config{Enabled: true, ChatID: "42",
 		SuccessReaction: "✅", FailureReaction: "❌"},
-		al, st, an, bot, nopLogger())
+		al, st, an, bot, bot, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -219,7 +228,7 @@ func TestProcessOne_EditFailureFallsBackToFollowup(t *testing.T) {
 	bot := &fakeBot{editErr: telegram.ErrEditUnsupported}
 	w := New(Config{Enabled: true, ChatID: "42",
 		SuccessReaction: "✅", FailureReaction: "❌"},
-		al, st, an, bot, nopLogger())
+		al, st, an, bot, bot, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -242,7 +251,7 @@ func TestProcessOne_NoMessageIDSendsFollowup(t *testing.T) {
 	st := &fakeStore{}
 	an := &fakeAnalyzer{out: analysis.OutcomeAnalysis{Status: analysis.StatusOK, ReasonText: "x"}}
 	bot := &fakeBot{}
-	w := New(Config{Enabled: true, ChatID: "42"}, al, st, an, bot, nopLogger())
+	w := New(Config{Enabled: true, ChatID: "42"}, al, st, an, bot, bot, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -263,7 +272,7 @@ func TestProcessOne_AnalyzerErrorStillPersistsAndDelivers(t *testing.T) {
 	an := &fakeAnalyzer{err: errors.New("upstream down")}
 	bot := &fakeBot{}
 	w := New(Config{Enabled: true, ChatID: "42", SuccessReaction: "✅"},
-		al, st, an, bot, nopLogger())
+		al, st, an, bot, bot, nopLogger())
 
 	w.Tick(context.Background())
 
@@ -284,7 +293,7 @@ func TestDisabledWorkerIsNoop(t *testing.T) {
 	st := &fakeStore{}
 	an := &fakeAnalyzer{out: analysis.OutcomeAnalysis{Status: analysis.StatusOK, ReasonText: "x"}}
 	bot := &fakeBot{}
-	w := New(Config{Enabled: false, ChatID: "42"}, al, st, an, bot, nopLogger())
+	w := New(Config{Enabled: false, ChatID: "42"}, al, st, an, bot, bot, nopLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

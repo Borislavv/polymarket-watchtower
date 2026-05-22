@@ -14,6 +14,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ai/openai"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
+	"github.com/Borislavv/polymarket-watchtower/internal/infra/telegram"
 )
 
 // --- Fakes ----------------------------------------------------------------
@@ -134,21 +135,23 @@ func (f *fakeAnalyzer) EvaluateHourlyNewsIntel(ctx context.Context, req openai.N
 }
 
 type fakeTG struct {
-	mu     sync.Mutex
-	sent   []string
-	failOn int
-	hits   int
+	mu       sync.Mutex
+	sent     []string
+	surfaces []telegram.Surface
+	failOn   int
+	hits     int
 }
 
-func (f *fakeTG) SendHTML(ctx context.Context, chatID, text string) (int64, error) {
+func (f *fakeTG) Send(_ context.Context, msg telegram.Message) (telegram.SendResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hits++
 	if f.failOn != 0 && f.hits == f.failOn {
-		return 0, errors.New("telegram boom")
+		return telegram.SendResult{}, errors.New("telegram boom")
 	}
-	f.sent = append(f.sent, text)
-	return int64(f.hits), nil
+	f.sent = append(f.sent, msg.HTML)
+	f.surfaces = append(f.surfaces, msg.Surface)
+	return telegram.SendResult{MessageID: int64(f.hits)}, nil
 }
 
 // --- Helpers --------------------------------------------------------------

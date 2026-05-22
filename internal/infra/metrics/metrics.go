@@ -584,6 +584,57 @@ type Metrics struct {
 	// NewsIntelCycleLatency: full Tick duration including AI + DB +
 	// Telegram.
 	NewsIntelCycleLatency prometheus.Histogram
+
+	// --- v11.1 central Telegram guard --------------------------------
+	// TelegramSuppressed: per-surface suppressions emitted by the
+	// telegram.Guard wrapper. Labels: surface (watchtower_stats /
+	// prediction_update / prediction_state_transition /
+	// prediction_blocked), reason (typically "config_disabled").
+	TelegramSuppressed *prometheus.CounterVec
+
+	// --- v11.3 typed Telegram router ---------------------------------
+	// TelegramRoute: every Send call increments this counter with
+	// (surface, destination, decision) where decision is one of
+	// allowed / blocked / suppressed.
+	TelegramRoute *prometheus.CounterVec
+	// TelegramSent: successfully-delivered messages by surface +
+	// destination + status (status="ok" today).
+	TelegramSent *prometheus.CounterVec
+	// TelegramSuppressedV2: per-surface suppressions emitted by the
+	// router (labelled with destination + reason). Lives alongside
+	// the v11.1 TelegramSuppressed for compatibility — the v2 vec
+	// carries richer labels.
+	TelegramSuppressedV2 *prometheus.CounterVec
+	// TelegramSendFailed: transport-error counter by surface +
+	// destination + reason category.
+	TelegramSendFailed *prometheus.CounterVec
+
+	// --- v11.4 typed Telegram annotation adapter ------------------
+	// TelegramAnnotation: per-(surface, action, status) counter for
+	// EditMessageText + SetMessageReaction. action ∈ {edit,
+	// reaction}; status ∈ {ok, failed}.
+	TelegramAnnotation *prometheus.CounterVec
+	// TelegramAnnotationFailed: failure-reason breakdown (e.g.
+	// unsupported / timeout / chat_unavailable).
+	TelegramAnnotationFailed *prometheus.CounterVec
+
+	// --- v11.4 Market Close Review learning loop ------------------
+	// MarketCloseReviewRuns: per-(status, verdict) review outcomes.
+	MarketCloseReviewRuns *prometheus.CounterVec
+	// MarketCloseReviewCandidates: per-(decision, reason) candidate
+	// outcomes (accepted / rejected / skipped + reason).
+	MarketCloseReviewCandidates *prometheus.CounterVec
+	// MarketCloseReviewAICalls: AI dispatch outcomes by status +
+	// model.
+	MarketCloseReviewAICalls *prometheus.CounterVec
+	// MarketCloseReviewAICost: cumulative AI cost by model.
+	MarketCloseReviewAICost *prometheus.CounterVec
+	// MarketCloseReviewReactions: reaction outcomes by status +
+	// reaction label (success/failure/ambiguous).
+	MarketCloseReviewReactions *prometheus.CounterVec
+	// MarketCloseReviewFailures: top-level worker failures by
+	// reason (panic / list_candidates / etc).
+	MarketCloseReviewFailures *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -1417,6 +1468,66 @@ func New() *Metrics {
 		Buckets: prometheus.ExponentialBuckets(0.5, 2, 10),
 	})
 
+	// --- v11.1 central Telegram guard ----------------------------------
+	m.TelegramSuppressed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "suppressed_total",
+		Help: "Telegram messages suppressed by the central guard, by surface + reason.",
+	}, []string{"surface", "reason"})
+
+	// --- v11.3 typed Telegram router -----------------------------------
+	m.TelegramRoute = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "route_total",
+		Help: "Every typed Telegram Send call, labelled by surface, destination, and decision.",
+	}, []string{"surface", "destination", "decision"})
+	m.TelegramSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "sent_total",
+		Help: "Successfully-delivered Telegram messages by surface + destination + status.",
+	}, []string{"surface", "destination", "status"})
+	m.TelegramSuppressedV2 = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "suppressed_v2_total",
+		Help: "Telegram messages suppressed by the v11.3 router, by surface + destination + reason.",
+	}, []string{"surface", "destination", "reason"})
+	m.TelegramSendFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "send_failed_total",
+		Help: "Transport-error Telegram sends, by surface + destination + categorised reason.",
+	}, []string{"surface", "destination", "reason"})
+
+	// --- v11.4 typed Telegram annotation adapter -----------------------
+	m.TelegramAnnotation = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "annotation_total",
+		Help: "EditMessageText / SetMessageReaction outcomes by surface + action + status.",
+	}, []string{"surface", "action", "status"})
+	m.TelegramAnnotationFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "telegram", Name: "annotation_failed_total",
+		Help: "EditMessageText / SetMessageReaction failures by surface + action + reason.",
+	}, []string{"surface", "action", "reason"})
+
+	// --- v11.4 Market Close Review learning loop -----------------------
+	m.MarketCloseReviewRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "runs_total",
+		Help: "Market Close Review per-market run outcomes by status + verdict.",
+	}, []string{"status", "verdict"})
+	m.MarketCloseReviewCandidates = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "candidates_total",
+		Help: "Market Close Review candidate decisions by decision + reason.",
+	}, []string{"decision", "reason"})
+	m.MarketCloseReviewAICalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "ai_calls_total",
+		Help: "Market Close Review AI dispatch outcomes by status + model.",
+	}, []string{"status", "model"})
+	m.MarketCloseReviewAICost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "ai_cost_usd_total",
+		Help: "Cumulative AI cost in USD for Market Close Review, by model.",
+	}, []string{"model"})
+	m.MarketCloseReviewReactions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "reactions_total",
+		Help: "Market Close Review reaction outcomes by status + reaction label.",
+	}, []string{"status", "reaction"})
+	m.MarketCloseReviewFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "market_close_review", Name: "failures_total",
+		Help: "Top-level Market Close Review worker failures by reason.",
+	}, []string{"reason"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -1497,6 +1608,12 @@ func New() *Metrics {
 		m.NewsIntelRuns, m.NewsIntelItemsTotal, m.NewsIntelAIRequests,
 		m.NewsIntelSentinel, m.NewsIntelDecisions, m.NewsIntelTelegramChunks,
 		m.NewsIntelAILatency, m.NewsIntelCycleLatency,
+		m.TelegramSuppressed,
+		m.TelegramRoute, m.TelegramSent, m.TelegramSuppressedV2, m.TelegramSendFailed,
+		m.TelegramAnnotation, m.TelegramAnnotationFailed,
+		m.MarketCloseReviewRuns, m.MarketCloseReviewCandidates,
+		m.MarketCloseReviewAICalls, m.MarketCloseReviewAICost,
+		m.MarketCloseReviewReactions, m.MarketCloseReviewFailures,
 	)
 	return m
 }

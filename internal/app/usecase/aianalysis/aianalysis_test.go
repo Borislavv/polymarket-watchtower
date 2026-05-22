@@ -31,9 +31,6 @@ func (f *fakeAnalyzer) AnalyzeAlert(_ context.Context, _ analysis.AlertAnalysisR
 	f.calls++
 	return f.result, f.err
 }
-func (f *fakeAnalyzer) AnalyzeMarketReport(_ context.Context, _ analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
-	return analysis.MarketReportAnalysis{}, nil
-}
 func (f *fakeAnalyzer) AnalyzeOutcome(_ context.Context, _ analysis.OutcomeAnalysisRequest) (analysis.OutcomeAnalysis, error) {
 	return analysis.OutcomeAnalysis{}, nil
 }
@@ -271,9 +268,6 @@ type erroringAnalyzer struct{}
 
 func (erroringAnalyzer) AnalyzeAlert(_ context.Context, _ analysis.AlertAnalysisRequest) (analysis.AlertAnalysis, error) {
 	return analysis.AlertAnalysis{}, errors.New("upstream blew up")
-}
-func (erroringAnalyzer) AnalyzeMarketReport(_ context.Context, _ analysis.MarketReportRequest) (analysis.MarketReportAnalysis, error) {
-	return analysis.MarketReportAnalysis{}, nil
 }
 func (erroringAnalyzer) AnalyzeOutcome(_ context.Context, _ analysis.OutcomeAnalysisRequest) (analysis.OutcomeAnalysis, error) {
 	return analysis.OutcomeAnalysis{}, nil

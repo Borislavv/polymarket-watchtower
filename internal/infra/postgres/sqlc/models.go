@@ -321,6 +321,32 @@ type PolymarketMarketCategories struct {
 	CategoryID int64
 }
 
+type PolymarketMarketCloseReviews struct {
+	ID               int64
+	MarketID         *int64
+	ConditionID      string
+	EventSlug        string
+	ClosedAt         pgtype.Timestamptz
+	ResolvedAt       pgtype.Timestamptz
+	ReviewedAt       pgtype.Timestamptz
+	Status           string
+	SkipReason       string
+	Verdict          string
+	Confidence       *float64
+	AdminSummary     string
+	AiJson           []byte
+	EvidenceJson     []byte
+	AiModel          string
+	InputTokens      *int32
+	OutputTokens     *int32
+	EstimatedCostUsd *float64
+	Error            string
+	Attempts         int32
+	NextRetryAt      pgtype.Timestamptz
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
+}
+
 type PolymarketMarketIntelligenceReports struct {
 	ID                int64
 	GeneratedAt       pgtype.Timestamptz

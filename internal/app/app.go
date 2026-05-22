@@ -21,38 +21,27 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/ownership"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
-	sfdet "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/stablefavorite"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/traderbaseline"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/annotationranking"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/backfill"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/collect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/concentration"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/dailypoliticalintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detect"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/detection"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/discover"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/drift"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst"
 	catalystimporter "github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventcatalyst/importer"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventflow"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/eventpagecontext"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketintel"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/create"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketprediction/evolution"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketclosereview"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/newsintel"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomeai"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/outcomes"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/persist"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionarchival"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/predictionfeedback"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/realtime"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/repricing"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalreport"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/stablefavorite"
-	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/statsreport"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalquality"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -68,7 +57,6 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/httpx"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/ws"
 	pg "github.com/Borislavv/polymarket-watchtower/internal/infra/postgres"
-	"github.com/Borislavv/polymarket-watchtower/internal/infra/postgres/sqlc"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/ratelimit"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/repository"
 	shutdown2 "github.com/Borislavv/polymarket-watchtower/internal/infra/shutdown"
@@ -91,26 +79,19 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill          *backfill.Worker
-	sender            *alertsender.Worker
-	sanity            *sanity.Worker
-	outcomes          *outcomes.Worker
-	drift             *drift.Worker
-	stats             *statsreport.Worker
-	signalReport      *signalreport.Worker
-	detection         *detection.Worker
-	stableFavorite    *stablefavorite.Worker
-	aiAnalysis        *aianalysis.Service
-	outcomeAI         *outcomeai.Worker
-	marketIntel       *marketintel.Worker
-	catalystImporter  *catalystimporter.Worker
-	dailyIntel        *dailypoliticalintel.Worker
-	newsIntel         *newsintel.Worker
-	predictionEvolver *evolution.Worker
-	predictionCreator *create.Worker
-	predictionFeedbk  *predictionfeedback.Worker
-	predictionArchive *predictionarchival.Worker
-	realtimeWS        *realtime.Worker
+	backfill         *backfill.Worker
+	sender           *alertsender.Worker
+	sanity           *sanity.Worker
+	outcomes         *outcomes.Worker
+	drift            *drift.Worker
+	detection        *detection.Worker
+	aiAnalysis       *aianalysis.Service
+	outcomeAI        *outcomeai.Worker
+	catalystImporter *catalystimporter.Worker
+	newsIntel        *newsintel.Worker
+	signalQuality    *signalquality.Worker
+	marketCloseReview *marketclosereview.Worker
+	realtimeWS       *realtime.Worker
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -193,11 +174,9 @@ func New() (*App, error) {
 		mmFilter           *mmfilter.Filter
 		backfillWorker     *backfill.Worker
 		senderWorker       *alertsender.Worker
-		sanityWorker       *sanity.Worker
-		outcomesWorker     *outcomes.Worker
-		driftWorker        *drift.Worker
-		statsWorker        *statsreport.Worker
-		signalReportWorker *signalreport.Worker
+		sanityWorker   *sanity.Worker
+		outcomesWorker *outcomes.Worker
+		driftWorker    *drift.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -299,6 +278,27 @@ func New() (*App, error) {
 	// outcomes-reactor pass and the signal-report worker can both
 	// reach the same handle without re-constructing it.
 	var bot *telegram.Bot
+	// guardedTG is the SendHTML-only sender that runs every outgoing
+	// Telegram message through the central suppression guard. Real
+	// alerts pass through transparently; messages that match a
+	// disabled-surface marker (Watchtower stats / PREDICTION UPDATE /
+	// state transition / blocked) are dropped + counted. Outcome-reactor
+	// paths that call EditMessageText / SetMessageReaction continue to
+	// use the raw `bot` handle.
+	// guardedHTML is the low-level HTML transport wrapped by the
+	// legacy text-marker guard (defense-in-depth tripwire for any
+	// untyped call site).
+	var guardedHTML telegram.HTMLSender
+	// telegramRouter is the v11.3 typed Sender every new worker
+	// targets. It resolves chat id from the message Surface so a
+	// flow alert ALWAYS goes to the signal chat and a signal-quality
+	// report ALWAYS goes to the admin chat — no matter what the
+	// worker has been told.
+	var telegramRouter *telegram.Router
+	// telegramAnnotation is the v11.4 typed adapter for the non-Send
+	// Telegram operations (EditMessageText / SetMessageReaction).
+	// outcomeai + the v11.4 Market Close Review worker both use it.
+	var telegramAnnotation *telegram.Annotation
 	if cfg.Postgres.Enabled() && cfg.Alerting.TelegramEnabled {
 		var err error
 		bot, err = telegram.New(telegram.Config{
@@ -312,6 +312,66 @@ func New() (*App, error) {
 		if cfg.Alerting.TelegramChatID == "" {
 			return nil, fmt.Errorf("telegram: chat id required when enabled (TELEGRAM_CHAT_ID)")
 		}
+		// v11.2: all noise surfaces removed at the worker layer; the
+		// guard is now a defense-in-depth tripwire that catches any
+		// future regression that re-introduces those bodies.
+		guardCfg := telegram.GuardConfig{
+			WatchtowerStatsEnabled:           false,
+			PredictionUpdateEnabled:          false,
+			PredictionStateTransitionEnabled: false,
+			PredictionBlockedEnabled:         false,
+			// v11.3: tell the guard which chat is the signal feed
+			// so it can suppress admin-marker bodies that try to
+			// reach customers via the wrong chat.
+			SignalChatID: cfg.Alerting.TelegramChatID,
+		}
+		guardedHTML = telegram.NewGuard(bot, guardCfg, met.TelegramSuppressed)
+		logger.Info().
+			Bool("watchtower_stats", guardCfg.WatchtowerStatsEnabled).
+			Bool("prediction_update", guardCfg.PredictionUpdateEnabled).
+			Bool("prediction_state_transition", guardCfg.PredictionStateTransitionEnabled).
+			Bool("prediction_blocked", guardCfg.PredictionBlockedEnabled).
+			Msg("telegram guard: wired (v11.1)")
+
+		// v11.3 typed router. Validate() fails loud at boot so a
+		// misconfigured admin chat never silently swaps to the
+		// signal chat.
+		routerCfg := telegram.RouterConfig{
+			SignalEnabled:             true,
+			SignalChatID:              cfg.Alerting.TelegramChatID,
+			AdminEnabled:              cfg.Alerting.TelegramAdminEnabled,
+			AdminChatID:               cfg.Alerting.TelegramAdminChatID,
+			AllowSameChat:             cfg.Alerting.TelegramAllowSameChatAdmin,
+			AdminSignalQualityReports: cfg.Alerting.TelegramAdminSignalQualityReports,
+			AdminStats:                cfg.Alerting.TelegramAdminStats,
+			AdminStrategyScorecard:    cfg.Alerting.TelegramAdminStrategyScorecard,
+			AdminOperationalHealth:    cfg.Alerting.TelegramAdminOperationalHealth,
+			AdminBudgetReports:        cfg.Alerting.TelegramAdminBudgetReports,
+			AdminSuppressionReports:   cfg.Alerting.TelegramAdminSuppressionReports,
+		}
+		if err := routerCfg.Validate(); err != nil {
+			return nil, fmt.Errorf("telegram router config: %w", err)
+		}
+		routerMetrics := telegram.PromMetricsAdapter{
+			Route:      met.TelegramRoute,
+			Sent:       met.TelegramSent,
+			Suppressed: met.TelegramSuppressedV2,
+			SendFailed: met.TelegramSendFailed,
+		}
+		telegramRouter = telegram.NewRouter(routerCfg, guardedHTML, routerMetrics)
+		telegramAnnotation = telegram.NewAnnotation(bot, telegram.PromAnnotationMetricsAdapter{
+			Annotation:       met.TelegramAnnotation,
+			AnnotationFailed: met.TelegramAnnotationFailed,
+		})
+		logger.Info().
+			Str("signal_chat_id", cfg.Alerting.TelegramChatID).
+			Bool("admin_enabled", routerCfg.AdminEnabled).
+			Str("admin_chat_id", routerCfg.AdminChatID).
+			Bool("admin_signal_quality_reports", routerCfg.AdminSignalQualityReports).
+			Bool("admin_stats", routerCfg.AdminStats).
+			Bool("admin_operational_health", routerCfg.AdminOperationalHealth).
+			Msg("telegram router: wired (v11.3)")
+
 		senderWorker = alertsender.New(alertsender.Config{
 			Interval:          cfg.AlertSender.Interval,
 			ClaimLimit:        cfg.AlertSender.ClaimLimit,
@@ -325,58 +385,18 @@ func New() (*App, error) {
 				MaxBackoff:     cfg.AlertSender.RetryMaxBackoff,
 				JitterFraction: cfg.AlertSender.RetryJitterFraction,
 			},
-		}, alertsRepo, bot, met, logger)
+		}, alertsRepo, telegramRouter, met, logger)
 		logger.Info().
 			Str("chat_id", cfg.Alerting.TelegramChatID).
 			Int("workers", cfg.AlertSender.Workers).
 			Msg("alertsender: enabled")
 
-		if cfg.StatsReport.Enabled {
-			statsWorker = statsreport.New(statsreport.Config{
-				Interval:     cfg.StatsReport.Interval,
-				ChatID:       cfg.Alerting.TelegramChatID,
-				StartupGrace: cfg.StatsReport.StartupGrace,
-			}, statsreport.NewStore(pgPool), telegramSenderAdapter{bot: bot}, met, logger)
-			logger.Info().
-				Dur("interval", cfg.StatsReport.Interval).
-				Msg("statsreport: enabled (periodic Telegram summary)")
-		}
+		// v11.2 cleanup: periodic stats Telegram heartbeat removed.
+		// Operators read pipeline health from Grafana, not Telegram.
 
-		if cfg.SignalReport.Enabled {
-			loc, err := time.LoadLocation(cfg.SignalReport.Timezone)
-			if err != nil {
-				return nil, fmt.Errorf("signal_reports: invalid timezone %q: %w", cfg.SignalReport.Timezone, err)
-			}
-			sendAt := map[signalreport.PeriodType]signalreport.TimeOfDay{}
-			for k, raw := range map[signalreport.PeriodType]string{
-				signalreport.PeriodDaily:     cfg.SignalReport.DailyAt,
-				signalreport.PeriodWeekly:    cfg.SignalReport.WeeklyAt,
-				signalreport.PeriodMonthly:   cfg.SignalReport.MonthlyAt,
-				signalreport.PeriodQuarterly: cfg.SignalReport.QuarterlyAt,
-				signalreport.PeriodYearly:    cfg.SignalReport.YearlyAt,
-			} {
-				tod, err := signalreport.ParseTimeOfDay(raw)
-				if err != nil {
-					return nil, fmt.Errorf("signal_reports: %s: %w", k, err)
-				}
-				sendAt[k] = tod
-			}
-			signalReportWorker = signalreport.New(signalreport.Config{
-				Enabled:      true,
-				Location:     loc,
-				ChatID:       cfg.Alerting.TelegramChatID,
-				TickInterval: cfg.SignalReport.TickInterval,
-				SendAt:       sendAt,
-				YearlyDelay:  cfg.SignalReport.YearlyDelay,
-			}, repository.NewSignalReportRepository(pgPool),
-				telegramSignalSenderAdapter{bot: bot},
-				signalReportMetricsAdapter{m: met},
-				logger)
-			logger.Info().
-				Str("timezone", cfg.SignalReport.Timezone).
-				Dur("yearly_delay", cfg.SignalReport.YearlyDelay).
-				Msg("signalreport: enabled (signal-quality reports)")
-		}
+		// v11.2 cleanup: scheduled signal-quality Telegram reports
+		// removed. Outcome / drift persistence remains; the
+		// scheduled Telegram report worker is gone.
 	}
 	if cfg.Postgres.Enabled() {
 		backfillWorker = backfill.New(backfill.Config{
@@ -651,37 +671,8 @@ func New() (*App, error) {
 	}
 	collectLoop := collect.New(collectCfg, dataClient, cache, collectObserver, met, logger)
 
-	// Stable-favorite strategy — separate from whale-flow detection.
-	// Runs only when Postgres is wired (it reads from polymarket_*) AND
-	// the operator opts in via STABLE_FAVORITE_ENABLED=true.
-	var stableFavWorker *stablefavorite.Worker
-	if cfg.Postgres.Enabled() && cfg.StableFavorite.Enabled {
-		sfCfg := sfdet.Config{
-			Enabled:                    cfg.StableFavorite.Enabled,
-			MinLifecyclePct:            cfg.StableFavorite.MinLifecyclePct,
-			HotLifecyclePct:            cfg.StableFavorite.HotLifecyclePct,
-			MinProbability:             cfg.StableFavorite.MinProbability,
-			MaxProbability:             cfg.StableFavorite.MaxProbability,
-			MinReturnPct:               cfg.StableFavorite.MinReturnPct,
-			StabilityWindow:            cfg.StableFavorite.StabilityWindow,
-			MaxPriceStddev:             cfg.StableFavorite.MaxPriceStddev,
-			MaxDrawdown:                cfg.StableFavorite.MaxDrawdown,
-			MaxAdverseMove6h:           cfg.StableFavorite.MaxAdverseMove6h,
-			MaxNegativeDrift6h:         cfg.StableFavorite.MaxNegativeDrift6h,
-			MinMarketVolumeUSD:         cfg.StableFavorite.MinMarketVolumeUSD,
-			MinRecentTrades:            cfg.StableFavorite.MinRecentTrades,
-			CrossMarketEnabled:         cfg.StableFavorite.CrossMarketEnabled,
-			MaxCrossMarketDisagreement: cfg.StableFavorite.MaxCrossMarketDisagreement,
-		}
-		sfDet := sfdet.New(sfCfg)
-		sfCache := stableFavoriteCacheAdapter{cache: cache}
-		stableFavWorker = stablefavorite.New(stablefavorite.Config{
-			Enabled:         true,
-			Interval:        cfg.StableFavorite.Interval,
-			CandidateLimit:  int32(cfg.StableFavorite.CandidateLimit),
-			StrategyVersion: anomaly.StrategyIdentity,
-		}, sfDet, tradesRepo, tradesRepo, sfCache, nil, alertsRepo, emitter, met, logger)
-	}
+	// v11.2 cleanup: stable-favorite strategy fully removed. Not
+	// wired into detect.Loop and no downstream consumer remained.
 
 	httpSrv := httpsrv.New(cfg.Application.MetricsPort, met.Registry(), logger)
 
@@ -732,7 +723,6 @@ func New() (*App, error) {
 				Int("rate_limit_per_min", cfg.AIAnalysis.RateLimitPerMin).
 				Bool("telegram_alerts_enabled", cfg.AIAnalysis.AlertsEnabled).
 				Bool("reports_enabled", cfg.AIAnalysis.ReportsEnabled).
-				Bool("market_intelligence_enabled", cfg.AIAnalysis.MarketIntelligenceEnabled).
 				Bool("web_search_enabled", cfg.AIAnalysis.WebSearchEnabled).
 				Msg("ai analysis enabled")
 		}
@@ -838,7 +828,7 @@ func New() (*App, error) {
 			ChatID:          cfg.Alerting.TelegramChatID,
 			SuccessReaction: cfg.TelegramReactions.SuccessEmoji,
 			FailureReaction: cfg.TelegramReactions.FailureEmoji,
-		}, alertsRepo, repository.NewAlertOutcomeAnalysisRepository(pgPool), analyzerForOutcome, bot, logger)
+		}, alertsRepo, repository.NewAlertOutcomeAnalysisRepository(pgPool), analyzerForOutcome, telegramRouter, telegramAnnotation, logger)
 		if eventPageProvider != nil {
 			outcomeAIWorker.SetNarrativeLoader(eventPageProvider)
 		}
@@ -850,99 +840,10 @@ func New() (*App, error) {
 	// worker stores a "skipped" row and ships a deterministic
 	// fallback report with markets + annotation links. With the
 	// key, the AI summary lands inline.
-	var marketIntelWorker *marketintel.Worker
-	if cfg.Postgres.Enabled() && bot != nil && cfg.AIAnalysis.MarketIntelligenceEnabled && cfg.AIAnalysis.MarketIntelLegacyEnabled {
-		var analyzerForReport analysis.Analyzer = analysis.NoopAnalyzer{}
-		var marketIntelOpenAIClient *openai.Client
-		if cfg.AIAnalysis.APIKey != "" {
-			marketIntelOpenAIClient = openai.New(openai.Config{
-				APIKey:  cfg.AIAnalysis.APIKey,
-				BaseURL: cfg.AIAnalysis.BaseURL,
-				Model:   cfg.AIAnalysis.Model,
-				// v9.7: dedicated per-surface timeout. Marketintel
-				// prompts are heavier than alerts and used to share
-				// the alert 8s budget — the prod timeout flood is
-				// caused by exactly that. 60s is the new default
-				// (operator override: MARKET_INTEL_AI_TIMEOUT).
-				Timeout:                cfg.AIAnalysis.MarketIntelAITimeout,
-				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
-				MaxOutputChars:         cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
-				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
-				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
-				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
-				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-				WebSearchEnabled:       cfg.AIAnalysis.WebSearchEnabled,
-			})
-			analyzerForReport = marketIntelOpenAIClient
-		}
-		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
-		marketIntelWorker = marketintel.New(marketintel.Config{
-			Enabled:            true,
-			Interval:           cfg.AIAnalysis.MarketIntelligenceInterval,
-			MaxMarkets:         cfg.AIAnalysis.MarketIntelligenceMaxMarkets,
-			MaxOutputChars:     cfg.AIAnalysis.MarketIntelligenceMaxOutputChars,
-			ChatID:             cfg.Alerting.TelegramChatID,
-			AITimeout:          cfg.AIAnalysis.MarketIntelAITimeout,
-			RetryOnTimeout:     cfg.AIAnalysis.MarketIntelRetryOnTimeout,
-			RetryBackoffMin:    cfg.AIAnalysis.MarketIntelRetryBackoffMin,
-			RetryBackoffMax:    cfg.AIAnalysis.MarketIntelRetryBackoffMax,
-			FallbackOnFailure:  cfg.AIAnalysis.MarketIntelFallbackOnAIFailure,
-			SuppressOnSentinel: cfg.AIAnalysis.MarketIntelSuppressOnSentinel,
-			AnnotationsPerEvt:  cfg.AIAnalysis.MarketIntelAnnotationsPerEvent,
-			VisibleMarkets:     cfg.AIAnalysis.MarketIntelVisibleMarkets,
-			MaxInputChars:      cfg.AIPreflight.MaxInputCharsMarketIntel,
-			Links: marketintel.LinkConfig{
-				PolymarketBase:     cfg.Polymarket.PublicBaseURL,
-				GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
-				GrafanaDashUID:     cfg.Alerting.GrafanaDashUID,
-				GrafanaContext:     cfg.Alerting.GrafanaContext,
-				SourceLinksEnabled: cfg.AIAnalysis.MarketIntelSourceLinksEnabled,
-				MaxSourceLinks:     cfg.AIAnalysis.MarketIntelMaxSourceLinks,
-				MaxLinksPerRow:     cfg.AIAnalysis.MarketIntelMaxLinksPerRow,
-			},
-		}, intelRepo, intelRepo, analyzerForReport, bot, logger)
-		marketIntelWorker.SetMetrics(met)
-		// Annotation lister for the deterministic "Important
-		// Polymarket events" section. Best-effort — failure NEVER
-		// blocks the report.
-		marketIntelWorker.SetAnnotationLister(repository.NewEventPageRepository(pgPool))
-		// v10.8 news-fingerprint gating. When the aggregate
-		// annotation set across candidates is unchanged since the
-		// last cycle, marketintel skips the AI call entirely.
-		marketIntelWorker.SetNewsFingerprintStore(repository.NewNewsFingerprintRepository(pgPool))
-		if marketIntelOpenAIClient != nil {
-			marketIntelWorker.SetPromptCharsLoader(marketIntelOpenAIClient)
-		}
-		if eventPageProvider != nil {
-			marketIntelWorker.SetNarrativeLoader(eventPageProvider)
-		}
-		// v9.7: annotation ranking hook. When the AI key is wired,
-		// the marketintel report appends a "Top important
-		// annotations" block ranked by the model.
-		if cfg.AIAnalysis.APIKey != "" && eventPageProvider != nil {
-			ranker := openai.New(openai.Config{
-				APIKey:  cfg.AIAnalysis.APIKey,
-				BaseURL: cfg.AIAnalysis.BaseURL,
-				Model:   cfg.AIAnalysis.Model,
-				// v9.7: dedicated annotation-ranking timeout. The
-				// ranker call is lighter than the marketintel
-				// report itself but still benefits from breathing
-				// room over the alert default.
-				Timeout:                cfg.AIAnalysis.MarketIntelAnnotationRankingAITimeout,
-				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
-				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
-				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
-				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
-				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
-				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-			})
-			annoRepoForHook := repository.NewAnnotationIntelRepository(pgPool)
-			hook := annotationranking.New(annotationranking.Config{
-				AITimeout: cfg.AIAnalysis.MarketIntelAnnotationRankingAITimeout,
-			}, marketsRepo, eventPageProvider, ranker, annoRepoForHook, met, logger)
-			marketIntelWorker.SetAnnotationRankingHook(hook)
-		}
-	}
+	// v11.2 cleanup: market intelligence + annotation ranking
+	// surfaces fully removed. The 2h "Market intelligence" Telegram
+	// report and the AI-ranked annotation appendix are gone; AI
+	// budget for these buckets is no longer reserved.
 
 	// v9.6 Political-Catalyst Intelligence importer. Every Interval
 	// (default 5m) the importer refreshes annotations + extracts
@@ -1010,64 +911,9 @@ func New() (*App, error) {
 	// v9.7 Daily Political Intelligence report worker. Runs once per
 	// day at DAILY_POLITICAL_INTEL_TIME in DAILY_POLITICAL_INTEL_TIMEZONE,
 	// selects 100 markets, calls AI, splits + sends Telegram.
-	var dailyIntelWorker *dailypoliticalintel.Worker
-	if cfg.Postgres.Enabled() && cfg.DailyIntel.Enabled && cfg.AIAnalysis.DailyIntelLegacyEnabled && marketsRepo != nil && eventPageProvider != nil {
-		var dailyGen analysis.DailyPoliticalIntelGenerator = analysis.NoopDailyPoliticalIntelGenerator{}
-		if cfg.AIAnalysis.APIKey != "" && cfg.DailyIntel.AIEnabled {
-			dailyGen = openai.New(openai.Config{
-				APIKey:                 cfg.AIAnalysis.APIKey,
-				BaseURL:                cfg.AIAnalysis.BaseURL,
-				Model:                  cfg.AIAnalysis.Model,
-				Timeout:                cfg.DailyIntel.AITimeout,
-				MaxPromptChars:         cfg.DailyIntel.PromptMaxChars,
-				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
-				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
-				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
-				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
-				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-			})
-		}
-		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
-		catalystRepo := repository.NewEventCatalystRepository(pgPool)
-		annoRepo := repository.NewAnnotationIntelRepository(pgPool)
-		var tgAdapter dailypoliticalintel.Telegram
-		if bot != nil {
-			tgAdapter = dailyIntelTelegramAdapter{bot: bot}
-		}
-		dailyIntelWorker = dailypoliticalintel.New(dailypoliticalintel.Config{
-			Enabled:              cfg.DailyIntel.Enabled,
-			TimeOfDay:            cfg.DailyIntel.TimeOfDay,
-			Timezone:             cfg.DailyIntel.Timezone,
-			MarketLimit:          cfg.DailyIntel.MarketLimit,
-			AnnotationsPerMarket: cfg.DailyIntel.AnnotationsPerMarket,
-			AIEnabled:            cfg.DailyIntel.AIEnabled,
-			AITimeout:            cfg.DailyIntel.AITimeout,
-			PromptMaxChars:       cfg.DailyIntel.PromptMaxChars,
-			SendTelegram:         cfg.DailyIntel.SendTelegram,
-			ChatID:               cfg.Alerting.TelegramChatID,
-		}, intelRepo, marketsRepo, eventPageProvider, catalystRepo, annoRepo, dailyGen, tgAdapter, met, logger)
-		// v9.8: wire the deterministic flow aggregator so the daily
-		// AI sees real Watchtower context instead of empty fields.
-		if cfg.EventFlow.Enabled {
-			flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
-				Enabled:          true,
-				Lookback:         cfg.EventFlow.Lookback,
-				MaxAlerts:        cfg.EventFlow.MaxAlerts,
-				MaxTrades:        cfg.EventFlow.MaxTrades,
-				MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
-				TopItems:         cfg.EventFlow.TopItems,
-			}, met, logger)
-			dailyIntelWorker.SetFlowLoader(flowRepo)
-		}
-		logger.Info().
-			Bool("enabled", cfg.DailyIntel.Enabled).
-			Str("time_of_day", cfg.DailyIntel.TimeOfDay).
-			Str("timezone", cfg.DailyIntel.Timezone).
-			Int("market_limit", cfg.DailyIntel.MarketLimit).
-			Bool("ai_enabled", cfg.DailyIntel.AIEnabled).
-			Bool("send_telegram", cfg.DailyIntel.SendTelegram).
-			Msg("daily political intel: wired")
-	}
+	// v11.2 cleanup: daily political intelligence worker fully
+	// removed. The once-per-day Telegram report is gone; the
+	// dailypoliticalintel package is no longer wired.
 
 	// v11.0 Hourly News Intelligence Worker — the v11.0 product.
 	// One AI call per hour over NEW Polymarket annotations attached
@@ -1093,8 +939,8 @@ func New() (*App, error) {
 			})
 		}
 		var newsTG newsintel.TelegramSender
-		if bot != nil && cfg.AIAnalysis.NewsIntelSendTelegram {
-			newsTG = newsIntelTelegramAdapter{bot: bot}
+		if telegramRouter != nil && cfg.AIAnalysis.NewsIntelSendTelegram {
+			newsTG = telegramRouter
 		}
 		newsIntelWorker = newsintel.New(newsintel.Config{
 			Enabled:            cfg.AIAnalysis.NewsIntelEnabled,
@@ -1126,88 +972,50 @@ func New() (*App, error) {
 			Msg("news intelligence: wired (v11.0)")
 	}
 
-	// v9.9 Prediction Evolution Worker (the heartbeat).
-	var evolutionWorker *evolution.Worker
-	if cfg.Postgres.Enabled() && cfg.Prediction.EvolutionEnabled && marketsRepo != nil && eventPageProvider != nil {
-		predsRepo := repository.NewRepricingPredictionsRepository(pgPool)
-		flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
-			Enabled:          true,
-			Lookback:         cfg.EventFlow.Lookback,
-			MaxAlerts:        cfg.EventFlow.MaxAlerts,
-			MaxTrades:        cfg.EventFlow.MaxTrades,
-			MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
-			TopItems:         cfg.EventFlow.TopItems,
-		}, met, logger)
-		repricingComp := repricing.New(repricing.Config{
-			Enabled:                cfg.Repricing.Enabled,
-			Lookback:               cfg.Repricing.Lookback,
-			PreWindow:              cfg.Repricing.PreWindow,
-			PostWindow:             cfg.Repricing.PostWindow,
-			MinAnnotationMove:      cfg.Repricing.MinAnnotationMove,
-			MinFlowUSD:             cfg.Repricing.MinFlowUSD,
-			UnderreactionThreshold: cfg.Repricing.UnderreactionThreshold,
-			OverreactionThreshold:  cfg.Repricing.OverreactionThreshold,
-		}, sqlc.New(pgPool), predsRepo, met, logger)
-		var aiGen analysis.PredictionEvolutionGenerator = analysis.NoopPredictionEvolutionGenerator{}
-		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.EvolutionAIEnabled && cfg.AIAnalysis.PredictionAILegacyEnabled {
-			aiGen = openai.New(openai.Config{
-				APIKey:                 cfg.AIAnalysis.APIKey,
-				BaseURL:                cfg.AIAnalysis.BaseURL,
-				Model:                  cfg.AIAnalysis.Model,
-				Timeout:                cfg.Prediction.EvolutionTimeout,
-				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
-				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
-				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
-				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
-				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
-				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-			})
-		}
-		catalystRepoForEvolver := repository.NewEventCatalystRepository(pgPool)
-		var tgAdapter evolution.Telegram
-		if bot != nil && cfg.Prediction.EvolutionSendTelegram {
-			tgAdapter = evolutionTelegramAdapter{bot: bot}
-		}
-		evolutionWorker = evolution.New(evolution.Config{
-			Enabled:            cfg.Prediction.EvolutionEnabled,
-			Interval:           cfg.Prediction.EvolutionInterval,
-			BatchSize:          cfg.Prediction.EvolutionBatchSize,
-			Concurrency:        cfg.Prediction.EvolutionConcurrency,
-			Timeout:            cfg.Prediction.EvolutionTimeout,
-			AIEnabled:          cfg.Prediction.EvolutionAIEnabled,
-			AIMinInterval:      cfg.Prediction.EvolutionAIMinInterval,
-			AIMaxPerRun:        cfg.Prediction.EvolutionAIMaxPerRun,
-			StaleAfter:         cfg.Prediction.EvolutionStaleAfter,
-			DecayEnabled:       cfg.Prediction.EvolutionDecayEnabled,
-			DecayPerDay:        cfg.Prediction.EvolutionDecayPerDay,
-			MinConfidence:      cfg.Prediction.EvolutionMinConfidence,
-			MajorPriceMove:     cfg.Prediction.EvolutionMajorPriceMove,
-			CatalystNearWindow: cfg.Prediction.EvolutionCatalystNearWindow,
-			SendTelegram:       cfg.Prediction.EvolutionSendTelegram,
-			TelegramCooldown:   cfg.Prediction.EvolutionTelegramCooldown,
-			TelegramChatID:     cfg.Alerting.TelegramChatID,
-			PolymarketBase:     cfg.Polymarket.PublicBaseURL,
-			GrafanaBase:        cfg.Alerting.GrafanaBaseURL,
-			GrafanaDashUID:     cfg.Alerting.GrafanaDashUID,
-			GrafanaContext:     cfg.Alerting.GrafanaContext,
-			// v10.7 noise suppression — defaults to FALSE so the
-			// worker drops watching→blocked Telegrams whose only
-			// blocker is a resolution-day catalyst (the canonical
-			// noise pattern in prod). Operator opt-in via env.
-			SendResolutionOnlyBlocked: cfg.Prediction.SendResolutionOnlyBlocked,
-			SendSentinelResults:       cfg.Prediction.SendSentinelResults,
-		}, predsRepo, eventPageProvider, catalystRepoForEvolver, flowRepo, repricingComp, aiGen, tgAdapter, met, logger)
+	// v11.3 Signal-quality admin telemetry worker.
+	// Reads polymarket_alerts deterministically (no AI) and posts
+	// a periodic "Signal quality · Daily ..." body to the admin
+	// chat. The Router enforces destination — even if some future
+	// code path passes the wrong chat id, the body never reaches
+	// the customer signal feed.
+	var signalQualityWorker *signalquality.Worker
+	if cfg.Postgres.Enabled() &&
+		telegramRouter != nil &&
+		cfg.Alerting.TelegramAdminEnabled &&
+		cfg.Alerting.TelegramAdminSignalQualityReports {
+		signalQualityWorker = signalquality.New(
+			signalquality.Config{
+				Enabled:      true,
+				Interval:     24 * time.Hour,
+				StartupGrace: 5 * time.Minute,
+				Period:       signalquality.PeriodDaily,
+			},
+			// v11.4 bounded store: daily worker reads the 24h
+			// window, capped at SIGNAL_QUALITY_MAX_ALERTS rows.
+			signalquality.NewStoreWithLimits(
+				pgPool,
+				cfg.Alerting.SignalQualityDailyLookback,
+				cfg.Alerting.SignalQualityMaxAlerts,
+			),
+			telegramRouter,
+			logger,
+		)
 		logger.Info().
-			Bool("enabled", cfg.Prediction.EvolutionEnabled).
-			Dur("interval", cfg.Prediction.EvolutionInterval).
-			Int("batch_size", cfg.Prediction.EvolutionBatchSize).
-			Int("concurrency", cfg.Prediction.EvolutionConcurrency).
-			Bool("ai_enabled", cfg.Prediction.EvolutionAIEnabled).
-			Dur("ai_min_interval", cfg.Prediction.EvolutionAIMinInterval).
-			Bool("decay_enabled", cfg.Prediction.EvolutionDecayEnabled).
-			Bool("send_telegram", cfg.Prediction.EvolutionSendTelegram).
-			Msg("prediction evolution: wired")
+			Str("admin_chat_id", cfg.Alerting.TelegramAdminChatID).
+			Msg("signal-quality admin report: wired (v11.3)")
 	}
+
+	// v11.4 Market Close Review worker declared here, constructed
+	// after aiBudget so the budget gate is wired in.
+	var marketCloseReviewWorker *marketclosereview.Worker
+
+	// v9.9 Prediction Evolution Worker (the heartbeat).
+	// v11.2 cleanup: prediction evolution / feedback / archival
+	// workers fully removed. The Telegram "PREDICTION UPDATE" surface
+	// is gone and the underlying state machine is no longer wired.
+	// `polymarket_market_predictions` and related tables remain in
+	// the schema (append-only migration policy) but are no longer
+	// written to.
 
 	// AI budget governor — single process-local instance shared by
 	// every worker that issues AI calls. nil-friendly seam: any
@@ -1217,83 +1025,78 @@ func New() (*App, error) {
 		BucketDailyBudgetsUSD: map[string]float64{
 			aibudget.BucketAlertAnalysis:     cfg.AIBudget.AlertAnalysisDailyUSD,
 			aibudget.BucketCatalystImporter:  cfg.AIBudget.CatalystImporterDailyUSD,
-			aibudget.BucketPredictionCreate:  cfg.AIBudget.PredictionCreationDailyUSD,
-			aibudget.BucketPredictionEvolve:  cfg.AIBudget.PredictionEvolveDailyUSD,
-			aibudget.BucketMarketIntel:       cfg.AIBudget.MarketIntelDailyUSD,
-			aibudget.BucketDailyIntel:        cfg.AIBudget.DailyIntelDailyUSD,
-			aibudget.BucketAnnotationRanking: cfg.AIBudget.AnnotationRankDailyUSD,
+			aibudget.BucketMarketCloseReview: cfg.Alerting.MarketCloseReviewDailyBudgetUSD,
 		},
 	}, met)
-	if evolutionWorker != nil {
-		evolutionWorker.SetBudget(aiBudget)
-	}
 	if catalystImporterWorker != nil {
 		catalystImporterWorker.SetBudget(aiBudget)
 	}
-	// v10.3: ensure every periodic AI surface is gated by the
-	// shared aibudget governor. The alert analyzer is covered by
-	// the openai.Client's internal ledger (AI_ANALYSIS_DAILY_BUDGET_USD);
-	// these two were previously bypassing the v10.0 governor.
-	if dailyIntelWorker != nil {
-		dailyIntelWorker.SetBudget(aiBudget)
-	}
-	if marketIntelWorker != nil {
-		marketIntelWorker.SetBudget(aiBudget)
-	}
-	// v10.2: usefulness scoring is persisted via the new
-	// PredictionIntelligenceRepository. The evolver writes a fresh
-	// score row at the end of every per-prediction cycle.
-	if evolutionWorker != nil && cfg.Postgres.Enabled() {
-		evolutionWorker.SetUsefulness(repository.NewPredictionIntelligenceRepository(pgPool))
-	}
 
-	// v10.2 prediction feedback worker.
-	var predictionFeedback *predictionfeedback.Worker
-	if cfg.Postgres.Enabled() && cfg.Prediction.FeedbackEnabled && marketsRepo != nil {
-		horizons := parseHorizonsCSV(cfg.Prediction.FeedbackHorizonsCSV)
-		intelRepo := repository.NewPredictionIntelligenceRepository(pgPool)
-		eventPageRepo := repository.NewEventPageRepository(pgPool)
-		predictionFeedback = predictionfeedback.New(
-			predictionfeedback.Config{
-				Enabled:           cfg.Prediction.FeedbackEnabled,
-				Interval:          cfg.Prediction.FeedbackInterval,
-				Horizons:          horizons,
-				BatchSize:         cfg.Prediction.FeedbackBatchSize,
-				MinMaterialDelta:  cfg.Prediction.EvaluationMinPriceDelta,
-				UsefulEarlyWindow: cfg.Prediction.EvaluationUsefulEarlyWindow,
+	// v11.4 Market Close Review learning loop construction.
+	// Reviews recently-closed markets, asks AI whether
+	// Watchtower's alerts caught real informed flow, persists
+	// verdict + cost, posts an admin Telegram summary, and
+	// applies reactions to the original signal alerts.
+	if cfg.Postgres.Enabled() &&
+		cfg.Alerting.MarketCloseReviewEnabled &&
+		telegramRouter != nil {
+		var mcrAnalyzer marketclosereview.Analyzer
+		if cfg.AIAnalysis.APIKey != "" && cfg.Alerting.MarketCloseReviewAIEnabled {
+			model := cfg.Alerting.MarketCloseReviewAIModel
+			if model == "" {
+				model = cfg.AIAnalysis.Model
+			}
+			mcrAnalyzer = openai.New(openai.Config{
+				APIKey:                 cfg.AIAnalysis.APIKey,
+				BaseURL:                cfg.AIAnalysis.BaseURL,
+				Model:                  model,
+				Timeout:                cfg.Alerting.MarketCloseReviewAITimeout,
+				MaxPromptChars:         cfg.AIAnalysis.MaxPromptChars,
+				MaxOutputChars:         cfg.AIAnalysis.MaxOutputChars,
+				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
+				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
+				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
+				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
+			})
+		}
+		marketCloseReviewWorker = marketclosereview.New(
+			marketclosereview.Config{
+				Enabled:                cfg.Alerting.MarketCloseReviewEnabled,
+				Interval:               cfg.Alerting.MarketCloseReviewInterval,
+				Lookback:               cfg.Alerting.MarketCloseReviewLookback,
+				MarketMaxAgeAfterClose: cfg.Alerting.MarketCloseReviewMarketMaxAgeAfterClose,
+				HistoryLookback:        cfg.Alerting.MarketCloseReviewHistoryLookback,
+				MinAlerts:              cfg.Alerting.MarketCloseReviewMinAlerts,
+				RequireAlertOrNews:     cfg.Alerting.MarketCloseReviewRequireAlertOrNews,
+				MaxMarketsPerRun:       cfg.Alerting.MarketCloseReviewMaxMarketsPerRun,
+				MaxAlertsPerMarket:     cfg.Alerting.MarketCloseReviewMaxAlertsPerMarket,
+				MaxEventsPerMarket:     cfg.Alerting.MarketCloseReviewMaxEventsPerMarket,
+				AIEnabled:              cfg.Alerting.MarketCloseReviewAIEnabled,
+				AITimeout:              cfg.Alerting.MarketCloseReviewAITimeout,
+				AIModel:                cfg.Alerting.MarketCloseReviewAIModel,
+				DailyBudgetUSD:         cfg.Alerting.MarketCloseReviewDailyBudgetUSD,
+				SendAdminTelegram:      cfg.Alerting.MarketCloseReviewSendAdminTelegram,
+				SetReactions:           cfg.Alerting.MarketCloseReviewSetReactions,
+				ReactionSuccess:        cfg.Alerting.MarketCloseReviewReactionSuccess,
+				ReactionFailure:        cfg.Alerting.MarketCloseReviewReactionFailure,
+				ReactionAmbiguous:      cfg.Alerting.MarketCloseReviewReactionAmbiguous,
+				ReactionSkipAmbiguous:  cfg.Alerting.MarketCloseReviewReactionSkipAmbiguous,
+				SignalChatID:           cfg.Alerting.TelegramChatID,
 			},
-			intelRepo, marketsRepo, eventPageRepo, tradesRepo, met, logger,
-		)
-		// v10.3: feedback worker also writes prediction evaluations.
-		predictionFeedback.SetEvaluator(intelRepo)
-		logger.Info().
-			Bool("enabled", cfg.Prediction.FeedbackEnabled).
-			Dur("interval", cfg.Prediction.FeedbackInterval).
-			Int("horizons", len(horizons)).
-			Msg("prediction feedback: wired")
-	}
-
-	// v10.3 prediction archival worker.
-	var predictionArchiver *predictionarchival.Worker
-	if cfg.Postgres.Enabled() && cfg.Prediction.ArchivalEnabled {
-		intelRepo := repository.NewPredictionIntelligenceRepository(pgPool)
-		predictionArchiver = predictionarchival.New(
-			predictionarchival.Config{
-				Enabled:            cfg.Prediction.ArchivalEnabled,
-				Interval:           cfg.Prediction.ArchivalInterval,
-				TerminalRetention:  cfg.Prediction.ArchivalTerminalRetention,
-				StaleNoSignalAfter: cfg.Prediction.ArchivalStaleNoSignalAfter,
-				BlockedRevalidate:  cfg.Prediction.ArchivalBlockedRevalidate,
-				BatchSize:          cfg.Prediction.ArchivalBatchSize,
-			},
-			intelRepo, met, logger,
+			repository.NewMarketCloseReviewRepository(pgPool),
+			mcrAnalyzer,
+			aiBudget,
+			telegramRouter,
+			telegramAnnotation,
+			met,
+			logger,
 		)
 		logger.Info().
-			Bool("enabled", cfg.Prediction.ArchivalEnabled).
-			Dur("interval", cfg.Prediction.ArchivalInterval).
-			Dur("terminal_retention", cfg.Prediction.ArchivalTerminalRetention).
-			Dur("stale_no_signal_after", cfg.Prediction.ArchivalStaleNoSignalAfter).
-			Msg("prediction archival: wired")
+			Bool("enabled", cfg.Alerting.MarketCloseReviewEnabled).
+			Dur("interval", cfg.Alerting.MarketCloseReviewInterval).
+			Bool("ai_enabled", cfg.Alerting.MarketCloseReviewAIEnabled && cfg.AIAnalysis.APIKey != "").
+			Float64("daily_budget_usd", cfg.Alerting.MarketCloseReviewDailyBudgetUSD).
+			Msg("market close review: wired (v11.4)")
 	}
 
 	// v10.4 Hybrid WebSocket realtime fast-lane. WS_ENABLED=false
@@ -1348,187 +1151,40 @@ func New() (*App, error) {
 
 	// v10.0 Prediction Creation Worker (cold-start path). Without
 	// this loop, the evolution worker has nothing to evolve.
-	var predictionCreator *create.Worker
-	if cfg.Postgres.Enabled() && cfg.Prediction.CreationEnabled && marketsRepo != nil && eventPageProvider != nil {
-		predsRepo := repository.NewRepricingPredictionsRepository(pgPool)
-		flowRepo := eventflow.New(sqlc.New(pgPool), eventflow.Config{
-			Enabled:          true,
-			Lookback:         cfg.EventFlow.Lookback,
-			MaxAlerts:        cfg.EventFlow.MaxAlerts,
-			MaxTrades:        cfg.EventFlow.MaxTrades,
-			MinLargeTradeUSD: cfg.EventFlow.MinLargeTradeUSD,
-			TopItems:         cfg.EventFlow.TopItems,
-		}, met, logger)
-		repricingComp := repricing.New(repricing.Config{
-			Enabled:                cfg.Repricing.Enabled,
-			Lookback:               cfg.Repricing.Lookback,
-			PreWindow:              cfg.Repricing.PreWindow,
-			PostWindow:             cfg.Repricing.PostWindow,
-			MinAnnotationMove:      cfg.Repricing.MinAnnotationMove,
-			MinFlowUSD:             cfg.Repricing.MinFlowUSD,
-			UnderreactionThreshold: cfg.Repricing.UnderreactionThreshold,
-			OverreactionThreshold:  cfg.Repricing.OverreactionThreshold,
-		}, sqlc.New(pgPool), predsRepo, met, logger)
-		catalystRepoForCreator := repository.NewEventCatalystRepository(pgPool)
-		intelRepo := repository.NewMarketIntelligenceRepository(pgPool)
-		var ranker analysis.PredictionRanker = analysis.NoopPredictionRanker{}
-		var creator analysis.PredictionCreator = analysis.NoopPredictionCreator{}
-		if cfg.AIAnalysis.APIKey != "" && cfg.Prediction.CreationAIEnabled {
-			cli := openai.New(openai.Config{
-				APIKey:                 cfg.AIAnalysis.APIKey,
-				BaseURL:                cfg.AIAnalysis.BaseURL,
-				Model:                  cfg.Prediction.CreationAIModel,
-				Timeout:                cfg.Prediction.CreationAITimeout,
-				RatePerMin:             cfg.AIAnalysis.RateLimitPerMin,
-				DailyBudget:            cfg.AIAnalysis.DailyBudgetUSD,
-				PromptCostPer1kUSD:     cfg.AIAnalysis.PromptCostPer1kUSD,
-				CompletionCostPer1kUSD: cfg.AIAnalysis.CompletionCostPer1kUSD,
-			})
-			ranker = cli
-			creator = cli
-		}
-		var creatorTG create.Telegram
-		if bot != nil && cfg.Prediction.CreationSendTelegram {
-			creatorTG = creationTelegramAdapter{bot: bot, chatID: cfg.Alerting.TelegramChatID}
-		}
-		predictionCreator = create.New(create.Config{
-			Enabled:      cfg.Prediction.CreationEnabled,
-			Interval:     cfg.Prediction.CreationInterval,
-			BatchSize:    cfg.Prediction.CreationBatchSize,
-			MaxSelected:  cfg.Prediction.CreationMaxSelected,
-			MinScore:     cfg.Prediction.CreationMinScore,
-			MaxPerDay:    cfg.Prediction.CreationMaxPerDay,
-			DedupeWindow: cfg.Prediction.CreationDedupeWindow,
-			AIEnabled:    cfg.Prediction.CreationAIEnabled,
-			AITimeout:    cfg.Prediction.CreationAITimeout,
-			SendTelegram: cfg.Prediction.CreationSendTelegram,
-			Concurrency:  cfg.Prediction.CreationConcurrency,
-			Categories:   cfg.Prediction.CreationCategories,
-			// v10.1 Telegram polish + quality gate + throttling.
-			AnnotationsEnabled:        cfg.Prediction.TelegramAnnotationsEnabled,
-			AnnotationsLimit:          cfg.Prediction.TelegramAnnotationsLimit,
-			AnnotationsMaxTitleChars:  cfg.Prediction.TelegramAnnotationsMaxTitleChars,
-			AnnotationsMaxSourceNames: cfg.Prediction.TelegramAnnotationsMaxSourceNames,
-			LinksEnabled:              cfg.Prediction.TelegramLinksEnabled,
-			PolymarketBase:            cfg.Polymarket.PublicBaseURL,
-			GrafanaBaseURL:            cfg.Alerting.GrafanaBaseURL,
-			GrafanaDashUID:            cfg.Alerting.GrafanaDashUID,
-			TelegramCooldown:          cfg.Prediction.CreationTelegramCooldown,
-			MaxTelegramPerRun:         cfg.Prediction.CreationMaxTelegramPerRun,
-			SendOnStartup:             cfg.Prediction.CreationSendOnStartup,
-			SendNeutral:               cfg.Prediction.CreationSendNeutral,
-			PersistLowQuality:         cfg.Prediction.CreationPersistLowQuality,
-			MinConfidence:             cfg.Prediction.CreationMinConfidence,
-			RequireSignal:             cfg.Prediction.CreationRequireSignal,
-			MinSummaryChars:           cfg.Prediction.CreationMinSummaryChars,
-		}, intelRepo, marketsRepo, predsRepo, eventPageProvider, catalystRepoForCreator, flowRepo, repricingComp, ranker, creator, creatorTG, met, logger)
-		predictionCreator.SetBudget(aiBudget)
-		logger.Info().
-			Bool("enabled", cfg.Prediction.CreationEnabled).
-			Dur("interval", cfg.Prediction.CreationInterval).
-			Int("max_selected", cfg.Prediction.CreationMaxSelected).
-			Int("max_per_day", cfg.Prediction.CreationMaxPerDay).
-			Float64("min_score", cfg.Prediction.CreationMinScore).
-			Bool("ai_enabled", cfg.Prediction.CreationAIEnabled).
-			Bool("send_telegram", cfg.Prediction.CreationSendTelegram).
-			Msg("prediction creation: wired")
-	}
+	// v11.2 cleanup: prediction creation worker fully removed.
+	// The output-product variant (Telegram + AI-driven thesis) is
+	// gone; the only surviving prediction-related surface is the
+	// flow-alert AI context (catalyst stamping), which does not
+	// require this worker.
 
 	return &App{
-		cfg:               cfg,
-		logger:            logger,
-		metrics:           met,
-		cache:             cache,
-		discover:          discoverLoop,
-		collect:           collectLoop,
-		detectRun:         detectLoop.Run,
-		httpSrv:           httpSrv,
-		backfill:          backfillWorker,
-		sender:            senderWorker,
-		sanity:            sanityWorker,
-		outcomes:          outcomesWorker,
-		drift:             driftWorker,
-		stats:             statsWorker,
-		signalReport:      signalReportWorker,
-		detection:         detectionWorker,
-		stableFavorite:    stableFavWorker,
-		aiAnalysis:        aiSvc,
-		outcomeAI:         outcomeAIWorker,
-		marketIntel:       marketIntelWorker,
-		catalystImporter:  catalystImporterWorker,
-		dailyIntel:        dailyIntelWorker,
-		newsIntel:         newsIntelWorker,
-		predictionEvolver: evolutionWorker,
-		predictionCreator: predictionCreator,
-		predictionFeedbk:  predictionFeedback,
-		predictionArchive: predictionArchiver,
-		realtimeWS:        realtimeWorker,
-		pgPool:            pgPool,
+		cfg:              cfg,
+		logger:           logger,
+		metrics:          met,
+		cache:            cache,
+		discover:         discoverLoop,
+		collect:          collectLoop,
+		detectRun:        detectLoop.Run,
+		httpSrv:          httpSrv,
+		backfill:         backfillWorker,
+		sender:           senderWorker,
+		sanity:           sanityWorker,
+		outcomes:         outcomesWorker,
+		drift:            driftWorker,
+		detection:        detectionWorker,
+		aiAnalysis:       aiSvc,
+		outcomeAI:        outcomeAIWorker,
+		catalystImporter: catalystImporterWorker,
+		newsIntel:        newsIntelWorker,
+		signalQuality:     signalQualityWorker,
+		marketCloseReview: marketCloseReviewWorker,
+		realtimeWS:       realtimeWorker,
+		pgPool:           pgPool,
 	}, nil
 }
 
-// creationTelegramAdapter narrows *telegram.Bot to the create
-// worker's small SendHTML seam. Keeps the create package free of a
-// hard dependency on the telegram package.
-type creationTelegramAdapter struct {
-	bot    *telegram.Bot
-	chatID string
-}
-
-func (a creationTelegramAdapter) SendHTML(ctx context.Context, body string) (int64, error) {
-	res, err := a.bot.SendHTML(ctx, a.chatID, body)
-	return res.MessageID, err
-}
-
-// evolutionTelegramAdapter narrows *telegram.Bot to the evolution
-// worker's small Telegram seam — same pattern as the daily-intel
-// adapter, kept local to keep cross-package wiring tight.
-type evolutionTelegramAdapter struct{ bot *telegram.Bot }
-
-func (a evolutionTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (evolution.TelegramResult, error) {
-	res, err := a.bot.SendHTML(ctx, chatID, text)
-	return evolution.TelegramResult{MessageID: res.MessageID}, err
-}
-
-// dailyIntelTelegramAdapter narrows *telegram.Bot to the small seam
-// the daily-intel worker expects. We keep the seam local to the
-// usecase package to avoid cross-importing infra/telegram.
-type dailyIntelTelegramAdapter struct {
-	bot *telegram.Bot
-}
-
-// newsIntelTelegramAdapter narrows *telegram.Bot to the v11.0 news
-// intel worker's seam — same pattern as the daily-intel adapter.
-type newsIntelTelegramAdapter struct {
-	bot *telegram.Bot
-}
-
-func (a newsIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (int64, error) {
-	res, err := a.bot.SendHTML(ctx, chatID, text)
-	return res.MessageID, err
-}
-
-func (a dailyIntelTelegramAdapter) SendHTML(ctx context.Context, chatID, text string) (dailypoliticalintel.TelegramResult, error) {
-	res, err := a.bot.SendHTML(ctx, chatID, text)
-	return dailypoliticalintel.TelegramResult{MessageID: res.MessageID}, err
-}
-
-// parseHorizonsCSV converts "1h,6h,24h" into []time.Duration. Bad
-// entries are silently dropped; an empty list falls back to the
-// worker's default at construction time.
-func parseHorizonsCSV(s string) []time.Duration {
-	var out []time.Duration
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if d, err := time.ParseDuration(p); err == nil {
-			out = append(out, d)
-		}
-	}
-	return out
-}
+// v11.3: newsIntelTelegramAdapter removed — newsintel.Worker now
+// takes the *telegram.Router directly via the typed Send seam.
 
 // splitCSV trims and splits a comma-separated env value. Empty
 // entries are dropped; the empty input returns nil.
@@ -1565,30 +1221,6 @@ func walletResolver(traders *repository.TraderRepository) detection.WalletResolv
 		}
 		return wallet
 	}
-}
-
-// telegramSenderAdapter narrows *telegram.Bot to statsreport.Sender by
-// dropping the SendResult — the stats worker has no use for the
-// upstream Telegram message id.
-type telegramSenderAdapter struct{ bot *telegram.Bot }
-
-func (a telegramSenderAdapter) SendHTML(ctx context.Context, chatID, text string) error {
-	_, err := a.bot.SendHTML(ctx, chatID, text)
-	return err
-}
-
-// telegramSignalSenderAdapter is the signalreport.Sender adapter. The
-// signal-report worker DOES need the upstream message_id (it persists
-// it on the polymarket_signal_reports row), so this adapter returns
-// the int64 directly rather than dropping it.
-type telegramSignalSenderAdapter struct{ bot *telegram.Bot }
-
-func (a telegramSignalSenderAdapter) SendHTML(ctx context.Context, chatID, text string) (int64, error) {
-	res, err := a.bot.SendHTML(ctx, chatID, text)
-	if err != nil {
-		return 0, err
-	}
-	return res.MessageID, nil
 }
 
 // reactionMetricsAdapter shims metrics.TelegramReactions over the
@@ -1642,35 +1274,6 @@ func (o outcomeMetricsAdapter) ObservePAL(snap outcomes.PALSnapshot) {
 	if o.m.AlertWeightedSuccessTotal != nil && snap.Weight > 0 {
 		o.m.AlertWeightedSuccessTotal.WithLabelValues(snap.Severity, snap.Kind).Add(snap.Weight * snap.SuccessBinary)
 	}
-}
-
-// signalReportMetricsAdapter shims metrics.SignalReportsSent over the
-// signalreport.Metrics shape.
-type signalReportMetricsAdapter struct{ m *metrics.Metrics }
-
-func (s signalReportMetricsAdapter) ObserveReportSent(periodType, status string) {
-	if s.m == nil || s.m.SignalReportsSent == nil {
-		return
-	}
-	s.m.SignalReportsSent.WithLabelValues(periodType, status).Inc()
-}
-
-// stableFavoriteCacheAdapter projects *marketcache.Cache into the
-// MarketView the stablefavorite worker consumes. Kept here rather
-// than in the worker package because *marketcache.Cache's return
-// type (market.Market) lives in a separate domain package and would
-// otherwise force the worker to depend on it transitively.
-type stableFavoriteCacheAdapter struct{ cache *marketcache.Cache }
-
-func (a stableFavoriteCacheAdapter) View(id vo.MarketID) (stablefavorite.MarketView, bool) {
-	m, ok := a.cache.Get(id)
-	if !ok {
-		return stablefavorite.MarketView{}, false
-	}
-	return stablefavorite.MarketView{
-		Tokens:   m.TokenIDs,
-		Outcomes: m.Outcomes,
-	}, true
 }
 
 // marketcacheUpstream adapts *marketcache.Cache to sanity.UpstreamChecker.
@@ -1809,21 +1412,9 @@ func (a *App) Run() error {
 	if a.drift != nil {
 		execs = append(execs, shutdown2.Exec{Name: "drift", Fn: a.drift.Run})
 	}
-	if a.stats != nil {
-		execs = append(execs, shutdown2.Exec{Name: "statsreport", Fn: a.stats.Run})
-	}
-	if a.signalReport != nil {
-		execs = append(execs, shutdown2.Exec{Name: "signalreport", Fn: a.signalReport.Run})
-	}
 	if a.detection != nil {
 		execs = append(execs, shutdown2.Exec{Name: "detection", Fn: func(ctx context.Context) error {
 			a.detection.Run(ctx)
-			return nil
-		}})
-	}
-	if a.stableFavorite != nil {
-		execs = append(execs, shutdown2.Exec{Name: "stablefavorite", Fn: func(ctx context.Context) error {
-			a.stableFavorite.Run(ctx)
 			return nil
 		}})
 	}
@@ -1833,21 +1424,9 @@ func (a *App) Run() error {
 			return nil
 		}})
 	}
-	if a.marketIntel != nil {
-		execs = append(execs, shutdown2.Exec{Name: "marketintel", Fn: func(ctx context.Context) error {
-			a.marketIntel.Run(ctx)
-			return nil
-		}})
-	}
 	if a.catalystImporter != nil {
 		execs = append(execs, shutdown2.Exec{Name: "catalyst-importer", Fn: func(ctx context.Context) error {
 			a.catalystImporter.Run(ctx)
-			return nil
-		}})
-	}
-	if a.dailyIntel != nil {
-		execs = append(execs, shutdown2.Exec{Name: "daily-political-intel", Fn: func(ctx context.Context) error {
-			a.dailyIntel.Run(ctx)
 			return nil
 		}})
 	}
@@ -1857,27 +1436,12 @@ func (a *App) Run() error {
 			return nil
 		}})
 	}
-	if a.predictionEvolver != nil {
-		execs = append(execs, shutdown2.Exec{Name: "prediction-evolution", Fn: func(ctx context.Context) error {
-			a.predictionEvolver.Run(ctx)
-			return nil
-		}})
+	if a.signalQuality != nil {
+		execs = append(execs, shutdown2.Exec{Name: "signalquality-admin", Fn: a.signalQuality.Run})
 	}
-	if a.predictionCreator != nil {
-		execs = append(execs, shutdown2.Exec{Name: "prediction-creation", Fn: func(ctx context.Context) error {
-			a.predictionCreator.Run(ctx)
-			return nil
-		}})
-	}
-	if a.predictionFeedbk != nil {
-		execs = append(execs, shutdown2.Exec{Name: "prediction-feedback", Fn: func(ctx context.Context) error {
-			a.predictionFeedbk.Run(ctx)
-			return nil
-		}})
-	}
-	if a.predictionArchive != nil {
-		execs = append(execs, shutdown2.Exec{Name: "prediction-archival", Fn: func(ctx context.Context) error {
-			a.predictionArchive.Run(ctx)
+	if a.marketCloseReview != nil {
+		execs = append(execs, shutdown2.Exec{Name: "market-close-review", Fn: func(ctx context.Context) error {
+			a.marketCloseReview.Run(ctx)
 			return nil
 		}})
 	}

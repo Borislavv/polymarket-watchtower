@@ -47,12 +47,22 @@ type PostmortemStore interface {
 	Insert(ctx context.Context, a repository.NewAlertOutcomeAnalysis) (repository.AlertOutcomeAnalysis, bool, error)
 }
 
-// Bot is the Telegram surface this worker needs.
-// *telegram.Bot satisfies it.
-type Bot interface {
-	EditMessageText(ctx context.Context, chatID string, messageID int64, text string) error
-	SendHTML(ctx context.Context, chatID, text string) (telegram.SendResult, error)
-	SetMessageReaction(ctx context.Context, chatID string, messageID int64, emoji string) error
+// Sender is the typed Telegram send surface for the v11.4
+// follow-up path. *telegram.Router satisfies it. The router
+// resolves the signal chat id from SurfaceOutcomeFollowup so the
+// worker never picks a chat id of its own.
+type Sender interface {
+	Send(ctx context.Context, msg telegram.Message) (telegram.SendResult, error)
+}
+
+// Annotator is the typed surface for EditMessageText +
+// SetMessageReaction. *telegram.Annotation satisfies it. Edits +
+// reactions target an already-sent message id so they don't fit
+// the router's chat-by-surface contract — the annotator passes the
+// surface label through purely for metric attribution.
+type Annotator interface {
+	EditOutcomeMessage(ctx context.Context, surface telegram.Surface, chatID string, messageID int64, html string) error
+	SetOutcomeReaction(ctx context.Context, surface telegram.Surface, chatID string, messageID int64, emoji string) error
 }
 
 // Analyzer is the AI postmortem entry point.
@@ -105,16 +115,22 @@ type Worker struct {
 	store     PostmortemStore
 	analyzer  Analyzer
 	narrative NarrativeLoader
-	bot       Bot
+	sender    Sender
+	annotator Annotator
 	log       *zerolog.Logger
 }
 
 // New wires the worker. All deps required; pass analysis.NoopAnalyzer
 // to disable the AI call (the worker still applies reactions and
 // still records an empty postmortem row).
-func New(cfg Config, alerts AlertSource, store PostmortemStore, analyzer Analyzer, bot Bot, log *zerolog.Logger) *Worker {
+//
+// v11.4: split the legacy Bot interface into a typed Sender (for
+// fresh follow-up messages, routed via *telegram.Router) and a
+// typed Annotator (for Edit + Reaction on already-sent messages,
+// metric-attributed via *telegram.Annotation).
+func New(cfg Config, alerts AlertSource, store PostmortemStore, analyzer Analyzer, sender Sender, annotator Annotator, log *zerolog.Logger) *Worker {
 	cfg.applyDefaults()
-	return &Worker{cfg: cfg, alerts: alerts, store: store, analyzer: analyzer, bot: bot, log: log}
+	return &Worker{cfg: cfg, alerts: alerts, store: store, analyzer: analyzer, sender: sender, annotator: annotator, log: log}
 }
 
 // SetNarrativeLoader wires the optional Polymarket event-page
@@ -212,7 +228,7 @@ func (w *Worker) processOne(ctx context.Context, a repository.Alert) {
 }
 
 func (w *Worker) deliver(ctx context.Context, a repository.Alert, f anomaly.Finding, out analysis.OutcomeAnalysis) {
-	if w.bot == nil || w.cfg.ChatID == "" {
+	if w.cfg.ChatID == "" {
 		return
 	}
 
@@ -220,39 +236,51 @@ func (w *Worker) deliver(ctx context.Context, a repository.Alert, f anomaly.Find
 	// We use the same formatter the sender used so the surrounding
 	// content stays consistent.
 	body := renderUpdatedBody(f, a, out)
-	if a.TelegramMessageID != nil && *a.TelegramMessageID > 0 {
-		err := w.bot.EditMessageText(ctx, w.cfg.ChatID, *a.TelegramMessageID, body)
+	if a.TelegramMessageID != nil && *a.TelegramMessageID > 0 && w.annotator != nil {
+		err := w.annotator.EditOutcomeMessage(ctx, telegram.SurfaceOutcomeFollowup, w.cfg.ChatID, *a.TelegramMessageID, body)
 		if err != nil {
 			if errors.Is(err, telegram.ErrEditUnsupported) {
 				// Edit not allowed (message too old, etc.) → send a
-				// linked follow-up so the operator still sees the
-				// resolution.
-				if _, sendErr := w.bot.SendHTML(ctx, w.cfg.ChatID, renderFollowupBody(f, a, out)); sendErr != nil {
-					w.log.Err(sendErr).Int64("alert_id", a.ID).Msg("outcomeai: follow-up send failed")
-				}
+				// linked follow-up through the Router so the operator
+				// still sees the resolution. The router resolves the
+				// signal chat from SurfaceOutcomeFollowup.
+				w.sendFollowup(ctx, f, a, out)
 			} else {
 				w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomeai: edit failed")
 			}
 		}
 	} else {
-		// No message id on record (older alert / lost message id) —
-		// linked follow-up only.
-		if _, err := w.bot.SendHTML(ctx, w.cfg.ChatID, renderFollowupBody(f, a, out)); err != nil {
-			w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomeai: follow-up send failed")
-		}
+		// No message id on record (older alert / lost message id) OR
+		// no annotator wired — linked follow-up only.
+		w.sendFollowup(ctx, f, a, out)
 	}
 
 	// Reaction. We always try — the failure mode is well-handled
 	// (ErrReactionUnsupported terminates silently; transient
 	// errors are retryable but we don't retry here because the
 	// edit/follow-up already carries the result text).
-	if a.TelegramMessageID != nil && *a.TelegramMessageID > 0 {
+	if a.TelegramMessageID != nil && *a.TelegramMessageID > 0 && w.annotator != nil {
 		emoji := w.pickReaction(string(a.OutcomeStatus))
 		if emoji != "" {
-			if err := w.bot.SetMessageReaction(ctx, w.cfg.ChatID, *a.TelegramMessageID, emoji); err != nil {
+			if err := w.annotator.SetOutcomeReaction(ctx, telegram.SurfaceOutcomeFollowup, w.cfg.ChatID, *a.TelegramMessageID, emoji); err != nil {
 				w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomeai: reaction failed")
 			}
 		}
+	}
+}
+
+// sendFollowup dispatches the linked follow-up body through the
+// typed Sender (v11.3 Router). Surface=outcome_followup maps to the
+// signal chat; the worker never picks the chat id itself.
+func (w *Worker) sendFollowup(ctx context.Context, f anomaly.Finding, a repository.Alert, out analysis.OutcomeAnalysis) {
+	if w.sender == nil {
+		return
+	}
+	if _, err := w.sender.Send(ctx, telegram.Message{
+		Surface: telegram.SurfaceOutcomeFollowup,
+		HTML:    renderFollowupBody(f, a, out),
+	}); err != nil {
+		w.log.Err(err).Int64("alert_id", a.ID).Msg("outcomeai: follow-up send failed")
 	}
 }
 

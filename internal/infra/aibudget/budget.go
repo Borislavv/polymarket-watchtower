@@ -51,13 +51,14 @@ import (
 // Bucket identifiers. Use these constants instead of string literals
 // at call sites so the compiler catches typos.
 const (
-	BucketAlertAnalysis     = "alert_analysis"
-	BucketPredictionEvolve  = "prediction_evolution"
-	BucketPredictionCreate  = "prediction_creation"
-	BucketCatalystImporter  = "catalyst_importer"
-	BucketMarketIntel       = "market_intel"
-	BucketDailyIntel        = "daily_political_intel"
-	BucketAnnotationRanking = "annotation_ranking"
+	BucketAlertAnalysis      = "alert_analysis"
+	BucketPredictionEvolve   = "prediction_evolution"
+	BucketPredictionCreate   = "prediction_creation"
+	BucketCatalystImporter   = "catalyst_importer"
+	BucketMarketIntel        = "market_intel"
+	BucketDailyIntel         = "daily_political_intel"
+	BucketAnnotationRanking  = "annotation_ranking"
+	BucketMarketCloseReview  = "market_close_review"
 )
 
 // AllowedBuckets is the closed set of bucket names the Manager
@@ -72,6 +73,7 @@ var AllowedBuckets = []string{
 	BucketMarketIntel,
 	BucketDailyIntel,
 	BucketAnnotationRanking,
+	BucketMarketCloseReview,
 }
 
 // Config wires the Manager.

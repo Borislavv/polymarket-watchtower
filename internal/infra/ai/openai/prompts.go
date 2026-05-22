@@ -182,48 +182,10 @@ func buildWebContextBlock(req analysis.AlertAnalysisRequest) string {
 	return "public_context: NOT checked. Do not invent public facts; if asked, say \"Live public context was not checked.\""
 }
 
-// buildMarketReportPrompt — 2h market-news-review.
-//
-// v9 reformulation: same core question as the alert prompt — "do fresh
-// events confirm or invalidate a tradable trend before the market
-// fully reprices?" — applied at the period level over the top-N
-// candidate markets. The model is asked to scan for repricing,
-// underreaction, and stale flow, not to produce a generic market
-// summary.
-func buildMarketReportPrompt(req analysis.MarketReportRequest) string {
-	var b strings.Builder
-	b.WriteString("PRODUCE A 2H PREDICTION-MARKET INTELLIGENCE REVIEW.\n\n")
-	fmt.Fprintf(&b, "period: %s — %s\n",
-		req.PeriodStart.Format(time.RFC3339), req.PeriodEnd.Format(time.RFC3339))
-	fmt.Fprintf(&b, "whale_flow_candidates: %d\n", req.WhaleFlowCandidates)
-	fmt.Fprintf(&b, "stable_favorites: %d\n", req.StableFavorites)
-	fmt.Fprintf(&b, "asymmetric_setups: %d\n", req.AsymmetricSetups)
-	fmt.Fprintf(&b, "developing_signals: %d\n", req.DevelopingSignals)
-	if req.UpcomingEventsNote != "" {
-		fmt.Fprintf(&b, "upcoming_events_note: %s\n", req.UpcomingEventsNote)
-	}
-	b.WriteString("\nMarkets (top candidates):\n")
-	for i, m := range req.Markets {
-		fmt.Fprintf(&b, "%d. %s | category=%s | lifecycle=%.1f%% | prob=%.3f | rem_return_pct=%.1f | vol24h=$%.0f | trades24h=%d | alerts24h=%d | %s\n",
-			i+1, oneLine(m.Title), m.Category, m.LifecyclePct, m.Probability,
-			m.RemainingReturnPct, m.Volume24hUSD, m.RecentTrades24h, m.AlertsLast24h, m.Notes)
-	}
-	b.WriteString("\nFresh news / web context:\n")
-	b.WriteString("If you have web_search available, use it to retrieve the most recent (last 24-72h) news relevant to the candidate markets. Cite specific facts only when found by the tool. If the tool is unavailable, write \"Live public context was not checked.\" and do not invent news.\n")
-	b.WriteString("\nPolymarket event page context:\n")
-	if epc := strings.TrimSpace(req.EventNarrativeContext); epc != "" {
-		const lead = "Polymarket event page context:"
-		if strings.HasPrefix(epc, lead) {
-			epc = strings.TrimSpace(epc[len(lead):])
-		}
-		b.WriteString(epc)
-		b.WriteString("\n")
-	} else {
-		b.WriteString("unavailable. Do not invent market news; reduce confidence.\n")
-	}
-	b.WriteString(marketReportPrompt)
-	return b.String()
-}
+// v11.2: buildMarketReportPrompt removed. The 2h market intelligence
+// report (and its renderer / worker / prompt body) was retired as part
+// of the v11 simplification. The Analyzer.AnalyzeMarketReport method
+// is also gone; AlertAnalysis is the only kept Analyzer surface.
 
 // buildOutcomePrompt — postmortem on a resolved alert. Unchanged in
 // v9; the goal here is signal-quality auditing, not trend validation.
