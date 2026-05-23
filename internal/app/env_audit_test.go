@@ -102,16 +102,16 @@ func TestEnvFiles_StrategyV11KeysAllPresent(t *testing.T) {
 // TestEnvFiles_DangerousDefaultsBlocked guarantees no env file ships
 // with a dangerous live-promotion / Telegram-noise default.
 func TestEnvFiles_DangerousDefaultsBlocked(t *testing.T) {
+	// v11.10 precision-first: only check keys that are ACTIVE in the
+	// config struct. Legacy noisy surfaces (WATCHTOWER_STATS_TELEGRAM
+	// _ENABLED, PREDICTION_*_TELEGRAM_ENABLED) are stale-rejected via
+	// `staleEnvKeys{}` — setting them with ANY value boot-fails, so
+	// they must NOT appear in env files at all.
 	mustFalse := map[string]struct{}{
-		"STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED":     {},
-		"STRATEGY_PROMOTION_BYPASS_EXPLICIT":           {},
-		"STRATEGY_SHADOW_RECORD_NOFIRE":                {},
-		"WATCHTOWER_STATS_TELEGRAM_ENABLED":            {},
-		"PREDICTION_UPDATE_TELEGRAM_ENABLED":           {},
-		"PREDICTION_BLOCKED_TELEGRAM_ENABLED":          {},
-		"PREDICTION_STATE_TRANSITION_TELEGRAM_ENABLED": {},
-		// User-flow default must stay false until promoted.
-		"TELEGRAM_STRATEGY_USER_FLOW_ENABLED": {},
+		"STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED": {},
+		"STRATEGY_PROMOTION_BYPASS_EXPLICIT":       {},
+		"STRATEGY_SHADOW_RECORD_NOFIRE":            {},
+		"TELEGRAM_STRATEGY_USER_FLOW_ENABLED":      {},
 	}
 	pairRe := regexp.MustCompile(`^([A-Z][A-Z0-9_]+)=(.*)$`)
 	for _, file := range []string{".env", ".env.example"} {
