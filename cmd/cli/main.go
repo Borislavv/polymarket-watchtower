@@ -65,6 +65,14 @@ func main() {
 		// eval/fired/skipped stats on real data. Never writes,
 		// never calls Telegram or AI.
 		runReplayStrategyShadow(os.Args[2:])
+	case "alert-funnel-debug":
+		// v11.11 read-only end-to-end alert funnel report. Walks
+		// market universe → trade input → lifecycle gate → alerts
+		// → strategy shadow → dedup → top events → top silent
+		// markets. Answers "why so few alerts and why always the
+		// same events?" from DB state alone. Never writes, never
+		// calls Telegram or AI.
+		runAlertFunnelDebug(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -79,6 +87,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  import-catalysts --event <slug> [--persist] [--ai-key $OPENAI_API_KEY] [--model gpt-4.1-mini]")
 	fmt.Fprintln(os.Stderr, "  ws-smoke         --tokens <id1,id2,…> [--duration 60s] [--persist --dsn postgres://…]")
 	fmt.Fprintln(os.Stderr, "  replay-strategy-shadow --dsn postgres://… [--since 24h] [--json]")
+	fmt.Fprintln(os.Stderr, "  alert-funnel-debug     --dsn postgres://… [--since 24h] [--top 20] [--json]")
 }
 
 func runMigrate(args []string) {

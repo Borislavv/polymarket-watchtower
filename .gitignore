@@ -33,3 +33,5 @@ go.work.sum
 
 # Generated AI handoff bundles
 tmp/
+.env.local
+.env.local.*
