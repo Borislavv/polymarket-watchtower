@@ -1160,6 +1160,9 @@ func New() (*App, error) {
 			EventBuffer:  cfg.WS.EventBuffer,
 		}, met, logger)
 		selector := realtime.NewPostgresSelector(pgPool)
+		selector.IncludeHighTrade = cfg.WS.IncludeHighTradeMarkets
+		selector.HighTradeMinTrades24h = cfg.WS.HighTradeMinTrades24h
+		selector.HighTradeLookbackHours = cfg.WS.HighTradeLookbackHours
 		realtimeWorker = realtime.New(realtime.Config{
 			Enabled:                   cfg.WS.Enabled,
 			MarketStreamEnabled:       cfg.WS.MarketStreamEnabled,

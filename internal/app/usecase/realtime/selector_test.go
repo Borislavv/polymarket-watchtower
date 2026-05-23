@@ -19,7 +19,7 @@ import (
 func TestBuildSelectorSQL_NoSRFInsideCoalesce(t *testing.T) {
 	srfRe := regexp.MustCompile(`(?i)COALESCE\s*\(\s*[^()]*(unnest|jsonb_array_elements_text|jsonb_array_elements|regexp_split_to_table)\s*\(`)
 	for _, mode := range []string{"hot", "predictions", "alerts", "all_active_limited"} {
-		sql := buildSelectorSQL(mode)
+		sql := buildSelectorSQL(mode, selectorOptions{})
 		if loc := srfRe.FindStringIndex(sql); loc != nil {
 			t.Fatalf("mode=%s SQL contains set-returning function inside COALESCE — Postgres rejects with SQLSTATE 0A000.\nOffending fragment: %q",
 				mode, sql[loc[0]:min(loc[0]+120, len(sql))])
@@ -34,7 +34,7 @@ func TestBuildSelectorSQL_NoSRFInsideCoalesce(t *testing.T) {
 // reaches Postgres.
 func TestBuildSelectorSQL_UsesLateralWithOrdinality(t *testing.T) {
 	for _, mode := range []string{"hot", "predictions", "alerts", "all_active_limited"} {
-		sql := buildSelectorSQL(mode)
+		sql := buildSelectorSQL(mode, selectorOptions{})
 		if !strings.Contains(sql, "WITH ORDINALITY") {
 			t.Fatalf("mode=%s SQL must pair tokens with outcomes via WITH ORDINALITY", mode)
 		}
@@ -48,9 +48,28 @@ func TestBuildSelectorSQL_UsesLateralWithOrdinality(t *testing.T) {
 // from the file comment: every variant must LIMIT $1.
 func TestBuildSelectorSQL_AlwaysLimitsByOne(t *testing.T) {
 	for _, mode := range []string{"hot", "predictions", "alerts", "all_active_limited"} {
-		sql := buildSelectorSQL(mode)
+		sql := buildSelectorSQL(mode, selectorOptions{})
 		if !strings.Contains(sql, "LIMIT $1") {
 			t.Fatalf("mode=%s SQL missing LIMIT $1 — unbounded WS subscription is unsafe", mode)
+		}
+	}
+}
+
+// TestBuildSelectorSQL_DistinctOnPerCondition pins the v11.11 fix:
+// polymarket_event_page_markets is snapshot-historical, so the outer
+// SELECT MUST collapse to one row per condition_id (the freshest
+// snapshot). Without DISTINCT ON, the same token id is emitted dozens
+// of times per market, burning WS_MAX_MARKETS slots on duplicates.
+func TestBuildSelectorSQL_DistinctOnPerCondition(t *testing.T) {
+	for _, mode := range []string{"hot", "predictions", "alerts", "all_active_limited"} {
+		sql := buildSelectorSQL(mode, selectorOptions{})
+		if !strings.Contains(sql, "DISTINCT ON (em.condition_id)") {
+			t.Fatalf("mode=%s SQL must DISTINCT ON (em.condition_id) to dedupe snapshot rows — got: %s",
+				mode, sql)
+		}
+		// freshest snapshot wins.
+		if !strings.Contains(sql, "ORDER BY em.condition_id, em.created_at DESC") {
+			t.Fatalf("mode=%s DISTINCT ON must ORDER BY (em.condition_id, em.created_at DESC) so the freshest snapshot wins", mode)
 		}
 	}
 }

@@ -73,6 +73,14 @@ func main() {
 		// same events?" from DB state alone. Never writes, never
 		// calls Telegram or AI.
 		runAlertFunnelDebug(os.Args[2:])
+	case "ws-selector-debug":
+		// v11.11 read-only WS selector explainer. Replicates the
+		// production hot-mode selector SQL, annotated with the
+		// winning priority bucket per market. Prints summary
+		// (unique markets / events / tokens, top-event share,
+		// per-bucket mix) plus first 50 rows. Never writes,
+		// never calls Telegram or AI.
+		runWSSelectorDebug(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -88,6 +96,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  ws-smoke         --tokens <id1,id2,…> [--duration 60s] [--persist --dsn postgres://…]")
 	fmt.Fprintln(os.Stderr, "  replay-strategy-shadow --dsn postgres://… [--since 24h] [--json]")
 	fmt.Fprintln(os.Stderr, "  alert-funnel-debug     --dsn postgres://… [--since 24h] [--top 20] [--json]")
+	fmt.Fprintln(os.Stderr, "  ws-selector-debug      --dsn postgres://… [--limit 100] [--mode hot|predictions|alerts|all_active_limited] [--json]")
 }
 
 func runMigrate(args []string) {

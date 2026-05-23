@@ -231,15 +231,24 @@ func (c *Client) runOnce(ctx context.Context, out chan<- Event) error {
 		c.observeConnected(false)
 	}()
 
-	// Build the union of all token ids, capped at MaxTokens.
+	// Build the union of all token ids, deduped + capped at MaxTokens.
+	// v11.11: dedup defensively here too — selectors built outside
+	// internal/app/usecase/realtime can still hand us a list with
+	// duplicates, and a duplicate burns a MaxTokens slot without
+	// adding any real subscription.
 	c.subMu.RLock()
 	tokens := make([]string, 0, c.cfg.MaxTokens)
+	seen := make(map[string]struct{}, c.cfg.MaxTokens)
 	for _, m := range c.currentSubs.Markets {
 		for _, tok := range m.CLOBTokenIDs {
 			tok = strings.TrimSpace(tok)
 			if tok == "" {
 				continue
 			}
+			if _, dup := seen[tok]; dup {
+				continue
+			}
+			seen[tok] = struct{}{}
 			if len(tokens) >= c.cfg.MaxTokens {
 				break
 			}

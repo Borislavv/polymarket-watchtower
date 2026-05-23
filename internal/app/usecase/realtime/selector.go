@@ -24,8 +24,17 @@ import (
 // The query always JOINs polymarket_event_page_markets to pull the
 // CLOBTokenIDs + OutcomeByToken so the WS client can subscribe by
 // asset id without re-querying the mapper per cycle.
+//
+// v11.11: IncludeHighTrade adds priority 7 — markets with significant
+// recent trading activity but no prediction / alert / catalyst /
+// repricing / annotation hook. Off by default; flip via
+// WS_INCLUDE_HIGH_TRADE_MARKETS=true once the operator has confirmed
+// the resulting load is acceptable.
 type PostgresSelector struct {
-	pool *pgxpool.Pool
+	pool                   *pgxpool.Pool
+	IncludeHighTrade       bool
+	HighTradeMinTrades24h  int
+	HighTradeLookbackHours int
 }
 
 func NewPostgresSelector(pool *pgxpool.Pool) *PostgresSelector {
@@ -38,7 +47,7 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 	if mode == "off" || maxMarkets <= 0 {
 		return ws.SubscriptionSet{}, nil
 	}
-	sql := buildSelectorSQL(mode)
+	sql := buildSelectorSQL(mode, s.selectorOptions())
 	rows, err := s.pool.Query(ctx, sql, int32(maxMarkets))
 	if err != nil {
 		return ws.SubscriptionSet{}, fmt.Errorf("selector query: %w", err)
@@ -49,6 +58,10 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 	// rows (one per outcome) and we want a single subscription per
 	// market with all token ids.
 	byCondition := map[string]*ws.MarketSubscription{}
+	// v11.11: per-(condition, token) seen-set so a defensive dedup
+	// of token ids is independent of OutcomeByToken (which may carry
+	// an empty outcome legitimately).
+	tokenSeen := map[string]map[string]struct{}{}
 	for rows.Next() {
 		var eventSlug, conditionID, marketSlug, tokenID, outcome string
 		if err := rows.Scan(&eventSlug, &conditionID, &marketSlug, &tokenID, &outcome); err != nil {
@@ -68,7 +81,19 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 			}
 			byCondition[conditionID] = sub
 		}
-		sub.CLOBTokenIDs = append(sub.CLOBTokenIDs, tokenID)
+		// v11.11: dedup tokens per market — even though the SQL now
+		// emits one row per (condition, ord) pair, defensive dedup
+		// here means a future SQL refactor can't accidentally bloat
+		// the subscribe payload (or hit WS_MAX_TOKENS prematurely).
+		seenSet, ok := tokenSeen[conditionID]
+		if !ok {
+			seenSet = map[string]struct{}{}
+			tokenSeen[conditionID] = seenSet
+		}
+		if _, dup := seenSet[tokenID]; !dup {
+			seenSet[tokenID] = struct{}{}
+			sub.CLOBTokenIDs = append(sub.CLOBTokenIDs, tokenID)
+		}
 		if outcome != "" {
 			sub.OutcomeByToken[tokenID] = outcome
 		}
@@ -78,6 +103,30 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 		set.Markets = append(set.Markets, *sub)
 	}
 	return set, nil
+}
+
+// selectorOptions snapshots the runtime knobs the selector reads on
+// every Select call. The selector itself is concurrency-safe and
+// caller-owned — these reads happen under no lock.
+type selectorOptions struct {
+	IncludeHighTrade       bool
+	HighTradeMinTrades24h  int
+	HighTradeLookbackHours int
+}
+
+func (s *PostgresSelector) selectorOptions() selectorOptions {
+	opts := selectorOptions{
+		IncludeHighTrade:       s.IncludeHighTrade,
+		HighTradeMinTrades24h:  s.HighTradeMinTrades24h,
+		HighTradeLookbackHours: s.HighTradeLookbackHours,
+	}
+	if opts.HighTradeMinTrades24h <= 0 {
+		opts.HighTradeMinTrades24h = 50
+	}
+	if opts.HighTradeLookbackHours <= 0 {
+		opts.HighTradeLookbackHours = 24
+	}
+	return opts
 }
 
 // buildSelectorSQL returns the SQL for the mode. We hand-roll it
@@ -91,7 +140,15 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 // JSONB arrays joined by position. We do NOT call set-returning
 // functions (unnest, jsonb_array_elements_text) inside COALESCE or
 // CASE — Postgres rejects that as SQLSTATE 0A000.
-func buildSelectorSQL(mode string) string {
+//
+// v11.11 fix: polymarket_event_page_markets is snapshot-historical —
+// the same condition_id can appear dozens of times over 24h. The
+// previous form expanded EVERY snapshot through the LATERAL join,
+// emitting the same token id 10-40+ times per market. At low
+// WS_MAX_MARKETS this catastrophically undersubscribed: 25 row-slots
+// could land on a single market's 25 snapshot copies. DISTINCT ON
+// (em.condition_id) picks the freshest snapshot per market.
+func buildSelectorSQL(mode string, opts selectorOptions) string {
 	common := `
 SELECT m.event_slug,
        m.condition_id,
@@ -99,7 +156,8 @@ SELECT m.event_slug,
        tok.token AS clob_token_id,
        COALESCE(out.outcome, '') AS outcome
 FROM (
-    SELECT em.event_slug,
+    SELECT DISTINCT ON (em.condition_id)
+           em.event_slug,
            em.condition_id,
            em.market_slug,
            em.clob_token_ids_json,
@@ -108,7 +166,7 @@ FROM (
     FROM polymarket_event_page_markets em
     WHERE em.created_at > NOW() - INTERVAL '24 hours'
       AND em.active = TRUE
-    ORDER BY em.created_at DESC
+    ORDER BY em.condition_id, em.created_at DESC
 ) m
 CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(m.clob_token_ids_json, '[]'::jsonb))
     WITH ORDINALITY AS tok(token, ord)
@@ -172,10 +230,29 @@ LIMIT $1
 	//               status in {underreacting, overreacting,
 	//               still_repricing}).
 	//   priority 6: events with annotations in last 12h.
+	//   priority 7: (opt-in via WS_INCLUDE_HIGH_TRADE_MARKETS=true)
+	//               high-trade markets in whitelisted categories,
+	//               ≥WS_HIGH_TRADE_MIN_TRADES_24H over the last
+	//               WS_HIGH_TRADE_LOOKBACK_HOURS — closes the
+	//               coverage gap where active geopolitics markets
+	//               have no annotation/catalyst hook but heavy flow.
 	//
 	// The outer SELECT ORDER BY priority ASC + LIMIT $1 — so when the
 	// candidate set exceeds the cap, we keep the highest-priority
 	// rows. Dedup by (event_slug, condition_id) via DISTINCT ON.
+	highTradeCTE := ""
+	if opts.IncludeHighTrade {
+		highTradeCTE = fmt.Sprintf(`
+    UNION ALL
+    SELECT pm.event_slug, pm.condition_id, 7 AS priority
+    FROM polymarket_markets pm
+    JOIN polymarket_trades t ON t.market_id = pm.id
+    WHERE pm.active = TRUE AND pm.deleted_at IS NULL AND pm.purged_at IS NULL
+      AND t.traded_at >= NOW() - INTERVAL '%d hours'
+    GROUP BY pm.event_slug, pm.condition_id
+    HAVING COUNT(t.id) >= %d
+`, opts.HighTradeLookbackHours, opts.HighTradeMinTrades24h)
+	}
 	return `
 WITH hot_set AS (
     SELECT event_slug, condition_id, 1 AS priority
@@ -215,6 +292,7 @@ WITH hot_set AS (
     FROM polymarket_event_annotations an
     JOIN polymarket_markets pm ON pm.event_slug = an.event_slug
     WHERE an.timestamp > NOW() - INTERVAL '12 hours'
+` + highTradeCTE + `
 ),
 ranked AS (
     SELECT event_slug, condition_id, MIN(priority) AS priority

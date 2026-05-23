@@ -666,6 +666,14 @@ type WebSocketConfig struct {
 	RepricingTriggerCooldown  time.Duration `env:"WS_REPRICING_TRIGGER_COOLDOWN" envDefault:"60s" validate:"gt=0"`
 	PredictionRefreshCooldown time.Duration `env:"WS_PREDICTION_REFRESH_TRIGGER_COOLDOWN" envDefault:"5m" validate:"gt=0"`
 	Endpoint                  string        `env:"WS_ENDPOINT" envDefault:"wss://ws-subscriptions-clob.polymarket.com/ws/market"`
+	// v11.11 — opt-in priority 7 in hot mode. When true, markets
+	// with ≥HighTradeMinTrades24h trades over HighTradeLookbackHours
+	// are added to the selector universe even when they have no
+	// prediction / catalyst / annotation hook. Off by default so the
+	// load profile cannot regress without an explicit operator flip.
+	IncludeHighTradeMarkets   bool          `env:"WS_INCLUDE_HIGH_TRADE_MARKETS" envDefault:"false"`
+	HighTradeMinTrades24h     int           `env:"WS_HIGH_TRADE_MIN_TRADES_24H" envDefault:"50" validate:"gte=1,lte=100000"`
+	HighTradeLookbackHours    int           `env:"WS_HIGH_TRADE_LOOKBACK_HOURS" envDefault:"24" validate:"gte=1,lte=168"`
 }
 
 // EventFlowConfig drives the deterministic event-level flow
