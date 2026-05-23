@@ -301,8 +301,8 @@ func TestTick_HappyPath_PersistsAdminAndReacts(t *testing.T) {
 	store.alerts[7] = []repository.Alert{sampleAlert(1, 7, 100), sampleAlert(2, 7, 200)}
 	analyzer := &fakeAnalyzer{
 		response: openai.MarketCloseReviewResponse{
-			Verdict:    "confirmed_signal",
-			Confidence: 0.78,
+			Verdict:      "confirmed_signal",
+			Confidence:   0.78,
 			AdminSummary: "Alerts caught the move; YES resolved as expected.",
 			ReactionPlan: []openai.MarketCloseReviewReactionPlan{
 				{AlertID: 1, Reaction: "success", Reason: "won"},

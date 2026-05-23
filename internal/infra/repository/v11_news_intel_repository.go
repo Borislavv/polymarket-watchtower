@@ -76,13 +76,13 @@ type NewsIntelDecision struct {
 
 // NewsIntelProcessedItem is the dedupe-ledger row shape.
 type NewsIntelProcessedItem struct {
-	ItemHash     string
-	EventSlug    string
-	Title        string
-	FirstSeenAt  time.Time
-	LastSeenAt   time.Time
-	ProcessedAt  time.Time
-	LastRunID    int64 // 0 when NULL
+	ItemHash    string
+	EventSlug   string
+	Title       string
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+	ProcessedAt time.Time
+	LastRunID   int64 // 0 when NULL
 }
 
 // NewsIntelRepository wraps the three v11.0 tables.

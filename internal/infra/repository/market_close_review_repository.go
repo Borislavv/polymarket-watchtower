@@ -29,16 +29,16 @@ type MarketCloseReviewCandidate struct {
 // MarketCloseReviewFinish is the v11.4 succeeded-payload the
 // worker hands the repo after a clean AI run.
 type MarketCloseReviewFinish struct {
-	ID                int64
-	Verdict           string
-	Confidence        *float64
-	AdminSummary      string
-	AIJSON            []byte
-	EvidenceJSON      []byte
-	AIModel           string
-	InputTokens       *int32
-	OutputTokens      *int32
-	EstimatedCostUSD  *float64
+	ID               int64
+	Verdict          string
+	Confidence       *float64
+	AdminSummary     string
+	AIJSON           []byte
+	EvidenceJSON     []byte
+	AIModel          string
+	InputTokens      *int32
+	OutputTokens     *int32
+	EstimatedCostUSD *float64
 }
 
 // MarketCloseReviewRepository wraps polymarket_market_close_reviews.

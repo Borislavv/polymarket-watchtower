@@ -635,6 +635,65 @@ type Metrics struct {
 	// MarketCloseReviewFailures: top-level worker failures by
 	// reason (panic / list_candidates / etc).
 	MarketCloseReviewFailures *prometheus.CounterVec
+
+	// --- v11.5 Strategy Learning Loop ---
+	//
+	// All v11.5 metrics are intentionally low-cardinality: strategy
+	// name + bucketed dimensions. Wallet, condition_id, event_slug
+	// stay in logs / DB rows, never on labels.
+
+	// StrategyShadowDecisionsTotal — every detector decision lands
+	// here regardless of shadow_only / promotion. Labels:
+	// strategy, decision_kind={standalone|boost|suppress|degrade|tag},
+	// level={info|warning|critical|hard|none}.
+	StrategyShadowDecisionsTotal *prometheus.CounterVec
+	// StrategyShadowScoreBucket — histogram of detector scores by
+	// strategy. Buckets chosen to make promotion-eligibility queries
+	// fast in Grafana.
+	StrategyShadowScoreBucket *prometheus.HistogramVec
+	// StrategyShadowConfidenceBucket — histogram of detector
+	// confidence by strategy.
+	StrategyShadowConfidenceBucket *prometheus.HistogramVec
+	// StrategyValueSignedMoveCents — signed favourable price move
+	// (post-fire) by strategy + window. Filled by a periodic
+	// evaluator reading polymarket_strategy_shadow_decisions.
+	StrategyValueSignedMoveCents *prometheus.HistogramVec
+	// StrategyReversalTotal — count of 15m / 1h reversals per
+	// strategy. Lower is better.
+	StrategyReversalTotal *prometheus.CounterVec
+	// StrategyPromotionEligible — gauge per strategy: 1 if the
+	// strategy currently satisfies the promotion criteria.
+	StrategyPromotionEligible *prometheus.GaugeVec
+	// StrategyShadowWriteErrors — Writer.Record failures, labelled
+	// by strategy. Increment-only; the orchestration layer logs
+	// the error before bumping.
+	StrategyShadowWriteErrors *prometheus.CounterVec
+
+	// --- v11.5 supporting workers ---
+	StrategyWorkerRuns    *prometheus.CounterVec   // worker, status={ok|failed|empty|skipped}
+	StrategyWorkerItems   *prometheus.CounterVec   // worker, op={persisted|skipped|errored}
+	StrategyWorkerLatency *prometheus.HistogramVec // worker
+
+	// --- v11.6 detect.Loop ↔ strategybus bridge ---
+	// StrategyEvalTotal — per-(strategy, status) counter for every
+	// time a detector was actually invoked from detect.Loop. status ∈
+	// {ok, write_failed, decide_panic}.
+	StrategyEvalTotal *prometheus.CounterVec
+	// StrategyEvalSkipped — per-(strategy, reason) counter when the
+	// hot path could NOT evaluate the strategy because of missing
+	// context, missing detector, or disabled flag.
+	StrategyEvalSkipped *prometheus.CounterVec
+	// StrategyValueEvalTotal — per-(status, window) counter for the
+	// shadow value evaluator.
+	StrategyValueEvalTotal *prometheus.CounterVec
+	// StrategyValueEvalMissingPrice — per-(window) counter when the
+	// evaluator could not resolve a reference price for the window.
+	StrategyValueEvalMissingPrice *prometheus.CounterVec
+	// StrategyValueEvalLatency — per-tick latency histogram.
+	StrategyValueEvalLatency prometheus.Histogram
+	// StrategyPromotionReviews — per-(strategy, eligible) counter for
+	// the promotion review worker.
+	StrategyPromotionReviews *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -1528,6 +1587,80 @@ func New() *Metrics {
 		Help: "Top-level Market Close Review worker failures by reason.",
 	}, []string{"reason"})
 
+	// --- v11.5 Strategy Learning Loop ----------------------------------
+	m.StrategyShadowDecisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "shadow_decisions_total",
+		Help: "v11.5 shadow-first detector decisions written to polymarket_strategy_shadow_decisions, by strategy + decision_kind + level.",
+	}, []string{"strategy", "decision_kind", "level"})
+	m.StrategyShadowScoreBucket = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "shadow_score_bucket",
+		Help:    "Distribution of detector scores at decision time, by strategy.",
+		Buckets: []float64{0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 8, 13},
+	}, []string{"strategy"})
+	m.StrategyShadowConfidenceBucket = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "shadow_confidence_bucket",
+		Help:    "Distribution of detector confidence at decision time, by strategy.",
+		Buckets: []float64{0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
+	}, []string{"strategy"})
+	m.StrategyValueSignedMoveCents = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "value_signed_move_cents",
+		Help:    "Signed favourable post-fire price move in cents, by strategy + window.",
+		Buckets: []float64{-10, -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, 10, 25},
+	}, []string{"strategy", "window"})
+	m.StrategyReversalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "reversal_total",
+		Help: "Post-fire reversals (price returned through entry within window), by strategy + window.",
+	}, []string{"strategy", "window"})
+	m.StrategyPromotionEligible = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "promotion_eligible",
+		Help: "1 when the strategy currently satisfies the promotion criteria documented in CLAUDE.md; 0 otherwise.",
+	}, []string{"strategy"})
+	m.StrategyShadowWriteErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "shadow_write_errors_total",
+		Help: "Errors persisting shadow decisions, by strategy.",
+	}, []string{"strategy"})
+
+	m.StrategyWorkerRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy_worker", Name: "runs_total",
+		Help: "v11.5 supporting-worker tick outcomes, by worker + status.",
+	}, []string{"worker", "status"})
+	m.StrategyWorkerItems = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy_worker", Name: "items_total",
+		Help: "Per-tick item counts, by worker + op={persisted|skipped|errored}.",
+	}, []string{"worker", "op"})
+	m.StrategyWorkerLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "strategy_worker", Name: "latency_seconds",
+		Help:    "Per-tick latency in seconds, by worker.",
+		Buckets: prometheus.ExponentialBuckets(0.01, 2, 12),
+	}, []string{"worker"})
+
+	// --- v11.6 detect.Loop bridge + value/promotion evaluators ---------
+	m.StrategyEvalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "eval_total",
+		Help: "Detector invocations from detect.Loop, by strategy + status.",
+	}, []string{"strategy", "status"})
+	m.StrategyEvalSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy", Name: "eval_skipped_total",
+		Help: "Detector evaluations skipped by detect.Loop, by strategy + reason.",
+	}, []string{"strategy", "reason"})
+	m.StrategyValueEvalTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy_value", Name: "eval_total",
+		Help: "Shadow value evaluator per-row outcomes, by status + window.",
+	}, []string{"status", "window"})
+	m.StrategyValueEvalMissingPrice = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy_value", Name: "missing_price_total",
+		Help: "Shadow value rows that could not resolve a reference price.",
+	}, []string{"window"})
+	m.StrategyValueEvalLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "watchtower", Subsystem: "strategy_value", Name: "eval_latency_seconds",
+		Help:    "Shadow value evaluator per-tick latency.",
+		Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+	})
+	m.StrategyPromotionReviews = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "watchtower", Subsystem: "strategy_promotion", Name: "reviews_total",
+		Help: "Promotion review outcomes, by strategy + eligible.",
+	}, []string{"strategy", "eligible"})
+
 	reg.MustRegister(
 		m.UpstreamRequests, m.UpstreamLatency,
 		m.MarketsTracked,
@@ -1614,6 +1747,14 @@ func New() *Metrics {
 		m.MarketCloseReviewRuns, m.MarketCloseReviewCandidates,
 		m.MarketCloseReviewAICalls, m.MarketCloseReviewAICost,
 		m.MarketCloseReviewReactions, m.MarketCloseReviewFailures,
+		m.StrategyShadowDecisionsTotal, m.StrategyShadowScoreBucket,
+		m.StrategyShadowConfidenceBucket, m.StrategyValueSignedMoveCents,
+		m.StrategyReversalTotal, m.StrategyPromotionEligible,
+		m.StrategyShadowWriteErrors,
+		m.StrategyWorkerRuns, m.StrategyWorkerItems, m.StrategyWorkerLatency,
+		m.StrategyEvalTotal, m.StrategyEvalSkipped,
+		m.StrategyValueEvalTotal, m.StrategyValueEvalMissingPrice, m.StrategyValueEvalLatency,
+		m.StrategyPromotionReviews,
 	)
 	return m
 }

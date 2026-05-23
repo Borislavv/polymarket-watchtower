@@ -25,27 +25,27 @@ import "time"
 // Config tunes the worker. Mirrors the operator env vars under
 // MARKET_CLOSE_REVIEW_* (see internal/app/config.go).
 type Config struct {
-	Enabled                  bool
-	Interval                 time.Duration
-	Lookback                 time.Duration
-	MarketMaxAgeAfterClose   time.Duration
-	HistoryLookback          time.Duration
-	MinAlerts                int
-	RequireAlertOrNews       bool
-	MaxMarketsPerRun         int
-	MaxAlertsPerMarket       int
-	MaxEventsPerMarket       int
-	AIEnabled                bool
-	AITimeout                time.Duration
-	AIModel                  string
-	DailyBudgetUSD           float64
-	SendAdminTelegram        bool
-	SetReactions             bool
-	ReactionSuccess          string
-	ReactionFailure          string
-	ReactionAmbiguous        string
-	ReactionSkipAmbiguous    bool
-	SignalChatID             string // for reactions (matches alert.TelegramMessageID chat)
+	Enabled                bool
+	Interval               time.Duration
+	Lookback               time.Duration
+	MarketMaxAgeAfterClose time.Duration
+	HistoryLookback        time.Duration
+	MinAlerts              int
+	RequireAlertOrNews     bool
+	MaxMarketsPerRun       int
+	MaxAlertsPerMarket     int
+	MaxEventsPerMarket     int
+	AIEnabled              bool
+	AITimeout              time.Duration
+	AIModel                string
+	DailyBudgetUSD         float64
+	SendAdminTelegram      bool
+	SetReactions           bool
+	ReactionSuccess        string
+	ReactionFailure        string
+	ReactionAmbiguous      string
+	ReactionSkipAmbiguous  bool
+	SignalChatID           string // for reactions (matches alert.TelegramMessageID chat)
 
 	// Retry policy for failed reviews. Operator-tunable later;
 	// the worker uses these as in-process defaults.

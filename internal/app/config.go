@@ -620,6 +620,10 @@ type Config struct {
 	AIBudget          AIBudgetConfig
 	AIPreflight       AIPreflightConfig
 	WS                WebSocketConfig
+	// Strategy is the v11.5 shadow-first detector + worker block.
+	// Every nested field defaults to disabled / shadow-only so the
+	// block is inert until an operator opts in.
+	Strategy StrategyConfig
 }
 
 // WebSocketConfig wires the v10.4 hybrid WebSocket fast-lane.
@@ -676,15 +680,14 @@ type EventFlowConfig struct {
 	TopItems         int           `env:"EVENT_FLOW_SUMMARY_TOP_ITEMS" envDefault:"10" validate:"gte=1,lte=50"`
 }
 
-
 // AIPreflightConfig wires the v10.3 per-surface preflight caps.
 // Every AI surface routes its prompt through aipreflight.Preflight
 // which enforces these caps + the AIBudgetConfig daily budgets.
 type AIPreflightConfig struct {
-	MaxInputCharsAlert       int `env:"AI_MAX_INPUT_CHARS_ALERT" envDefault:"18000" validate:"gte=1000"`
-	MaxInputCharsCatalyst    int `env:"AI_MAX_INPUT_CHARS_CATALYST" envDefault:"18000" validate:"gte=1000"`
-	MaxOutputTokensAlert     int `env:"AI_MAX_OUTPUT_TOKENS_ALERT" envDefault:"1200" validate:"gte=200"`
-	MaxOutputTokensCatalyst  int `env:"AI_MAX_OUTPUT_TOKENS_CATALYST" envDefault:"1200" validate:"gte=200"`
+	MaxInputCharsAlert      int `env:"AI_MAX_INPUT_CHARS_ALERT" envDefault:"18000" validate:"gte=1000"`
+	MaxInputCharsCatalyst   int `env:"AI_MAX_INPUT_CHARS_CATALYST" envDefault:"18000" validate:"gte=1000"`
+	MaxOutputTokensAlert    int `env:"AI_MAX_OUTPUT_TOKENS_ALERT" envDefault:"1200" validate:"gte=200"`
+	MaxOutputTokensCatalyst int `env:"AI_MAX_OUTPUT_TOKENS_CATALYST" envDefault:"1200" validate:"gte=200"`
 }
 
 // AIBudgetConfig wires the process-local AI budget governor (PART 5
@@ -696,7 +699,6 @@ type AIBudgetConfig struct {
 	AlertAnalysisDailyUSD    float64 `env:"AI_ANALYSIS_DAILY_BUDGET_USD_OVERRIDE" envDefault:"0" validate:"gte=0"`
 	CatalystImporterDailyUSD float64 `env:"EVENT_CATALYST_IMPORTER_DAILY_BUDGET_USD" envDefault:"8" validate:"gte=0"`
 }
-
 
 // CatalystConfig wires the Political-Catalyst Intelligence overlay.
 // Catalyst rows are stored in polymarket_event_catalysts and modify
@@ -809,12 +811,12 @@ type AIAnalysisConfig struct {
 	// alert thesis. Operator-billable (web_search calls have their
 	// own cost line); default true now that the path is wired and
 	// tested. Set false to fall back to Chat Completions.
-	WebSearchEnabled            bool          `env:"AI_ANALYSIS_WEB_SEARCH_ENABLED" envDefault:"true"`
-	WebContextMinSeverity       string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
-	WebContextForHotInfo        bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
-	WebContextForPolitics       bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_POLITICS" envDefault:"true"`
-	WebContextMaxResults        int           `env:"AI_ANALYSIS_WEB_CONTEXT_MAX_RESULTS" envDefault:"5" validate:"gte=1,lte=20"`
-	WebContextTimeout           time.Duration `env:"AI_ANALYSIS_WEB_CONTEXT_TIMEOUT" envDefault:"12s" validate:"gt=0"`
+	WebSearchEnabled      bool          `env:"AI_ANALYSIS_WEB_SEARCH_ENABLED" envDefault:"true"`
+	WebContextMinSeverity string        `env:"AI_ANALYSIS_WEB_CONTEXT_MIN_SEVERITY" envDefault:"warning"`
+	WebContextForHotInfo  bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_HOT_INFO" envDefault:"true"`
+	WebContextForPolitics bool          `env:"AI_ANALYSIS_WEB_CONTEXT_FOR_POLITICS" envDefault:"true"`
+	WebContextMaxResults  int           `env:"AI_ANALYSIS_WEB_CONTEXT_MAX_RESULTS" envDefault:"5" validate:"gte=1,lte=20"`
+	WebContextTimeout     time.Duration `env:"AI_ANALYSIS_WEB_CONTEXT_TIMEOUT" envDefault:"12s" validate:"gt=0"`
 
 	// Refresh policy.
 	LifecycleRefreshDeltaPct float64 `env:"AI_ANALYSIS_LIFECYCLE_REFRESH_DELTA_PCT" envDefault:"1" validate:"gte=0"`
@@ -834,20 +836,20 @@ type AIAnalysisConfig struct {
 	// AI is silent (sentinel) when no new news or nothing
 	// actionable — operator gets messages ONLY when there is
 	// real underpriced/repricing intelligence.
-	NewsIntelEnabled         bool          `env:"NEWS_INTEL_ENABLED" envDefault:"true"`
-	NewsIntelStartupRun      bool          `env:"NEWS_INTEL_STARTUP_RUN" envDefault:"true"`
-	NewsIntelInterval        time.Duration `env:"NEWS_INTEL_INTERVAL" envDefault:"1h" validate:"gt=0"`
-	NewsIntelLookback        time.Duration `env:"NEWS_INTEL_LOOKBACK" envDefault:"1h" validate:"gt=0"`
-	NewsIntelMaxItems        int           `env:"NEWS_INTEL_MAX_ITEMS" envDefault:"100" validate:"gte=1,lte=500"`
-	NewsIntelMaxMarketsPerItem int         `env:"NEWS_INTEL_MAX_MARKETS_PER_ITEM" envDefault:"5" validate:"gte=1,lte=20"`
-	NewsIntelMaxSelected     int           `env:"NEWS_INTEL_MAX_SELECTED" envDefault:"8" validate:"gte=1,lte=50"`
-	NewsIntelAIEnabled       bool          `env:"NEWS_INTEL_AI_ENABLED" envDefault:"true"`
-	NewsIntelAITimeout       time.Duration `env:"NEWS_INTEL_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
-	NewsIntelSendTelegram    bool          `env:"NEWS_INTEL_SEND_TELEGRAM" envDefault:"true"`
-	NewsIntelSuppressNoEdge  bool          `env:"NEWS_INTEL_SUPPRESS_NO_EDGE" envDefault:"true"`
-	NewsIntelDedupeEnabled   bool          `env:"NEWS_INTEL_DEDUPE_ENABLED" envDefault:"true"`
-	NewsIntelSemanticCooldown time.Duration `env:"NEWS_INTEL_SEMANTIC_COOLDOWN" envDefault:"12h" validate:"gt=0"`
-	NewsIntelMinConfidence   float64       `env:"NEWS_INTEL_MIN_CONFIDENCE" envDefault:"0.60" validate:"gte=0,lte=1"`
+	NewsIntelEnabled           bool          `env:"NEWS_INTEL_ENABLED" envDefault:"true"`
+	NewsIntelStartupRun        bool          `env:"NEWS_INTEL_STARTUP_RUN" envDefault:"true"`
+	NewsIntelInterval          time.Duration `env:"NEWS_INTEL_INTERVAL" envDefault:"1h" validate:"gt=0"`
+	NewsIntelLookback          time.Duration `env:"NEWS_INTEL_LOOKBACK" envDefault:"1h" validate:"gt=0"`
+	NewsIntelMaxItems          int           `env:"NEWS_INTEL_MAX_ITEMS" envDefault:"100" validate:"gte=1,lte=500"`
+	NewsIntelMaxMarketsPerItem int           `env:"NEWS_INTEL_MAX_MARKETS_PER_ITEM" envDefault:"5" validate:"gte=1,lte=20"`
+	NewsIntelMaxSelected       int           `env:"NEWS_INTEL_MAX_SELECTED" envDefault:"8" validate:"gte=1,lte=50"`
+	NewsIntelAIEnabled         bool          `env:"NEWS_INTEL_AI_ENABLED" envDefault:"true"`
+	NewsIntelAITimeout         time.Duration `env:"NEWS_INTEL_AI_TIMEOUT" envDefault:"60s" validate:"gt=0"`
+	NewsIntelSendTelegram      bool          `env:"NEWS_INTEL_SEND_TELEGRAM" envDefault:"true"`
+	NewsIntelSuppressNoEdge    bool          `env:"NEWS_INTEL_SUPPRESS_NO_EDGE" envDefault:"true"`
+	NewsIntelDedupeEnabled     bool          `env:"NEWS_INTEL_DEDUPE_ENABLED" envDefault:"true"`
+	NewsIntelSemanticCooldown  time.Duration `env:"NEWS_INTEL_SEMANTIC_COOLDOWN" envDefault:"12h" validate:"gt=0"`
+	NewsIntelMinConfidence     float64       `env:"NEWS_INTEL_MIN_CONFIDENCE" envDefault:"0.60" validate:"gte=0,lte=1"`
 
 	// v11.0 hard lock — even if the legacy prediction-evolution
 	// worker is somehow re-enabled, this final gate blocks the
@@ -863,9 +865,9 @@ type AIAnalysisConfig struct {
 	//
 	// Defaults are FALSE — disabled. This is the production state
 	// the operator wants after the v11.x cleanup.
-	WatchtowerStatsTelegramEnabled            bool `env:"WATCHTOWER_STATS_TELEGRAM_ENABLED" envDefault:"false"`
-	PredictionUpdateTelegramEnabled           bool `env:"PREDICTION_UPDATE_TELEGRAM_ENABLED" envDefault:"false"`
-	PredictionStateTransitionTelegramEnabled  bool `env:"PREDICTION_STATE_TRANSITION_TELEGRAM_ENABLED" envDefault:"false"`
+	WatchtowerStatsTelegramEnabled           bool `env:"WATCHTOWER_STATS_TELEGRAM_ENABLED" envDefault:"false"`
+	PredictionUpdateTelegramEnabled          bool `env:"PREDICTION_UPDATE_TELEGRAM_ENABLED" envDefault:"false"`
+	PredictionStateTransitionTelegramEnabled bool `env:"PREDICTION_STATE_TRANSITION_TELEGRAM_ENABLED" envDefault:"false"`
 }
 
 // DetectionConfig tunes the v6 detection worker that drains
@@ -881,7 +883,6 @@ type DetectionConfig struct {
 	// recovery). Must exceed the per-row processing budget; default 5m.
 	ClaimTTL time.Duration `env:"DETECTION_CLAIM_TTL" envDefault:"5m" validate:"gt=0"`
 }
-
 
 func LoadConfig() (*Config, error) {
 	// v11.2: reject stale env keys at startup. Every surface listed
@@ -1001,9 +1002,7 @@ var staleEnvKeys = []string{
 	// TELEGRAM_STATS_ENABLED switch is kept for the metrics path).
 	"WATCHTOWER_STATS_TELEGRAM_ENABLED",
 	// Pre-v11 narrative-context surfaces.
-	"MARKET_ACTIVITY_CONTEXT_ENABLED",
 	"MARKET_ACTIVITY_CONTEXT_LOOKBACK",
-	"EVENT_NARRATIVE_CONTEXT_ENABLED",
 	"EVENT_NARRATIVE_CONTEXT_LOOKBACK",
 }
 

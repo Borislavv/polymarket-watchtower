@@ -338,10 +338,10 @@ type RouterMetrics interface {
 // nilMetrics is the zero-value RouterMetrics. Methods are no-ops.
 type nilMetrics struct{}
 
-func (nilMetrics) ObserveRoute(string, string, string)       {}
-func (nilMetrics) ObserveSent(string, string, string)        {}
-func (nilMetrics) ObserveSuppressed(string, string, string)  {}
-func (nilMetrics) ObserveSendFailed(string, string, string)  {}
+func (nilMetrics) ObserveRoute(string, string, string)      {}
+func (nilMetrics) ObserveSent(string, string, string)       {}
+func (nilMetrics) ObserveSuppressed(string, string, string) {}
+func (nilMetrics) ObserveSendFailed(string, string, string) {}
 
 // Router is the production typed Sender. It owns the routing
 // matrix + the underlying HTML transport. Concurrency-safe (no
@@ -436,10 +436,10 @@ func classifySendErr(err error) string {
 // passed in at wiring time so this package doesn't import the
 // metrics package (avoids an import cycle through repository).
 type PromMetricsAdapter struct {
-	Route        *prometheus.CounterVec
-	Sent         *prometheus.CounterVec
-	Suppressed   *prometheus.CounterVec
-	SendFailed   *prometheus.CounterVec
+	Route      *prometheus.CounterVec
+	Sent       *prometheus.CounterVec
+	Suppressed *prometheus.CounterVec
+	SendFailed *prometheus.CounterVec
 }
 
 func (a PromMetricsAdapter) ObserveRoute(surface, destination, decision string) {

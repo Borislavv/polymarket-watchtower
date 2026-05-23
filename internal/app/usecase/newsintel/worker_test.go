@@ -49,13 +49,13 @@ type fakeStore struct {
 
 	processed map[string]int64 // hash -> last_run_id
 
-	runs           []repository.NewsIntelRunInsert
-	finishes       []repository.NewsIntelRunFinish
-	decisions      []repository.NewsIntelDecision
-	nextRunID      int64
-	insertRunErr   error
-	filterErr      error
-	markErr        error
+	runs         []repository.NewsIntelRunInsert
+	finishes     []repository.NewsIntelRunFinish
+	decisions    []repository.NewsIntelDecision
+	nextRunID    int64
+	insertRunErr error
+	filterErr    error
+	markErr      error
 }
 
 func newFakeStore() *fakeStore {
@@ -121,10 +121,10 @@ func (s *fakeStore) TouchProcessed(ctx context.Context, hash string) error {
 }
 
 type fakeAnalyzer struct {
-	mu      sync.Mutex
-	calls   int
-	result  openai.NewsIntelAIResult
-	err     error
+	mu     sync.Mutex
+	calls  int
+	result openai.NewsIntelAIResult
+	err    error
 }
 
 func (f *fakeAnalyzer) EvaluateHourlyNewsIntel(ctx context.Context, req openai.NewsIntelAIRequest) (openai.NewsIntelAIResult, error) {
@@ -308,18 +308,18 @@ func TestTick_ActionableResult_PersistsAndSends(t *testing.T) {
 			Summary:  "endorsement creates fresh repricing window",
 			Selected: []openai.NewsIntelAIDecision{
 				{
-					NewsItemHash:    "h1",
-					EventSlug:       "election-2026",
-					ConditionID:     "0xCOND",
-					MarketTitle:     "Will candidate win?",
-					Rank:            1,
-					Confidence:      0.82,
-					ImpactDirection: "YES_up",
-					ExpectedWindow:  "12h",
-					WhyItMatters:    "endorser controls demographic that swings the runoff",
+					NewsItemHash:     "h1",
+					EventSlug:        "election-2026",
+					ConditionID:      "0xCOND",
+					MarketTitle:      "Will candidate win?",
+					Rank:             1,
+					Confidence:       0.82,
+					ImpactDirection:  "YES_up",
+					ExpectedWindow:   "12h",
+					WhyItMatters:     "endorser controls demographic that swings the runoff",
 					TriggerCondition: "next poll shows +3 movement",
-					TradeStance:     "consider",
-					TelegramWorthy:  true,
+					TradeStance:      "consider",
+					TelegramWorthy:   true,
 				},
 			},
 		},
@@ -368,15 +368,15 @@ func TestTick_TelegramHTMLEscapesEvilFields(t *testing.T) {
 			Summary:  "<i>summary</i>",
 			Selected: []openai.NewsIntelAIDecision{
 				{
-					NewsItemHash:   "h1",
-					EventSlug:      "election-2026",
-					ConditionID:    "0xCOND",
-					MarketTitle:    "<script>X</script>",
-					Confidence:     0.7,
+					NewsItemHash:    "h1",
+					EventSlug:       "election-2026",
+					ConditionID:     "0xCOND",
+					MarketTitle:     "<script>X</script>",
+					Confidence:      0.7,
 					ImpactDirection: "YES_up",
-					ExpectedWindow: "12h",
-					WhyItMatters:   "<b>injection</b>",
-					TradeStance:    "watch",
+					ExpectedWindow:  "12h",
+					WhyItMatters:    "<b>injection</b>",
+					TradeStance:     "watch",
 				},
 			},
 		},

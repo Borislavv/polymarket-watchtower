@@ -1038,3 +1038,369 @@ Three opinionated overlays under `presets/` (see `presets/README.md`):
 
 Apply via `set -a && source presets/<name>.env` or `env_file:` in compose.
 Preset behaviour pinned by tests in `internal/app/preset_test.go`.
+
+## Strategy Learning Loop (v11.5)
+
+Nine new detectors land as a **shadow-first surveillance layer**. None
+of them can fire a Telegram alert today: every one writes to
+`polymarket_strategy_shadow_decisions` and the bus
+(`internal/app/usecase/strategybus`) rewrites `shadow_only=true` until
+both `STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED=true` AND the
+per-strategy `*_SHADOW_ONLY=false`. Promotion is operator-driven.
+
+Detector classification (matches the ТЗ — do NOT treat as nine equal
+Telegram surfaces):
+
+- **Primary standalone**: `thesisaccum`, `holderdelta` (a.k.a.
+  ownership_v2), `repricinglag`, `cheaptail`.
+- **Boosters / upgraders**: `catalystwindow`, `bookvacuum`,
+  `walletcohort`.
+- **Safety / arbitration**: `conflictresolve`, `rulesrisk`.
+
+Detector contract (pinned by tests under
+`internal/app/usecase/analytics/<name>/detector_test.go`):
+
+- `New(Config) *Detector` — pure constructor; no I/O.
+- `Decide(Input) Verdict` — pure; no SQL, HTTP, Telegram, OpenAI.
+- No global state. Unit tests run hermetically.
+
+The bus is the single sink + flag enforcer. Detectors / workers call
+`bus.ShouldEvaluate(name)` before running `Decide()` and
+`bus.Record(ctx, Decision)` afterward. The bus forces
+`Decision.ShadowOnly=true` whenever promotion is not allowed for the
+strategy. It NEVER calls Telegram, OpenAI, or the alertsender path.
+
+Supporting workers (also default-disabled):
+
+- `marketlinks.Builder` — builds market ↔ market thesis graph;
+  upserts `polymarket_market_links`.
+- `holdersync.Worker` — periodic holder snapshots →
+  `polymarket_holder_snapshots`.
+- `riskscore.Worker` — pure `rulesrisk.Detector.Decide` over market
+  facts; persists `polymarket_market_risk_scores`.
+- `repricing.Worker` — opens/closes `polymarket_repricing_windows`
+  rows around annotations + catalysts.
+- `walletgraph.Worker` — co-trade behavioural edges →
+  `polymarket_wallet_graph_edges`. Phase B (shared funding) is
+  flag-gated behind `WALLETGRAPH_USE_FUNDING_PROVIDER`.
+
+Every worker is fail-open: per-item failures log + metric
+(`strategy_worker_items{op=errored}`), the batch continues, and the
+existing alert pipeline is fully insulated.
+
+Value-tracking columns on `polymarket_strategy_shadow_decisions`
+(`clv_15m`, `clv_1h`, `clv_6h`, `clv_24h`, `outcome_status`) are
+filled async by the existing drift + outcomes workers via the
+`linked_alert_dedup_key` join key. A dedicated shadow evaluator for
+unlinked rows is Phase B.
+
+Promotion criteria (encoded in this doc; enforced by an operator
+review job, not in code today):
+
+- **Standalone**: N ≥ 50 firings, median `signed_move_6h` uplift ≥
+  +1.5c vs the matched control bucket
+  (`category|lifecycle|odds|notional|event_kind`), `reversal_15m` ≤
+  control, alerts/day ≤ budget.
+- **Booster**: parent uplift ≥ +1.0c OR PAL uplift ≥ +4pp.
+- **Safety**: ≥ 15% reduction in later-reversed alerts without
+  destroying parent drift.
+
+Per-strategy / per-worker env knobs (defaults — all OFF):
+
+`THESIS_ACCUM_*`, `OWNERSHIP_V2_*`, `CATALYST_WINDOW_*`,
+`BOOK_VACUUM_*`, `REPRICING_LAG_*`, `WALLET_COHORT_*`,
+`CONFLICT_RESOLVE_*`, `RULES_RISK_*`, `CHEAPTAIL_*`,
+`MARKETLINKS_*`, `OWNERSHIP_SYNC_*`, `RISKSCORE_*`,
+`REPRICING_WORKER_*`, `WALLETGRAPH_*`. Every detector exposes its
+own `*_ENABLED` + `*_SHADOW_ONLY` knob; the global kill-switch is
+`STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED=false`.
+
+Metrics: `watchtower_strategy_shadow_decisions_total{strategy,
+decision_kind, level}`, `watchtower_strategy_shadow_score_bucket`,
+`watchtower_strategy_shadow_confidence_bucket`,
+`watchtower_strategy_value_signed_move_cents{strategy, window}`,
+`watchtower_strategy_reversal_total{strategy, window}`,
+`watchtower_strategy_promotion_eligible{strategy}` (gauge),
+`watchtower_strategy_shadow_write_errors_total{strategy}`,
+`watchtower_strategy_worker_runs_total{worker, status}`,
+`watchtower_strategy_worker_items_total{worker, op}`,
+`watchtower_strategy_worker_latency_seconds{worker}`. Wallet /
+condition_id / event_slug are deliberately NOT labels.
+
+Verify-local (`scripts/verify-local.sh`): authoritative go version
+read from `go.mod`; gates on go vet + go test; lint is advisory
+because of pre-existing legacy debt — but the script explicitly
+fails if any v11.5 path appears in the lint report.
+
+## Strategy Learning Loop Phase B (v11.6)
+
+Phase B closes the v11.5 gaps: shadow rows are now written from the
+live detect.Loop path; the shadow value evaluator backfills CLV
+columns; a promotion review worker re-evaluates eligibility on a
+schedule and gates the bus.
+
+**detect.Loop hook (`internal/app/usecase/detect/strategy_shadow.go`):**
+Every newly-persisted alert (single-trade, accumulation, ownership)
+triggers a single call to `Loop.recordStrategyShadow`. The bridge
+runs the pure `rulesrisk.Detector` against the market's question
+text and writes ONE tag-kind shadow row keyed to the alert dedup
+key. Other detectors that need staged worker output (thesisaccum,
+holderdelta, walletcohort, …) are counted as `eval_skipped{reason=
+no_detect_loop_input}` here; they remain owned by their respective
+workers. The hook is fully gated behind `cfg.StrategyShadowBus !=
+nil` so a Postgres-less boot path is unaffected.
+
+**Shadow value evaluator (`internal/app/usecase/strategyvalue`):**
+Bounded batch worker. Reads pending shadow rows whose CLV columns
+are still NULL (sqlc query `ListPendingValueRows`), samples first-
+trade prices at fired_at + {15m, 1h, 6h, 24h} via
+`PriceWindowStats`, and writes signed-cents moves through the
+nullable-friendly `UpdateShadowDecisionValues` query. Idempotent:
+the SQL uses `SET clv_15m = COALESCE(clv_15m, sqlc.narg('clv_15m'))`
+so a re-run can never overwrite an already-computed value. Reversal
+heuristic (`reversal_15m`) is derived per row when both 15m and 1h
+land in the same tick. Missing price → `missing_price_total` metric,
+row left NULL.
+
+**Promotion review (`internal/app/usecase/strategypromotion`):**
+Periodic worker computes per-(strategy, version) aggregates from
+`polymarket_strategy_shadow_decisions` (sample size, median
+signed_move_6h, reversal_15m ratio, alerts/day), writes one row to
+`polymarket_strategy_promotion_reviews` (migration 00031), and
+caches the latest eligibility in-memory. The bus consults
+`PromotionGate.Allow(strategy)` BEFORE letting a non-shadow row
+through. ТЗ guarantee pinned by
+`TestRecord_PromotionGateDeniesForcesShadow`: even with
+`STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED=true` AND
+`<STRATEGY>_SHADOW_ONLY=false`, the gate's denial forces shadow.
+`STRATEGY_PROMOTION_BYPASS_EXPLICIT=true` is a kill-switch — when
+set, `Allow` returns false for everything regardless of state.
+
+**App wiring (`internal/app/strategy_phase_b.go` +
+`internal/app/app.go`):** when Postgres is wired, `wireStrategyPhaseB`
+constructs the bus + RulesRisk detector + value evaluator + promotion
+worker; the bus is injected into `detect.Config.StrategyShadowBus` and
+the two new workers are appended to the graceful-shutdown exec list.
+Workers are inert when their per-strategy flags stay disabled.
+
+**Production integration test:** `internal/app/strategy_phase_b_integration_test.go`
+is gated on `POSTGRES_TEST_DSN`. Connects to the live pool, writes
+one probe row through the bus, runs the value evaluator + promotion
+worker once, and asserts the row is present + shadow_only=true.
+Cleans up afterward. Skipped when DSN is unset.
+
+## Strategy Learning Loop Phase C (v11.7)
+
+Phase C closes the v11.6 adapter gap and proves real shadow data
+against the live Postgres pool.
+
+**Production adapters (`internal/app/strategy_phase_c.go`):**
+
+- `marketlinks.Builder` — sqlc `ListEventGroupedMarkets` builds a
+  same-event star graph (anchor → siblings), persists through
+  `UpsertMarketLink`. Real run: **833 rows** from 827 multi-market
+  events.
+- `riskscore.Worker` — sqlc `ListRiskScoreCandidates` →
+  `rulesrisk.Detector.Decide` → `UpsertMarketRiskScore`. Real
+  run: **50 rows** with ambiguity scoring on real market questions.
+- `walletgraph.Worker` — sqlc `ListWalletCoTradeRows` against
+  polymarket_trades, computes Phase A co-trade similarity in pure
+  Go, persists via direct pool exec (composite-UNIQUE keeps
+  sqlc-narg awkward). Real run: **58 edges** from 1.6M recent trades.
+- `repricing.Worker` — sqlc `ListRepricingTriggers` against
+  polymarket_event_catalysts opens windows; close-phase no-ops
+  pending Phase D price sampler. Real run: **22 windows** opened
+  from 39 catalysts.
+- `holdersync.Worker` — adapter is intentionally a NO-LIVE-SOURCE
+  stub (no Polymarket holders endpoint wrapped in
+  `internal/infra/polymarket/`). The worker still ticks but
+  `ListHolderSyncCandidates` returns empty + `FetchHolders`
+  returns `ErrNoSource`. Documented Phase D gap.
+
+**Outcome backfill (`internal/app/usecase/strategyoutcome`):** new
+worker that joins `polymarket_strategy_shadow_decisions` to
+`polymarket_alerts` via `linked_alert_dedup_key` and propagates the
+terminal `outcome_status`. Idempotent — only writes to rows whose
+outcome_status is still NULL. Standalone shadow rows that never
+linked to an alert remain NULL.
+
+**Promotion thresholds → env-driven:**
+`STRATEGY_PROMOTION_MIN_SAMPLE=50`,
+`STRATEGY_PROMOTION_MIN_SIGNED_MOVE_6H_CENTS=1.5`,
+`STRATEGY_PROMOTION_MAX_REVERSAL_15M_RATIO=0.5`,
+`STRATEGY_PROMOTION_MAX_ALERTS_PER_DAY=40`,
+`STRATEGY_PROMOTION_BYPASS_EXPLICIT=false`,
+`STRATEGY_PROMOTION_REVIEW_INTERVAL=1h`,
+`STRATEGY_PROMOTION_REVIEW_LOOKBACK=336h`. Defaults exactly match
+the v11.6 hardcoded values; test
+`TestStrategyConfig_PromotionDefaultsMatchV11_6` pins them.
+
+**Real-run evidence:** `internal/app/strategy_phase_c_integration_test.go`
+exercises every Phase C worker against the live pool and asserts
+non-zero rows in marketlinks + risk_scores. Run with
+`POSTGRES_TEST_DSN=... go test -tags integration -run TestPhaseC_RealRunOnLivePool`.
+
+**SQL audit hooks (operator):**
+```
+-- worker output counts
+SELECT 'market_links', COUNT(*) FROM polymarket_market_links UNION ALL
+SELECT 'risk_scores',  COUNT(*) FROM polymarket_market_risk_scores WHERE is_active UNION ALL
+SELECT 'wallet_edges', COUNT(*) FROM polymarket_wallet_graph_edges UNION ALL
+SELECT 'repricing',    COUNT(*) FROM polymarket_repricing_windows UNION ALL
+SELECT 'shadow',       COUNT(*) FROM polymarket_strategy_shadow_decisions;
+
+-- per-strategy shadow rate + CLV uplift
+SELECT strategy_name,
+       COUNT(*) AS rows,
+       COUNT(*) FILTER (WHERE clv_15m IS NOT NULL) AS evaluated_15m,
+       AVG(clv_6h) AS avg_6h_cents
+FROM polymarket_strategy_shadow_decisions
+GROUP BY strategy_name
+ORDER BY rows DESC;
+
+-- skip reasons (Prometheus)
+sum by (strategy, reason) (rate(watchtower_strategy_eval_skipped_total[5m]))
+```
+
+## Strategy Learning Loop Phase D (v11.8)
+
+Phase D closes the hot-path fanout gap: `internal/app/usecase/stagedinputs`
+exposes 6 bounded Postgres readers (market_links, catalysts,
+risk_scores, wallet_edges, repricing_windows, recent_decisions) with
+a TTL cache, and `internal/app/usecase/detect/strategy_shadow.go`
+fans every newly-persisted alert across all 9 strategies. Each
+strategy either writes a real shadow row through `strategybus.Bus`
+or emits a precise `eval_skipped{reason=...}` metric for missing
+staged data.
+
+**Strategies on the hot path:**
+
+| Strategy | Hot-path read | Verdict mapping |
+|---|---|---|
+| rulesrisk | none (pure on market title) | KindTag |
+| catalystwindow | `CatalystsByEvent` | KindBoost |
+| walletcohort | `WalletEdgesForWallet` | KindBoost |
+| conflictresolve | `RecentDecisionsForCondition` | KindDegrade/Suppress/Tag |
+| cheaptail | `CatalystsByEvent` + `RiskScoreForCondition` | KindStandalone |
+| repricinglag | `ClosedRepricingWindowsForCondition` | KindStandalone |
+| thesisaccum | `MarketLinksByEvent` | KindTag (structural only — wallet aggregate is Phase E) |
+| holderdelta | _no holder_snapshots producer_ | skip `no_holder_snapshots_available` |
+| bookvacuum | _no book_feature_bars producer_ | skip `no_book_feature_bars_producer` |
+
+**Real production proof:** `internal/app/strategy_phase_d_integration_test.go`
+replays 25 most-recent real alerts through `bus.Record` + staged
+readers and verifies non-zero shadow rows across multiple
+strategies. Last live run wrote **32 rows across 3 strategies**
+(rulesrisk: 14, thesisaccum: 17, catalystwindow: 1) from real
+production data.
+
+**Promotion review excludes probe rows.** `AggregatePromotionSamples`
+now filters `strategy_version NOT ILIKE '%integration%' / '%probe%'
+/ '%test%'` AND requires `clv_6h IS NOT NULL`, so promotion can
+never promote a strategy that only saw synthetic data.
+
+**Standalone outcome resolver (v11.8 PART 7).** The outcome lister
+also reads `ListStandaloneShadowRowsForOutcomeBackfill` — shadow
+rows without `linked_alert_dedup_key` whose market is `closed=TRUE`
+get `outcome_status='unknown'` (market closed but per-side resolution
+is Phase E). Stops the "forever NULL" state.
+
+**Operator runbook:**
+
+```sql
+-- per-strategy shadow row counts in the last 24h
+SELECT strategy_name, COUNT(*), AVG(clv_6h) AS avg_clv_6h_cents
+FROM polymarket_strategy_shadow_decisions
+WHERE fired_at >= NOW() - INTERVAL '24 hours'
+GROUP BY strategy_name ORDER BY 2 DESC;
+
+-- skip reasons over the last hour
+sum by (strategy, reason) (rate(watchtower_strategy_eval_skipped_total[1h]))
+
+-- promotion eligibility per strategy
+SELECT strategy_name, sample_size, median_signed_move_6h,
+       reversal_15m_ratio, alerts_per_day, eligible
+FROM polymarket_strategy_promotion_reviews
+WHERE reviewed_at = (SELECT MAX(reviewed_at) FROM polymarket_strategy_promotion_reviews)
+ORDER BY eligible DESC, strategy_name;
+```
+
+**To promote a strategy to live:**
+1. Wait for ≥50 shadow firings AND `eligible=true` in the latest review.
+2. Set `STRATEGY_LEARNING_LOOP_PROMOTION_ALLOWED=true`.
+3. Set `<STRATEGY>_SHADOW_ONLY=false` for the specific strategy.
+4. Verify `STRATEGY_PROMOTION_BYPASS_EXPLICIT=false` (the default).
+
+Bus enforces all three gates simultaneously. Operator-flag-alone is
+insufficient.
+
+## Strategy Learning Loop v11.9 (gap closure / honest limitations)
+
+v11.9 closed multiple v11.8 stubs and made the remaining limitations
+explicit.
+
+**Repricing close phase — real (PART 4).**
+`repricingPriceSampler.SampleTarget` reads the first trade price on
+the target condition via the sqlc `FirstTradePriceForCondition`
+query. `SamplePeerMedian` resolves peers via
+`ListPeerConditionsByMarketLinks` and computes a median across
+per-peer first-trade prices. The worker now emits
+`stale_missing_price` / `stale_missing_peers` instead of the v11.8
+universal `closed_blocked` stub. Migration 00033 widens the status
+CHECK to cover both stale codes.
+
+**Thesis lines background matrix (PART 5).**
+New table `polymarket_wallet_thesis_lines` (migration 00032). The
+`thesislines.Worker` periodically aggregates per-(wallet, condition,
+side) directional exposure via sqlc `AggregateWalletThesisLines` and
+upserts into the table. The hot-path reader (`ListWalletThesisLinesForEvent`)
+is bounded by `THESIS_HOTPATH_MAX_LINKED_MARKETS` + a 250ms timeout.
+thesisaccum can now compute real breadth/consistency once the worker
+populates the table — replacing the v11.8 structural-tag-only path.
+
+**Outcome resolver per-side correct/wrong (PART 6).**
+`outcomeLister.ListShadowRowsForOutcomeBackfill` now also iterates
+`ListStandaloneResolvedAlertOutcomes` and maps shadow rows to
+`resolved_correct`/`resolved_wrong` by exact case-insensitive match
+of `Side` against the alert's `winning_outcome_label`. Closed
+markets without a winning label still fall back to `unknown`.
+
+**Holdersync — no live source (HONEST limitation).**
+`internal/infra/polymarket/dataapi/client.go` does NOT wrap a
+Polymarket holders/positions/OI endpoint. `HOLDERSYNC_SOURCE_MODE`
+defaults to `disabled` and the adapter returns `ErrNoSource`. No
+fake pct_oi or holder rows. holderdelta remains explicitly silent
+with `eval_skipped{reason=no_holder_snapshots_available}`. Adding
+a verified endpoint is **Phase F**.
+
+**Book feature bars — no producer (HONEST limitation).**
+The Polymarket CLOB WS `book` event has `Bids/Asks` depth on the
+wire (`internal/infra/polymarket/ws/types.go::wireBook`) but the
+decoded `Event` struct only surfaces `BestBid/BestAsk/Mid`. Wiring
+depth through Event + aggregating into `polymarket_book_feature_bars`
+is **Phase F**. bookvacuum remains silent with
+`eval_skipped{reason=no_book_feature_bars_producer}`.
+
+**v11.9 env audit invariant (PART X).**
+Three pinned tests in `internal/app/env_audit_test.go`:
+- `TestEnvFiles_StrategyKeysSynchronized` — `.env` ≡ `.env.example`
+  key sets.
+- `TestEnvFiles_StrategyV11KeysAllPresent` — every v11.5–v11.9
+  required strategy key is in both files.
+- `TestEnvFiles_DangerousDefaultsBlocked` — promotion / Telegram
+  noise surfaces default `false` everywhere.
+
+`scripts/audit-env.sh` is the operator-facing diff tool; it prints
+keys missing on either side AND warns on `.env` keys that don't bind
+to a config struct (legacy stale keys).
+
+**Phase F (residual — verified-external-source gated):**
+
+1. Polymarket holders / positions / OI HTTP client (verified
+   endpoint shape needed before adapter can be wired).
+2. WS orderbook depth → `polymarket_book_feature_bars` aggregator.
+3. thesisaccum hot-path consumes `polymarket_wallet_thesis_lines`
+   (currently the staged reader has structure but the detector path
+   continues to emit Tag-only — once the lines table is populated by
+   the v11.9 worker, the existing thesisaccum hooks can switch from
+   structural Tag to real KindStandalone fires).

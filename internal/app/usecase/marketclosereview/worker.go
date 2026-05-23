@@ -372,9 +372,9 @@ func buildEvidenceJSON(c repository.MarketCloseReviewCandidate, alerts []reposit
 		pack.Alerts = append(pack.Alerts, alertSnap{
 			ID: a.ID, Kind: string(a.Kind), Severity: a.Severity,
 			StrategyVersion: a.StrategyVersion, Reason: a.Reason,
-			Timestamp: a.SentAt.UTC().Format(time.RFC3339),
+			Timestamp:         a.SentAt.UTC().Format(time.RFC3339),
 			TelegramMessageID: a.TelegramMessageID,
-			CLV6h: a.CLV6h, OutcomeStatus: string(a.OutcomeStatus),
+			CLV6h:             a.CLV6h, OutcomeStatus: string(a.OutcomeStatus),
 		})
 	}
 	b, _ := json.Marshal(pack)

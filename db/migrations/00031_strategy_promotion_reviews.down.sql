@@ -1,0 +1,3 @@
+DROP INDEX IF EXISTS idx_strategy_promotion_reviews_eligible;
+DROP INDEX IF EXISTS idx_strategy_promotion_reviews_latest;
+DROP TABLE IF EXISTS polymarket_strategy_promotion_reviews;

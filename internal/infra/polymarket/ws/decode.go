@@ -97,7 +97,43 @@ func decodeBook(raw []byte, ev *Event) {
 		mid := (*bid + *ask) / 2
 		ev.Mid = &mid
 	}
+	// v11.10: preserve the full depth arrays so downstream
+	// aggregators / bookvacuum / book_feature_bars can consume them.
+	// Sort DESC for bids, ASC for asks so callers see best-of-book
+	// at index 0 regardless of the wire ordering.
+	ev.BidLevels = parseAndSortLevels(b.Bids, true)
+	ev.AskLevels = parseAndSortLevels(b.Asks, false)
 	ev.Sequence = b.Hash
+}
+
+// parseAndSortLevels parses wire-string decimals and returns levels
+// sorted by price (DESC when descending=true, ASC otherwise).
+// Invalid / zero / negative entries are skipped.
+func parseAndSortLevels(raw []wireBookLevel, descending bool) []BookLevel {
+	out := make([]BookLevel, 0, len(raw))
+	for _, r := range raw {
+		px := parseFloatStr(r.Price)
+		sz := parseFloatStr(r.Size)
+		if px == nil || sz == nil || *px <= 0 || *sz <= 0 {
+			continue
+		}
+		out = append(out, BookLevel{Price: *px, Size: *sz})
+	}
+	// Insertion sort by price.
+	if descending {
+		for i := 1; i < len(out); i++ {
+			for j := i; j > 0 && out[j-1].Price < out[j].Price; j-- {
+				out[j-1], out[j] = out[j], out[j-1]
+			}
+		}
+	} else {
+		for i := 1; i < len(out); i++ {
+			for j := i; j > 0 && out[j-1].Price > out[j].Price; j-- {
+				out[j-1], out[j] = out[j], out[j-1]
+			}
+		}
+	}
+	return out
 }
 
 func decodePriceChange(raw []byte, ev *Event) {

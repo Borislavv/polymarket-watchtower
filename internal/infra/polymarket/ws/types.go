@@ -108,6 +108,13 @@ type Event struct {
 	BestAsk *float64
 	Mid     *float64
 
+	// v11.10: depth from the `book` event. nil for non-book events.
+	// BidLevels is sorted DESC by price (best bid first); AskLevels
+	// ASC (best ask first). Empty array means the event payload had
+	// no levels; nil means "depth was not present on the wire".
+	BidLevels []BookLevel
+	AskLevels []BookLevel
+
 	TxHash   string
 	TradeID  string
 	Wallet   string
@@ -133,6 +140,14 @@ type subscribeMsg struct {
 type wireBookLevel struct {
 	Price string `json:"price"`
 	Size  string `json:"size"`
+}
+
+// BookLevel is the public-facing decoded level (price + size as
+// float64). Exposed because the realtime worker / bookbars producer
+// consume the depth array directly.
+type BookLevel struct {
+	Price float64
+	Size  float64
 }
 
 type wireBook struct {

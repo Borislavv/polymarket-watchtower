@@ -47,11 +47,11 @@ func (r *recordingHTML) SendHTML(_ context.Context, chatID, text string) (SendRe
 }
 
 type recordingMetrics struct {
-	mu          sync.Mutex
-	route       []labels
-	sent        []labels
-	suppressed  []labels
-	sendFailed  []labels
+	mu         sync.Mutex
+	route      []labels
+	sent       []labels
+	suppressed []labels
+	sendFailed []labels
 }
 
 type labels [3]string

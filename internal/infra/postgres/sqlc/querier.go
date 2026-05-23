@@ -23,9 +23,16 @@ type Querier interface {
 	// 1/avg_price when price > 0. max_odds is computed server-side as the
 	// minimum price's inverse (price closest to 0 ⇒ largest odds).
 	AccumulationLineSummary(ctx context.Context, arg AccumulationLineSummaryParams) (AccumulationLineSummaryRow, error)
+	ActiveMarketRiskScore(ctx context.Context, conditionID string) (ActiveMarketRiskScoreRow, error)
 	// Returns per-(kind, severity) counts for all alerts whose market
 	// has the given event_slug within the lookback window.
 	AggregateEventAlertsByKindAndSeverity(ctx context.Context, arg AggregateEventAlertsByKindAndSeverityParams) ([]AggregateEventAlertsByKindAndSeverityRow, error)
+	AggregatePromotionSamples(ctx context.Context, lookbackStart pgtype.Timestamptz) ([]AggregatePromotionSamplesRow, error)
+	// v11.9 PART 5 — thesis lines wallet aggregate.
+	// Aggregates per (wallet, condition_id) directional exposure across
+	// linked markets within a lookback window. The orchestration layer
+	// groups these rows by event_slug to feed thesisaccum.
+	AggregateWalletThesisLines(ctx context.Context, arg AggregateWalletThesisLinesParams) ([]AggregateWalletThesisLinesRow, error)
 	AlertExistsByDedupKey(ctx context.Context, dedupKey string) (bool, error)
 	// Single-roundtrip statistical summary for the per-bucket reservoir.
 	// Powers the DB-backed detector's hot path: count + total + mean + median
@@ -65,6 +72,7 @@ type Querier interface {
 	// MarkTradeDetectionResult; if the worker crashes, ResetStaleDetectionClaims
 	// reclaims rows whose lease is older than the configured TTL.
 	ClaimUndetectedTrades(ctx context.Context, arg ClaimUndetectedTradesParams) ([]ClaimUndetectedTradesRow, error)
+	CloseRepricingWindow(ctx context.Context, arg CloseRepricingWindowParams) error
 	CompleteMarketBackfill(ctx context.Context, arg CompleteMarketBackfillParams) error
 	// Periodic cleanup so the queue doesn't grow without bound.
 	DeleteOldRealtimeWork(ctx context.Context, olderThan pgtype.Timestamptz) error
@@ -81,6 +89,10 @@ type Querier interface {
 	FinishMarketCloseReviewSkipped(ctx context.Context, arg FinishMarketCloseReviewSkippedParams) error
 	FinishMarketCloseReviewSucceeded(ctx context.Context, arg FinishMarketCloseReviewSucceededParams) error
 	FinishNewsIntelRun(ctx context.Context, arg FinishNewsIntelRunParams) error
+	// Returns the first trade price for (condition_id, traded_at >= @at).
+	// Used by the repricing close-phase target sampler.
+	FirstTradePriceForCondition(ctx context.Context, arg FirstTradePriceForConditionParams) (float64, error)
+	GetActiveRiskScoreForCondition(ctx context.Context, conditionID string) (GetActiveRiskScoreForConditionRow, error)
 	// Single-row fetch used by the outcome-learning worker to reload
 	// the full row (payload, telegram_message_id, outcome_status, etc.)
 	// before invoking the AI postmortem path.
@@ -142,6 +154,17 @@ type Querier interface {
 	// News intel runs
 	// =========================================================================
 	InsertNewsIntelRun(ctx context.Context, arg InsertNewsIntelRunParams) (int64, error)
+	// =========================================================================
+	// Repricing windows
+	// =========================================================================
+	InsertRepricingWindow(ctx context.Context, arg InsertRepricingWindowParams) (int64, error)
+	// v11.6 PART 7 — promotion review queries.
+	InsertStrategyPromotionReview(ctx context.Context, arg InsertStrategyPromotionReviewParams) error
+	// v11.5 Strategy Learning Loop queries (Wave P0).
+	// =========================================================================
+	// Shadow decisions
+	// =========================================================================
+	InsertStrategyShadowDecision(ctx context.Context, arg InsertStrategyShadowDecisionParams) (int64, error)
 	// Insert a single trade. ON CONFLICT (dedup_key) DO NOTHING is the dedup
 	// primitive — concurrent inserters of the same trade race to the unique
 	// constraint and exactly one wins. The caller maps pgx.ErrNoRows to
@@ -156,6 +179,8 @@ type Querier interface {
 	// yields the gap to the previous historical trade so the detector can
 	// judge "idle for how long?" without re-listing rows.
 	LastTradeAtBefore(ctx context.Context, arg LastTradeAtBeforeParams) (pgtype.Timestamptz, error)
+	// Returns the most recent trade price for (condition_id, traded_at <= @at).
+	LastTradePriceForCondition(ctx context.Context, arg LastTradePriceForConditionParams) (float64, error)
 	// Returns the most recent analysis row for the alert. Telegram
 	// formatter and operators reading the alert page consume this.
 	LatestAlertAnalysis(ctx context.Context, alertID int64) (PolymarketAlertAnalyses, error)
@@ -165,6 +190,7 @@ type Querier interface {
 	// Used by the cluster cooldown gate. Returns NULL when there's been no
 	// cluster alert for this market+outcome under the current strategy.
 	LatestClusterAlertForCategory(ctx context.Context, arg LatestClusterAlertForCategoryParams) (PolymarketAlerts, error)
+	LatestHolderSnapshot(ctx context.Context, arg LatestHolderSnapshotParams) (LatestHolderSnapshotRow, error)
 	LatestMarketIntelligenceReport(ctx context.Context) (PolymarketMarketIntelligenceReports, error)
 	// Most recent observed price for (market, outcome). Used by the
 	// stable-favorite worker as "current price" since there is no CLOB
@@ -217,6 +243,10 @@ type Querier interface {
 	// (deliberately not in SQL so the same statistics live next to the score
 	// function and can be unit-tested without a database).
 	ListBaselineTrades(ctx context.Context, arg ListBaselineTradesParams) ([]PolymarketTrades, error)
+	// Active tokens for bookbars worker. Bounded by limit.
+	ListBookbarsCandidates(ctx context.Context, rowLimit int32) ([]ListBookbarsCandidatesRow, error)
+	ListCatalystsForEvent(ctx context.Context, arg ListCatalystsForEventParams) ([]ListCatalystsForEventRow, error)
+	ListClosedRepricingWindowsForCondition(ctx context.Context, arg ListClosedRepricingWindowsForConditionParams) ([]ListClosedRepricingWindowsForConditionRow, error)
 	// All trades in the per-category cluster window. Used by the cluster
 	// detector to count distinct wallets and total notional.
 	ListClusterWindowTrades(ctx context.Context, arg ListClusterWindowTradesParams) ([]ListClusterWindowTradesRow, error)
@@ -226,6 +256,9 @@ type Querier interface {
 	// reason about whether a previously expected catalyst actually
 	// materialised.
 	ListEventCatalysts(ctx context.Context, eventSlug string) ([]PolymarketEventCatalysts, error)
+	// v11.7 PART 2 — marketlinks Builder production source.
+	// Returns market sets grouped by event_slug, capped by limit.
+	ListEventGroupedMarkets(ctx context.Context, rowLimit int32) ([]ListEventGroupedMarketsRow, error)
 	// Top N alerts (highest severity first, then newest) for one event.
 	ListEventTopAlerts(ctx context.Context, arg ListEventTopAlertsParams) ([]ListEventTopAlertsRow, error)
 	// Top N trades by notional for one event in the lookback window.
@@ -262,10 +295,24 @@ type Querier interface {
 	// timeout + links pass). Slug columns may be NULL on edge data; the
 	// renderer skips broken links via sanitizeLinkURL.
 	ListMarketIntelligenceCandidates(ctx context.Context, limitCount int32) ([]ListMarketIntelligenceCandidatesRow, error)
+	ListMarketLinksBySource(ctx context.Context, arg ListMarketLinksBySourceParams) ([]PolymarketMarketLinks, error)
+	// v11.8 PART 5 — staged input readers.
+	ListMarketLinksForEvent(ctx context.Context, arg ListMarketLinksForEventParams) ([]ListMarketLinksForEventRow, error)
 	ListNewsIntelDecisionsByRun(ctx context.Context, runID int64) ([]PolymarketNewsIntelDecisions, error)
 	ListNewsIntelProcessedHashes(ctx context.Context, itemHashes []string) ([]string, error)
+	// v11.9 PART 4 — repricing close-phase price sampler.
+	ListOpenRepricingWindows(ctx context.Context, arg ListOpenRepricingWindowsParams) ([]ListOpenRepricingWindowsRow, error)
+	// Returns peer condition_ids from polymarket_market_links anchored
+	// on @src_condition_id. Bounded by the link_version + a row limit.
+	ListPeerConditionsByMarketLinks(ctx context.Context, arg ListPeerConditionsByMarketLinksParams) ([]string, error)
+	// v11.6 PART 6 — shadow value evaluator queries.
+	ListPendingValueRows(ctx context.Context, arg ListPendingValueRowsParams) ([]ListPendingValueRowsRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	ListRecentNewsIntelRuns(ctx context.Context, rowLimit int32) ([]PolymarketNewsIntelRuns, error)
+	ListRecentShadowDecisionsForCondition(ctx context.Context, arg ListRecentShadowDecisionsForConditionParams) ([]ListRecentShadowDecisionsForConditionRow, error)
+	// v11.7 PART 5 — repricing trigger source.
+	// New unprocessed catalyst rows over the recent lookback window.
+	ListRepricingTriggers(ctx context.Context, arg ListRepricingTriggersParams) ([]ListRepricingTriggersRow, error)
 	// Returns sent alerts whose outcome is terminal AND which do NOT
 	// yet have an outcome-analysis row. The LEFT JOIN keeps the query
 	// a single roundtrip per claim cycle.
@@ -273,6 +320,9 @@ type Querier interface {
 	// We process newest-first so a resolution burst (e.g. an event
 	// night) gets postmortems for the most-recent settlements first.
 	ListResolvedAlertsForPostmortem(ctx context.Context, limitCount int32) ([]PolymarketAlerts, error)
+	// v11.7 PART 4 — riskscore production source.
+	// Returns market facts in bounded batches, ordered by stale-first.
+	ListRiskScoreCandidates(ctx context.Context, rowLimit int32) ([]ListRiskScoreCandidatesRow, error)
 	// Used by the drift worker. Returns sent alerts whose drift is still
 	// pending AND whose oldest reference window (15m by convention) has
 	// already elapsed. Bounded by claim_limit per tick.
@@ -284,6 +334,10 @@ type Querier interface {
 	// whose end_date has passed (or which are flagged closed) — we only
 	// check markets that could plausibly be resolved.
 	ListSentAlertsForOutcomeCheck(ctx context.Context, claimLimit int32) ([]PolymarketAlerts, error)
+	ListShadowDecisionsByStrategy(ctx context.Context, arg ListShadowDecisionsByStrategyParams) ([]PolymarketStrategyShadowDecisions, error)
+	// v11.7 PART 10 — outcome_status backfill.
+	// Returns shadow rows linked to alerts that have a terminal outcome.
+	ListShadowRowsForOutcomeBackfill(ctx context.Context, rowLimit int32) ([]ListShadowRowsForOutcomeBackfillRow, error)
 	// Used by the sanity worker (internal/app/usecase/sanity) to find markets
 	// whose soft-delete retention window has elapsed. Returns markets that:
 	//   - have been soft-deleted (deleted_at IS NOT NULL)
@@ -293,9 +347,20 @@ type Querier interface {
 	// a market that has resumed flips back via UpsertMarket; one that is
 	// still gone gets stamped purged_at.
 	ListSoftDeletedForPurge(ctx context.Context, arg ListSoftDeletedForPurgeParams) ([]PolymarketMarkets, error)
+	// v11.9 PART 6 — outcome resolver per-side.
+	// Returns shadow rows linked to an alert with a resolved outcome
+	// (winning_outcome_token IS NOT NULL). Used by strategyoutcome to
+	// compute correct/wrong based on the shadow row's Side.
+	ListStandaloneResolvedAlertOutcomes(ctx context.Context, rowLimit int32) ([]ListStandaloneResolvedAlertOutcomesRow, error)
+	ListStandaloneShadowRowsForOutcomeBackfill(ctx context.Context, rowLimit int32) ([]ListStandaloneShadowRowsForOutcomeBackfillRow, error)
 	// Used by the BackfillWorker to verify which fetched trade dedup_keys are
 	// already persisted (defence in depth on top of ON CONFLICT DO NOTHING).
 	ListTradesForBackfillPage(ctx context.Context, arg ListTradesForBackfillPageParams) ([]string, error)
+	// v11.7 PART 6 — walletgraph production source.
+	// Returns recent (wallet, event_slug, side) tuples bounded by lookback.
+	ListWalletCoTradeRows(ctx context.Context, arg ListWalletCoTradeRowsParams) ([]ListWalletCoTradeRowsRow, error)
+	ListWalletEdgesForWallet(ctx context.Context, arg ListWalletEdgesForWalletParams) ([]ListWalletEdgesForWalletRow, error)
+	ListWalletThesisLinesForEvent(ctx context.Context, arg ListWalletThesisLinesForEventParams) ([]ListWalletThesisLinesForEventRow, error)
 	// Persists the four CLV-lite windows. A NULL CLV column means the
 	// reference price for that window was unavailable (e.g. no later trade
 	// on the same (market, outcome)). drift_status flips to 'available'
@@ -474,11 +539,15 @@ type Querier interface {
 	// against the same trade batch is a no-op. Called by persist.Sink
 	// after collect's UpsertBatch; backfill never calls this.
 	UpdateMarketCollectCursor(ctx context.Context, arg UpdateMarketCollectCursorParams) error
+	UpdateShadowDecisionValues(ctx context.Context, arg UpdateShadowDecisionValuesParams) error
+	UpdateShadowOutcomeStatus(ctx context.Context, arg UpdateShadowOutcomeStatusParams) error
 	// One row per alert; idempotent. Called by the alertsender worker
 	// BEFORE Telegram delivery so the attribution row exists by the
 	// time the operator sees the alert. Overwrites any prior bucketing
 	// (so a re-run after schema fix doesn't accumulate ghosts).
 	UpsertAlertStrategyDimensions(ctx context.Context, arg UpsertAlertStrategyDimensionsParams) error
+	// v11.10 book feature bars upsert.
+	UpsertBookFeatureBar(ctx context.Context, arg UpsertBookFeatureBarParams) error
 	// Insert-or-update a Polymarket category. `enabled` is preserved on update
 	// (it's a local setting driven by CATEGORY_WHITELIST, not Polymarket data).
 	UpsertCategory(ctx context.Context, arg UpsertCategoryParams) (PolymarketCategories, error)
@@ -495,6 +564,10 @@ type Querier interface {
 	UpsertEventPageFetchState(ctx context.Context, arg UpsertEventPageFetchStateParams) error
 	// v10.5 canonical-slug alias persistence. Idempotent.
 	UpsertEventSlugAlias(ctx context.Context, arg UpsertEventSlugAliasParams) error
+	// =========================================================================
+	// Holder snapshots
+	// =========================================================================
+	UpsertHolderSnapshot(ctx context.Context, arg UpsertHolderSnapshotParams) error
 	// Top-of-book / mid / last-price per condition_id. Updated from both
 	// WS events and the reconciliation sweep. Idempotent — every write
 	// bumps updated_at + last_ws_event_at.
@@ -510,13 +583,23 @@ type Querier interface {
 	// The next BackfillWorker tick picks up missing history because
 	// ApplyWhitelist callers re-stamp backfill_status='pending' on resume.
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (PolymarketMarkets, error)
+	// =========================================================================
+	// Market links
+	// =========================================================================
+	UpsertMarketLink(ctx context.Context, arg UpsertMarketLinkParams) error
 	UpsertMarketOutcome(ctx context.Context, arg UpsertMarketOutcomeParams) error
+	// =========================================================================
+	// Market risk scores
+	// =========================================================================
+	UpsertMarketRiskScore(ctx context.Context, arg UpsertMarketRiskScoreParams) error
 	UpsertNewsIntelProcessedItem(ctx context.Context, arg UpsertNewsIntelProcessedItemParams) error
 	// Records the most recent semantic-fingerprint + code we shipped for
 	// this event so the cooldown check can suppress repeats.
 	UpsertSemanticFingerprint(ctx context.Context, arg UpsertSemanticFingerprintParams) error
 	// Insert a trader by wallet address; on conflict bump last_seen_at.
 	UpsertTrader(ctx context.Context, walletAddress string) (PolymarketTraders, error)
+	// v11.9 wallet thesis lines.
+	UpsertWalletThesisLine(ctx context.Context, arg UpsertWalletThesisLineParams) error
 }
 
 var _ Querier = (*Queries)(nil)

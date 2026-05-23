@@ -59,6 +59,27 @@ func TestDecodeBook_FillsBestBidAskMid(t *testing.T) {
 	}
 }
 
+// v11.10: depth arrays must be preserved on the decoded Event so
+// bookvacuum / book_feature_bars can read them without re-parsing
+// the raw payload.
+func TestDecodeBook_PreservesFullDepth(t *testing.T) {
+	ev := decode([]byte(bookSample), nil, time.Now())
+	if len(ev.BidLevels) != 3 || len(ev.AskLevels) != 3 {
+		t.Fatalf("depth counts: bids=%d asks=%d (expected 3+3)", len(ev.BidLevels), len(ev.AskLevels))
+	}
+	// Bids DESC: 0.50 > 0.49 > 0.48
+	if ev.BidLevels[0].Price != 0.50 || ev.BidLevels[2].Price != 0.48 {
+		t.Fatalf("bid sort: %+v", ev.BidLevels)
+	}
+	// Asks ASC: 0.52 < 0.53 < 0.54
+	if ev.AskLevels[0].Price != 0.52 || ev.AskLevels[2].Price != 0.54 {
+		t.Fatalf("ask sort: %+v", ev.AskLevels)
+	}
+	if ev.BidLevels[0].Size != 15 || ev.AskLevels[0].Size != 25 {
+		t.Fatalf("best-of-book sizes: bid=%v ask=%v", ev.BidLevels[0].Size, ev.AskLevels[0].Size)
+	}
+}
+
 func TestDecodePriceChange_FillsSideSourceWebsocket(t *testing.T) {
 	ev := decode([]byte(priceChangeSample), nil, time.Now())
 	if ev.Type != EventTypePriceChange {

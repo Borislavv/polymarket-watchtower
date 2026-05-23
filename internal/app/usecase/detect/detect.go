@@ -31,10 +31,12 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/mmfilter"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/ownership"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/quietmarket"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/rulesrisk"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/score"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/category"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/concentration"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/marketcache"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/stagedinputs"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/market"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/trade"
@@ -314,6 +316,30 @@ type Config struct {
 	// TraderActivity backs the dormant-wallet booster's idle-gap
 	// computation. Production: *repository.TradeRepository.
 	TraderActivity TraderActivityFetcher
+
+	// --- v11.6 strategy learning loop hook ----------------------------
+	// StrategyShadowBus is the strategybus.Bus the detector calls once
+	// per newly-persisted alert. nil = disabled (default). The bus
+	// owns the per-strategy enabled / shadow-only gate, so leaving
+	// every strategy's flag off keeps the hook inert.
+	StrategyShadowBus StrategyShadowSink
+	// StrategyRulesRisk runs deterministic resolution-ambiguity scoring
+	// on the alert's market. nil = disabled. The detector is pure.
+	StrategyRulesRisk *rulesrisk.Detector
+	// StrategyShadowMaxPerTrade caps how many shadow rows one trade
+	// may spawn. Defaults to 20 if non-positive.
+	StrategyShadowMaxPerTrade int
+	// StrategyShadowRecordNoFire — when true, also write a shadow row
+	// when a detector returned a "no fire" verdict. Defaults to false
+	// to avoid row-volume blowup on every benign trade.
+	StrategyShadowRecordNoFire bool
+	// StrategyStagedInputs — v11.8. Bridges background-worker output
+	// (market_links, risk_scores, repricing_windows, wallet_graph_edges,
+	// event_catalysts, recent shadow_decisions) to the hot path. nil
+	// makes the loop fall back to the v11.6 rulesrisk-only behaviour
+	// (every other strategy is metric-skipped with reason
+	// `staged_inputs_disabled`).
+	StrategyStagedInputs *stagedinputs.Readers
 }
 
 // DormantWalletConfig tunes the dormant-wallet revival booster.
@@ -805,6 +831,9 @@ func (l *Loop) emitTradeAnomaly(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit single-trade failed")
 	}
+	// v11.6: shadow-write per-alert strategy decisions. Fails open;
+	// never blocks the existing alert flow.
+	l.recordStrategyShadow(ctx, m, t, f, dedup)
 }
 
 func (l *Loop) emitCategoryWatch(
@@ -1185,6 +1214,8 @@ func (l *Loop) evaluateAccumulationWindow(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit accumulation failed")
 	}
+	// v11.6: shadow-write per-alert strategy decisions.
+	l.recordStrategyShadow(ctx, m, t, f, dedup)
 
 	// Strategy E hook: once an accumulation alert is established, check
 	// whether the wallet's net position has crossed an ownership-
@@ -1293,6 +1324,8 @@ func (l *Loop) evaluateOwnership(
 	if err := l.emit.Notify(ctx, f); err != nil {
 		l.log.Err(err).Msg("detect: emit ownership failed")
 	}
+	// v11.6: shadow-write per-alert strategy decisions.
+	l.recordStrategyShadow(ctx, m, t, f, dedup)
 }
 
 // stampQuietMarket runs the quiet-market wake-up detector against the

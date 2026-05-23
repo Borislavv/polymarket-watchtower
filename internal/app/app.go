@@ -42,6 +42,7 @@ import (
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/realtime"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/sanity"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/signalquality"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/stagedinputs"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/analysis"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/model/anomaly"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
@@ -79,19 +80,27 @@ type App struct {
 	httpSrv   *httpsrv.Server
 
 	// Postgres-backed background workers; nil when DSN is unset.
-	backfill         *backfill.Worker
-	sender           *alertsender.Worker
-	sanity           *sanity.Worker
-	outcomes         *outcomes.Worker
-	drift            *drift.Worker
-	detection        *detection.Worker
-	aiAnalysis       *aianalysis.Service
-	outcomeAI        *outcomeai.Worker
-	catalystImporter *catalystimporter.Worker
-	newsIntel        *newsintel.Worker
-	signalQuality    *signalquality.Worker
+	backfill          *backfill.Worker
+	sender            *alertsender.Worker
+	sanity            *sanity.Worker
+	outcomes          *outcomes.Worker
+	drift             *drift.Worker
+	detection         *detection.Worker
+	aiAnalysis        *aianalysis.Service
+	outcomeAI         *outcomeai.Worker
+	catalystImporter  *catalystimporter.Worker
+	newsIntel         *newsintel.Worker
+	signalQuality     *signalquality.Worker
 	marketCloseReview *marketclosereview.Worker
-	realtimeWS       *realtime.Worker
+	realtimeWS        *realtime.Worker
+
+	// v11.6 Phase B workers (Postgres-only).
+	strategyPhaseB StrategyPhaseB
+	// v11.7 Phase C workers — 5 supporting workers + outcome backfill.
+	strategyPhaseC StrategyPhaseC
+	// v11.10 Phase F producers — real holdersync + bookbars against
+	// verified public Polymarket endpoints.
+	strategyPhaseF StrategyPhaseF
 
 	// pgPool is nil when POSTGRES_DSN is unset. Owned by App so shutdown
 	// can drain it cleanly.
@@ -162,21 +171,21 @@ func New() (*App, error) {
 	// exploration. Production must run with POSTGRES_DSN set; the user
 	// guidance is in README.md and presets/README.md.
 	var (
-		pgPool             *pgxpool.Pool
-		persistSink        *persist.Sink
-		alertsRepo         *repository.AlertRepository
-		alertAnalysisRepo  *repository.AlertAnalysisRepository
-		marketsRepo        *repository.MarketRepository
-		tradesRepo         *repository.TradeRepository
-		tradersRepo        *repository.TraderRepository
-		dbBaseline         *dbbaseline.Provider
-		traderBaseline     *traderbaseline.Provider
-		mmFilter           *mmfilter.Filter
-		backfillWorker     *backfill.Worker
-		senderWorker       *alertsender.Worker
-		sanityWorker   *sanity.Worker
-		outcomesWorker *outcomes.Worker
-		driftWorker    *drift.Worker
+		pgPool            *pgxpool.Pool
+		persistSink       *persist.Sink
+		alertsRepo        *repository.AlertRepository
+		alertAnalysisRepo *repository.AlertAnalysisRepository
+		marketsRepo       *repository.MarketRepository
+		tradesRepo        *repository.TradeRepository
+		tradersRepo       *repository.TraderRepository
+		dbBaseline        *dbbaseline.Provider
+		traderBaseline    *traderbaseline.Provider
+		mmFilter          *mmfilter.Filter
+		backfillWorker    *backfill.Worker
+		senderWorker      *alertsender.Worker
+		sanityWorker      *sanity.Worker
+		outcomesWorker    *outcomes.Worker
+		driftWorker       *drift.Worker
 	)
 	if cfg.Postgres.Enabled() {
 		if cfg.Postgres.AutoMigrate {
@@ -612,6 +621,41 @@ func New() (*App, error) {
 		}
 		detectCfg.TraderActivity = tradesRepo
 	}
+
+	// v11.6 Phase B: wire strategy bus + rulesrisk + value evaluator
+	// + promotion review. All inert when StrategyConfig keeps every
+	// strategy disabled (the default), but the bus is ALWAYS injected
+	// when Postgres is wired so per-strategy operator flips take
+	// effect without a binary restart.
+	strategyPhaseB := wireStrategyPhaseB(pgPool, cfg.Strategy, met, logger)
+	if strategyPhaseB.Bus != nil {
+		detectCfg.StrategyShadowBus = strategyPhaseB.Bus
+		detectCfg.StrategyRulesRisk = strategyPhaseB.RulesRisk
+		detectCfg.StrategyShadowMaxPerTrade = cfg.Strategy.ShadowMaxDecisionsPerTrade
+		detectCfg.StrategyShadowRecordNoFire = cfg.Strategy.ShadowRecordNoFire
+		// v11.8: staged inputs bridge — hot-path readers backed by
+		// Postgres + TTL cache. nil when Postgres absent.
+		detectCfg.StrategyStagedInputs = stagedinputs.New(pgPool, stagedinputs.Config{
+			Enabled:      cfg.Strategy.StagedInputs.Enabled,
+			CacheEnabled: cfg.Strategy.StagedInputs.CacheEnabled,
+			CacheTTL:     cfg.Strategy.StagedInputs.CacheTTL,
+			MaxRows:      cfg.Strategy.StagedInputs.MaxRows,
+			QueryTimeout: cfg.Strategy.StagedInputs.QueryTimeout,
+		})
+	}
+	// v11.7 Phase C — production adapters for the 5 supporting
+	// workers + outcome backfill evaluator. Inert when their
+	// per-worker *_ENABLED flags stay false.
+	strategyPhaseC := wireStrategyPhaseC(pgPool, cfg.Strategy, met, strategyPhaseB.RulesRisk)
+
+	// v11.10 Phase F — real-source producers (holdersync via Data
+	// API /holders, bookbars via CLOB /book + /books). When
+	// HOLDERSYNC_SOURCE_MODE=dataapi we replace the v11.7 stub.
+	strategyPhaseF, realHolderSync := wireStrategyPhaseF(pgPool, cfg.Strategy, met, dataClient)
+	if realHolderSync != nil {
+		strategyPhaseC.HolderSync = realHolderSync
+	}
+
 	detectLoop := detect.New(detectCfg, cache, emitter, met, logger)
 
 	// Detection worker — v6 architecture. When Postgres is wired, every
@@ -1158,28 +1202,31 @@ func New() (*App, error) {
 	// require this worker.
 
 	return &App{
-		cfg:              cfg,
-		logger:           logger,
-		metrics:          met,
-		cache:            cache,
-		discover:         discoverLoop,
-		collect:          collectLoop,
-		detectRun:        detectLoop.Run,
-		httpSrv:          httpSrv,
-		backfill:         backfillWorker,
-		sender:           senderWorker,
-		sanity:           sanityWorker,
-		outcomes:         outcomesWorker,
-		drift:            driftWorker,
-		detection:        detectionWorker,
-		aiAnalysis:       aiSvc,
-		outcomeAI:        outcomeAIWorker,
-		catalystImporter: catalystImporterWorker,
-		newsIntel:        newsIntelWorker,
+		cfg:               cfg,
+		logger:            logger,
+		metrics:           met,
+		cache:             cache,
+		discover:          discoverLoop,
+		collect:           collectLoop,
+		detectRun:         detectLoop.Run,
+		httpSrv:           httpSrv,
+		backfill:          backfillWorker,
+		sender:            senderWorker,
+		sanity:            sanityWorker,
+		outcomes:          outcomesWorker,
+		drift:             driftWorker,
+		detection:         detectionWorker,
+		aiAnalysis:        aiSvc,
+		outcomeAI:         outcomeAIWorker,
+		catalystImporter:  catalystImporterWorker,
+		newsIntel:         newsIntelWorker,
 		signalQuality:     signalQualityWorker,
 		marketCloseReview: marketCloseReviewWorker,
-		realtimeWS:       realtimeWorker,
-		pgPool:           pgPool,
+		realtimeWS:        realtimeWorker,
+		strategyPhaseB:    strategyPhaseB,
+		strategyPhaseC:    strategyPhaseC,
+		strategyPhaseF:    strategyPhaseF,
+		pgPool:            pgPool,
 	}, nil
 }
 
@@ -1448,6 +1495,68 @@ func (a *App) Run() error {
 	if a.realtimeWS != nil {
 		execs = append(execs, shutdown2.Exec{Name: "realtime-ws", Fn: func(ctx context.Context) error {
 			a.realtimeWS.Run(ctx)
+			return nil
+		}})
+	}
+	// v11.6 Phase B workers.
+	if a.strategyPhaseB.ValueWorker != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-value-evaluator", Fn: func(ctx context.Context) error {
+			a.strategyPhaseB.ValueWorker.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseB.PromotionRev != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-promotion-review", Fn: func(ctx context.Context) error {
+			a.strategyPhaseB.PromotionRev.Run(ctx)
+			return nil
+		}})
+	}
+	// v11.7 Phase C workers — only registered when feature flags allow.
+	if a.strategyPhaseC.MarketLinks != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-marketlinks", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.MarketLinks.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.HolderSync != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-holdersync", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.HolderSync.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.RiskScore != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-riskscore", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.RiskScore.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.Repricing != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-repricing", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.Repricing.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.WalletGraph != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-walletgraph", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.WalletGraph.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.OutcomeBackfill != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-outcome-backfill", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.OutcomeBackfill.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseF.BookBars != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-bookbars", Fn: func(ctx context.Context) error {
+			a.strategyPhaseF.BookBars.Run(ctx)
+			return nil
+		}})
+	}
+	if a.strategyPhaseC.ThesisLines != nil {
+		execs = append(execs, shutdown2.Exec{Name: "strategy-thesis-lines", Fn: func(ctx context.Context) error {
+			a.strategyPhaseC.ThesisLines.Run(ctx)
 			return nil
 		}})
 	}

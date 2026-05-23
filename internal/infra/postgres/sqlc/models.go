@@ -123,6 +123,25 @@ type PolymarketAlerts struct {
 	LastReactionAt         pgtype.Timestamptz
 }
 
+type PolymarketBookFeatureBars struct {
+	ID               int64
+	ConditionID      string
+	OutcomeToken     string
+	BarSeconds       int32
+	BarStart         pgtype.Timestamptz
+	BestBid          *float64
+	BestAsk          *float64
+	MidPrice         *float64
+	BidDepthTopN     *float64
+	AskDepthTopN     *float64
+	Spread           *float64
+	SpreadZ          *float64
+	BidDepthDeltaPct *float64
+	AskDepthDeltaPct *float64
+	MidDelta         *float64
+	CreatedAt        pgtype.Timestamptz
+}
+
 type PolymarketCategories struct {
 	ID         int64
 	ExternalID string
@@ -280,6 +299,21 @@ type PolymarketEventSlugAliases struct {
 	LastSeenAt    pgtype.Timestamptz
 }
 
+type PolymarketHolderSnapshots struct {
+	ID           int64
+	ConditionID  string
+	OutcomeToken string
+	SnapshotAt   pgtype.Timestamptz
+	Wallet       string
+	Rank         int32
+	Shares       float64
+	NotionalUsd  float64
+	PctOi        float64
+	TotalOi      float64
+	RawJson      []byte
+	CreatedAt    pgtype.Timestamptz
+}
+
 type PolymarketLiveMarketState struct {
 	ConditionID   string
 	EventSlug     *string
@@ -367,6 +401,20 @@ type PolymarketMarketIntelligenceReports struct {
 	PeriodKey         string
 }
 
+type PolymarketMarketLinks struct {
+	ID             int64
+	SrcConditionID string
+	DstConditionID string
+	LinkType       string
+	Direction      string
+	Confidence     float64
+	EventSlug      string
+	SeriesID       string
+	LinkVersion    int32
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+}
+
 type PolymarketMarketOutcomes struct {
 	ID       int64
 	MarketID int64
@@ -418,6 +466,17 @@ type PolymarketMarketPriceSnapshots struct {
 	Source      string
 	SampledAt   pgtype.Timestamptz
 	CreatedAt   pgtype.Timestamptz
+}
+
+type PolymarketMarketRiskScores struct {
+	ID             int64
+	ConditionID    string
+	ScoreVersion   int32
+	AmbiguityScore float64
+	DisputeRisk    float64
+	ReasonsJson    []byte
+	IsActive       bool
+	ComputedAt     pgtype.Timestamptz
 }
 
 type PolymarketMarkets struct {
@@ -596,6 +655,27 @@ type PolymarketRepricingTheses struct {
 	CreatedAt         pgtype.Timestamptz
 }
 
+type PolymarketRepricingWindows struct {
+	ID                int64
+	ConditionID       string
+	EventSlug         string
+	TriggerKind       string
+	TriggerRef        string
+	OpenedAt          pgtype.Timestamptz
+	ClosesAt          pgtype.Timestamptz
+	ExpectedImpactMin *float64
+	ExpectedImpactMax *float64
+	SideBias          string
+	BaselinePrice     *float64
+	Status            string
+	ResolvedAt        pgtype.Timestamptz
+	ObservedMove      *float64
+	PeerMove          *float64
+	LagScore          *float64
+	Notes             string
+	CreatedAt         pgtype.Timestamptz
+}
+
 type PolymarketSignalReports struct {
 	ID                int64
 	PeriodType        string
@@ -610,6 +690,47 @@ type PolymarketSignalReports struct {
 	DedupKey          string
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
+}
+
+type PolymarketStrategyPromotionReviews struct {
+	ID                 int64
+	StrategyName       string
+	StrategyVersion    string
+	SampleSize         int32
+	MedianSignedMove6h float64
+	Reversal15mRatio   float64
+	AlertsPerDay       float64
+	Eligible           bool
+	ReasonsJson        []byte
+	ReviewedAt         pgtype.Timestamptz
+	CreatedAt          pgtype.Timestamptz
+}
+
+type PolymarketStrategyShadowDecisions struct {
+	ID                  int64
+	StrategyName        string
+	StrategyVersion     string
+	ConditionID         string
+	EventSlug           string
+	Wallet              string
+	CohortID            *string
+	Side                string
+	DecisionKind        string
+	DecisionLevel       string
+	Score               float64
+	Confidence          float64
+	ReasonsJson         []byte
+	FeaturesJson        []byte
+	ShadowOnly          bool
+	FiredAt             pgtype.Timestamptz
+	LinkedAlertDedupKey *string
+	ControlBucketKey    string
+	Clv15m              *float64
+	Clv1h               *float64
+	Clv6h               *float64
+	Clv24h              *float64
+	OutcomeStatus       *string
+	CreatedAt           pgtype.Timestamptz
 }
 
 type PolymarketTelegramSemanticDedupe struct {
@@ -701,6 +822,33 @@ type PolymarketUnifiedIntelRuns struct {
 	CreatedAt        pgtype.Timestamptz
 }
 
+type PolymarketWalletGraphEdges struct {
+	ID              int64
+	WalletA         string
+	WalletB         string
+	EdgeKind        string
+	SimilarityScore float64
+	CoEventsCount   int32
+	CohortID        string
+	FirstSeenAt     pgtype.Timestamptz
+	LastSeenAt      pgtype.Timestamptz
+	EdgeVersion     int32
+}
+
+type PolymarketWalletThesisLines struct {
+	ID            int64
+	Wallet        string
+	ConditionID   string
+	EventSlug     string
+	Side          string
+	NotionalUsd   float64
+	Trades        int32
+	LastTradedAt  pgtype.Timestamptz
+	LookbackHours int32
+	RefreshedAt   pgtype.Timestamptz
+	CreatedAt     pgtype.Timestamptz
+}
+
 type PolymarketWsEvents struct {
 	ID                int64
 	ReceivedAt        pgtype.Timestamptz
@@ -739,4 +887,80 @@ type PolymarketWsGapRecoveries struct {
 	Status          string
 	LastError       *string
 	CreatedAt       pgtype.Timestamptz
+}
+
+type WatchtowerAiCostQualityV struct {
+	Day              pgtype.Interval
+	Surface          string
+	Model            string
+	Requests         int64
+	Succeeded        int64
+	Failed           int64
+	InputTokens      int64
+	OutputTokens     int64
+	EstimatedCostUsd int64
+}
+
+type WatchtowerMarketCloseReviewExamplesV struct {
+	ReviewedAt       pgtype.Timestamptz
+	ConditionID      string
+	Market           string
+	Verdict          string
+	Confidence       *float64
+	AdminSummary     string
+	EstimatedCostUsd *float64
+	AiModel          string
+	Status           string
+}
+
+type WatchtowerMarketCloseReviewQualityV struct {
+	ReviewedAt          pgtype.Timestamptz
+	MarketID            *int64
+	ConditionID         string
+	EventSlug           string
+	Title               string
+	Category            string
+	Verdict             string
+	Confidence          *float64
+	AlertCount          int64
+	ConfirmedAlertCount int64
+	FailedAlertCount    int64
+	AmbiguousAlertCount int64
+	AvgClv15m           float64
+	AvgClv1h            float64
+	AvgClv6h            float64
+	AvgClv24h           float64
+	AiModel             string
+	InputTokens         *int32
+	OutputTokens        *int32
+	EstimatedCostUsd    *float64
+	Status              string
+}
+
+type WatchtowerStrategyQualityV struct {
+	Strategy                 interface{}
+	AlertKind                string
+	Severity                 string
+	StrategyVersion          string
+	ReviewedAlertCount       int64
+	ConfirmedCount           int64
+	FalsePositiveCount       int64
+	InconclusiveCount        int64
+	AvgClv1h                 float64
+	AvgClv6h                 float64
+	AvgClv24h                float64
+	PositiveClvRate6h        float64
+	MarketCloseConfirmedRate interface{}
+	Verdict                  string
+	VerdictReason            string
+}
+
+type WatchtowerStrategyReasonQualityV struct {
+	Reason        string
+	BaseStrategy  string
+	AlertCount    int64
+	ConfirmedRate interface{}
+	AvgClv6h      float64
+	Verdict       string
+	VerdictReason string
 }

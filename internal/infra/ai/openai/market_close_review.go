@@ -20,15 +20,15 @@ import (
 // AI receives. Closed/resolved timestamps + winning outcome anchor
 // the verdict; the AI has no other source-of-truth for the result.
 type MarketCloseReviewMarketSummary struct {
-	ConditionID   string
-	EventSlug     string
-	Title         string
-	Category      string
-	OpenedAt      time.Time
-	ClosedAt      time.Time
-	ResolvedAt    time.Time
+	ConditionID    string
+	EventSlug      string
+	Title          string
+	Category       string
+	OpenedAt       time.Time
+	ClosedAt       time.Time
+	ResolvedAt     time.Time
 	WinningOutcome string
-	FinalPrice    *float64
+	FinalPrice     *float64
 }
 
 // MarketCloseReviewAlertEvidence is one alert row in the prompt
@@ -117,9 +117,9 @@ type MarketCloseReviewTuningRec struct {
 // MarketCloseReviewResponse is the parsed JSON output. Mirrors
 // the schema in market_close_review_prompt.go exactly.
 type MarketCloseReviewResponse struct {
-	Verdict              string                                `json:"verdict"`
-	Confidence           float64                               `json:"confidence"`
-	MarketOutcomeSummary string                                `json:"market_outcome_summary"`
+	Verdict               string  `json:"verdict"`
+	Confidence            float64 `json:"confidence"`
+	MarketOutcomeSummary  string  `json:"market_outcome_summary"`
 	WatchtowerPerformance struct {
 		Early                bool    `json:"early"`
 		DirectionallyCorrect bool    `json:"directionally_correct"`
@@ -128,10 +128,10 @@ type MarketCloseReviewResponse struct {
 		WorstAlertIDs        []int64 `json:"worst_alert_ids"`
 	} `json:"watchtower_performance"`
 	FlowAssessment struct {
-		InformedFlowLikely         bool   `json:"informed_flow_likely"`
-		InsiderLikeRisk            string `json:"insider_like_risk"`
-		SpeculationVsInformation   string `json:"speculation_vs_information"`
-		Rationale                  string `json:"rationale"`
+		InformedFlowLikely       bool   `json:"informed_flow_likely"`
+		InsiderLikeRisk          string `json:"insider_like_risk"`
+		SpeculationVsInformation string `json:"speculation_vs_information"`
+		Rationale                string `json:"rationale"`
 	} `json:"flow_assessment"`
 	MarketRepricingAssessment struct {
 		UnderreactionDetected bool   `json:"underreaction_detected"`

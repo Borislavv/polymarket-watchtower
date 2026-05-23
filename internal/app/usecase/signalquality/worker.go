@@ -174,9 +174,9 @@ func (s *Store) ReadSnapshot(ctx context.Context, asOf time.Time) (Snapshot, err
 		return Snapshot{}, errors.New("signalquality: nil pool")
 	}
 	out := Snapshot{
-		ReportDate:        asOf,
-		LookbackHours:     int(s.lookback.Hours()),
-		MaxAlertsScanCap:  s.maxAlerts,
+		ReportDate:       asOf,
+		LookbackHours:    int(s.lookback.Hours()),
+		MaxAlertsScanCap: s.maxAlerts,
 	}
 	since := asOf.Add(-s.lookback)
 
