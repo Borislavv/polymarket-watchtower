@@ -66,6 +66,33 @@ type StrategyConfig struct {
 	ThesisLines     ThesisLinesConfig
 	// v11.10 additions
 	TelegramFlow StrategyTelegramFlowConfig
+	// v11.10 PART 6 — worker priority-bucket budgeting.
+	WorkerBudget WorkerBudgetConfig
+}
+
+// WorkerBudgetConfig — v11.10 PART 6 priority-bucket caps used by
+// strategy-supporting workers (holdersync, bookbars). The selector
+// (internal/app/usecase/workerbudget) issues one bucketed Postgres
+// query per cycle. A zero cap disables that bucket entirely; when
+// every cap is zero AND no pins are supplied, workers fall back to
+// the legacy unbucketed lister so the surface is backward-compatible.
+//
+// Bucket priorities (1=highest):
+//
+//	1 = operator-pinned (explicit condition ids)
+//	2 = recent-alert (any market fired in last 24h)
+//	3 = catalyst-near (active/expected catalyst, ≤72h out)
+//	4 = linked-to-fired (market_links neighbour of fired alert)
+//	5 = liquid (top by Polymarket liquidity, 24h event-page snapshot)
+//	6 = fallback active (last_seen_at DESC, safety net)
+type WorkerBudgetConfig struct {
+	OperatorPinned     int      `env:"WORKER_BUDGET_OPERATOR_PINNED_MARKETS" envDefault:"20" validate:"gte=0,lte=2000"`
+	RecentAlert        int      `env:"WORKER_BUDGET_RECENT_ALERT_MARKETS" envDefault:"30" validate:"gte=0,lte=2000"`
+	CatalystNear       int      `env:"WORKER_BUDGET_CATALYST_NEAR_MARKETS" envDefault:"40" validate:"gte=0,lte=2000"`
+	LinkedToFired      int      `env:"WORKER_BUDGET_LINKED_TO_FIRED_MARKETS" envDefault:"30" validate:"gte=0,lte=2000"`
+	Liquid             int      `env:"WORKER_BUDGET_LIQUID_MARKETS" envDefault:"50" validate:"gte=0,lte=2000"`
+	FallbackActive     int      `env:"WORKER_BUDGET_FALLBACK_ACTIVE_MARKETS" envDefault:"20" validate:"gte=0,lte=2000"`
+	PinnedConditionIDs []string `env:"WORKER_OPERATOR_PINNED_CONDITION_IDS" envSeparator:"," envDefault:""`
 }
 
 // OutcomeBackfillConfig — strategyoutcome worker.

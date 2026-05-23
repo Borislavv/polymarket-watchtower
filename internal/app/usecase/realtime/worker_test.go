@@ -246,12 +246,17 @@ func TestBuildDedupeKey_BucketsByMinute(t *testing.T) {
 }
 
 // TestHandle_RawCaptureTruncatesAtCap pins PART 9: when
-// RawCaptureEnabled=true, ev.Raw is stored on the persisted row but
-// truncated to RawCaptureMaxBytes. Off by default → Raw is nil.
+// RawCaptureEnabled=true and raw fits inside RawCaptureMaxBytes,
+// ev.Raw is stored on the persisted row verbatim.
+//
+// v11.10 hardening: raw_json is a JSONB column, so any byte slice that
+// is NOT valid JSON (including a truncated JSON prefix) is dropped at
+// the persist boundary rather than fed to Postgres — otherwise the
+// driver returns SQLSTATE 22P02. See worker.persistEvent.
 func TestHandle_RawCaptureTruncatesAtCap(t *testing.T) {
 	store := newFakeStore()
-	w := newTestWorker(t, store, Config{RawCaptureEnabled: true, RawCaptureMaxBytes: 8})
-	bigRaw := []byte(`{"event_type":"book","market":"0xabc","x":"aaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	smallValidJSON := []byte(`{"a":1}`)
+	w := newTestWorker(t, store, Config{RawCaptureEnabled: true, RawCaptureMaxBytes: 128})
 	w.handle(context.Background(), ws.Event{
 		Type:        ws.EventTypeBook,
 		ConditionID: "0xabc",
@@ -259,13 +264,37 @@ func TestHandle_RawCaptureTruncatesAtCap(t *testing.T) {
 		BestBid:     floatPtr(0.40),
 		BestAsk:     floatPtr(0.42),
 		Mid:         floatPtr(0.41),
-		Raw:         bigRaw,
+		Raw:         smallValidJSON,
 	})
 	if len(store.events) != 1 {
 		t.Fatalf("expected 1 event")
 	}
-	if got := len(store.events[0].RawJSON); got != 8 {
-		t.Errorf("raw payload should be capped to 8 bytes; got %d", got)
+	if got := len(store.events[0].RawJSON); got != len(smallValidJSON) {
+		t.Errorf("valid JSON within cap must be stored verbatim; got %d bytes", got)
+	}
+}
+
+// TestHandle_RawCaptureDropsInvalidJSON pins v11.10 PART 1: raw_json
+// is a JSONB column. The WS stream carries heartbeats / pongs /
+// truncated frames whose Raw payload is NOT valid JSON. Persist must
+// drop the bytes rather than feeding garbage to Postgres.
+func TestHandle_RawCaptureDropsInvalidJSON(t *testing.T) {
+	store := newFakeStore()
+	w := newTestWorker(t, store, Config{RawCaptureEnabled: true, RawCaptureMaxBytes: 128})
+	w.handle(context.Background(), ws.Event{
+		Type:        ws.EventTypeBook,
+		ConditionID: "0xabc",
+		ReceivedAt:  time.Now(),
+		BestBid:     floatPtr(0.40),
+		BestAsk:     floatPtr(0.42),
+		Mid:         floatPtr(0.41),
+		Raw:         []byte(`PONG`), // not JSON
+	})
+	if len(store.events) != 1 {
+		t.Fatalf("expected 1 event")
+	}
+	if got := store.events[0].RawJSON; got != nil {
+		t.Errorf("non-JSON raw must be dropped to nil; got %q", string(got))
 	}
 }
 

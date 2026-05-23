@@ -22,6 +22,7 @@ import (
 
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/bookbars"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/holdersync"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/workerbudget"
 	"github.com/Borislavv/polymarket-watchtower/internal/domain/vo"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/metrics"
 	"github.com/Borislavv/polymarket-watchtower/internal/infra/polymarket/clob"
@@ -68,6 +69,23 @@ func wireStrategyPhaseF(
 		return StrategyPhaseF{}, nil
 	}
 
+	// v11.10 PART 6 — bucket-budgeted selection. The selector reads
+	// from the same pool; budget is snapshotted by the worker on
+	// every Tick via the closure below so an operator config change
+	// (when we add hot-reload) would take effect on the next cycle.
+	budgetSel := workerbudget.New(q)
+	budgetSnapshot := func() workerbudget.Budget {
+		return workerbudget.Budget{
+			OperatorPinned:     scfg.WorkerBudget.OperatorPinned,
+			RecentAlert:        scfg.WorkerBudget.RecentAlert,
+			CatalystNear:       scfg.WorkerBudget.CatalystNear,
+			LinkedToFired:      scfg.WorkerBudget.LinkedToFired,
+			Liquid:             scfg.WorkerBudget.Liquid,
+			FallbackActive:     scfg.WorkerBudget.FallbackActive,
+			PinnedConditionIDs: scfg.WorkerBudget.PinnedConditionIDs,
+		}
+	}
+
 	bookBarsWorker := bookbars.New(
 		bookbars.Config{
 			Enabled:      scfg.BookFeatureBars.Enabled,
@@ -78,7 +96,7 @@ func wireStrategyPhaseF(
 			BatchSize:    25,
 			FetchTimeout: 5 * time.Second,
 		},
-		&bookbarsLister{q: q},
+		&bookbarsLister{q: q, budget: budgetSnapshot, sel: budgetSel, met: met},
 		&bookbarsFetcher{cl: clobClient},
 		&bookbarsSink{q: q},
 		met,
@@ -101,7 +119,7 @@ func wireStrategyPhaseF(
 				Concurrency:  scfg.HolderSync.Concurrency,
 				StaleAfter:   scfg.HolderSync.StaleAfter,
 			},
-			&holdersyncCandidatesLister{q: q},
+			&holdersyncCandidatesLister{q: q, budget: budgetSnapshot, sel: budgetSel, met: met},
 			&holdersyncRealFetcher{cl: dataClient, requireOI: scfg.HolderSync.RequireOpenInterest},
 			&holdersyncRealSink{q: q},
 			met,
@@ -113,10 +131,38 @@ func wireStrategyPhaseF(
 }
 
 // --- bookbars adapters --------------------------------------------
+//
+// v11.10 PART 6: the lister now consults the workerbudget selector
+// FIRST. When a non-zero budget is configured the bucketed selection
+// is authoritative — the legacy unbucketed query is only used as a
+// fallback when (a) the budget is all-zero, or (b) the bucketed query
+// errored and we want to keep the worker producing rows rather than
+// stalling. Per-bucket counts are emitted as Prometheus labels via
+// the shared StrategyWorkerItems counter (op="bucket:<name>").
 
-type bookbarsLister struct{ q *sqlc.Queries }
+type bookbarsLister struct {
+	q      *sqlc.Queries
+	budget func() workerbudget.Budget
+	sel    *workerbudget.Selector
+	met    *metrics.Metrics
+}
 
 func (l *bookbarsLister) ListBookbarsCandidates(ctx context.Context, limit int) ([]bookbars.Candidate, error) {
+	if l.budget != nil && l.sel != nil {
+		b := l.budget()
+		if !b.AllZero() {
+			res, err := l.sel.Select(ctx, b)
+			if err == nil {
+				recordBucketMetrics(l.met, "bookbars", res)
+				out := make([]bookbars.Candidate, 0, len(res.Rows))
+				for _, r := range res.Rows {
+					out = append(out, bookbars.Candidate{ConditionID: r.ConditionID, Token: r.TokenID})
+				}
+				return out, nil
+			}
+			// fall through to legacy on error — never stall.
+		}
+	}
 	rows, err := l.q.ListBookbarsCandidates(ctx, int32(limit))
 	if err != nil {
 		return nil, err
@@ -126,6 +172,20 @@ func (l *bookbarsLister) ListBookbarsCandidates(ctx context.Context, limit int) 
 		out = append(out, bookbars.Candidate{ConditionID: r.ConditionID, Token: r.TokenID})
 	}
 	return out, nil
+}
+
+// recordBucketMetrics emits one counter increment per (worker, bucket)
+// pair so an operator can graph the bucket mix per worker.
+func recordBucketMetrics(met *metrics.Metrics, worker string, res workerbudget.Result) {
+	if met == nil || met.StrategyWorkerItems == nil {
+		return
+	}
+	for b, n := range res.PerBucket {
+		if n <= 0 {
+			continue
+		}
+		met.StrategyWorkerItems.WithLabelValues(worker, "bucket:"+b.Name()).Add(float64(n))
+	}
 }
 
 type bookbarsFetcher struct{ cl *clob.Client }
@@ -165,9 +225,31 @@ func (s *bookbarsSink) UpsertBar(ctx context.Context, b bookbars.Bar) error {
 
 // --- holdersync v11.10 real adapters ------------------------------
 
-type holdersyncCandidatesLister struct{ q *sqlc.Queries }
+type holdersyncCandidatesLister struct {
+	q      *sqlc.Queries
+	budget func() workerbudget.Budget
+	sel    *workerbudget.Selector
+	met    *metrics.Metrics
+}
 
 func (l *holdersyncCandidatesLister) ListHolderSyncCandidates(ctx context.Context, limit int, _ time.Duration) ([]holdersync.Candidate, error) {
+	if l.budget != nil && l.sel != nil {
+		b := l.budget()
+		if !b.AllZero() {
+			res, err := l.sel.Select(ctx, b)
+			if err == nil {
+				recordBucketMetrics(l.met, "holdersync", res)
+				out := make([]holdersync.Candidate, 0, len(res.Rows))
+				for _, r := range res.Rows {
+					out = append(out, holdersync.Candidate{
+						ConditionID:  r.ConditionID,
+						OutcomeToken: r.TokenID,
+					})
+				}
+				return out, nil
+			}
+		}
+	}
 	// Reuse the bookbars candidate query — it returns (condition_id,
 	// token_id) pairs for active markets, which is exactly what
 	// holdersync needs (one snapshot per token).

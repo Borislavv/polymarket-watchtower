@@ -58,6 +58,13 @@ func main() {
 		// worker uses (polymarket_ws_events, polymarket_live_market_state,
 		// polymarket_realtime_work_queue). NO AI. NO Telegram.
 		runWSSmoke(os.Args[2:])
+	case "replay-strategy-shadow":
+		// v11.10 PART 4 strategy fanout replay report — read-only
+		// aggregate of polymarket_strategy_shadow_decisions plus
+		// staged-input coverage so an operator can see per-strategy
+		// eval/fired/skipped stats on real data. Never writes,
+		// never calls Telegram or AI.
+		runReplayStrategyShadow(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -71,6 +78,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  diagnose-ai      -dsn postgres://… [--limit 20]")
 	fmt.Fprintln(os.Stderr, "  import-catalysts --event <slug> [--persist] [--ai-key $OPENAI_API_KEY] [--model gpt-4.1-mini]")
 	fmt.Fprintln(os.Stderr, "  ws-smoke         --tokens <id1,id2,…> [--duration 60s] [--persist --dsn postgres://…]")
+	fmt.Fprintln(os.Stderr, "  replay-strategy-shadow --dsn postgres://… [--since 24h] [--json]")
 }
 
 func runMigrate(args []string) {

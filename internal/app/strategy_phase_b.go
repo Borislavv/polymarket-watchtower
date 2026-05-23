@@ -21,6 +21,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -239,6 +240,51 @@ func (a *promotionSampleAdapter) ListPromotionSamples(ctx context.Context, lookb
 	return out, nil
 }
 
+// ListPromotionBucketSamples — v11.10 PART 7. Returns per-bucket
+// sub-aggregates across the two diagnostic dimensions:
+//   - decision_level (info / warning / critical / hard)
+//   - linkage        (linked / standalone)
+//
+// Failure to load buckets is non-fatal at the worker layer; we still
+// return an error here so the worker can log it.
+func (a *promotionSampleAdapter) ListPromotionBucketSamples(ctx context.Context, lookback time.Duration) ([]strategypromotion.BucketSample, error) {
+	since := tsFromTime(time.Now().Add(-lookback))
+	out := make([]strategypromotion.BucketSample, 0, 64)
+	dlRows, err := a.q.AggregatePromotionSamplesByDecisionLevel(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range dlRows {
+		out = append(out, strategypromotion.BucketSample{
+			StrategyName:       r.StrategyName,
+			StrategyVersion:    r.StrategyVersion,
+			Dimension:          "decision_level",
+			Key:                r.BucketKey,
+			SampleSize:         int(r.SampleSize),
+			MedianSignedMove6h: r.MedianSignedMove6h,
+			Reversal15mRatio:   r.Reversal15mRatio,
+			AlertsPerDay:       r.AlertsPerDay,
+		})
+	}
+	linkRows, err := a.q.AggregatePromotionSamplesByLinkage(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range linkRows {
+		out = append(out, strategypromotion.BucketSample{
+			StrategyName:       r.StrategyName,
+			StrategyVersion:    r.StrategyVersion,
+			Dimension:          "linkage",
+			Key:                r.BucketKey,
+			SampleSize:         int(r.SampleSize),
+			MedianSignedMove6h: r.MedianSignedMove6h,
+			Reversal15mRatio:   r.Reversal15mRatio,
+			AlertsPerDay:       r.AlertsPerDay,
+		})
+	}
+	return out, nil
+}
+
 type promotionWriterAdapter struct{ q *sqlc.Queries }
 
 func newPromotionWriterAdapter(pool *pgxpool.Pool) *promotionWriterAdapter {
@@ -247,6 +293,12 @@ func newPromotionWriterAdapter(pool *pgxpool.Pool) *promotionWriterAdapter {
 
 func (a *promotionWriterAdapter) WritePromotionReview(ctx context.Context, r strategypromotion.Review) error {
 	reasons, _ := shadowdecisions.MarshalReasons(r.Reasons)
+	var bucketJSON []byte
+	if len(r.Buckets.ByDecisionLevel) > 0 || len(r.Buckets.ByLinkage) > 0 {
+		if b, err := json.Marshal(r.Buckets); err == nil {
+			bucketJSON = b
+		}
+	}
 	return a.q.InsertStrategyPromotionReview(ctx, sqlc.InsertStrategyPromotionReviewParams{
 		StrategyName:       r.StrategyName,
 		StrategyVersion:    r.StrategyVersion,
@@ -256,6 +308,7 @@ func (a *promotionWriterAdapter) WritePromotionReview(ctx context.Context, r str
 		AlertsPerDay:       r.AlertsPerDay,
 		Eligible:           r.Eligible,
 		ReasonsJson:        reasons,
+		BucketDiagnostics:  bucketJSON,
 		ReviewedAt:         tsFromTime(r.ReviewedAt),
 	})
 }

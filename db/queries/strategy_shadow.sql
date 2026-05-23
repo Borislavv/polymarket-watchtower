@@ -169,12 +169,52 @@ WHERE id = @id;
 INSERT INTO polymarket_strategy_promotion_reviews (
     strategy_name, strategy_version, sample_size,
     median_signed_move_6h, reversal_15m_ratio, alerts_per_day,
-    eligible, reasons_json, reviewed_at
+    eligible, reasons_json, bucket_diagnostics, reviewed_at
 ) VALUES (
     @strategy_name, @strategy_version, @sample_size,
     @median_signed_move_6h, @reversal_15m_ratio, @alerts_per_day,
-    @eligible, @reasons_json, @reviewed_at
+    @eligible, @reasons_json, @bucket_diagnostics, @reviewed_at
 );
+
+-- v11.10 PART 7 — bucketed promotion samples (decision_level dim).
+-- Per-(strategy, version, decision_level) sub-aggregate. The Go layer
+-- joins this with AggregatePromotionSamplesByLinkage to assemble the
+-- bucket_diagnostics JSONB column on the review row.
+
+-- name: AggregatePromotionSamplesByDecisionLevel :many
+SELECT strategy_name,
+       COALESCE(strategy_version, '') AS strategy_version,
+       COALESCE(decision_level, 'unknown') AS bucket_key,
+       COUNT(*)::INTEGER AS sample_size,
+       COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY clv_6h), 0)::DOUBLE PRECISION AS median_signed_move_6h,
+       COALESCE(AVG(CASE WHEN clv_15m IS NOT NULL AND clv_15m > 0 AND clv_1h IS NOT NULL AND clv_1h <= 0 THEN 1.0 ELSE 0.0 END), 0)::DOUBLE PRECISION AS reversal_15m_ratio,
+       (COUNT(*)::DOUBLE PRECISION / GREATEST(EXTRACT(EPOCH FROM (NOW() - MIN(fired_at))) / 86400, 1))::DOUBLE PRECISION AS alerts_per_day
+FROM polymarket_strategy_shadow_decisions
+WHERE fired_at >= @lookback_start
+  AND COALESCE(strategy_version, '') NOT ILIKE '%integration%'
+  AND COALESCE(strategy_version, '') NOT ILIKE '%probe%'
+  AND COALESCE(strategy_version, '') NOT ILIKE '%test%'
+  AND clv_6h IS NOT NULL
+GROUP BY strategy_name, strategy_version, decision_level
+ORDER BY strategy_name, strategy_version, bucket_key;
+
+-- name: AggregatePromotionSamplesByLinkage :many
+SELECT strategy_name,
+       COALESCE(strategy_version, '') AS strategy_version,
+       CASE WHEN linked_alert_dedup_key IS NULL OR linked_alert_dedup_key = ''
+            THEN 'standalone' ELSE 'linked' END AS bucket_key,
+       COUNT(*)::INTEGER AS sample_size,
+       COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY clv_6h), 0)::DOUBLE PRECISION AS median_signed_move_6h,
+       COALESCE(AVG(CASE WHEN clv_15m IS NOT NULL AND clv_15m > 0 AND clv_1h IS NOT NULL AND clv_1h <= 0 THEN 1.0 ELSE 0.0 END), 0)::DOUBLE PRECISION AS reversal_15m_ratio,
+       (COUNT(*)::DOUBLE PRECISION / GREATEST(EXTRACT(EPOCH FROM (NOW() - MIN(fired_at))) / 86400, 1))::DOUBLE PRECISION AS alerts_per_day
+FROM polymarket_strategy_shadow_decisions
+WHERE fired_at >= @lookback_start
+  AND COALESCE(strategy_version, '') NOT ILIKE '%integration%'
+  AND COALESCE(strategy_version, '') NOT ILIKE '%probe%'
+  AND COALESCE(strategy_version, '') NOT ILIKE '%test%'
+  AND clv_6h IS NOT NULL
+GROUP BY strategy_name, strategy_version, bucket_key
+ORDER BY strategy_name, strategy_version, bucket_key;
 
 -- name: AggregatePromotionSamples :many
 SELECT strategy_name,
@@ -487,3 +527,99 @@ WHERE m.active = TRUE AND m.closed = FALSE
   AND mo.token_id IS NOT NULL AND mo.token_id <> ''
 ORDER BY m.last_seen_at DESC NULLS LAST
 LIMIT @row_limit;
+
+-- v11.10 PART 6 — worker priority-bucket budgeting.
+-- Returns deduped (condition_id, token_id) pairs annotated with their
+-- highest-priority bucket. Buckets:
+--   1 = operator-pinned (explicit condition_ids array)
+--   2 = recent-alert (≤24h)
+--   3 = catalyst-near (status active/expected, ≤72h ahead)
+--   4 = linked-to-fired (market_links neighbour of any recent alert)
+--   5 = liquid (top by Polymarket liquidity, recent event-page snapshot)
+--   6 = fallback active (last_seen_at DESC)
+-- Each bucket respects its own LIMIT so a fat bucket can't starve the
+-- others. Dedupe keeps the MIN(bucket) per condition_id — once a
+-- market is operator-pinned it is not double-counted as fallback.
+
+-- name: ListBucketedMarketTokens :many
+WITH pinned AS (
+    SELECT m.condition_id, 1::int AS bucket
+    FROM polymarket_markets m
+    WHERE m.deleted_at IS NULL AND m.purged_at IS NULL
+      AND m.condition_id = ANY(@pinned_condition_ids::text[])
+    LIMIT @pinned_limit::int
+),
+recent_alert AS (
+    SELECT DISTINCT pm.condition_id, 2::int AS bucket
+    FROM polymarket_alerts a
+    JOIN polymarket_markets pm ON pm.id = a.market_id
+    WHERE a.created_at > NOW() - INTERVAL '24 hours'
+      AND pm.deleted_at IS NULL AND pm.purged_at IS NULL
+    LIMIT @recent_alert_limit::int
+),
+catalyst_near AS (
+    SELECT DISTINCT pm.condition_id, 3::int AS bucket
+    FROM polymarket_event_catalysts c
+    JOIN polymarket_markets pm ON pm.event_slug = c.event_slug
+    WHERE c.status IN ('active','expected')
+      AND pm.deleted_at IS NULL AND pm.purged_at IS NULL
+      AND (c.expected_at IS NULL OR c.expected_at <= NOW() + INTERVAL '72 hours')
+    LIMIT @catalyst_near_limit::int
+),
+linked_to_fired AS (
+    SELECT DISTINCT ml.src_condition_id AS condition_id, 4::int AS bucket
+    FROM polymarket_market_links ml
+    JOIN polymarket_alerts a ON a.created_at > NOW() - INTERVAL '24 hours'
+    JOIN polymarket_markets pm_a ON pm_a.id = a.market_id
+    WHERE ml.dst_condition_id = pm_a.condition_id
+    UNION
+    SELECT DISTINCT ml.dst_condition_id, 4::int AS bucket
+    FROM polymarket_market_links ml
+    JOIN polymarket_alerts a ON a.created_at > NOW() - INTERVAL '24 hours'
+    JOIN polymarket_markets pm_a ON pm_a.id = a.market_id
+    WHERE ml.src_condition_id = pm_a.condition_id
+    LIMIT @linked_to_fired_limit::int
+),
+liquid AS (
+    SELECT q.condition_id, 5::int AS bucket
+    FROM (
+        SELECT pm.condition_id, MAX(em.liquidity) AS max_liq
+        FROM polymarket_event_page_markets em
+        JOIN polymarket_markets pm ON pm.condition_id = em.condition_id
+        WHERE em.created_at > NOW() - INTERVAL '24 hours'
+          AND em.active = TRUE
+          AND pm.deleted_at IS NULL AND pm.purged_at IS NULL
+        GROUP BY pm.condition_id
+    ) q
+    ORDER BY q.max_liq DESC NULLS LAST
+    LIMIT @liquid_limit::int
+),
+fallback_active AS (
+    SELECT m.condition_id, 6::int AS bucket
+    FROM polymarket_markets m
+    WHERE m.active = TRUE AND m.closed = FALSE
+      AND m.deleted_at IS NULL AND m.purged_at IS NULL
+    ORDER BY m.last_seen_at DESC NULLS LAST
+    LIMIT @fallback_limit::int
+),
+unioned AS (
+    SELECT * FROM pinned
+    UNION ALL SELECT * FROM recent_alert
+    UNION ALL SELECT * FROM catalyst_near
+    UNION ALL SELECT * FROM linked_to_fired
+    UNION ALL SELECT * FROM liquid
+    UNION ALL SELECT * FROM fallback_active
+),
+dedup AS (
+    SELECT condition_id, MIN(bucket) AS bucket
+    FROM unioned
+    GROUP BY condition_id
+)
+SELECT d.condition_id::text   AS condition_id,
+       COALESCE(mo.token_id, '')::text AS token_id,
+       d.bucket::int          AS bucket
+FROM dedup d
+JOIN polymarket_markets m ON m.condition_id = d.condition_id
+JOIN polymarket_market_outcomes mo ON mo.market_id = m.id
+WHERE mo.token_id IS NOT NULL AND mo.token_id <> ''
+ORDER BY d.bucket ASC, d.condition_id ASC;

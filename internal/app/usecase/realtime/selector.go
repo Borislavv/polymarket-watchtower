@@ -86,25 +86,39 @@ func (s *PostgresSelector) Select(ctx context.Context, mode string, maxMarkets i
 //
 // IMPORTANT: every variant LIMITs by $1 so we never subscribe to
 // thousands of markets blindly.
+//
+// Pairing tokens with outcomes uses LATERAL `WITH ORDINALITY` on both
+// JSONB arrays joined by position. We do NOT call set-returning
+// functions (unnest, jsonb_array_elements_text) inside COALESCE or
+// CASE — Postgres rejects that as SQLSTATE 0A000.
 func buildSelectorSQL(mode string) string {
 	common := `
 SELECT m.event_slug,
        m.condition_id,
        m.market_slug,
-       unnest(m.clob_token_ids_arr) AS clob_token_id,
-       COALESCE(m.outcomes_arr[array_position(m.clob_token_ids_arr, unnest(m.clob_token_ids_arr))], '') AS outcome
+       tok.token AS clob_token_id,
+       COALESCE(out.outcome, '') AS outcome
 FROM (
     SELECT em.event_slug,
            em.condition_id,
            em.market_slug,
-           ARRAY(SELECT jsonb_array_elements_text(em.clob_token_ids_json)) AS clob_token_ids_arr,
-           ARRAY(SELECT jsonb_array_elements_text(em.outcomes_json))       AS outcomes_arr,
+           em.clob_token_ids_json,
+           em.outcomes_json,
            em.created_at
     FROM polymarket_event_page_markets em
     WHERE em.created_at > NOW() - INTERVAL '24 hours'
       AND em.active = TRUE
     ORDER BY em.created_at DESC
 ) m
+CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(m.clob_token_ids_json, '[]'::jsonb))
+    WITH ORDINALITY AS tok(token, ord)
+LEFT JOIN LATERAL (
+    SELECT o.outcome
+    FROM jsonb_array_elements_text(COALESCE(m.outcomes_json, '[]'::jsonb))
+        WITH ORDINALITY AS o(outcome, ord)
+    WHERE o.ord = tok.ord
+    LIMIT 1
+) AS out ON TRUE
 `
 	switch mode {
 	case "predictions":

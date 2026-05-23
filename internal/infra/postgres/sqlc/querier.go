@@ -28,6 +28,12 @@ type Querier interface {
 	// has the given event_slug within the lookback window.
 	AggregateEventAlertsByKindAndSeverity(ctx context.Context, arg AggregateEventAlertsByKindAndSeverityParams) ([]AggregateEventAlertsByKindAndSeverityRow, error)
 	AggregatePromotionSamples(ctx context.Context, lookbackStart pgtype.Timestamptz) ([]AggregatePromotionSamplesRow, error)
+	// v11.10 PART 7 — bucketed promotion samples (decision_level dim).
+	// Per-(strategy, version, decision_level) sub-aggregate. The Go layer
+	// joins this with AggregatePromotionSamplesByLinkage to assemble the
+	// bucket_diagnostics JSONB column on the review row.
+	AggregatePromotionSamplesByDecisionLevel(ctx context.Context, lookbackStart pgtype.Timestamptz) ([]AggregatePromotionSamplesByDecisionLevelRow, error)
+	AggregatePromotionSamplesByLinkage(ctx context.Context, lookbackStart pgtype.Timestamptz) ([]AggregatePromotionSamplesByLinkageRow, error)
 	// v11.9 PART 5 — thesis lines wallet aggregate.
 	// Aggregates per (wallet, condition_id) directional exposure across
 	// linked markets within a lookback window. The orchestration layer
@@ -245,6 +251,19 @@ type Querier interface {
 	ListBaselineTrades(ctx context.Context, arg ListBaselineTradesParams) ([]PolymarketTrades, error)
 	// Active tokens for bookbars worker. Bounded by limit.
 	ListBookbarsCandidates(ctx context.Context, rowLimit int32) ([]ListBookbarsCandidatesRow, error)
+	// v11.10 PART 6 — worker priority-bucket budgeting.
+	// Returns deduped (condition_id, token_id) pairs annotated with their
+	// highest-priority bucket. Buckets:
+	//   1 = operator-pinned (explicit condition_ids array)
+	//   2 = recent-alert (≤24h)
+	//   3 = catalyst-near (status active/expected, ≤72h ahead)
+	//   4 = linked-to-fired (market_links neighbour of any recent alert)
+	//   5 = liquid (top by Polymarket liquidity, recent event-page snapshot)
+	//   6 = fallback active (last_seen_at DESC)
+	// Each bucket respects its own LIMIT so a fat bucket can't starve the
+	// others. Dedupe keeps the MIN(bucket) per condition_id — once a
+	// market is operator-pinned it is not double-counted as fallback.
+	ListBucketedMarketTokens(ctx context.Context, arg ListBucketedMarketTokensParams) ([]ListBucketedMarketTokensRow, error)
 	ListCatalystsForEvent(ctx context.Context, arg ListCatalystsForEventParams) ([]ListCatalystsForEventRow, error)
 	ListClosedRepricingWindowsForCondition(ctx context.Context, arg ListClosedRepricingWindowsForConditionParams) ([]ListClosedRepricingWindowsForConditionRow, error)
 	// All trades in the per-category cluster window. Used by the cluster

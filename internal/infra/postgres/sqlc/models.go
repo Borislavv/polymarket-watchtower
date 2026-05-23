@@ -704,6 +704,7 @@ type PolymarketStrategyPromotionReviews struct {
 	ReasonsJson        []byte
 	ReviewedAt         pgtype.Timestamptz
 	CreatedAt          pgtype.Timestamptz
+	BucketDiagnostics  []byte
 }
 
 type PolymarketStrategyShadowDecisions struct {

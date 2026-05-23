@@ -299,6 +299,28 @@ Safety layer — caps/blocks risky signals. NOT standalone alpha.
 | `TELEGRAM_STRATEGY_USER_DEDUPE_WINDOW` | `12h` | duration | user dedupe window |
 | `TELEGRAM_STRATEGY_ADMIN_DEDUPE_WINDOW` | `1h` | duration | admin dedupe window |
 
+## 5b. Worker priority-bucket budgeting (v11.10 PART 6)
+
+Bucket caps for the strategy-supporting workers (holdersync, bookbars).
+Instead of `MAX_MARKETS` scanning all active markets, the selector
+issues ONE bucketed Postgres query and distributes the worker's
+per-cycle quota across six priority buckets. A zero cap disables a
+bucket; when every cap is 0 AND no pins are supplied the workers fall
+back to the legacy unbucketed lister (backward-compatible).
+
+| KEY | DEFAULT | TYPE | EFFECT |
+|---|---|---|---|
+| `WORKER_BUDGET_OPERATOR_PINNED_MARKETS` | `20` | int | cap for explicit pins (bucket 1) |
+| `WORKER_BUDGET_RECENT_ALERT_MARKETS` | `30` | int | markets fired in last 24h (bucket 2) |
+| `WORKER_BUDGET_CATALYST_NEAR_MARKETS` | `40` | int | active/expected catalyst, ≤72h ahead (bucket 3) |
+| `WORKER_BUDGET_LINKED_TO_FIRED_MARKETS` | `30` | int | market_links neighbour of fired alert (bucket 4) |
+| `WORKER_BUDGET_LIQUID_MARKETS` | `50` | int | top by Polymarket liquidity, 24h event-page snapshot (bucket 5) |
+| `WORKER_BUDGET_FALLBACK_ACTIVE_MARKETS` | `20` | int | safety net (`last_seen_at DESC`, bucket 6) |
+| `WORKER_OPERATOR_PINNED_CONDITION_IDS` | empty | string list (comma-separated) | explicit condition ids for bucket 1 |
+
+Per-bucket attribution lands in
+`watchtower_strategy_worker_items_total{worker=…, op="bucket:<name>"}`.
+
 ## 6. Legacy disabled surfaces (must remain false)
 
 Pinned by `TestEnvFiles_DangerousDefaultsBlocked` + `TestLegacyTelegramSurfaces_StayDisabledByDefault` + `staleEnvKeys{}`.

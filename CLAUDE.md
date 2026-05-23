@@ -1404,3 +1404,93 @@ to a config struct (legacy stale keys).
    continues to emit Tag-only — once the lines table is populated by
    the v11.9 worker, the existing thesisaccum hooks can switch from
    structural Tag to real KindStandalone fires).
+
+## Strategy Learning Loop v11.10 (production-grade hardening)
+
+v11.10 PART 1 — **WS selector COALESCE bug fix.** The hot-mode
+subscription SQL used `unnest()` inside a `COALESCE()` expression to
+align JSONB `clob_token_ids` with `outcomes` by index. Postgres 14+
+rejects this with SQLSTATE 0A000 ("set-returning functions are not
+allowed in COALESCE"). The fix uses two `LATERAL ... WITH ORDINALITY`
+joins on `jsonb_array_elements_text` — token ↔ outcome are paired by
+ordinal position. Pinned by
+`TestBuildSelectorSQL_NoSRFInsideCoalesce`,
+`TestBuildSelectorSQL_UsesLateralWithOrdinality`, and
+`TestBuildSelectorSQL_AlwaysLimitsByOne` in
+`internal/app/usecase/realtime/selector_test.go`.
+
+The companion safety guard in `Worker.persistEvent`: `raw_json` is a
+JSONB column, so any byte slice that is NOT valid JSON (heartbeat /
+pong / truncated frames) is dropped to nil at the persist boundary
+via `json.Valid` rather than fed to Postgres. Otherwise the driver
+returns SQLSTATE 22P02 per event. Pinned by
+`TestHandle_RawCaptureDropsInvalidJSON`.
+
+v11.10 PART 6 — **Worker priority-bucket budgeting.** Strategy-
+supporting workers (holdersync, bookbars) no longer scan every active
+market. They consult `internal/app/usecase/workerbudget.Selector`,
+which issues ONE Postgres roundtrip (`ListBucketedMarketTokens`) that
+returns deduped `(condition_id, token_id)` rows annotated with their
+highest-priority bucket:
+
+| Bucket | Source |
+|---|---|
+| 1 — operator_pinned | `WORKER_OPERATOR_PINNED_CONDITION_IDS` |
+| 2 — recent_alert | `polymarket_alerts.created_at > NOW() - 24h` |
+| 3 — catalyst_near | `polymarket_event_catalysts.status IN ('active','expected')` AND `expected_at ≤ NOW()+72h` |
+| 4 — linked_to_fired | `polymarket_market_links` neighbour of any recent alert |
+| 5 — liquid | top by `polymarket_event_page_markets.liquidity` over recent 24h snapshot |
+| 6 — fallback_active | safety net — `polymarket_markets ORDER BY last_seen_at DESC` |
+
+Each bucket has its own per-cycle cap so a fat bucket cannot starve
+operator pins. Dedup keeps MIN(bucket) per `condition_id`. Per-bucket
+selection counts are emitted as
+`watchtower_strategy_worker_items_total{worker, op="bucket:<name>"}`
+so an operator can see the bucket mix per worker on the dashboard.
+When all caps are 0 AND no pins are set, workers fall back to the
+legacy unbucketed lister (backward-compatible).
+
+Config keys (defaults match the v11.10 ТЗ):
+`WORKER_BUDGET_OPERATOR_PINNED_MARKETS=20`,
+`WORKER_BUDGET_RECENT_ALERT_MARKETS=30`,
+`WORKER_BUDGET_CATALYST_NEAR_MARKETS=40`,
+`WORKER_BUDGET_LINKED_TO_FIRED_MARKETS=30`,
+`WORKER_BUDGET_LIQUID_MARKETS=50`,
+`WORKER_BUDGET_FALLBACK_ACTIVE_MARKETS=20`,
+`WORKER_OPERATOR_PINNED_CONDITION_IDS=`. All pinned in
+`internal/app/env_audit_test.go::TestEnvFiles_StrategyV11KeysAllPresent`.
+
+v11.10 PART 7 — **Bucketed promotion review.**
+`polymarket_strategy_promotion_reviews.bucket_diagnostics JSONB`
+(migration 00034) carries per-bucket sub-aggregates so a strategy
+cannot be declared healthy purely on a weak whole-strategy median.
+Two dimensions today: `decision_level` (info / warning / critical /
+hard) and `linkage` (linked / standalone). The worker now consumes
+`AggregatePromotionSamplesByDecisionLevel` +
+`AggregatePromotionSamplesByLinkage`, computes a `BucketReview` per
+key, and persists the assembly into the JSONB column. The eligibility
+veto: a strategy with `Eligible=true` on the whole-strategy aggregate
+is downgraded to `Eligible=false` (reason `no_eligible_non_trivial_bucket`)
+unless at least ONE bucket with `SampleSize ≥ MinSampleSize` is also
+eligible — exactly the failure mode PART 7 closes. Pinned by
+`TestEvaluateBuckets_PerBucketEligibilityFollowsSameRules`,
+`TestTick_BucketVetoBlocksHealthyAggregate`, and
+`TestTick_BucketDiagnosticsPersisted`.
+
+v11.10 PART 4 — **Strategy fanout replay report.** New CLI command
+`go run ./cmd/cli replay-strategy-shadow --dsn=… [--since 24h] [--json]`.
+Read-only aggregate over `polymarket_strategy_shadow_decisions` +
+latest promotion review (with bucket diagnostics) +
+staged-input coverage of recent alerts (active catalysts,
+market_links, closed/stale repricing windows, risk scores,
+walletgraph edges, fresh bookbars, fresh holder snapshots). Lets the
+operator see per-strategy eval / fired / shadow_only / promoted /
+linked / standalone / with_clv counts WITHOUT touching Telegram, AI,
+or the live alert pipeline. The report is the canonical "did the
+fanout actually fire?" diagnostic.
+
+The command is intentionally NOT a write path — synthesising shadow
+rows during a smoke would violate the v11.10 "never fake data" rule.
+Fresh shadow rows only land when a real alert fires on the production
+binary.
+

@@ -27,6 +27,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -307,6 +308,14 @@ func (w *Worker) persistEvent(ctx context.Context, ev ws.Event) {
 		raw = nil
 	} else if w.cfg.RawCaptureMaxBytes > 0 && len(raw) > w.cfg.RawCaptureMaxBytes {
 		raw = raw[:w.cfg.RawCaptureMaxBytes]
+	}
+	// raw_json is a JSONB column — Postgres rejects non-JSON bytes
+	// with SQLSTATE 22P02. The WS stream contains heartbeat / pong /
+	// "unknown" frames whose Raw payload is plain text. Validate
+	// before persisting; on invalid input drop the raw bytes (the
+	// other typed columns still land).
+	if len(raw) > 0 && !json.Valid(raw) {
+		raw = nil
 	}
 	row := repository.WSEventRow{
 		ReceivedAt:        ev.ReceivedAt,
