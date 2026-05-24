@@ -1494,3 +1494,55 @@ rows during a smoke would violate the v11.10 "never fake data" rule.
 Fresh shadow rows only land when a real alert fires on the production
 binary.
 
+## WebSocket selector v11.12 (insider-prior; market-limited)
+
+v11.12 rebuilt `internal/app/usecase/realtime/selector.go` around two
+non-negotiable contracts:
+
+- **prediction-free.** The selector no longer references
+  `polymarket_market_predictions`, `current_state`, or any prediction-
+  state input. Prediction tables are stale (v11.2 stopped writing) and
+  were silently degrading WS coverage by ranking dead rows into the hot
+  set. The legacy modes `predictions` and `all_active_limited` are
+  removed; `hot` and `alerts` are the only valid `WS_SUBSCRIPTION_MODE`
+  values. Pinned by
+  `selector_test.go::TestBuildSelectorSQL_NoPredictionReferences`.
+
+- **market-limited, not token-limited.** The selector caps at
+  `WS_MAX_MARKETS` ($1) and every selected market expands to ALL its
+  `clob_token_ids`. The WS client subscribes to every distinct token
+  with no per-market cap, no first-N slicing, no `WS_MAX_TOKENS`
+  truncation. The previous behaviour silently dropped May/Jul/Dec
+  multi-leg outcome tokens when the binary cap landed between
+  outcomes — the explicit failure mode this rebuild closes. The legacy
+  `WS_MAX_TOKENS` key is in `staleEnvKeys{}` and boot-fails loudly if
+  set. The replacement `WS_MAX_TOKENS_HARD_CAP` (default 50000) is a
+  circuit-breaker only — when exceeded, `ws.Client.Run` returns
+  `ws.ErrTokenHardCapExceeded` rather than slicing. Pinned by
+  `selector_test.go::TestBuildSelectorSQL_LimitIsMarketsNotTokens`,
+  `subscribe_resolver_test.go::TestResolveSubscribeTokens_*`.
+
+New hot bucket scheme (priority 1 = highest):
+
+| Priority | Bucket | Source |
+|---|---|---|
+| 1 | `operator_pinned` | `WORKER_OPERATOR_PINNED_CONDITION_IDS` (text[] passed as $2) |
+| 2 | `recent_alert` | `polymarket_alerts.created_at > NOW() - 24h` |
+| 3 | `active_or_expected_catalyst` | `polymarket_event_catalysts.status IN ('active','expected')` |
+| 4 | `repricing_signal` | `polymarket_repricing_signals.created_at > NOW() - 24h` with status / flow_timing filter |
+| 5 | `event_annotation_recent` | `polymarket_event_annotations.timestamp > NOW() - WS_ANNOTATION_LOOKBACK` (default 168h = 7d) |
+| 6 | `high_trade_market` | opt-in (`WS_INCLUDE_HIGH_TRADE_MARKETS=true`) |
+
+**Annotation lookback widened from 12h to 7d.** Live audit of
+`polymarket_event_annotations` (875 rows, source=`linkup`, title +
+summary + price_change) showed the linkup feed emits ~1 entry per day
+per event. The previous 12h window caught **1** event vs **4** events
+at 7d on identical live data. The widening is configured via
+`WS_ANNOTATION_LOOKBACK=168h` (default).
+
+CLI: `go run ./cmd/cli ws-selector-debug --dsn=… --limit-markets=… [--show-tokens] [--include-high-trade] [--operator-pinned=cid1,cid2] [--json]`
+reports `selected markets`, `selected tokens`, `max tokens per market`,
+`markets with >2 tokens`, `total token expansion`,
+`dropped tokens` (must be 0), `prediction buckets present`
+(must be `no`), and per-market full token expansion.
+

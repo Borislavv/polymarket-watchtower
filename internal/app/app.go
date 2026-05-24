@@ -642,6 +642,77 @@ func New() (*App, error) {
 			MaxRows:      cfg.Strategy.StagedInputs.MaxRows,
 			QueryTimeout: cfg.Strategy.StagedInputs.QueryTimeout,
 		})
+		// v11.12-insider-prior: typed strategy thresholds flow through
+		// here, replacing the previously-hardcoded detector configs
+		// inside detect.recordStrategyShadow. Zero-value sub-structs
+		// fall through to detector defaults.
+		detectCfg.StrategyThesisAccum = detect.ThesisAccumRuntimeConfig{
+			LookbackLifetime:  cfg.Strategy.ThesisAccum.LookbackLifetime,
+			MinBreadth:        cfg.Strategy.ThesisAccum.MinBreadth,
+			MinConsistency:    cfg.Strategy.ThesisAccum.MinConsistency,
+			MinAlignedScore:   cfg.Strategy.ThesisAccum.MinAlignedScore,
+			CatalystBoostMax:  cfg.Strategy.ThesisAccum.CatalystBoostMax,
+			LiquidityFloorUSD: cfg.Strategy.ThesisAccum.LiquidityFloorUSD,
+			MaxLinkedMarkets:  cfg.Strategy.ThesisAccum.MaxLinkedMarkets,
+		}
+		detectCfg.StrategyHolderDelta = detect.HolderDeltaRuntimeConfig{
+			MinPctOIInfo:        cfg.Strategy.OwnershipV2.MinPctOIInfo,
+			MinPctOIWarning:     cfg.Strategy.OwnershipV2.MinPctOIWarn,
+			MinPctOICritical:    cfg.Strategy.OwnershipV2.MinPctOICrit,
+			TopK:                cfg.Strategy.OwnershipV2.TopK,
+			MinSharesDelta:      cfg.Strategy.OwnershipV2.MinSharesDelta,
+			OIShrinkPenalty:     cfg.Strategy.OwnershipV2.DenominatorPenaltyOI,
+			FreshSnapshotMaxAge: cfg.Strategy.OwnershipV2.FreshSnapshotMaxAge,
+		}
+		detectCfg.StrategyCatalystWindow = detect.CatalystWindowRuntimeConfig{
+			MinConfidence:         cfg.Strategy.CatalystWindow.MinConfidence,
+			DebatePre:             cfg.Strategy.CatalystWindow.DebatePre,
+			DebatePost:            cfg.Strategy.CatalystWindow.DebatePost,
+			CourtRulingPre:        cfg.Strategy.CatalystWindow.CourtRulingPre,
+			CourtRulingPost:       cfg.Strategy.CatalystWindow.CourtRulingPost,
+			ElectionDayPre:        cfg.Strategy.CatalystWindow.ElectionDayPre,
+			ElectionDayPost:       cfg.Strategy.CatalystWindow.ElectionDayPost,
+			OfficialStatementPre:  cfg.Strategy.CatalystWindow.OfficialStatementPre,
+			OfficialStatementPost: cfg.Strategy.CatalystWindow.OfficialStatementPost,
+			GenericPre:            cfg.Strategy.CatalystWindow.GenericPre,
+			GenericPost:           cfg.Strategy.CatalystWindow.GenericPost,
+		}
+		detectCfg.StrategyBookVacuum = detect.BookVacuumRuntimeConfig{
+			MinCollapsePct: cfg.Strategy.BookVacuum.MinCollapsePct,
+			MinSpreadZ:     cfg.Strategy.BookVacuum.MinSpreadZ,
+			MinMidShiftPct: cfg.Strategy.BookVacuum.MinMidShiftPct,
+			MaxAgeBar:      cfg.Strategy.BookVacuum.MaxAgeBar,
+			TopN:           cfg.Strategy.BookVacuum.TopN,
+		}
+		detectCfg.StrategyRepricingLag = detect.RepricingLagRuntimeConfig{
+			MinLagCents:  cfg.Strategy.RepricingLag.MinLagCents,
+			PeerMinCount: cfg.Strategy.RepricingLag.PeerMinCount,
+			MaxAmbiguity: cfg.Strategy.RepricingLag.MaxAmbiguity,
+		}
+		detectCfg.StrategyWalletCohort = detect.WalletCohortRuntimeConfig{
+			MinSimilarity:       cfg.Strategy.WalletCohort.MinSimilarity,
+			MinEvents:           cfg.Strategy.WalletCohort.MinEvents,
+			MinCohortHits:       cfg.Strategy.WalletCohort.MinCohortHits,
+			ConvergenceWindow:   cfg.Strategy.WalletCohort.ConvergenceWindow,
+			FreshWalletMinBurst: cfg.Strategy.WalletCohort.FreshWalletMinBurst,
+			FreshWalletMaxAge:   cfg.Strategy.WalletCohort.FreshWalletMaxAge,
+		}
+		detectCfg.StrategyConflictResolve = detect.ConflictResolveRuntimeConfig{
+			Window:        cfg.Strategy.ConflictResolve.Window,
+			MinDominance:  cfg.Strategy.ConflictResolve.MinDominance,
+			MMPenalty:     cfg.Strategy.ConflictResolve.MMPenalty,
+			MinQualitySum: cfg.Strategy.ConflictResolve.MinQualitySum,
+		}
+		detectCfg.StrategyCheapTail = detect.CheapTailRuntimeConfig{
+			MinPrice:        cfg.Strategy.CheapTail.MinProb,
+			MaxPrice:        cfg.Strategy.CheapTail.MaxProb,
+			MinNotionalUSD:  cfg.Strategy.CheapTail.MinNotionalUSD,
+			MinTrades:       cfg.Strategy.CheapTail.MinTrades,
+			RequireCatalyst: cfg.Strategy.CheapTail.RequireCatalyst,
+			AmbiguityCutoff: cfg.Strategy.CheapTail.AmbiguityCutoff,
+		}
+		// v11.12 marketregime classifier — pure, stateless.
+		detectCfg.StrategyMarketRegime = newMarketRegimeAdapter()
 	}
 	// v11.7 Phase C — production adapters for the 5 supporting
 	// workers + outcome backfill evaluator. Inert when their
@@ -1150,25 +1221,27 @@ func New() (*App, error) {
 	if cfg.Postgres.Enabled() && cfg.WS.Enabled {
 		realtimeStore := repository.NewRealtimeRepository(pgPool)
 		wsClient := ws.New(ws.Config{
-			Endpoint:     cfg.WS.Endpoint,
-			MaxTokens:    cfg.WS.MaxTokens,
-			PingInterval: cfg.WS.PingInterval,
-			ReadTimeout:  cfg.WS.ReadTimeout,
-			WriteTimeout: cfg.WS.WriteTimeout,
-			ReconnectMin: cfg.WS.ReconnectMinBackoff,
-			ReconnectMax: cfg.WS.ReconnectMaxBackoff,
-			EventBuffer:  cfg.WS.EventBuffer,
+			Endpoint:         cfg.WS.Endpoint,
+			MaxTokensHardCap: cfg.WS.MaxTokensHardCap,
+			PingInterval:     cfg.WS.PingInterval,
+			ReadTimeout:      cfg.WS.ReadTimeout,
+			WriteTimeout:     cfg.WS.WriteTimeout,
+			ReconnectMin:     cfg.WS.ReconnectMinBackoff,
+			ReconnectMax:     cfg.WS.ReconnectMaxBackoff,
+			EventBuffer:      cfg.WS.EventBuffer,
 		}, met, logger)
 		selector := realtime.NewPostgresSelector(pgPool)
 		selector.IncludeHighTrade = cfg.WS.IncludeHighTradeMarkets
 		selector.HighTradeMinTrades24h = cfg.WS.HighTradeMinTrades24h
 		selector.HighTradeLookbackHours = cfg.WS.HighTradeLookbackHours
+		selector.AnnotationLookback = cfg.WS.AnnotationLookback
+		selector.OperatorPinnedConditionIDs = cfg.Strategy.WorkerBudget.PinnedConditionIDs
 		realtimeWorker = realtime.New(realtime.Config{
 			Enabled:                   cfg.WS.Enabled,
 			MarketStreamEnabled:       cfg.WS.MarketStreamEnabled,
 			SubscriptionMode:          cfg.WS.SubscriptionMode,
 			MaxMarkets:                cfg.WS.MaxMarkets,
-			MaxTokens:                 cfg.WS.MaxTokens,
+			MaxTokensHardCap:          cfg.WS.MaxTokensHardCap,
 			ReconnectMin:              cfg.WS.ReconnectMinBackoff,
 			ReconnectMax:              cfg.WS.ReconnectMaxBackoff,
 			PingInterval:              cfg.WS.PingInterval,

@@ -623,3 +623,44 @@ JOIN polymarket_markets m ON m.condition_id = d.condition_id
 JOIN polymarket_market_outcomes mo ON mo.market_id = m.id
 WHERE mo.token_id IS NOT NULL AND mo.token_id <> ''
 ORDER BY d.bucket ASC, d.condition_id ASC;
+
+-- v11.12-insider-prior — staged readers for holderdelta + bookvacuum.
+-- Both detectors take pure inputs (snapshot pair / FeatureBar pair),
+-- so the readers must return the alert wallet's CURRENT + PREVIOUS
+-- snapshot in a single roundtrip. detect.Loop is hot-path; queries
+-- are bounded by indexes already present on the production tables.
+
+-- name: GetCurrentAndPreviousHolderSnapshot :many
+-- Returns the latest two snapshots for (condition_id, outcome_token,
+-- wallet). Hits the `idx_holder_snapshots_wallet_at` index for the
+-- bounded scan; row order is freshest-first so the caller treats
+-- index 0 as current, index 1 as previous.
+--
+-- The previous-snapshot pair is the input to holderdelta.Decide;
+-- when only one row exists, the caller falls through with a
+-- "no_previous_snapshot" skip reason.
+SELECT condition_id, outcome_token, wallet,
+       snapshot_at, rank, shares, notional_usd, pct_oi, total_oi
+FROM polymarket_holder_snapshots
+WHERE condition_id  = @condition_id
+  AND outcome_token = @outcome_token
+  AND wallet        = @wallet
+ORDER BY snapshot_at DESC
+LIMIT 2;
+
+-- name: ListRecentBookFeatureBars :many
+-- Returns the most-recent `row_limit` 1s/5s bars for a token.
+-- bookvacuum.Decide consumes index 0 as Recent and computes a
+-- rolling baseline from the remainder. Bar freshness gate is
+-- enforced by the caller; this query is purely a bounded reader.
+SELECT condition_id, outcome_token, bar_seconds, bar_start,
+       best_bid, best_ask, mid_price,
+       bid_depth_top_n, ask_depth_top_n,
+       spread, spread_z,
+       bid_depth_delta_pct, ask_depth_delta_pct, mid_delta
+FROM polymarket_book_feature_bars
+WHERE condition_id  = @condition_id
+  AND outcome_token = @outcome_token
+  AND bar_start    >= @since
+ORDER BY bar_start DESC
+LIMIT @row_limit;

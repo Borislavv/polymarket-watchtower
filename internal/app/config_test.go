@@ -213,7 +213,7 @@ func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WS.Enabled = true
 				c.WS.MaxMarkets = 25
-				c.WS.MaxTokens = 50
+				c.WS.MaxTokensHardCap = 50
 			},
 			wantErr: "",
 		},
@@ -222,7 +222,7 @@ func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WS.Enabled = false
 				c.WS.MaxMarkets = 0
-				c.WS.MaxTokens = 0
+				c.WS.MaxTokensHardCap = 0
 			},
 			wantErr: "",
 		},
@@ -231,16 +231,16 @@ func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WS.Enabled = true
 				c.WS.MaxMarkets = 25
-				c.WS.MaxTokens = 10
+				c.WS.MaxTokensHardCap = 10
 			},
-			wantErr: "WS_MAX_TOKENS",
+			wantErr: "WS_MAX_TOKENS_HARD_CAP",
 		},
 		{
 			name: "ws enabled with zero max_markets fails",
 			mutate: func(c *Config) {
 				c.WS.Enabled = true
 				c.WS.MaxMarkets = 0
-				c.WS.MaxTokens = 100
+				c.WS.MaxTokensHardCap = 100
 			},
 			wantErr: "WS_MAX_MARKETS > 0",
 		},
@@ -249,7 +249,7 @@ func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WS.Enabled = true
 				c.WS.MaxMarkets = 2500
-				c.WS.MaxTokens = 5000
+				c.WS.MaxTokensHardCap = 5000
 				c.WS.AllowLargeSubscription = false
 			},
 			wantErr: "WS_ALLOW_LARGE_SUBSCRIPTION",
@@ -259,7 +259,7 @@ func TestValidateInvariants_WSSafetyBelts(t *testing.T) {
 			mutate: func(c *Config) {
 				c.WS.Enabled = true
 				c.WS.MaxMarkets = 2500
-				c.WS.MaxTokens = 5000
+				c.WS.MaxTokensHardCap = 5000
 				c.WS.AllowLargeSubscription = true
 			},
 			wantErr: "",

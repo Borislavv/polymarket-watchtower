@@ -1,25 +1,33 @@
-// strategy_shadow.go — v11.6 detect↔strategybus bridge, extended in
-// v11.8 to fan out across all 9 strategies with staged-input readers.
+// strategy_shadow.go — v11.12-insider-prior detect↔strategybus
+// bridge. Wires the production staged readers + typed StrategyConfig
+// into the hot path so prod ENV is the single source of truth for
+// every detector threshold.
 //
-// Surface:
-//   - detect.Loop calls recordStrategyShadow once per newly-persisted
-//     alert (after persistAlert returned true).
-//   - For each enabled strategy, the bridge resolves staged inputs
-//     from Postgres-backed readers (cached, bounded, timeout-guarded)
-//     and runs the pure Decide().
-//   - Each fired/tag/boost decision writes one shadow row via bus.
-//   - When staged data is missing, the bridge records a precise
-//     skip reason rather than firing a synthetic decision.
+// Surface (per alert):
+//
+//	rulesrisk        — pure, no staged input
+//	catalystwindow   — staged catalysts
+//	walletcohort     — staged wallet edges
+//	conflictresolve  — staged recent shadow decisions
+//	cheaptail        — staged catalysts + staged risk score
+//	repricinglag     — staged closed repricing windows
+//	thesisaccum      — staged market_links + staged wallet thesis lines
+//	holderdelta      — staged holder snapshots (current + previous)
+//	bookvacuum       — staged recent book feature bars + rolling baseline
+//	marketregime     — pure tag (no staged input)
 //
 // Safety:
 //   - bus.Record forces shadow_only=true while promotion is not
-//     allowed (see strategybus.Bus). No Telegram, no AI.
-//   - Bridge fails open: any non-nil error from a reader or the
-//     writer is logged + metric'd but never blocks the live alert.
-//   - Per-trade budget (StrategyShadowMaxPerTrade) caps how many
-//     rows a single trade can spawn.
-//   - All reads are bounded by ctx + the staged-inputs query
-//     timeout (default 250ms).
+//     allowed. No Telegram, no AI.
+//   - Bridge fails open: any non-nil error from a reader or writer
+//     is logged + metric'd but never blocks the live alert.
+//   - All reads are bounded by ctx + staged-inputs query timeout
+//     (default 250ms).
+//   - StrategyShadowMaxPerTrade caps per-trade rows.
+//
+// All previously-hardcoded thresholds now come from cfg.Strategy*.
+// Zero-value runtime configs fall through to per-detector defaults
+// (applyDefaults in each analytics package).
 package detect
 
 import (
@@ -27,9 +35,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/bookvacuum"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/catalystwindow"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/cheaptail"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/conflictresolve"
+	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/holderdelta"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/repricinglag"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/rulesrisk"
 	"github.com/Borislavv/polymarket-watchtower/internal/app/usecase/analytics/shadowdecisions"
@@ -42,16 +52,16 @@ import (
 
 // StrategyShadowSink is the minimal surface detect.Loop needs from
 // strategybus.Bus. Defined here so detect/ doesn't import strategybus
-// directly — avoids a future import cycle if the bus ever needs to
-// reference detect-public types.
+// directly — avoids a future import cycle.
 type StrategyShadowSink interface {
 	ShouldEvaluate(name string) bool
 	Record(ctx context.Context, d shadowdecisions.Decision) (int64, error)
 }
 
-// recordStrategyShadow is the per-alert v11.6/v11.8 hook. Called
-// once for every alert that survived dedup. Returns the number of
-// shadow rows written.
+// recordStrategyShadow is the per-alert v11.12 hook. Called once for
+// every alert that survived dedup. Returns the number of shadow rows
+// written. Sequence is deterministic: rulesrisk first (its
+// AmbiguityScore is consumed by cheaptail and repricinglag downstream).
 func (l *Loop) recordStrategyShadow(
 	ctx context.Context,
 	m market.Market,
@@ -69,19 +79,32 @@ func (l *Loop) recordStrategyShadow(
 	}
 	bus := l.cfg.StrategyShadowBus
 
-	// 1. rulesrisk — pure, no staged input.
+	// 0. marketregime — pure, no staged input. Runs first so the
+	// regime label is available for downstream features (today it
+	// is stamped on its own KindTag row; future work attaches it
+	// to every shadow features_json under "market_regime").
+	var regime string
+	if l.cfg.StrategyMarketRegime != nil && written < maxPerTrade && bus.ShouldEvaluate("marketregime") {
+		w, r := l.shadowMarketRegime(ctx, m, t, f, dedupKey)
+		written += w
+		regime = r
+	}
+
+	// 1. rulesrisk — pure ambiguity scorer. Score consumed
+	// downstream by cheaptail + repricinglag.
+	var ambiguity float64
 	if bus.ShouldEvaluate("rulesrisk") {
 		if l.cfg.StrategyRulesRisk != nil && written < maxPerTrade {
-			written += l.shadowRulesRisk(ctx, m, t, f, dedupKey)
+			w, a := l.shadowRulesRisk(ctx, m, t, f, dedupKey, regime)
+			written += w
+			ambiguity = a
 		} else {
 			l.observeStrategySkipped("rulesrisk", "no_detector")
 		}
 	}
 
-	// All remaining strategies need staged inputs.
 	staged := l.cfg.StrategyStagedInputs
 	if staged == nil || !staged.Enabled() {
-		// Single skip metric per strategy when readers are off entirely.
 		for _, name := range []string{"thesisaccum", "holderdelta", "walletcohort", "catalystwindow", "bookvacuum", "repricinglag", "cheaptail", "conflictresolve"} {
 			if bus.ShouldEvaluate(name) {
 				l.observeStrategySkipped(name, "staged_inputs_disabled")
@@ -90,43 +113,71 @@ func (l *Loop) recordStrategyShadow(
 		return written
 	}
 
-	// 2. catalystwindow — booster. Needs catalysts for event.
+	// 2. catalystwindow — booster.
 	if written < maxPerTrade && bus.ShouldEvaluate("catalystwindow") {
-		written += l.shadowCatalystWindow(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowCatalystWindow(ctx, m, t, f, dedupKey, staged, regime)
 	}
-	// 3. walletcohort — booster. Needs wallet edges.
+	// 3. walletcohort — booster (edge_density + fresh_wallet_burst).
 	if written < maxPerTrade && bus.ShouldEvaluate("walletcohort") {
-		written += l.shadowWalletCohort(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowWalletCohort(ctx, m, t, f, dedupKey, staged, regime)
 	}
-	// 4. conflictresolve — arbitration. Needs recent shadow decisions.
+	// 4. conflictresolve — arbitration.
 	if written < maxPerTrade && bus.ShouldEvaluate("conflictresolve") {
-		written += l.shadowConflictResolve(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowConflictResolve(ctx, m, t, f, dedupKey, staged, regime)
 	}
-	// 5. cheaptail — primary, requires risk + catalyst context.
+	// 5. cheaptail — primary, blocked by rulesrisk ambiguity.
 	if written < maxPerTrade && bus.ShouldEvaluate("cheaptail") {
-		written += l.shadowCheapTail(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowCheapTail(ctx, m, t, f, dedupKey, staged, ambiguity, regime)
 	}
-	// 6. repricinglag — primary, needs closed repricing windows.
+	// 6. repricinglag — primary, blocked by rulesrisk ambiguity.
 	if written < maxPerTrade && bus.ShouldEvaluate("repricinglag") {
-		written += l.shadowRepricingLag(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowRepricingLag(ctx, m, t, f, dedupKey, staged, ambiguity, regime)
 	}
-	// 7. thesisaccum — primary, needs market_links presence + wallet aggregates.
+	// 7. thesisaccum — primary.
 	if written < maxPerTrade && bus.ShouldEvaluate("thesisaccum") {
-		written += l.shadowThesisAccum(ctx, m, t, f, dedupKey, staged)
+		written += l.shadowThesisAccum(ctx, m, t, f, dedupKey, staged, regime)
 	}
-	// 8. holderdelta — primary, needs holder snapshots (typically absent).
-	if bus.ShouldEvaluate("holderdelta") {
-		// No snapshot fetcher reader yet; surface explicit skip reason.
-		l.observeStrategySkipped("holderdelta", "no_holder_snapshots_available")
+	// 8. holderdelta — primary, real staged snapshots.
+	if written < maxPerTrade && bus.ShouldEvaluate("holderdelta") {
+		written += l.shadowHolderDelta(ctx, m, t, f, dedupKey, staged, regime)
 	}
-	// 9. bookvacuum — booster, needs book_feature_bars (no producer).
-	if bus.ShouldEvaluate("bookvacuum") {
-		l.observeStrategySkipped("bookvacuum", "no_book_feature_bars_producer")
+	// 9. bookvacuum — booster, real staged bars.
+	if written < maxPerTrade && bus.ShouldEvaluate("bookvacuum") {
+		written += l.shadowBookVacuum(ctx, m, t, f, dedupKey, staged, regime)
 	}
 	return written
 }
 
 // --- per-strategy shadow writers ---------------------------------
+
+func (l *Loop) shadowMarketRegime(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	f anomaly.Finding,
+	dedupKey string,
+) (int, string) {
+	catSlug, catLabel := "", ""
+	if f.Category != nil {
+		catSlug = f.Category.Slug
+		catLabel = f.Category.Label
+	}
+	v := l.cfg.StrategyMarketRegime.Classify(MarketRegimeInput{
+		CategorySlug:  catSlug,
+		CategoryLabel: catLabel,
+		Title:         m.Question,
+		EventSlug:     m.EventSlug,
+	})
+	features := map[string]any{
+		"market_regime":              v.Regime,
+		"market_regime_score":        v.Score,
+		"requires_dual_confirmation": v.Regime == "oracle_sensitive",
+	}
+	reasons := append([]string{}, v.Reasons...)
+	n := l.writeShadow(ctx, "marketregime", shadowdecisions.KindTag, shadowdecisions.LevelNone,
+		v.Score, v.Score, reasons, features, m, t, f, dedupKey, v.Regime)
+	return n, v.Regime
+}
 
 func (l *Loop) shadowRulesRisk(
 	ctx context.Context,
@@ -134,7 +185,8 @@ func (l *Loop) shadowRulesRisk(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-) int {
+	regime string,
+) (int, float64) {
 	in := rulesrisk.Input{
 		ConditionID: string(m.ID),
 		Title:       m.Question,
@@ -142,10 +194,15 @@ func (l *Loop) shadowRulesRisk(
 	v := l.cfg.StrategyRulesRisk.Decide(in)
 	if !l.cfg.StrategyShadowRecordNoFire && v.AmbiguityScore <= 0 {
 		l.observeStrategySkipped("rulesrisk", "no_markers")
-		return 0
+		return 0, 0
 	}
-	return l.writeShadow(ctx, "rulesrisk", shadowdecisions.KindTag, shadowdecisions.LevelNone,
-		v.AmbiguityScore, v.DisputeRisk, v.Reasons, v.Features, m, t, f, dedupKey)
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
+	n := l.writeShadow(ctx, "rulesrisk", shadowdecisions.KindTag, shadowdecisions.LevelNone,
+		v.AmbiguityScore, v.DisputeRisk, v.Reasons, features, m, t, f, dedupKey, regime)
+	return n, v.AmbiguityScore
 }
 
 func (l *Loop) shadowCatalystWindow(
@@ -154,7 +211,8 @@ func (l *Loop) shadowCatalystWindow(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	regime string,
 ) int {
 	cats, err := staged.CatalystsByEvent(ctx, m.EventSlug)
 	if err != nil {
@@ -165,7 +223,6 @@ func (l *Loop) shadowCatalystWindow(
 		l.observeStrategySkipped("catalystwindow", "no_catalysts_for_event")
 		return 0
 	}
-	// Map staged catalysts → detector input.
 	detCats := make([]catalystwindow.Catalyst, 0, len(cats))
 	for _, c := range cats {
 		detCats = append(detCats, catalystwindow.Catalyst{
@@ -175,13 +232,18 @@ func (l *Loop) shadowCatalystWindow(
 			EventSlug:  c.EventSlug,
 		})
 	}
+	rc := l.cfg.StrategyCatalystWindow
 	det := catalystwindow.New(catalystwindow.Config{})
+	minConf := rc.MinConfidence
+	if minConf <= 0 {
+		minConf = 0.65
+	}
 	in := catalystwindow.Input{
 		SignalTime:    l.now(),
 		EventSlug:     m.EventSlug,
 		Catalysts:     detCats,
-		WindowsByKind: defaultCatalystWindows(),
-		MinConfidence: 0.5,
+		WindowsByKind: catalystWindowsFromCfg(rc),
+		MinConfidence: minConf,
 		ParentScore:   1.0,
 	}
 	v := det.Decide(in)
@@ -189,8 +251,12 @@ func (l *Loop) shadowCatalystWindow(
 		l.observeStrategySkipped("catalystwindow", "outside_window")
 		return 0
 	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
 	return l.writeShadow(ctx, "catalystwindow", shadowdecisions.KindBoost, shadowdecisions.LevelNone,
-		v.Boost, v.Catalyst.Confidence, v.Reasons, v.Features, m, t, f, dedupKey)
+		v.Boost, v.Catalyst.Confidence, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 func (l *Loop) shadowWalletCohort(
@@ -199,7 +265,8 @@ func (l *Loop) shadowWalletCohort(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	regime string,
 ) int {
 	wallet := walletFromFinding(f)
 	if wallet == "" {
@@ -211,14 +278,21 @@ func (l *Loop) shadowWalletCohort(
 		l.observeStrategySkipped("walletcohort", "reader_error")
 		return 0
 	}
-	if len(edges) == 0 {
+	rc := l.cfg.StrategyWalletCohort
+	cohortHits := rc.MinCohortHits
+	if cohortHits <= 0 {
+		cohortHits = 2
+	}
+	if len(edges) == 0 && rc.FreshWalletMinBurst <= 0 {
 		l.observeStrategySkipped("walletcohort", "no_edges_for_wallet")
 		return 0
 	}
 	det := walletcohort.New(walletcohort.Config{
-		MinSimilarity: 0.5,
-		MinEvents:     2,
-		MinCohortSize: 2,
+		MinSimilarity:       rc.MinSimilarity,
+		MinEvents:           rc.MinEvents,
+		MinCohortSize:       cohortHits,
+		FreshWalletMinBurst: rc.FreshWalletMinBurst,
+		FreshWalletMaxAge:   rc.FreshWalletMaxAge,
 	})
 	dEdges := make([]walletcohort.Edge, 0, len(edges))
 	for _, e := range edges {
@@ -239,14 +313,19 @@ func (l *Loop) shadowWalletCohort(
 		EventSlug:   m.EventSlug,
 		AlertWallet: wallet,
 		AlertSide:   string(t.Side),
+		Now:         l.now(),
 		Edges:       dEdges,
 	})
 	if !v.Converged && !l.cfg.StrategyShadowRecordNoFire {
 		l.observeStrategySkipped("walletcohort", "no_convergence")
 		return 0
 	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
 	return l.writeShadow(ctx, "walletcohort", shadowdecisions.KindBoost, shadowdecisions.LevelNone,
-		v.Boost, v.SimilarityAvg, v.Reasons, v.Features, m, t, f, dedupKey)
+		v.Boost, v.SimilarityAvg, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 func (l *Loop) shadowConflictResolve(
@@ -255,9 +334,15 @@ func (l *Loop) shadowConflictResolve(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	regime string,
 ) int {
-	recent, err := staged.RecentDecisionsForCondition(ctx, string(m.ID), l.now().Add(-15*time.Minute))
+	rc := l.cfg.StrategyConflictResolve
+	window := rc.Window
+	if window <= 0 {
+		window = 20 * time.Minute
+	}
+	recent, err := staged.RecentDecisionsForCondition(ctx, string(m.ID), l.now().Add(-window))
 	if err != nil {
 		l.observeStrategySkipped("conflictresolve", "reader_error")
 		return 0
@@ -276,7 +361,6 @@ func (l *Loop) shadowConflictResolve(
 			sa = &conflictresolve.SideSignal{Side: d.Side}
 			sides[d.Side] = sa
 		}
-		// Use score/confidence as proxies for wallet quality + breadth.
 		if d.Score > sa.WalletQualityScore {
 			sa.WalletQualityScore = d.Score
 		}
@@ -288,7 +372,6 @@ func (l *Loop) shadowConflictResolve(
 		l.observeStrategySkipped("conflictresolve", "no_opposing_side")
 		return 0
 	}
-	// Build pairwise (A,B) input — pick first two distinct sides.
 	var a, b conflictresolve.SideSignal
 	picked := 0
 	for _, s := range sides {
@@ -302,7 +385,14 @@ func (l *Loop) shadowConflictResolve(
 			break
 		}
 	}
-	det := conflictresolve.New(conflictresolve.Config{})
+	// conflictresolve.Config does not surface MinQualitySum today;
+	// rc.MinQualitySum is recorded on the row's features_json so
+	// promotion review can re-aggregate if the detector later
+	// surfaces it. The other two knobs flow through directly.
+	det := conflictresolve.New(conflictresolve.Config{
+		MinDominance: rc.MinDominance,
+		MMPenalty:    rc.MMPenalty,
+	})
 	v := det.Decide(conflictresolve.ConflictInput{A: a, B: b})
 	kind := shadowdecisions.KindTag
 	switch v.Action {
@@ -310,11 +400,13 @@ func (l *Loop) shadowConflictResolve(
 		kind = shadowdecisions.KindDegrade
 	case conflictresolve.ActionBoostWinnerSuppress:
 		kind = shadowdecisions.KindSuppress
-	case conflictresolve.ActionTagUnresolved, conflictresolve.ActionKeepBoth:
-		kind = shadowdecisions.KindTag
+	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
 	}
 	return l.writeShadow(ctx, "conflictresolve", kind, shadowdecisions.LevelNone,
-		v.Dominance, 0.5, v.Reasons, v.Features, m, t, f, dedupKey)
+		v.Dominance, 0.5, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 func (l *Loop) shadowCheapTail(
@@ -323,22 +415,44 @@ func (l *Loop) shadowCheapTail(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	ambiguity float64,
+	regime string,
 ) int {
-	// Cheap-tail probability band = 0.02..0.15
-	if t.Price < 0.02 || t.Price > 0.15 {
+	rc := l.cfg.StrategyCheapTail
+	minPrice, maxPrice := rc.MinPrice, rc.MaxPrice
+	if minPrice <= 0 {
+		minPrice = 0.03
+	}
+	if maxPrice <= 0 {
+		maxPrice = 0.25
+	}
+	if t.Price < minPrice || t.Price > maxPrice {
 		l.observeStrategySkipped("cheaptail", "price_outside_band")
 		return 0
 	}
+	ambiguityCutoff := rc.AmbiguityCutoff
+	if ambiguityCutoff <= 0 {
+		ambiguityCutoff = 0.50
+	}
+	if ambiguity >= ambiguityCutoff {
+		l.observeStrategySkipped("cheaptail", "blocked_by_rulesrisk")
+		return 0
+	}
 	cats, _ := staged.CatalystsByEvent(ctx, m.EventSlug)
+	// Fall back to staged risk score if rulesrisk didn't run earlier.
 	risk, _, _ := staged.RiskScoreForCondition(ctx, string(m.ID))
+	combinedAmbiguity := ambiguity
+	if risk.AmbiguityScore > combinedAmbiguity {
+		combinedAmbiguity = risk.AmbiguityScore
+	}
 	det := cheaptail.New(cheaptail.Config{
-		MinPrice:        0.02,
-		MaxPrice:        0.15,
-		MinNotionalUSD:  500,
-		MinTrades:       1,
-		RequireCatalyst: false,
-		MaxAmbiguity:    0.7,
+		MinPrice:        minPrice,
+		MaxPrice:        maxPrice,
+		MinNotionalUSD:  rc.MinNotionalUSD,
+		MinTrades:       rc.MinTrades,
+		RequireCatalyst: rc.RequireCatalyst,
+		MaxAmbiguity:    ambiguityCutoff,
 	})
 	notional := 0.0
 	if f.Trade != nil {
@@ -348,7 +462,7 @@ func (l *Loop) shadowCheapTail(
 		ConditionID:       string(m.ID),
 		Wallet:            walletFromFinding(f),
 		HasActiveCatalyst: len(cats) > 0,
-		AmbiguityScore:    risk.AmbiguityScore,
+		AmbiguityScore:    combinedAmbiguity,
 		LifecyclePct:      f.LifecyclePct,
 		Trades: []cheaptail.Trade{{
 			Price:       t.Price,
@@ -362,8 +476,13 @@ func (l *Loop) shadowCheapTail(
 		l.observeStrategySkipped("cheaptail", "below_threshold")
 		return 0
 	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
+	features["ambiguity_score"] = combinedAmbiguity
 	return l.writeShadow(ctx, "cheaptail", shadowdecisions.KindStandalone,
-		shadowdecisions.DecisionLevel(v.Level), v.Score, v.Convexity, v.Reasons, v.Features, m, t, f, dedupKey)
+		shadowdecisions.DecisionLevel(v.Level), v.Score, v.Convexity, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 func (l *Loop) shadowRepricingLag(
@@ -372,8 +491,19 @@ func (l *Loop) shadowRepricingLag(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	ambiguity float64,
+	regime string,
 ) int {
+	rc := l.cfg.StrategyRepricingLag
+	maxAmb := rc.MaxAmbiguity
+	if maxAmb <= 0 {
+		maxAmb = 0.45
+	}
+	if ambiguity >= maxAmb {
+		l.observeStrategySkipped("repricinglag", "blocked_by_rulesrisk")
+		return 0
+	}
 	wins, err := staged.ClosedRepricingWindowsForCondition(ctx, string(m.ID), l.now().Add(-24*time.Hour))
 	if err != nil {
 		l.observeStrategySkipped("repricinglag", "reader_error")
@@ -383,26 +513,39 @@ func (l *Loop) shadowRepricingLag(
 		l.observeStrategySkipped("repricinglag", "no_closed_windows")
 		return 0
 	}
-	// Use the most recent window.
 	w := wins[0]
+	peerMin := rc.PeerMinCount
+	if peerMin <= 0 {
+		peerMin = 3
+	}
+	minLag := rc.MinLagCents
+	if minLag <= 0 {
+		minLag = 4
+	}
 	det := repricinglag.New(repricinglag.Config{
-		MinLagCents:  3,
-		PeerMinCount: 2,
+		MinLagCents:  minLag,
+		PeerMinCount: peerMin,
+		MaxAmbiguity: maxAmb,
 	})
 	in := repricinglag.Input{
 		ConditionID:       string(m.ID),
 		EventSlug:         m.EventSlug,
 		ObservedMoveCents: w.ObservedMove,
 		PeerMovesCents:    []float64{w.PeerMove},
-		AmbiguityScore:    0,
+		AmbiguityScore:    ambiguity,
 	}
 	v := det.Decide(in)
 	if !v.Fired && !l.cfg.StrategyShadowRecordNoFire {
 		l.observeStrategySkipped("repricinglag", "below_threshold")
 		return 0
 	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
+	features["ambiguity_score"] = ambiguity
 	return l.writeShadow(ctx, "repricinglag", shadowdecisions.KindStandalone,
-		shadowdecisions.DecisionLevel(v.Level), v.LagScore, v.PeerMedian, v.Reasons, v.Features, m, t, f, dedupKey)
+		shadowdecisions.DecisionLevel(v.Level), v.LagScore, v.PeerMedian, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 func (l *Loop) shadowThesisAccum(
@@ -411,7 +554,8 @@ func (l *Loop) shadowThesisAccum(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
-	staged *stagedinputs.Readers,
+	staged StagedReaders,
+	regime string,
 ) int {
 	links, err := staged.MarketLinksByEvent(ctx, m.EventSlug, 1)
 	if err != nil {
@@ -422,24 +566,26 @@ func (l *Loop) shadowThesisAccum(
 		l.observeStrategySkipped("thesisaccum", "no_market_links_for_event")
 		return 0
 	}
-	// v11.10: consume real wallet thesis lines from
-	// polymarket_wallet_thesis_lines (populated by thesislines worker).
-	// Hot-path-safe: bounded reader with TTL cache + 250ms timeout.
 	wallet := walletFromFinding(f)
 	if wallet == "" {
 		l.observeStrategySkipped("thesisaccum", "no_wallet")
 		return 0
 	}
-	const lookbackHours = 720 // 30 days, matches default THESIS_LINES_LOOKBACK
+	rc := l.cfg.StrategyThesisAccum
+	lookback := rc.LookbackLifetime
+	if lookback <= 0 {
+		// v11.12-insider-prior default = 2160h (90d) — matches
+		// THESIS_LINES_LOOKBACK so the worker output is consumed
+		// in full instead of the old 720h-vs-2160h truncation.
+		lookback = 2160 * time.Hour
+	}
+	lookbackHours := int(lookback.Hours())
 	lines, lerr := staged.WalletThesisLinesForEvent(ctx, m.EventSlug, wallet, lookbackHours)
 	if lerr != nil {
 		l.observeStrategySkipped("thesisaccum", "wallet_lines_reader_error")
 		return 0
 	}
 	if len(lines) == 0 {
-		// Wallet has no aggregate exposure in this event — emit a
-		// structural Tag (link_count only) so promotion can see the
-		// graph was present but the wallet hadn't built lines yet.
 		if !l.cfg.StrategyShadowRecordNoFire {
 			l.observeStrategySkipped("thesisaccum", "no_wallet_thesis_lines")
 			return 0
@@ -448,12 +594,13 @@ func (l *Loop) shadowThesisAccum(
 			fmt.Sprintf("links_found=%d", len(links)),
 			"no_wallet_thesis_lines",
 		}
+		features := map[string]any{"link_count": len(links), "wallet_lookback_h": lookbackHours}
+		if regime != "" {
+			features["market_regime"] = regime
+		}
 		return l.writeShadow(ctx, "thesisaccum", shadowdecisions.KindTag, shadowdecisions.LevelNone,
-			float64(len(links)), 0.2, reasons, map[string]any{"link_count": len(links)}, m, t, f, dedupKey)
+			float64(len(links)), 0.2, reasons, features, m, t, f, dedupKey, regime)
 	}
-	// Compute breadth + aligned/opposed exposure relative to the
-	// alert's Side. Single-market wallets cannot fire as cross-market
-	// thesis (breadth < 2).
 	alertSide := string(t.Side)
 	breadth := len(lines)
 	aligned, opposed := 0.0, 0.0
@@ -469,39 +616,232 @@ func (l *Loop) shadowThesisAccum(
 	if denom > 0 {
 		consistency = aligned / denom
 	}
-	if breadth < 2 {
-		l.observeStrategySkipped("thesisaccum", "single_market_line")
+	minBreadth := rc.MinBreadth
+	if minBreadth <= 0 {
+		minBreadth = 2
+	}
+	if breadth < minBreadth {
+		l.observeStrategySkipped("thesisaccum", "below_min_breadth")
 		return 0
 	}
-	// Score: breadth × consistency × log1p(aligned). Bounded by
-	// the existing detector's scoring shape; we record the row
-	// regardless and let promotion-review decide.
+	minCons := rc.MinConsistency
+	if minCons <= 0 {
+		minCons = 0.82
+	}
+	liqFloor := rc.LiquidityFloorUSD
+	if liqFloor <= 0 {
+		liqFloor = 1000
+	}
 	score := float64(breadth) * consistency
-	level := shadowdecisions.LevelInfo
-	if consistency >= 0.75 && aligned >= 1500 {
-		level = shadowdecisions.LevelWarning
+	level := shadowdecisions.LevelNone
+	if consistency >= minCons && aligned >= liqFloor {
+		level = shadowdecisions.LevelInfo
+		if breadth >= 3 && consistency >= 0.88 && aligned >= 3*liqFloor {
+			level = shadowdecisions.LevelWarning
+		}
 	}
 	reasons := []string{
 		fmt.Sprintf("breadth=%d", breadth),
 		fmt.Sprintf("aligned_usd=%.2f", aligned),
 		fmt.Sprintf("opposed_usd=%.2f", opposed),
 		fmt.Sprintf("consistency=%.3f", consistency),
+		fmt.Sprintf("min_consistency=%.2f liquidity_floor_usd=%.0f", minCons, liqFloor),
 	}
 	features := map[string]any{
-		"link_count":        len(links),
-		"breadth":           breadth,
-		"aligned_usd":       aligned,
-		"opposed_usd":       opposed,
-		"consistency":       consistency,
-		"wallet_lookback_h": lookbackHours,
+		"link_count":          len(links),
+		"breadth":             breadth,
+		"aligned_usd":         aligned,
+		"opposed_usd":         opposed,
+		"consistency":         consistency,
+		"wallet_lookback_h":   lookbackHours,
+		"min_consistency":     minCons,
+		"liquidity_floor_usd": liqFloor,
+	}
+	if regime != "" {
+		features["market_regime"] = regime
 	}
 	return l.writeShadow(ctx, "thesisaccum", shadowdecisions.KindStandalone, level,
-		score, consistency, reasons, features, m, t, f, dedupKey)
+		score, consistency, reasons, features, m, t, f, dedupKey, regime)
+}
+
+// shadowHolderDelta is the v11.12-insider-prior real-source holderdelta
+// path. Reads (current, previous) snapshot pair via stagedinputs and
+// runs the pure detector. Skip reasons are explicit and bounded:
+//
+//	no_wallet                     — finding had no wallet attached
+//	no_outcome_token              — finding lacks an outcome token to scope the snapshot
+//	holder_reader_error           — reader returned a non-NoRows error
+//	no_holder_snapshots_available — wallet has zero snapshots
+//	no_previous_snapshot          — only one snapshot exists (delta undefined)
+//	stale_snapshot                — current snapshot older than FreshSnapshotMaxAge
+//	below_threshold               — detector did not fire
+func (l *Loop) shadowHolderDelta(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	f anomaly.Finding,
+	dedupKey string,
+	staged StagedReaders,
+	regime string,
+) int {
+	wallet := walletFromFinding(f)
+	if wallet == "" {
+		l.observeStrategySkipped("holderdelta", "no_wallet")
+		return 0
+	}
+	token := outcomeTokenFromFinding(f, t)
+	if token == "" {
+		// Finding may carry only the outcome LABEL ("Yes"/"No"); the
+		// detector needs the CLOB token id to scope the snapshot. We
+		// could fall back to summing across all tokens but that
+		// would inflate PctOI on multi-leg markets — refuse safely.
+		l.observeStrategySkipped("holderdelta", "no_outcome_token")
+		return 0
+	}
+	pair, ok, err := staged.HolderSnapshotPairForWallet(ctx, string(m.ID), token, wallet)
+	if err != nil {
+		l.observeStrategySkipped("holderdelta", "holder_reader_error")
+		return 0
+	}
+	if !ok {
+		l.observeStrategySkipped("holderdelta", "no_holder_snapshots_available")
+		return 0
+	}
+	if !pair.PreviousValid {
+		l.observeStrategySkipped("holderdelta", "no_previous_snapshot")
+		return 0
+	}
+	rc := l.cfg.StrategyHolderDelta
+	freshMax := rc.FreshSnapshotMaxAge
+	if freshMax <= 0 {
+		freshMax = 45 * time.Minute
+	}
+	now := l.now()
+	if !pair.Current.SnapshotAt.IsZero() && now.Sub(pair.Current.SnapshotAt) > freshMax {
+		l.observeStrategySkipped("holderdelta", "stale_snapshot")
+		return 0
+	}
+	det := holderdelta.New(holderdelta.Config{
+		MinPctOIInfo:     rc.MinPctOIInfo,
+		MinPctOIWarning:  rc.MinPctOIWarning,
+		MinPctOICritical: rc.MinPctOICritical,
+		TopK:             rc.TopK,
+		MinSharesDelta:   rc.MinSharesDelta,
+		OIShrinkPenalty:  rc.OIShrinkPenalty,
+	})
+	in := holderdelta.Input{
+		ConditionID:  string(m.ID),
+		OutcomeToken: token,
+		Wallet:       wallet,
+		Now:          now,
+		Current:      holderSnapshotToDetector(pair.Current),
+		Previous:     holderSnapshotToDetector(pair.Previous),
+	}
+	v := det.Decide(in)
+	if !v.Fired && !l.cfg.StrategyShadowRecordNoFire {
+		l.observeStrategySkipped("holderdelta", "below_threshold")
+		return 0
+	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
+	return l.writeShadow(ctx, "holderdelta", shadowdecisions.KindStandalone,
+		shadowdecisions.DecisionLevel(v.Level), v.Score, v.Confidence, v.Reasons, features, m, t, f, dedupKey, regime)
+}
+
+// shadowBookVacuum is the v11.12-insider-prior real-source bookvacuum
+// path. Reads recent bars via stagedinputs and runs the pure detector.
+// Skip reasons:
+//
+//	no_outcome_token   — finding lacks an outcome token
+//	bookbars_reader_error
+//	no_book_feature_bars       — no producer wired for this token (default)
+//	stale_bar                  — latest bar older than MaxAgeBar
+//	baseline_missing           — only one bar exists, no baseline computable
+//	depth_missing              — bid/ask depth not produced (vacuum needs depth)
+//	below_threshold            — detector did not fire
+func (l *Loop) shadowBookVacuum(
+	ctx context.Context,
+	m market.Market,
+	t trade.Trade,
+	f anomaly.Finding,
+	dedupKey string,
+	staged StagedReaders,
+	regime string,
+) int {
+	token := outcomeTokenFromFinding(f, t)
+	if token == "" {
+		l.observeStrategySkipped("bookvacuum", "no_outcome_token")
+		return 0
+	}
+	rc := l.cfg.StrategyBookVacuum
+	maxAgeBar := rc.MaxAgeBar
+	if maxAgeBar <= 0 {
+		maxAgeBar = 90 * time.Second
+	}
+	// Look back 10× the freshness window so the rolling baseline has
+	// breathing room. The reader is bounded by MaxRows.
+	since := l.now().Add(-10 * maxAgeBar)
+	bars, err := staged.RecentBookFeatureBars(ctx, string(m.ID), token, since, 0)
+	if err != nil {
+		l.observeStrategySkipped("bookvacuum", "bookbars_reader_error")
+		return 0
+	}
+	if len(bars) == 0 {
+		l.observeStrategySkipped("bookvacuum", "no_book_feature_bars")
+		return 0
+	}
+	latest := bars[0]
+	if !latest.BarStart.IsZero() && l.now().Sub(latest.BarStart) > maxAgeBar {
+		l.observeStrategySkipped("bookvacuum", "stale_bar")
+		return 0
+	}
+	if !latest.BidDepthValid || !latest.AskDepthValid {
+		l.observeStrategySkipped("bookvacuum", "depth_missing")
+		return 0
+	}
+	if len(bars) < 2 {
+		l.observeStrategySkipped("bookvacuum", "baseline_missing")
+		return 0
+	}
+	// Build baseline by averaging the older bars (index 1..N).
+	baseline := bookvacuumBaseline(bars[1:])
+	det := bookvacuum.New(bookvacuum.Config{
+		MinCollapsePct: rc.MinCollapsePct,
+		MinSpreadZ:     rc.MinSpreadZ,
+	})
+	in := bookvacuum.Input{
+		Recent:   featureBarToDetector(latest),
+		Baseline: baseline,
+		SpreadZ:  latest.SpreadZ,
+		MMLike:   false, // MM-flagged markets are filtered upstream by MMfilter
+	}
+	v := det.Decide(in)
+	if !v.Detected && !l.cfg.StrategyShadowRecordNoFire {
+		l.observeStrategySkipped("bookvacuum", "below_threshold")
+		return 0
+	}
+	// Mid-shift gate: a real vacuum should accompany a mid move.
+	minMidShift := rc.MinMidShiftPct
+	if minMidShift > 0 && latest.MidPrice > 0 && (absFloat(latest.MidDelta)/latest.MidPrice) < minMidShift {
+		l.observeStrategySkipped("bookvacuum", "mid_shift_below_threshold")
+		return 0
+	}
+	features := copyFeatures(v.Features)
+	if regime != "" {
+		features["market_regime"] = regime
+	}
+	features["bar_age_seconds"] = l.now().Sub(latest.BarStart).Seconds()
+	features["baseline_bars"] = len(bars) - 1
+	return l.writeShadow(ctx, "bookvacuum", shadowdecisions.KindBoost, shadowdecisions.LevelNone,
+		v.Boost, 0.5, v.Reasons, features, m, t, f, dedupKey, regime)
 }
 
 // --- helpers ------------------------------------------------------
 
-// writeShadow is the common Bus.Record wrapper.
+// writeShadow is the common Bus.Record wrapper. regime is stamped
+// into the control bucket key so promotion can stratify per-regime.
 func (l *Loop) writeShadow(
 	ctx context.Context,
 	strategy string,
@@ -514,10 +854,19 @@ func (l *Loop) writeShadow(
 	t trade.Trade,
 	f anomaly.Finding,
 	dedupKey string,
+	regime string,
 ) int {
 	catLabel := ""
 	if f.Category != nil {
 		catLabel = f.Category.Label
+	}
+	if features == nil {
+		features = map[string]any{}
+	}
+	if regime != "" {
+		if _, present := features["market_regime"]; !present {
+			features["market_regime"] = regime
+		}
 	}
 	d := shadowdecisions.Decision{
 		StrategyName:        strategy,
@@ -537,7 +886,7 @@ func (l *Loop) writeShadow(
 			lifecycleBucket(f.LifecyclePct),
 			"",
 			notionalBucket(f.Trade),
-			"",
+			regime,
 		),
 	}
 	if _, err := l.cfg.StrategyShadowBus.Record(ctx, d); err != nil {
@@ -556,18 +905,101 @@ func walletFromFinding(f anomaly.Finding) string {
 	return f.Trade.Wallet
 }
 
-func defaultCatalystWindows() map[string]catalystwindow.WindowSpec {
-	return map[string]catalystwindow.WindowSpec{
-		"debate":             {Pre: 12 * time.Hour, Post: 4 * time.Hour},
-		"court_ruling":       {Pre: 24 * time.Hour, Post: 12 * time.Hour},
-		"election_day":       {Pre: 72 * time.Hour, Post: 24 * time.Hour},
-		"official_statement": {Pre: 4 * time.Hour, Post: 2 * time.Hour},
-		"generic":            {Pre: 6 * time.Hour, Post: 3 * time.Hour},
+// outcomeTokenFromFinding returns the CLOB token id for the alert's
+// outcome side. Falls through to t.OutcomeToken when the finding
+// doesn't carry one (the typical case for non-accumulation findings).
+func outcomeTokenFromFinding(f anomaly.Finding, t trade.Trade) string {
+	if f.Accumulation != nil && f.Accumulation.OutcomeToken != "" {
+		return f.Accumulation.OutcomeToken
+	}
+	if tok := string(t.Token); tok != "" {
+		return tok
+	}
+	return ""
+}
+
+func catalystWindowsFromCfg(rc CatalystWindowRuntimeConfig) map[string]catalystwindow.WindowSpec {
+	dflt := map[string]catalystwindow.WindowSpec{
+		"debate":             {Pre: 8 * time.Hour, Post: 3 * time.Hour},
+		"court_ruling":       {Pre: 18 * time.Hour, Post: 8 * time.Hour},
+		"election_day":       {Pre: 48 * time.Hour, Post: 12 * time.Hour},
+		"official_statement": {Pre: 6 * time.Hour, Post: 2 * time.Hour},
+		"generic":            {Pre: 3 * time.Hour, Post: 2 * time.Hour},
+	}
+	override := func(name string, pre, post time.Duration) {
+		spec := dflt[name]
+		if pre > 0 {
+			spec.Pre = pre
+		}
+		if post > 0 {
+			spec.Post = post
+		}
+		dflt[name] = spec
+	}
+	override("debate", rc.DebatePre, rc.DebatePost)
+	override("court_ruling", rc.CourtRulingPre, rc.CourtRulingPost)
+	override("election_day", rc.ElectionDayPre, rc.ElectionDayPost)
+	override("official_statement", rc.OfficialStatementPre, rc.OfficialStatementPost)
+	override("generic", rc.GenericPre, rc.GenericPost)
+	return dflt
+}
+
+func holderSnapshotToDetector(s stagedinputs.HolderSnapshot) holderdelta.Snapshot {
+	return holderdelta.Snapshot{
+		SnapshotAt:  s.SnapshotAt,
+		Wallet:      s.Wallet,
+		Rank:        s.Rank,
+		Shares:      s.Shares,
+		NotionalUSD: s.NotionalUSD,
+		PctOI:       s.PctOI,
+		TotalOI:     s.TotalOI,
 	}
 }
 
-// lifecycleBucket buckets a 0..100 lifecycle pct for control-bucket
-// joins. Bucket boundaries match the v11.x severity gates.
+func featureBarToDetector(b stagedinputs.BookFeatureBar) bookvacuum.FeatureBar {
+	return bookvacuum.FeatureBar{
+		BidDepthTopN:     b.BidDepthTopN,
+		AskDepthTopN:     b.AskDepthTopN,
+		MidPrice:         b.MidPrice,
+		Spread:           b.Spread,
+		BidDepthDeltaPct: b.BidDepthDeltaPct,
+		AskDepthDeltaPct: b.AskDepthDeltaPct,
+		MidDelta:         b.MidDelta,
+	}
+}
+
+// bookvacuumBaseline averages the depth + spread fields across the
+// older bars to produce the rolling-baseline FeatureBar. Delta fields
+// stay zero — Recent.*DeltaPct already encodes the change.
+func bookvacuumBaseline(bars []stagedinputs.BookFeatureBar) bookvacuum.FeatureBar {
+	if len(bars) == 0 {
+		return bookvacuum.FeatureBar{}
+	}
+	var bid, ask, mid, spread float64
+	n := 0
+	for _, b := range bars {
+		if !b.BidDepthValid || !b.AskDepthValid {
+			continue
+		}
+		bid += b.BidDepthTopN
+		ask += b.AskDepthTopN
+		mid += b.MidPrice
+		spread += b.Spread
+		n++
+	}
+	if n == 0 {
+		return bookvacuum.FeatureBar{}
+	}
+	fn := float64(n)
+	return bookvacuum.FeatureBar{
+		BidDepthTopN: bid / fn,
+		AskDepthTopN: ask / fn,
+		MidPrice:     mid / fn,
+		Spread:       spread / fn,
+	}
+}
+
+// lifecycleBucket buckets a 0..100 lifecycle pct for control-bucket joins.
 func lifecycleBucket(p float64) string {
 	switch {
 	case p < 50:
@@ -581,7 +1013,6 @@ func lifecycleBucket(p float64) string {
 	}
 }
 
-// notionalBucket buckets a trade's notional USD into compact ranges.
 func notionalBucket(ref *anomaly.TradeRef) string {
 	if ref == nil {
 		return ""
@@ -597,6 +1028,21 @@ func notionalBucket(ref *anomaly.TradeRef) string {
 	default:
 		return ">=100k"
 	}
+}
+
+func copyFeatures(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in)+2)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func absFloat(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (l *Loop) observeStrategyEval(strategy, status string) {

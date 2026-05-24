@@ -370,6 +370,79 @@ func (q *Queries) GetActiveRiskScoreForCondition(ctx context.Context, conditionI
 	return i, err
 }
 
+const getCurrentAndPreviousHolderSnapshot = `-- name: GetCurrentAndPreviousHolderSnapshot :many
+
+SELECT condition_id, outcome_token, wallet,
+       snapshot_at, rank, shares, notional_usd, pct_oi, total_oi
+FROM polymarket_holder_snapshots
+WHERE condition_id  = $1
+  AND outcome_token = $2
+  AND wallet        = $3
+ORDER BY snapshot_at DESC
+LIMIT 2
+`
+
+type GetCurrentAndPreviousHolderSnapshotParams struct {
+	ConditionID  string
+	OutcomeToken string
+	Wallet       string
+}
+
+type GetCurrentAndPreviousHolderSnapshotRow struct {
+	ConditionID  string
+	OutcomeToken string
+	Wallet       string
+	SnapshotAt   pgtype.Timestamptz
+	Rank         int32
+	Shares       float64
+	NotionalUsd  float64
+	PctOi        float64
+	TotalOi      float64
+}
+
+// v11.12-insider-prior — staged readers for holderdelta + bookvacuum.
+// Both detectors take pure inputs (snapshot pair / FeatureBar pair),
+// so the readers must return the alert wallet's CURRENT + PREVIOUS
+// snapshot in a single roundtrip. detect.Loop is hot-path; queries
+// are bounded by indexes already present on the production tables.
+// Returns the latest two snapshots for (condition_id, outcome_token,
+// wallet). Hits the `idx_holder_snapshots_wallet_at` index for the
+// bounded scan; row order is freshest-first so the caller treats
+// index 0 as current, index 1 as previous.
+//
+// The previous-snapshot pair is the input to holderdelta.Decide;
+// when only one row exists, the caller falls through with a
+// "no_previous_snapshot" skip reason.
+func (q *Queries) GetCurrentAndPreviousHolderSnapshot(ctx context.Context, arg GetCurrentAndPreviousHolderSnapshotParams) ([]GetCurrentAndPreviousHolderSnapshotRow, error) {
+	rows, err := q.db.Query(ctx, getCurrentAndPreviousHolderSnapshot, arg.ConditionID, arg.OutcomeToken, arg.Wallet)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetCurrentAndPreviousHolderSnapshotRow
+	for rows.Next() {
+		var i GetCurrentAndPreviousHolderSnapshotRow
+		if err := rows.Scan(
+			&i.ConditionID,
+			&i.OutcomeToken,
+			&i.Wallet,
+			&i.SnapshotAt,
+			&i.Rank,
+			&i.Shares,
+			&i.NotionalUsd,
+			&i.PctOi,
+			&i.TotalOi,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertRepricingWindow = `-- name: InsertRepricingWindow :one
 
 INSERT INTO polymarket_repricing_windows (
@@ -1183,6 +1256,88 @@ func (q *Queries) ListPendingValueRows(ctx context.Context, arg ListPendingValue
 			&i.Clv1h,
 			&i.Clv6h,
 			&i.Clv24h,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRecentBookFeatureBars = `-- name: ListRecentBookFeatureBars :many
+SELECT condition_id, outcome_token, bar_seconds, bar_start,
+       best_bid, best_ask, mid_price,
+       bid_depth_top_n, ask_depth_top_n,
+       spread, spread_z,
+       bid_depth_delta_pct, ask_depth_delta_pct, mid_delta
+FROM polymarket_book_feature_bars
+WHERE condition_id  = $1
+  AND outcome_token = $2
+  AND bar_start    >= $3
+ORDER BY bar_start DESC
+LIMIT $4
+`
+
+type ListRecentBookFeatureBarsParams struct {
+	ConditionID  string
+	OutcomeToken string
+	Since        pgtype.Timestamptz
+	RowLimit     int32
+}
+
+type ListRecentBookFeatureBarsRow struct {
+	ConditionID      string
+	OutcomeToken     string
+	BarSeconds       int32
+	BarStart         pgtype.Timestamptz
+	BestBid          *float64
+	BestAsk          *float64
+	MidPrice         *float64
+	BidDepthTopN     *float64
+	AskDepthTopN     *float64
+	Spread           *float64
+	SpreadZ          *float64
+	BidDepthDeltaPct *float64
+	AskDepthDeltaPct *float64
+	MidDelta         *float64
+}
+
+// Returns the most-recent `row_limit` 1s/5s bars for a token.
+// bookvacuum.Decide consumes index 0 as Recent and computes a
+// rolling baseline from the remainder. Bar freshness gate is
+// enforced by the caller; this query is purely a bounded reader.
+func (q *Queries) ListRecentBookFeatureBars(ctx context.Context, arg ListRecentBookFeatureBarsParams) ([]ListRecentBookFeatureBarsRow, error) {
+	rows, err := q.db.Query(ctx, listRecentBookFeatureBars,
+		arg.ConditionID,
+		arg.OutcomeToken,
+		arg.Since,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRecentBookFeatureBarsRow
+	for rows.Next() {
+		var i ListRecentBookFeatureBarsRow
+		if err := rows.Scan(
+			&i.ConditionID,
+			&i.OutcomeToken,
+			&i.BarSeconds,
+			&i.BarStart,
+			&i.BestBid,
+			&i.BestAsk,
+			&i.MidPrice,
+			&i.BidDepthTopN,
+			&i.AskDepthTopN,
+			&i.Spread,
+			&i.SpreadZ,
+			&i.BidDepthDeltaPct,
+			&i.AskDepthDeltaPct,
+			&i.MidDelta,
 		); err != nil {
 			return nil, err
 		}

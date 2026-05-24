@@ -241,3 +241,98 @@ func TestRepricingLagWindows_ParseRejectsBadToken(t *testing.T) {
 		t.Fatalf("expected parse error for bad token; got nil")
 	}
 }
+
+// ---- v11.12-insider-prior cross-field invariants ---------------
+
+// TestStrategyConfig_ValidateInvariants_ThesisLookbackMustMatch
+// pins the invariant: hot-path thesisaccum reads what the
+// thesislines worker writes; lookback divergence is a bug.
+func TestStrategyConfig_ValidateInvariants_ThesisLookbackMustMatch(t *testing.T) {
+	for _, k := range []string{"THESIS_ACCUM_LOOKBACK_LIFETIME", "THESIS_LINES_LOOKBACK"} {
+		_ = os.Unsetenv(k)
+	}
+	var cfg StrategyConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("env.Parse: %v", err)
+	}
+	if err := cfg.validateInvariants(); err != nil {
+		t.Fatalf("aligned defaults must pass; got %v", err)
+	}
+	cfg.ThesisAccum.LookbackLifetime = 720 * time.Hour
+	cfg.ThesisLines.Lookback = 2160 * time.Hour
+	if err := cfg.validateInvariants(); err == nil {
+		t.Fatalf("expected error on lookback divergence; got nil")
+	}
+}
+
+// TestStrategyConfig_ValidateInvariants_24hHorizonRequires26hCloseAfter
+// pins: REPRICING_LAG 24h horizon ⇒ REPRICING_WORKER_CLOSE_AFTER ≥ 26h.
+func TestStrategyConfig_ValidateInvariants_24hHorizonRequires26hCloseAfter(t *testing.T) {
+	for _, k := range []string{
+		"REPRICING_LAG_CHECK_WINDOWS",
+		"REPRICING_WORKER_CLOSE_AFTER",
+		"THESIS_ACCUM_LOOKBACK_LIFETIME",
+		"THESIS_LINES_LOOKBACK",
+	} {
+		_ = os.Unsetenv(k)
+	}
+	var cfg StrategyConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("env.Parse: %v", err)
+	}
+	cfg.Repricing.CloseAfter = 12 * time.Hour
+	if err := cfg.validateInvariants(); err == nil {
+		t.Fatalf("expected error for CLOSE_AFTER=12h with 24h horizon; got nil")
+	}
+	cfg.Repricing.CloseAfter = 26 * time.Hour
+	if err := cfg.validateInvariants(); err != nil {
+		t.Fatalf("26h CLOSE_AFTER must pass; got %v", err)
+	}
+}
+
+// TestStrategyConfig_ValidateInvariants_HolderSyncTopK20Cap pins the
+// cross-field cap at the validateInvariants layer (struct-tag already
+// guards lte=20 — this gives a clearer error).
+func TestStrategyConfig_ValidateInvariants_HolderSyncTopK20Cap(t *testing.T) {
+	for _, k := range []string{"HOLDERSYNC_TOPK", "OWNERSHIP_SYNC_TOPK", "THESIS_ACCUM_LOOKBACK_LIFETIME", "THESIS_LINES_LOOKBACK"} {
+		_ = os.Unsetenv(k)
+	}
+	var cfg StrategyConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("env.Parse: %v", err)
+	}
+	// Bypass struct-tag validator by mutating directly.
+	cfg.HolderSync.TopKV2 = 25
+	if err := cfg.validateInvariants(); err == nil {
+		t.Fatalf("expected error for TOPK=25; got nil")
+	}
+	cfg.HolderSync.TopKV2 = 20
+	cfg.HolderSync.TopK = 30
+	if err := cfg.validateInvariants(); err == nil {
+		t.Fatalf("expected error for legacy OWNERSHIP_SYNC_TOPK=30; got nil")
+	}
+}
+
+// TestStrategyConfig_ValidateInvariants_BookVacuumRequiresProducer
+// pins: BOOK_VACUUM_ENABLED=true requires BOOK_FEATURE_BARS_ENABLED=true.
+func TestStrategyConfig_ValidateInvariants_BookVacuumRequiresProducer(t *testing.T) {
+	for _, k := range []string{
+		"BOOK_VACUUM_ENABLED", "BOOK_FEATURE_BARS_ENABLED",
+		"THESIS_ACCUM_LOOKBACK_LIFETIME", "THESIS_LINES_LOOKBACK",
+	} {
+		_ = os.Unsetenv(k)
+	}
+	var cfg StrategyConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("env.Parse: %v", err)
+	}
+	cfg.BookVacuum.Enabled = true
+	cfg.BookFeatureBars.Enabled = false
+	if err := cfg.validateInvariants(); err == nil {
+		t.Fatalf("expected error: bookvacuum needs the bookbars producer")
+	}
+	cfg.BookFeatureBars.Enabled = true
+	if err := cfg.validateInvariants(); err != nil {
+		t.Fatalf("both enabled must pass; got %v", err)
+	}
+}

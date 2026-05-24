@@ -513,3 +513,73 @@ type WalletGraphConfig struct {
 	EdgeVersion        int           `env:"WALLETGRAPH_EDGE_VERSION" envDefault:"1" validate:"gte=1"`
 	UseFundingProvider bool          `env:"WALLETGRAPH_USE_FUNDING_PROVIDER" envDefault:"false"`
 }
+
+// validateInvariants applies the v11.12-insider-prior cross-field
+// rules that struct-tag validators cannot express. Boot fails loud
+// when any of these is violated so a misconfigured environment does
+// NOT silently degrade the strategy pipeline.
+//
+// Invariants:
+//
+//  1. THESIS_ACCUM_LOOKBACK_LIFETIME == THESIS_LINES_LOOKBACK.
+//     The thesisaccum hot-path consumes the wallet matrix the
+//     thesislines worker materialises; if the two lookbacks
+//     diverge, the detector reads a window the worker did not
+//     populate (or ignores rows the worker did populate).
+//
+//  2. REPRICING_LAG check_windows containing 24h ⇒
+//     REPRICING_WORKER_CLOSE_AFTER >= 26h.
+//     The worker closes a window CloseAfter after it opens; for the
+//     24h horizon to evaluate, the window must still be open at
+//     T+24h. We require a 2h grace.
+//
+//  3. HOLDERSYNC_TOPK / OWNERSHIP_SYNC_TOPK <= 20.
+//     Polymarket /holders returns at most 20 entries. The
+//     struct-tag validator already enforces lte=20; this is a
+//     belt-and-suspenders guard that surfaces a clearer error.
+//
+//  4. BOOK_VACUUM_ENABLED=true ⇒ BOOK_FEATURE_BARS_ENABLED=true.
+//     bookvacuum without bookbars has nothing to read; the worker
+//     output is the input. Without the producer, every hot-path
+//     evaluation skips with no_book_feature_bars.
+func (s StrategyConfig) validateInvariants() error {
+	// 1. thesisaccum / thesislines lookback consistency.
+	if s.ThesisAccum.LookbackLifetime != s.ThesisLines.Lookback {
+		return fmt.Errorf(
+			"THESIS_ACCUM_LOOKBACK_LIFETIME (%s) must equal THESIS_LINES_LOOKBACK (%s) — the hot-path detector consumes the worker's matrix; divergence is a correctness bug",
+			s.ThesisAccum.LookbackLifetime, s.ThesisLines.Lookback)
+	}
+	// 2. repricinglag 24h horizon requires CloseAfter >= 26h.
+	windows, err := s.RepricingLag.ParsedCheckWindows()
+	if err != nil {
+		return err
+	}
+	for _, w := range windows {
+		if w >= 24*time.Hour {
+			required := w + 2*time.Hour
+			if s.Repricing.CloseAfter < required {
+				return fmt.Errorf(
+					"REPRICING_LAG_CHECK_WINDOWS contains %s but REPRICING_WORKER_CLOSE_AFTER=%s is below the required %s (window + 2h grace)",
+					w, s.Repricing.CloseAfter, required)
+			}
+			break
+		}
+	}
+	// 3. holdersync TopK ≤ 20 (Polymarket /holders upstream cap).
+	if s.HolderSync.TopKV2 > 20 {
+		return fmt.Errorf(
+			"HOLDERSYNC_TOPK=%d exceeds the upstream /holders cap of 20 — Polymarket never returns more, requesting more would falsely advertise coverage",
+			s.HolderSync.TopKV2)
+	}
+	if s.HolderSync.TopK > 20 {
+		return fmt.Errorf(
+			"OWNERSHIP_SYNC_TOPK=%d exceeds the upstream /holders cap of 20",
+			s.HolderSync.TopK)
+	}
+	// 4. bookvacuum requires bookbars producer.
+	if s.BookVacuum.Enabled && !s.BookFeatureBars.Enabled {
+		return fmt.Errorf(
+			"BOOK_VACUUM_ENABLED=true requires BOOK_FEATURE_BARS_ENABLED=true — the detector consumes the bookbars worker output; without the producer every evaluation skips with no_book_feature_bars")
+	}
+	return nil
+}

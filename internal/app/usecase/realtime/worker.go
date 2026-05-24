@@ -42,11 +42,19 @@ import (
 
 // Config tunes the worker. Defaults match the v10.4 spec env knobs.
 type Config struct {
-	Enabled                   bool
-	MarketStreamEnabled       bool
-	SubscriptionMode          string // off | hot | predictions | alerts | all_active_limited
-	MaxMarkets                int
-	MaxTokens                 int
+	Enabled             bool
+	MarketStreamEnabled bool
+	// SubscriptionMode is the selector mode. Prediction-driven
+	// modes were removed in v11.12-insider-prior.
+	//   off    — empty set; worker no-op.
+	//   hot    — default; insider-prior bucket scheme.
+	//   alerts — recent alerts only (test/CLI convenience).
+	SubscriptionMode string
+	MaxMarkets       int
+	// MaxTokensHardCap is the WS-client circuit-breaker. The
+	// realtime worker forwards it to ws.Config.MaxTokensHardCap.
+	// NOT a tuning knob — tune by MaxMarkets instead.
+	MaxTokensHardCap          int
 	ReconnectMin              time.Duration
 	ReconnectMax              time.Duration
 	PingInterval              time.Duration
@@ -77,8 +85,8 @@ func (c *Config) applyDefaults() {
 	if c.MaxMarkets <= 0 {
 		c.MaxMarkets = 250
 	}
-	if c.MaxTokens <= 0 {
-		c.MaxTokens = 500
+	if c.MaxTokensHardCap <= 0 {
+		c.MaxTokensHardCap = 50_000
 	}
 	if c.ReconnectMin <= 0 {
 		c.ReconnectMin = 1 * time.Second

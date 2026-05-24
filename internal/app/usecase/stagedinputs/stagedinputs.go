@@ -147,6 +147,48 @@ type WalletThesisLine struct {
 	LastTradedAt time.Time
 }
 
+// HolderSnapshot mirrors holderdelta.Snapshot but lives in
+// stagedinputs so the reader and the detector remain decoupled. The
+// v11.12-insider-prior bridge converts these into the pure detector
+// input at call time.
+type HolderSnapshot struct {
+	SnapshotAt  time.Time
+	Wallet      string
+	Rank        int
+	Shares      float64
+	NotionalUSD float64
+	PctOI       float64
+	TotalOI     float64
+}
+
+// HolderSnapshotPair is the (current, previous) tuple holderdelta
+// consumes. PreviousValid=false when only one snapshot exists.
+type HolderSnapshotPair struct {
+	Current       HolderSnapshot
+	Previous      HolderSnapshot
+	PreviousValid bool
+}
+
+// BookFeatureBar mirrors bookvacuum.FeatureBar but isolates the
+// reader. Pointer fields on the SQL side map to zero+valid pairs
+// here so the detector never sees a NaN.
+type BookFeatureBar struct {
+	BarStart         time.Time
+	BarSeconds       int
+	BestBid          float64
+	BestAsk          float64
+	MidPrice         float64
+	BidDepthTopN     float64
+	AskDepthTopN     float64
+	Spread           float64
+	SpreadZ          float64
+	BidDepthDeltaPct float64
+	AskDepthDeltaPct float64
+	MidDelta         float64
+	BidDepthValid    bool
+	AskDepthValid    bool
+}
+
 // --- readers ------------------------------------------------------
 
 // MarketLinksByEvent returns same-event edges anchored on the
@@ -401,6 +443,142 @@ func (r *Readers) RecentDecisionsForCondition(ctx context.Context, conditionID s
 			Confidence:   x.Confidence,
 			FiredAt:      x.FiredAt.Time,
 		})
+	}
+	r.cachePut(key, out)
+	return out, nil
+}
+
+// HolderSnapshotPairForWallet returns the (current, previous)
+// snapshot pair for a single (condition_id, outcome_token, wallet).
+// Returns (zero, false, nil) when the table has no rows for the
+// wallet (the typical case before holdersync materialises one);
+// returns (current-only, true-but-PreviousValid=false, nil) when a
+// single row exists. Cached per key for the staged TTL.
+//
+// v11.12-insider-prior load-bearing path for holderdelta.
+func (r *Readers) HolderSnapshotPairForWallet(ctx context.Context, conditionID, outcomeToken, wallet string) (HolderSnapshotPair, bool, error) {
+	if r == nil || conditionID == "" || wallet == "" {
+		return HolderSnapshotPair{}, false, nil
+	}
+	key := "hsp:" + conditionID + "|" + outcomeToken + "|" + wallet
+	if v, ok := r.cacheGet(key); ok {
+		if v == nil {
+			return HolderSnapshotPair{}, false, nil
+		}
+		p := v.(HolderSnapshotPair)
+		return p, true, nil
+	}
+	qctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+	rows, err := r.q.GetCurrentAndPreviousHolderSnapshot(qctx, sqlc.GetCurrentAndPreviousHolderSnapshotParams{
+		ConditionID:  conditionID,
+		OutcomeToken: outcomeToken,
+		Wallet:       wallet,
+	})
+	if err != nil {
+		return HolderSnapshotPair{}, false, err
+	}
+	if len(rows) == 0 {
+		r.cachePut(key, nil)
+		return HolderSnapshotPair{}, false, nil
+	}
+	pair := HolderSnapshotPair{
+		Current: HolderSnapshot{
+			SnapshotAt:  tsTime(rows[0].SnapshotAt),
+			Wallet:      rows[0].Wallet,
+			Rank:        int(rows[0].Rank),
+			Shares:      rows[0].Shares,
+			NotionalUSD: rows[0].NotionalUsd,
+			PctOI:       rows[0].PctOi,
+			TotalOI:     rows[0].TotalOi,
+		},
+	}
+	if len(rows) >= 2 {
+		pair.Previous = HolderSnapshot{
+			SnapshotAt:  tsTime(rows[1].SnapshotAt),
+			Wallet:      rows[1].Wallet,
+			Rank:        int(rows[1].Rank),
+			Shares:      rows[1].Shares,
+			NotionalUSD: rows[1].NotionalUsd,
+			PctOI:       rows[1].PctOi,
+			TotalOI:     rows[1].TotalOi,
+		}
+		pair.PreviousValid = true
+	}
+	r.cachePut(key, pair)
+	return pair, true, nil
+}
+
+// RecentBookFeatureBars returns the most-recent bars for a token,
+// freshest-first. The caller treats index 0 as the "Recent" bar
+// for bookvacuum and computes a rolling baseline from index 1..N.
+// Returns at most r.cfg.MaxRows rows. Empty result is NOT an error
+// — production tokens often have no producer wired yet.
+//
+// `since` bounds the lookback to a known horizon (typically 5–15
+// minutes for vacuum freshness gates). The caller is responsible
+// for staleness gating via the latest bar's BarStart.
+func (r *Readers) RecentBookFeatureBars(ctx context.Context, conditionID, outcomeToken string, since time.Time, rowLimit int) ([]BookFeatureBar, error) {
+	if r == nil || conditionID == "" || outcomeToken == "" {
+		return nil, nil
+	}
+	if rowLimit <= 0 || rowLimit > r.cfg.MaxRows {
+		rowLimit = r.cfg.MaxRows
+	}
+	key := "bfb:" + conditionID + "|" + outcomeToken
+	if v, ok := r.cacheGet(key); ok {
+		return v.([]BookFeatureBar), nil
+	}
+	qctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+	rows, err := r.q.ListRecentBookFeatureBars(qctx, sqlc.ListRecentBookFeatureBarsParams{
+		ConditionID:  conditionID,
+		OutcomeToken: outcomeToken,
+		Since:        tsFromTime(since),
+		RowLimit:     int32(rowLimit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BookFeatureBar, 0, len(rows))
+	for _, x := range rows {
+		bar := BookFeatureBar{
+			BarStart:   tsTime(x.BarStart),
+			BarSeconds: int(x.BarSeconds),
+		}
+		if x.BestBid != nil {
+			bar.BestBid = *x.BestBid
+		}
+		if x.BestAsk != nil {
+			bar.BestAsk = *x.BestAsk
+		}
+		if x.MidPrice != nil {
+			bar.MidPrice = *x.MidPrice
+		}
+		if x.BidDepthTopN != nil {
+			bar.BidDepthTopN = *x.BidDepthTopN
+			bar.BidDepthValid = true
+		}
+		if x.AskDepthTopN != nil {
+			bar.AskDepthTopN = *x.AskDepthTopN
+			bar.AskDepthValid = true
+		}
+		if x.Spread != nil {
+			bar.Spread = *x.Spread
+		}
+		if x.SpreadZ != nil {
+			bar.SpreadZ = *x.SpreadZ
+		}
+		if x.BidDepthDeltaPct != nil {
+			bar.BidDepthDeltaPct = *x.BidDepthDeltaPct
+		}
+		if x.AskDepthDeltaPct != nil {
+			bar.AskDepthDeltaPct = *x.AskDepthDeltaPct
+		}
+		if x.MidDelta != nil {
+			bar.MidDelta = *x.MidDelta
+		}
+		out = append(out, bar)
 	}
 	r.cachePut(key, out)
 	return out, nil

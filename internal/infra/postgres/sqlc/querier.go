@@ -105,6 +105,20 @@ type Querier interface {
 	GetAlertByID(ctx context.Context, id int64) (PolymarketAlerts, error)
 	GetAlertOutcomeAnalysis(ctx context.Context, alertID int64) (PolymarketAlertOutcomeAnalyses, error)
 	GetCategoryByExternalID(ctx context.Context, externalID string) (PolymarketCategories, error)
+	// v11.12-insider-prior — staged readers for holderdelta + bookvacuum.
+	// Both detectors take pure inputs (snapshot pair / FeatureBar pair),
+	// so the readers must return the alert wallet's CURRENT + PREVIOUS
+	// snapshot in a single roundtrip. detect.Loop is hot-path; queries
+	// are bounded by indexes already present on the production tables.
+	// Returns the latest two snapshots for (condition_id, outcome_token,
+	// wallet). Hits the `idx_holder_snapshots_wallet_at` index for the
+	// bounded scan; row order is freshest-first so the caller treats
+	// index 0 as current, index 1 as previous.
+	//
+	// The previous-snapshot pair is the input to holderdelta.Decide;
+	// when only one row exists, the caller falls through with a
+	// "no_previous_snapshot" skip reason.
+	GetCurrentAndPreviousHolderSnapshot(ctx context.Context, arg GetCurrentAndPreviousHolderSnapshotParams) ([]GetCurrentAndPreviousHolderSnapshotRow, error)
 	GetEventNewsFingerprint(ctx context.Context, eventSlug string) (PolymarketEventNewsFingerprints, error)
 	GetEventPageFetchState(ctx context.Context, eventSlug string) (PolymarketEventPageFetches, error)
 	GetEventSlugAlias(ctx context.Context, originalSlug string) (string, error)
@@ -326,6 +340,11 @@ type Querier interface {
 	ListPeerConditionsByMarketLinks(ctx context.Context, arg ListPeerConditionsByMarketLinksParams) ([]string, error)
 	// v11.6 PART 6 — shadow value evaluator queries.
 	ListPendingValueRows(ctx context.Context, arg ListPendingValueRowsParams) ([]ListPendingValueRowsRow, error)
+	// Returns the most-recent `row_limit` 1s/5s bars for a token.
+	// bookvacuum.Decide consumes index 0 as Recent and computes a
+	// rolling baseline from the remainder. Bar freshness gate is
+	// enforced by the caller; this query is purely a bounded reader.
+	ListRecentBookFeatureBars(ctx context.Context, arg ListRecentBookFeatureBarsParams) ([]ListRecentBookFeatureBarsRow, error)
 	ListRecentEventAnnotations(ctx context.Context, arg ListRecentEventAnnotationsParams) ([]PolymarketEventAnnotations, error)
 	ListRecentNewsIntelRuns(ctx context.Context, rowLimit int32) ([]PolymarketNewsIntelRuns, error)
 	ListRecentShadowDecisionsForCondition(ctx context.Context, arg ListRecentShadowDecisionsForConditionParams) ([]ListRecentShadowDecisionsForConditionRow, error)

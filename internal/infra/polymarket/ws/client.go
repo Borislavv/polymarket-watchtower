@@ -25,10 +25,21 @@ type Config struct {
 	// Endpoint defaults to the public Polymarket CLOB market
 	// channel. Overridable for fixture/staging.
 	Endpoint string
-	// MaxTokens hard-caps how many token ids we subscribe to. Set
-	// to bound the per-cycle subscription explosion in tests + as
-	// a production safety belt.
-	MaxTokens int
+	// MaxTokensHardCap is an EMERGENCY safety guard, NOT a normal
+	// tuning knob. The selector caps by MARKETS (WS_MAX_MARKETS) and
+	// every selected market is subscribed with ALL its outcome
+	// tokens — no silent slicing. The hard cap exists purely so a
+	// runaway selector (bug, mis-pinned config) cannot fan out a
+	// 100k-token subscription before anyone notices.
+	//
+	// When the resolved token list exceeds MaxTokensHardCap, the
+	// client returns an explicit ErrTokenHardCapExceeded so the
+	// reconnect logic surfaces the failure loudly. Default 50000.
+	//
+	// Operators MUST NOT lower this to bound a "normal" subscription
+	// — bound by WS_MAX_MARKETS instead. Tests pin the loud-failure
+	// behaviour: see TestSubscribeOverHardCapFailsLoudly.
+	MaxTokensHardCap int
 	// PingInterval is the cadence at which we send the literal
 	// "PING" text frame the Polymarket server expects.
 	PingInterval time.Duration
@@ -70,10 +81,17 @@ func (c *Config) applyDefaults() {
 	if c.EventBuffer <= 0 {
 		c.EventBuffer = 10_000
 	}
-	if c.MaxTokens <= 0 {
-		c.MaxTokens = 500
+	if c.MaxTokensHardCap <= 0 {
+		c.MaxTokensHardCap = 50_000
 	}
 }
+
+// ErrTokenHardCapExceeded is returned from connectOnce when the
+// resolved token count exceeds MaxTokensHardCap. The reconnect loop
+// must surface this error rather than swallow it — silent token
+// truncation is the v11.12-insider-prior failure mode this guard
+// exists to prevent.
+var ErrTokenHardCapExceeded = errors.New("polymarket ws: subscription token count exceeds MaxTokensHardCap")
 
 // Status enumerates the client's externally-observable health.
 const (
@@ -231,34 +249,19 @@ func (c *Client) runOnce(ctx context.Context, out chan<- Event) error {
 		c.observeConnected(false)
 	}()
 
-	// Build the union of all token ids, deduped + capped at MaxTokens.
-	// v11.11: dedup defensively here too — selectors built outside
-	// internal/app/usecase/realtime can still hand us a list with
-	// duplicates, and a duplicate burns a MaxTokens slot without
-	// adding any real subscription.
 	c.subMu.RLock()
-	tokens := make([]string, 0, c.cfg.MaxTokens)
-	seen := make(map[string]struct{}, c.cfg.MaxTokens)
-	for _, m := range c.currentSubs.Markets {
-		for _, tok := range m.CLOBTokenIDs {
-			tok = strings.TrimSpace(tok)
-			if tok == "" {
-				continue
-			}
-			if _, dup := seen[tok]; dup {
-				continue
-			}
-			seen[tok] = struct{}{}
-			if len(tokens) >= c.cfg.MaxTokens {
-				break
-			}
-			tokens = append(tokens, tok)
-		}
-		if len(tokens) >= c.cfg.MaxTokens {
-			break
-		}
-	}
+	currentSubs := c.currentSubs
 	c.subMu.RUnlock()
+	tokens, marketCount, err := resolveSubscribeTokens(currentSubs, c.cfg.MaxTokensHardCap)
+	if err != nil {
+		if c.log != nil {
+			c.log.Error().
+				Int("markets", marketCount).
+				Int("hard_cap", c.cfg.MaxTokensHardCap).
+				Msg("polymarket ws: subscription token count exceeds MaxTokensHardCap — refusing to subscribe; lower WS_MAX_MARKETS or raise WS_MAX_TOKENS_HARD_CAP if this is intentional")
+		}
+		return err
+	}
 
 	payload, _ := json.Marshal(subscribeMsg{AssetsIDs: tokens, Type: "market"})
 	if err := c.writeText(conn, payload); err != nil {
@@ -266,7 +269,11 @@ func (c *Client) runOnce(ctx context.Context, out chan<- Event) error {
 	}
 	c.observeSubscriptionCount(len(tokens))
 	if c.log != nil {
-		c.log.Info().Int("tokens", len(tokens)).Str("endpoint", c.cfg.Endpoint).Msg("polymarket ws: subscribed")
+		c.log.Info().
+			Int("tokens", len(tokens)).
+			Int("markets", marketCount).
+			Str("endpoint", c.cfg.Endpoint).
+			Msg("polymarket ws: subscribed")
 	}
 
 	// Writer goroutine: pings + cancellation watchdog.
@@ -415,4 +422,35 @@ func MustParseURL(raw string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+// resolveSubscribeTokens is the v11.12-insider-prior token resolver.
+// Given the current SubscriptionSet, returns the deduped list of
+// ALL token ids across ALL markets — no per-market truncation, no
+// silent slicing. The only failure mode is the hard-cap circuit-
+// breaker (default 50_000) which returns ErrTokenHardCapExceeded.
+//
+// Exposed for unit testing via subscribe payload tests; not part of
+// the public API.
+func resolveSubscribeTokens(set SubscriptionSet, hardCap int) ([]string, int, error) {
+	marketCount := len(set.Markets)
+	tokens := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, m := range set.Markets {
+		for _, tok := range m.CLOBTokenIDs {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			if _, dup := seen[tok]; dup {
+				continue
+			}
+			seen[tok] = struct{}{}
+			tokens = append(tokens, tok)
+		}
+	}
+	if hardCap > 0 && len(tokens) > hardCap {
+		return nil, marketCount, ErrTokenHardCapExceeded
+	}
+	return tokens, marketCount, nil
 }

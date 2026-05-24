@@ -628,22 +628,31 @@ type Config struct {
 
 // WebSocketConfig wires the v10.4 hybrid WebSocket fast-lane.
 //
-// v10.6 flipped WS_ENABLED to true by default with conservative
-// "small hot" defaults (25 markets / 50 tokens). Polling + backfill +
+// v10.6 flipped WS_ENABLED to true by default. Polling + backfill +
 // alertsender remain the canonical pipeline; WS is strictly a low-
 // latency trigger accelerator. Operators who don't want any WS
 // traffic at all can still set WS_ENABLED=false.
 //
+// v11.12-insider-prior: WS subscription is MARKET-LIMITED, not
+// TOKEN-LIMITED. The selector caps at WS_MAX_MARKETS and every
+// selected market subscribes to ALL its outcome tokens (no silent
+// slicing). WS_MAX_TOKENS_HARD_CAP is an emergency circuit-breaker
+// only; when exceeded the WS client fails LOUDLY with
+// ws.ErrTokenHardCapExceeded rather than silently dropping tokens.
+//
+// The legacy WS_MAX_TOKENS knob is in staleEnvKeys{} and boot-fails
+// loudly if set — earlier it silently truncated tokens after market
+// selection, masking the May/Jul/Dec multi-outcome failure mode.
+//
 // Safety belts:
 //   - WS_MAX_MARKETS > 250 requires WS_ALLOW_LARGE_SUBSCRIPTION=true.
-//   - WS_MAX_TOKENS must be >= WS_MAX_MARKETS (enforced in Validate).
 //   - WS_ENABLED=true requires WS_MAX_MARKETS > 0.
 type WebSocketConfig struct {
 	Enabled             bool   `env:"WS_ENABLED" envDefault:"true"`
 	MarketStreamEnabled bool   `env:"WS_MARKET_STREAM_ENABLED" envDefault:"true"`
 	SubscriptionMode    string `env:"WS_SUBSCRIPTION_MODE" envDefault:"hot"`
 	MaxMarkets          int    `env:"WS_MAX_MARKETS" envDefault:"25" validate:"gte=1,lte=5000"`
-	MaxTokens           int    `env:"WS_MAX_TOKENS" envDefault:"50" validate:"gte=1,lte=10000"`
+	MaxTokensHardCap    int    `env:"WS_MAX_TOKENS_HARD_CAP" envDefault:"50000" validate:"gte=1,lte=200000"`
 	// AllowLargeSubscription unlocks WS_MAX_MARKETS > 250. False by
 	// default — a typo of WS_MAX_MARKETS=2500 now fails Validate()
 	// rather than fanning out a 5000-token subscription.
@@ -674,6 +683,12 @@ type WebSocketConfig struct {
 	IncludeHighTradeMarkets bool `env:"WS_INCLUDE_HIGH_TRADE_MARKETS" envDefault:"false"`
 	HighTradeMinTrades24h   int  `env:"WS_HIGH_TRADE_MIN_TRADES_24H" envDefault:"50" validate:"gte=1,lte=100000"`
 	HighTradeLookbackHours  int  `env:"WS_HIGH_TRADE_LOOKBACK_HOURS" envDefault:"24" validate:"gte=1,lte=168"`
+	// AnnotationLookback is the freshness window for the
+	// event_annotation_recent WS selector bucket. Default 168h = 7d
+	// matches the live linkup-source cadence (~1 entry/day/event).
+	// The previous 12h window caught 1 event vs 4 events in 7d on
+	// the live database — see selector.go bucket 5.
+	AnnotationLookback time.Duration `env:"WS_ANNOTATION_LOOKBACK" envDefault:"168h" validate:"gt=0"`
 }
 
 // EventFlowConfig drives the deterministic event-level flow
@@ -1012,6 +1027,12 @@ var staleEnvKeys = []string{
 	// Pre-v11 narrative-context surfaces.
 	"MARKET_ACTIVITY_CONTEXT_LOOKBACK",
 	"EVENT_NARRATIVE_CONTEXT_LOOKBACK",
+	// v11.12-insider-prior: WS_MAX_TOKENS retired. The old knob
+	// silently truncated tokens after market selection, masking the
+	// multi-outcome (May/Jul/Dec) failure mode. The replacement is
+	// WS_MAX_TOKENS_HARD_CAP, which is a circuit-breaker only and
+	// fails LOUDLY with ws.ErrTokenHardCapExceeded if breached.
+	"WS_MAX_TOKENS",
 }
 
 func rejectStaleEnvKeys() error {
@@ -1033,15 +1054,24 @@ func (c *Config) validateInvariants() error {
 		if c.WS.MaxMarkets <= 0 {
 			return fmt.Errorf("WS_ENABLED=true requires WS_MAX_MARKETS > 0 (got %d)", c.WS.MaxMarkets)
 		}
-		if c.WS.MaxTokens < c.WS.MaxMarkets {
-			return fmt.Errorf("WS_MAX_TOKENS (%d) must be >= WS_MAX_MARKETS (%d)",
-				c.WS.MaxTokens, c.WS.MaxMarkets)
+		// v11.12-insider-prior: WS_MAX_TOKENS_HARD_CAP is a circuit-
+		// breaker only; it MUST be far above any realistic
+		// market-count × tokens-per-market product. Refuse boot if
+		// the operator pins it below WS_MAX_MARKETS — that would
+		// guarantee a hard-cap trip on a healthy single-outcome
+		// subscription.
+		if c.WS.MaxTokensHardCap < c.WS.MaxMarkets {
+			return fmt.Errorf("WS_MAX_TOKENS_HARD_CAP (%d) must be >= WS_MAX_MARKETS (%d) — the cap is a circuit-breaker, not a tuning knob",
+				c.WS.MaxTokensHardCap, c.WS.MaxMarkets)
 		}
 		if c.WS.MaxMarkets > wsHardCap && !c.WS.AllowLargeSubscription {
 			return fmt.Errorf("WS_MAX_MARKETS=%d exceeds the safety cap of %d; "+
 				"set WS_ALLOW_LARGE_SUBSCRIPTION=true to override",
 				c.WS.MaxMarkets, wsHardCap)
 		}
+	}
+	if err := c.Strategy.validateInvariants(); err != nil {
+		return err
 	}
 	return nil
 }

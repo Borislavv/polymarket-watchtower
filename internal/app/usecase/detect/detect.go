@@ -333,13 +333,171 @@ type Config struct {
 	// when a detector returned a "no fire" verdict. Defaults to false
 	// to avoid row-volume blowup on every benign trade.
 	StrategyShadowRecordNoFire bool
-	// StrategyStagedInputs — v11.8. Bridges background-worker output
-	// (market_links, risk_scores, repricing_windows, wallet_graph_edges,
-	// event_catalysts, recent shadow_decisions) to the hot path. nil
+	// StrategyStagedInputs — v11.8/v11.12. Bridges background-worker
+	// output (market_links, risk_scores, repricing_windows,
+	// wallet_graph_edges, event_catalysts, recent shadow_decisions,
+	// holder_snapshots, book_feature_bars) to the hot path. nil
 	// makes the loop fall back to the v11.6 rulesrisk-only behaviour
 	// (every other strategy is metric-skipped with reason
 	// `staged_inputs_disabled`).
-	StrategyStagedInputs *stagedinputs.Readers
+	//
+	// The interface (not the concrete *stagedinputs.Readers) is
+	// stored so tests can inject deterministic fakes without
+	// standing up Postgres.
+	StrategyStagedInputs StagedReaders
+
+	// --- v11.12-insider-prior typed detector configs --------------
+	// The hot path used to instantiate detectors with hardcoded
+	// thresholds; v11.12 wires the parsed StrategyConfig in so
+	// operator ENV (THESIS_ACCUM_*, OWNERSHIP_V2_*, etc.) is the
+	// single source of truth. Zero-value structs fall through to
+	// detector defaults (per-package applyDefaults).
+	StrategyThesisAccum     ThesisAccumRuntimeConfig
+	StrategyHolderDelta     HolderDeltaRuntimeConfig
+	StrategyCatalystWindow  CatalystWindowRuntimeConfig
+	StrategyBookVacuum      BookVacuumRuntimeConfig
+	StrategyRepricingLag    RepricingLagRuntimeConfig
+	StrategyWalletCohort    WalletCohortRuntimeConfig
+	StrategyConflictResolve ConflictResolveRuntimeConfig
+	StrategyCheapTail       CheapTailRuntimeConfig
+	// StrategyMarketRegime is the stateless regime classifier. nil
+	// disables the regime tag on shadow features (no regime row,
+	// no metric); set to a constructed *marketregime.Classifier to
+	// stamp every shadow row with classified regime + reasons.
+	StrategyMarketRegime MarketRegimeClassifier
+}
+
+// ThesisAccumRuntimeConfig mirrors the operator-tunable subset of
+// thesisaccum.Config that the hot path passes through. Lookbacks are
+// kept in hours for the staged reader; the detector itself doesn't
+// need lookback inside Decide().
+type ThesisAccumRuntimeConfig struct {
+	LookbackLifetime  time.Duration
+	MinBreadth        int
+	MinConsistency    float64
+	MinAlignedScore   float64
+	CatalystBoostMax  float64
+	LiquidityFloorUSD float64
+	MaxLinkedMarkets  int
+}
+
+// HolderDeltaRuntimeConfig — operator knobs for holderdelta.
+type HolderDeltaRuntimeConfig struct {
+	MinPctOIInfo        float64
+	MinPctOIWarning     float64
+	MinPctOICritical    float64
+	TopK                int
+	MinSharesDelta      float64
+	OIShrinkPenalty     float64
+	FreshSnapshotMaxAge time.Duration
+}
+
+// CatalystWindowRuntimeConfig — per-kind pre/post windows + the
+// MinConfidence floor.
+type CatalystWindowRuntimeConfig struct {
+	MinConfidence         float64
+	DebatePre             time.Duration
+	DebatePost            time.Duration
+	CourtRulingPre        time.Duration
+	CourtRulingPost       time.Duration
+	ElectionDayPre        time.Duration
+	ElectionDayPost       time.Duration
+	OfficialStatementPre  time.Duration
+	OfficialStatementPost time.Duration
+	GenericPre            time.Duration
+	GenericPost           time.Duration
+}
+
+// BookVacuumRuntimeConfig — circuit-breaker thresholds + a bar
+// freshness gate the hot path enforces before passing the detector.
+type BookVacuumRuntimeConfig struct {
+	MinCollapsePct float64
+	MinSpreadZ     float64
+	MinMidShiftPct float64
+	MaxAgeBar      time.Duration
+	TopN           int
+}
+
+// RepricingLagRuntimeConfig — lag floor / peer floor / ambiguity cap.
+type RepricingLagRuntimeConfig struct {
+	MinLagCents  float64
+	PeerMinCount int
+	MaxAmbiguity float64
+}
+
+// WalletCohortRuntimeConfig — co-trade + fresh-wallet burst knobs.
+type WalletCohortRuntimeConfig struct {
+	MinSimilarity       float64
+	MinEvents           int
+	MinCohortHits       int
+	ConvergenceWindow   time.Duration
+	FreshWalletMinBurst int
+	FreshWalletMaxAge   time.Duration
+}
+
+// ConflictResolveRuntimeConfig — arbitration knobs.
+type ConflictResolveRuntimeConfig struct {
+	Window        time.Duration
+	MinDominance  float64
+	MMPenalty     float64
+	MinQualitySum float64
+}
+
+// CheapTailRuntimeConfig — cheap-tail band + ambiguity cap. The
+// load-bearing change in v11.12-insider-prior is the wider band
+// (0.03..0.25) and the AmbiguityCutoff that wires rulesrisk.
+type CheapTailRuntimeConfig struct {
+	MinPrice        float64
+	MaxPrice        float64
+	MinNotionalUSD  float64
+	MinTrades       int
+	RequireCatalyst bool
+	AmbiguityCutoff float64
+}
+
+// StagedReaders is the narrow surface detect.Loop needs from the
+// stagedinputs bundle. *stagedinputs.Readers satisfies it implicitly.
+// Defined here so tests can inject deterministic fakes without a
+// live Postgres pool, and so the detect package doesn't grow new
+// dependencies on every reader added in the analytics layer.
+type StagedReaders interface {
+	Enabled() bool
+	CatalystsByEvent(ctx context.Context, eventSlug string) ([]stagedinputs.Catalyst, error)
+	WalletEdgesForWallet(ctx context.Context, wallet string, edgeVersion int) ([]stagedinputs.WalletEdge, error)
+	RecentDecisionsForCondition(ctx context.Context, conditionID string, since time.Time) ([]stagedinputs.RecentDecision, error)
+	ClosedRepricingWindowsForCondition(ctx context.Context, conditionID string, since time.Time) ([]stagedinputs.RepricingWindow, error)
+	MarketLinksByEvent(ctx context.Context, eventSlug string, linkVersion int) ([]stagedinputs.MarketLink, error)
+	WalletThesisLinesForEvent(ctx context.Context, eventSlug, wallet string, lookbackHours int) ([]stagedinputs.WalletThesisLine, error)
+	RiskScoreForCondition(ctx context.Context, conditionID string) (stagedinputs.RiskScore, bool, error)
+	HolderSnapshotPairForWallet(ctx context.Context, conditionID, outcomeToken, wallet string) (stagedinputs.HolderSnapshotPair, bool, error)
+	RecentBookFeatureBars(ctx context.Context, conditionID, outcomeToken string, since time.Time, rowLimit int) ([]stagedinputs.BookFeatureBar, error)
+}
+
+// MarketRegimeClassifier is the narrow surface detect.Loop needs from
+// the marketregime classifier. Pure / stateless / no I/O.
+type MarketRegimeClassifier interface {
+	Classify(in MarketRegimeInput) MarketRegimeVerdict
+}
+
+// MarketRegimeInput / MarketRegimeVerdict are local mirrors of the
+// public marketregime types so detect/ does not need to import the
+// concrete package at the struct level (avoids any future import
+// cycle when marketregime grows persistent state). The wiring layer
+// (app.go) constructs the real classifier and adapts it through this
+// interface.
+type MarketRegimeInput struct {
+	CategorySlug    string
+	CategoryLabel   string
+	Title           string
+	Description     string
+	ResolutionRules string
+	EventSlug       string
+}
+
+type MarketRegimeVerdict struct {
+	Regime  string
+	Score   float64
+	Reasons []string
 }
 
 // DormantWalletConfig tunes the dormant-wallet revival booster.

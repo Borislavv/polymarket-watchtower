@@ -88,12 +88,12 @@ func runWSSmoke(args []string) {
 	// stdout printer regardless of --persist. The same Events stream
 	// optionally feeds the realtime.Worker for DB writes.
 	client := ws.New(ws.Config{
-		Endpoint:     *endpoint,
-		PingInterval: 10 * time.Second,
-		ReadTimeout:  45 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		EventBuffer:  4096,
-		MaxTokens:    16, // smoke ≤ 3 markets ⇒ tiny cap is fine
+		Endpoint:         *endpoint,
+		PingInterval:     10 * time.Second,
+		ReadTimeout:      45 * time.Second,
+		WriteTimeout:     10 * time.Second,
+		EventBuffer:      4096,
+		MaxTokensHardCap: 1024, // smoke runs only 3 markets — far below cap
 	}, nil, &logger)
 	client.Subscribe(set)
 

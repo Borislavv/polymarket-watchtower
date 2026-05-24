@@ -682,6 +682,24 @@ type Metrics struct {
 	// StrategyEvalSkipped — per-(strategy, reason) counter when the
 	// hot path could NOT evaluate the strategy because of missing
 	// context, missing detector, or disabled flag.
+	//
+	// v11.12-insider-prior reason catalog (all emitted strings are
+	// fixed enums — cardinality is bounded; no operator-supplied
+	// strings ever land on the label):
+	//
+	//   no_detector, no_markers, no_wallet, no_outcome_token,
+	//   no_recent_decisions, no_opposing_side, no_recent_convergence,
+	//   no_qualifying_edges_and_no_fresh_burst, no_edges_for_wallet,
+	//   no_catalysts_for_event, no_market_links_for_event,
+	//   no_wallet_thesis_lines, no_closed_windows,
+	//   no_holder_snapshots_available, no_previous_snapshot,
+	//   no_book_feature_bars, stale_snapshot, stale_bar,
+	//   depth_missing, baseline_missing, mid_shift_below_threshold,
+	//   below_threshold, below_min_breadth, single_market_line,
+	//   outside_window, price_outside_band, blocked_by_rulesrisk,
+	//   blocked_by_ambiguity, staged_inputs_disabled,
+	//   reader_error, holder_reader_error, bookbars_reader_error,
+	//   wallet_lines_reader_error, write_failed.
 	StrategyEvalSkipped *prometheus.CounterVec
 	// StrategyValueEvalTotal — per-(status, window) counter for the
 	// shadow value evaluator.
