@@ -7,18 +7,19 @@
 //
 // Stages (top → bottom of the funnel):
 //
-//	1. active markets / categories
-//	2. trades in window per market + per event
-//	3. detect.Loop work-queue lag (from Prometheus, optional)
-//	4. lifecycle / age gate (markets blocked by LIFECYCLE_ALERT_FROM_PCT
-//	   or MARKET_MIN_AGE)
-//	5. alerts persisted (per severity, per event_slug, per condition)
-//	6. strategy shadow decisions per strategy
-//	7. dedup_key cardinality (collisions hint at over-broad keys)
-//	8. top input-rich silent markets (high trade volume but zero alerts)
+//  1. active markets / categories
+//  2. trades in window per market + per event
+//  3. detect.Loop work-queue lag (from Prometheus, optional)
+//  4. lifecycle / age gate (markets blocked by LIFECYCLE_ALERT_FROM_PCT
+//     or MARKET_MIN_AGE)
+//  5. alerts persisted (per severity, per event_slug, per condition)
+//  6. strategy shadow decisions per strategy
+//  7. dedup_key cardinality (collisions hint at over-broad keys)
+//  8. top input-rich silent markets (high trade volume but zero alerts)
 //
 // Run:
-//   go run ./cmd/cli alert-funnel-debug --dsn=... --since 24h [--json]
+//
+//	go run ./cmd/cli alert-funnel-debug --dsn=... --since 24h [--json]
 package main
 
 import (
@@ -68,23 +69,23 @@ func runAlertFunnelDebug(args []string) {
 }
 
 type FunnelReport struct {
-	GeneratedAt    time.Time          `json:"generated_at"`
-	LookbackHours  float64            `json:"lookback_hours"`
-	MarketUniverse FunnelMarketStage  `json:"market_universe"`
-	TradeInput     FunnelTradeStage   `json:"trade_input"`
-	Lifecycle      FunnelLifecycle    `json:"lifecycle_buckets"`
-	Alerts         FunnelAlertStage   `json:"alerts"`
-	Shadow         FunnelShadowStage  `json:"strategy_shadow"`
-	Dedup          FunnelDedupStage   `json:"dedup_keys"`
-	Silent         []FunnelSilentRow  `json:"top_silent_markets"`
-	TopEvents      []FunnelTopEvent   `json:"top_alerted_events"`
+	GeneratedAt    time.Time           `json:"generated_at"`
+	LookbackHours  float64             `json:"lookback_hours"`
+	MarketUniverse FunnelMarketStage   `json:"market_universe"`
+	TradeInput     FunnelTradeStage    `json:"trade_input"`
+	Lifecycle      FunnelLifecycle     `json:"lifecycle_buckets"`
+	Alerts         FunnelAlertStage    `json:"alerts"`
+	Shadow         FunnelShadowStage   `json:"strategy_shadow"`
+	Dedup          FunnelDedupStage    `json:"dedup_keys"`
+	Silent         []FunnelSilentRow   `json:"top_silent_markets"`
+	TopEvents      []FunnelTopEvent    `json:"top_alerted_events"`
 	Telegram       FunnelTelegramRoute `json:"telegram_route"`
 }
 
 type FunnelMarketStage struct {
-	ActiveMarkets int            `json:"active_markets"`
-	ActiveEvents  int            `json:"active_events"`
-	PerCategory   []CategoryRow  `json:"per_category"`
+	ActiveMarkets int           `json:"active_markets"`
+	ActiveEvents  int           `json:"active_events"`
+	PerCategory   []CategoryRow `json:"per_category"`
 }
 type CategoryRow struct {
 	Slug    string `json:"slug"`
@@ -92,25 +93,25 @@ type CategoryRow struct {
 	Events  int    `json:"events"`
 }
 type FunnelTradeStage struct {
-	Trades         int `json:"trades"`
-	DistinctEvents int `json:"distinct_events"`
+	Trades          int `json:"trades"`
+	DistinctEvents  int `json:"distinct_events"`
 	DistinctMarkets int `json:"distinct_markets"`
 	DistinctWallets int `json:"distinct_wallets"`
 }
 type FunnelLifecycle struct {
-	Lt50          int `json:"under_50pct"`
-	From50To75    int `json:"50_to_75pct"`
-	From75To90    int `json:"75_to_90pct_eligible"`
-	Ge90          int `json:"ge_90pct_hot"`
-	UnknownLifec  int `json:"unknown_lifecycle"`
+	Lt50         int `json:"under_50pct"`
+	From50To75   int `json:"50_to_75pct"`
+	From75To90   int `json:"75_to_90pct_eligible"`
+	Ge90         int `json:"ge_90pct_hot"`
+	UnknownLifec int `json:"unknown_lifecycle"`
 }
 type FunnelAlertStage struct {
-	Total              int            `json:"total"`
-	DistinctEvents     int            `json:"distinct_events"`
-	DistinctMarkets    int            `json:"distinct_markets"`
-	BySeverity         map[string]int `json:"by_severity"`
-	TopEventShare      float64        `json:"top_event_share_pct"`
-	Top3EventShare     float64        `json:"top3_event_share_pct"`
+	Total           int            `json:"total"`
+	DistinctEvents  int            `json:"distinct_events"`
+	DistinctMarkets int            `json:"distinct_markets"`
+	BySeverity      map[string]int `json:"by_severity"`
+	TopEventShare   float64        `json:"top_event_share_pct"`
+	Top3EventShare  float64        `json:"top3_event_share_pct"`
 }
 type FunnelShadowStage struct {
 	Total       int            `json:"total"`
@@ -118,18 +119,18 @@ type FunnelShadowStage struct {
 	PerKind     map[string]int `json:"per_kind"`
 }
 type FunnelDedupStage struct {
-	DistinctDedupKeys  int `json:"distinct_dedup_keys"`
-	DedupCollisions    int `json:"dedup_collisions"`
+	DistinctDedupKeys int `json:"distinct_dedup_keys"`
+	DedupCollisions   int `json:"dedup_collisions"`
 }
 type FunnelSilentRow struct {
-	EventSlug    string `json:"event_slug"`
-	ConditionID  string `json:"condition_id"`
-	Trades       int    `json:"trades"`
+	EventSlug    string   `json:"event_slug"`
+	ConditionID  string   `json:"condition_id"`
+	Trades       int      `json:"trades"`
 	LifecyclePct *float64 `json:"lifecycle_pct,omitempty"`
 }
 type FunnelTopEvent struct {
-	EventSlug  string `json:"event_slug"`
-	Alerts     int    `json:"alerts"`
+	EventSlug string `json:"event_slug"`
+	Alerts    int    `json:"alerts"`
 }
 type FunnelTelegramRoute struct {
 	Routes map[string]int `json:"routes"`

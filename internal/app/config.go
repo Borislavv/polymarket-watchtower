@@ -671,9 +671,9 @@ type WebSocketConfig struct {
 	// are added to the selector universe even when they have no
 	// prediction / catalyst / annotation hook. Off by default so the
 	// load profile cannot regress without an explicit operator flip.
-	IncludeHighTradeMarkets   bool          `env:"WS_INCLUDE_HIGH_TRADE_MARKETS" envDefault:"false"`
-	HighTradeMinTrades24h     int           `env:"WS_HIGH_TRADE_MIN_TRADES_24H" envDefault:"50" validate:"gte=1,lte=100000"`
-	HighTradeLookbackHours    int           `env:"WS_HIGH_TRADE_LOOKBACK_HOURS" envDefault:"24" validate:"gte=1,lte=168"`
+	IncludeHighTradeMarkets bool `env:"WS_INCLUDE_HIGH_TRADE_MARKETS" envDefault:"false"`
+	HighTradeMinTrades24h   int  `env:"WS_HIGH_TRADE_MIN_TRADES_24H" envDefault:"50" validate:"gte=1,lte=100000"`
+	HighTradeLookbackHours  int  `env:"WS_HIGH_TRADE_LOOKBACK_HOURS" envDefault:"24" validate:"gte=1,lte=168"`
 }
 
 // EventFlowConfig drives the deterministic event-level flow

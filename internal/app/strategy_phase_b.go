@@ -70,7 +70,11 @@ func wireStrategyPhaseB(
 			MinSignedMove6hCents: scfg.PromotionMinSignedMove6hCents,
 			MaxReversal15mRatio:  scfg.PromotionMaxReversal15mRatio,
 			MaxAlertsPerDay:      scfg.PromotionMaxAlertsPerDay,
-			BypassExplicit:       scfg.PromotionBypassExplicit,
+			// Force-disable kill-switch: either the canonical
+			// STRATEGY_PROMOTION_FORCE_DISABLE or the legacy alias
+			// STRATEGY_PROMOTION_BYPASS_EXPLICIT being true closes
+			// the gate. Logical OR — never silently downgrade either.
+			BypassExplicit: scfg.PromotionForceDisable || scfg.PromotionBypassExplicit,
 		},
 		newPromotionSampleAdapter(pool),
 		newPromotionWriterAdapter(pool),

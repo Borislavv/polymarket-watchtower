@@ -17,8 +17,8 @@
 //
 // Run:
 //
-//   go run ./cmd/cli ws-selector-debug --dsn=$POSTGRES_DSN \
-//       --limit 5000 [--mode hot|predictions|alerts|all_active_limited] [--json]
+//	go run ./cmd/cli ws-selector-debug --dsn=$POSTGRES_DSN \
+//	    --limit 5000 [--mode hot|predictions|alerts|all_active_limited] [--json]
 package main
 
 import (
@@ -81,19 +81,19 @@ type WSSelectorRow struct {
 }
 
 type WSSelectorReport struct {
-	GeneratedAt        time.Time          `json:"generated_at"`
-	Mode               string             `json:"mode"`
-	Limit              int                `json:"limit"`
-	TotalRows          int                `json:"total_rows"`
-	UniqueMarkets      int                `json:"unique_markets"`
-	UniqueEvents       int                `json:"unique_events"`
-	UniqueTokens       int                `json:"unique_tokens"`
-	MaxTokensPerMarket int                `json:"max_tokens_per_market"`
-	MaxMarketsPerEvent int                `json:"max_markets_per_event"`
-	TopEventShare      float64            `json:"top_event_share_pct"`
-	PerBucket          map[string]int     `json:"per_bucket"`
-	PerEvent           []WSEventCount     `json:"per_event"`
-	Rows               []WSSelectorRow    `json:"rows"`
+	GeneratedAt        time.Time       `json:"generated_at"`
+	Mode               string          `json:"mode"`
+	Limit              int             `json:"limit"`
+	TotalRows          int             `json:"total_rows"`
+	UniqueMarkets      int             `json:"unique_markets"`
+	UniqueEvents       int             `json:"unique_events"`
+	UniqueTokens       int             `json:"unique_tokens"`
+	MaxTokensPerMarket int             `json:"max_tokens_per_market"`
+	MaxMarketsPerEvent int             `json:"max_markets_per_event"`
+	TopEventShare      float64         `json:"top_event_share_pct"`
+	PerBucket          map[string]int  `json:"per_bucket"`
+	PerEvent           []WSEventCount  `json:"per_event"`
+	Rows               []WSSelectorRow `json:"rows"`
 }
 
 type WSEventCount struct {
