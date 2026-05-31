@@ -9,12 +9,14 @@ services:
       POSTGRES_DB: watchtower
     volumes:
       - pg-data:/var/lib/postgresql/data
-    # Local-only port published on 5433 to avoid colliding with a host
-    # Postgres that may already own 5432. Inside the obs network the
-    # service is still on 5432; that's the port the watchtower POSTGRES_DSN
-    # below refers to.
+    # Host-published port is parameterised so collisions with other local
+    # Postgres containers can be resolved via .env (POSTGRES_HOST_PORT)
+    # without editing this file. Inside the obs network the service is
+    # still on 5432; that's the port the watchtower POSTGRES_DSN below
+    # refers to. Default 5434 because 5432 commonly hosts the system
+    # Postgres and 5433 is often claimed by a sibling project's container.
     ports:
-      - "5433:5432"
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U watchtower -d watchtower"]
       interval: 5s

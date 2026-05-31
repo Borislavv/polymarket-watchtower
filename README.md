@@ -201,8 +201,9 @@ Local URLs after `make up`:
 - Prometheus: <http://localhost:9091>
 - Grafana: <http://localhost:3000> (anonymous viewer; `admin/admin` to edit)
   - Dashboard: **Polymarket Watchtower** (`/d/watchtower-main`)
-- Postgres: `postgres://watchtower:watchtower@localhost:5433/watchtower`
-  (host port 5433 to avoid clashing with a local 5432)
+- Postgres: `postgres://watchtower:watchtower@localhost:5434/watchtower`
+  (host port defaults to 5434 to avoid clashing with a local 5432 / a
+  sibling project on 5433; override via `POSTGRES_HOST_PORT` in `.env`)
 
 ### PostgreSQL persistence (production shape)
 
@@ -223,7 +224,7 @@ parallel packages collide.
 make pg-up          # start the postgres service
 make migrate        # apply embedded SQL migrations
 make pg-test        # run repository integration tests
-POSTGRES_TEST_DSN="postgres://watchtower:watchtower@localhost:5433/watchtower?sslmode=disable" \
+POSTGRES_TEST_DSN="postgres://watchtower:watchtower@localhost:5434/watchtower?sslmode=disable" \
   go test -p 1 -count=1 \
     ./internal/infra/repository/... \
     ./internal/app/usecase/analytics/dbbaseline/... \

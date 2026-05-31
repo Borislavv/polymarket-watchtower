@@ -121,7 +121,7 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^watchtower-postgres$'
       psql -U watchtower -d watchtower -c 'SELECT 1;' > /dev/null 2>&1; then
     # Apply every unapplied migration via the CLI; the CLI itself
     # is idempotent + golang-migrate handles versioning.
-    if go run ./cmd/cli migrate -dsn "postgres://watchtower:watchtower@localhost:5433/watchtower?sslmode=disable" \
+    if go run ./cmd/cli migrate -dsn "postgres://watchtower:watchtower@localhost:${POSTGRES_HOST_PORT:-5434}/watchtower?sslmode=disable" \
         > /tmp/watchtower-verify.miglog 2>&1; then
       log_pass "migrations applied / idempotent"
     else
